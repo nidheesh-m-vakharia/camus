@@ -1,6 +1,6 @@
 # ADR 0004: Metadata Raft group
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-05
 
 ## Context

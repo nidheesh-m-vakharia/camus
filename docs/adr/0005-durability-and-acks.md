@@ -1,6 +1,6 @@
 # ADR 0005: Durability modes and acks
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-05
 
 ## Context

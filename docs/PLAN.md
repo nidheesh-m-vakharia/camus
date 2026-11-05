@@ -1,10 +1,9 @@
 # Camus plan
 
-Status: waiting for review. Date: 2026-11-05.
+Status: accepted. Date: 2026-11-05.
 
-Phase 0 implementation has not started. This document is the review packet.
-The ADRs under `docs/adr/` are the decisions. This file says what they add up
-to, which choices are still open, and what the first implementation phase is
+Phase 0 implementation has not started. The ADRs under `docs/adr/` are
+accepted. This file is the map of those decisions and of what Phase 0 is
 allowed to touch.
 
 ## Product
@@ -42,7 +41,7 @@ groups are not started. Any broker can serve a sealed offset from R2 once
 metadata says which object holds it. Details: [ADR 0001](adr/0001-system-architecture.md),
 [ADR 0004](adr/0004-metadata-raft.md), [ADR 0006](adr/0006-wal-shards.md).
 
-## Decisions proposed for acceptance
+## Decisions
 
 | # | Decision | ADR |
 | --- | --- | --- |
@@ -51,27 +50,20 @@ metadata says which object holds it. Details: [ADR 0001](adr/0001-system-archite
 | 3 | Consensus library is **openraft 0.9.25** (stable). Several Raft instances per process, with a router we write. The 0.10 alpha and `openraft-multi` stay out until 0.10 is stable. | [0004](adr/0004-metadata-raft.md) |
 | 4 | `acks=1` and `acks=all` both wait for the configured durability barrier. `acks=0` does not. Leader-only acks are not offered, because they can lose data when a minority of replicas fail. | [0005](adr/0005-durability-and-acks.md) |
 | 5 | Losing a majority of a WAL shard before upload takes the affected partitions offline. Camus does not silently truncate acked offsets. An operator can later truncate to the R2 prefix explicitly. | [0008](adr/0008-failure-and-recovery.md) |
-| 6 | Data objects are immutable and uniquely keyed. R2 allows one concurrent write per key per second and returns 429 above that. Recovery can rebuild the log index from object keys if the metadata tail is lost. | [0007](adr/0007-r2-layout-and-cost.md) |
+| 6 | Ingest objects are immutable bundles, one R2 PUT per flush for every partition in the window. R2 allows one concurrent write per key per second and returns 429 above that. The compactor later rewrites cold data into per-partition segments. Recovery rebuilds the log index from object footers. | [0007](adr/0007-r2-layout-and-cost.md) |
 | 7 | The broker writes the assigned base offset and leader epoch into each batch. The CRC-covered bytes, including compression, are copied through. | [0009](adr/0009-offsets-and-record-batches.md) |
-| 8 | The on-disk Raft engine is **not chosen yet**. Phase 0 runs the benchmark in [ADR 0011](adr/0011-local-log-storage.md) and stops for a one-line follow-up before any log format is committed. | [0011](adr/0011-local-log-storage.md) |
+| 8 | Raft logs are custom append-only segment files. State machines use `redb`. Both are open-source Rust. RocksDB and LMDB are out. Phase 0 benchmarks the segment file; it does not pick a different engine. | [0011](adr/0011-local-log-storage.md) |
 | 9 | Dev listeners are PLAINTEXT and must be opted into. The durable target for Phase 1 is SASL/PLAIN over TLS. | [0012](adr/0012-auth.md) |
 | 10 | Work lands in phases 0–5. A phase is done only when its acceptance tests pass. Unimplemented APIs return a Kafka error and a row in `compatibility.md`. They do not return success. | [0013](adr/0013-delivery-phases.md) |
+| 11 | The project license is Apache-2.0. Dependencies must be OSI-approved open source. Rust is preferred, and required for anything on the produce ack path. | `LICENSE` |
 
-## Still open, on purpose
+## Defaults
 
-**Local storage engine.** `redb`, `fjall`, and a custom append-only segment
-file are the candidates. The hypothesis, not a decision, is segment files for
-the Raft log and `redb` for state machines. Phase 0 measures fsync p99 before
-either format is locked. See ADR 0011.
+Metadata voters default to 3. WAL shard replication factor defaults to 3.
+Both are config. A 5-voter metadata group is allowed and is not the default.
+`durability.mode` defaults to `wal`.
 
-**Project license.** `NOTICE` attributes Apache Kafka. The license for
-Camus's own code is unset.
-
-**Cluster size defaults.** Metadata voters default to 3. WAL shard replication
-factor defaults to 3. Both are config. A 5-voter metadata group is allowed
-and not the default.
-
-## What Phase 0 will contain, after this review
+## What Phase 0 will contain
 
 Phase 0 is foundations only. No Produce or Fetch handler that accepts data.
 
@@ -79,8 +71,8 @@ Phase 0 is foundations only. No Produce or Fetch handler that accepts data.
 - `protocol` crate: frame codec, generated messages from the Kafka 4.4.0
   schemas, `ApiVersions` advertisement list (empty of data APIs, or limited
   to what the codec can round-trip in tests).
-- `raft` crate: one openraft 0.9.25 group, in-process, with the storage
-  engine selected by the benchmark.
+- `raft` crate: one openraft 0.9.25 group, in-process, with the segment-file
+  log and a `redb` state machine from ADR 0011.
 - `storage` crate: `object_store` against MinIO, then the same code path
   against R2. Put, ranged get, delete. Conditional put enabled (`etag`),
   which R2 and MinIO both support.
@@ -90,7 +82,9 @@ Phase 0 is foundations only. No Produce or Fetch handler that accepts data.
   local reading. The pin itself lives in `docs/compatibility.md`.
 - Unit tests: protocol round-trip, Raft election and a committed write,
   object put/get against MinIO.
-- The storage-engine benchmark and a short result note appended to ADR 0011.
+- The storage-engine benchmark, with the numbers appended to ADR 0011. The
+  engines under test are the segment file, `redb`, and `fjall`. Only the
+  first two are linked into the broker.
 
 Phase 0 will not implement Produce, Fetch, consumer groups, or the WAL
 uploader. Those are Phases 1 and 2.

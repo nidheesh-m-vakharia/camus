@@ -1,6 +1,6 @@
 # ADR 0007: R2 object layout and cost
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-05
 
 ## Context
@@ -46,29 +46,34 @@ to a key it already used. That stays clear of the 1 write/second/key limit
 and of last-writer-wins.
 
 ```
-log/{topic_id}/p{partition:08}/o{start_offset:020}-{end_offset:020}/{ulid}.seg
-```
-
-`end_offset` is exclusive. `topic_id` is the Kafka topic UUID, not the
-name, so a deleted and recreated name does not collide. The ULID keeps two
-attempted uploads of the same range distinct. After metadata commits one of
-them, the other is garbage.
-
-A combined flush that holds several partitions writes one object per
-partition in that flush, under that partition's prefix. Combining many
-partitions into one physical object is an optimization the compactor and
-uploader may use later; the key scheme above is the Phase 1 contract
-because it makes listing by partition correct. Phase 1's uploader may still
-issue those puts concurrently. If a future ADR switches to a single
-multi-partition object, the key will look like:
-
-```
 bundle/{ulid}.seg
 ```
 
-with a footer of `(topic_id, partition, start, end, file_offset, length)`
-and metadata extents pointing at byte ranges. That format is not Phase 1.
-It is recorded so the cost model below can show both.
+One flush is one object, covering every partition that received bytes in
+that window. The object footer lists `(topic_id, partition, start, end,
+file_offset, length)` and metadata extents point at those byte ranges.
+Fetch uses a ranged GET of one slice, so a consumer does not download other
+partitions' batches.
+
+`topic_id` is the Kafka topic UUID, not the name, so a deleted and
+recreated name does not collide. `end` is exclusive. The ULID makes two
+attempted uploads distinct. After metadata commits one of them, the other
+is garbage.
+
+This is the ingest layout from Phase 1, not a later optimization. Class A
+puts are the expensive R2 operation ($4.50 per million, against $0.36 for
+Class B). A per-partition object on the 250ms timer would multiply puts by
+the number of active partitions. Bundling keeps puts at four per second
+until the 8 MiB cap, regardless of partition count. The compactor (ADR
+0010) later rewrites cold bundles into per-partition 128 MiB segments so
+historical reads stay one GET per segment.
+
+```
+seg/{topic_id}/p{partition:08}/o{start_offset:020}-{end_offset:020}/{ulid}.seg
+```
+
+Those segment keys are written by the compactor only. They are also
+write-once.
 
 The metadata pointer `meta/snap/CURRENT` is the only hot key, and ADR 0004
 caps it at one put per second. No other key is updated in place.
@@ -99,8 +104,8 @@ Multipart is reserved for the compactor's larger segments (target 128 MiB).
 An object is invisible to fetch until the metadata group commits an extent
 covering it. A put that succeeded and a metadata commit that did not is an
 orphan. Orphans are not served. The orphan sweep deletes objects under
-`log/` that no snapshot and no live extent references and that are older
-than one hour.
+`bundle/` and `seg/` that no snapshot and no live extent references and
+that are older than one hour.
 
 Extent commit is a compare-and-append on `(topic, partition, sealed_end)`.
 The new extent's start must equal `sealed_end`. This is what makes offsets
@@ -120,8 +125,17 @@ Prices below are R2 Standard as published on the pricing page checked
 Let `T` be produced MiB/s of record-batch bytes, sustained, one cluster.
 Flush policy: 250ms or 8 MiB. Replication factor `RF = 3` in `wal` mode.
 
-**Class A, per-partition objects (Phase 1 path).**
-A flush writes one object per active partition. With `P` partitions
+**Class A, bundled objects (chosen path).**
+One put per flush for the broker, independent of partition count. At 1
+MiB/s the timer binds: 4 puts/s, about **$0.018 per GiB** of ingest
+(`4 * 1024` puts/GiB * $4.50 / 1e6). At 100 MiB/s the size cap binds:
+12.5 puts/s, 0.125 puts per MiB, about **$0.0006 per GiB**. Storage is
+$0.015 per GiB-month, so after the first month storage dominates except
+on the low-rate bundled path, where ingest ops and storage are the same
+order of magnitude.
+
+**Class A, per-partition objects (rejected for ingest).**
+A flush would write one object per active partition. With `P` partitions
 receiving data in the flush window:
 
 - Timer binds when a partition produces under 32 MiB/s (8 MiB / 0.25 s).
@@ -137,19 +151,14 @@ Class A ≈ 4 per MiB ≈ **$0.018 per GiB** of ingest
 Worked point: **100 MiB/s, 1 partition.** Size binds. 12.5 puts/s.
 Class A per MiB = 0.125. Per GiB ≈ **$0.0006**. Storage again dominates.
 
-Worked point: **1 MiB/s spread over 1,000 idle-but-ticked partitions** is
-the expensive shape. If the uploader flushes empty partitions it will burn
-Class A for nothing. The uploader flushes only partitions that received
-bytes. 1,000 partitions at 1 KiB/s each still produce 4,000 puts/s because
-the timer binds. That is about **$1.6 per hour** in Class A
-(4000 * 3600 * $4.50 / 1e6). The bundle format above exists for that shape.
-Until it lands, operators with many low-rate partitions should raise
-`upload.flush.ms`. The cost scales linearly with that interval.
+Worked point: **1 MiB/s spread over 1,000 partitions.** Per-partition
+objects still produce 4,000 puts/s because the timer binds on each
+partition. That is about **$1.6 per hour** in Class A
+(4000 * 3600 * $4.50 / 1e6). The bundled path stays at 4 puts/s for the
+same bytes. Empty partitions are not flushed either way.
 
-**Class A, bundled objects (later).** One put per flush for the whole
-broker, independent of `P`. At 1 MiB/s, 4 puts/s. At 100 MiB/s, 12.5
-puts/s. Same as the one-partition row. Metadata commits are Raft, not R2,
-except snapshots: one extra put each 30s, negligible.
+Metadata commits are Raft, not R2, except snapshots: one extra put each
+30s, negligible.
 
 **Class B.** Tail reads are served from the WAL or the `r2` leader's
 memory and cost no R2 ops. A consumer reading sealed data issues one ranged
@@ -181,22 +190,27 @@ merge, and the policy is ADR 0010.
 
 ## Consequences
 
-- Phase 1's many-partition cost is visible up front. The first uploader
-  still uses per-partition objects so recovery listing is simple. Bundling
-  is a follow-up ADR once the single-partition path is tested, or sooner
-  if the review wants it in Phase 1.
+- Recovery lists `bundle/` and `seg/` and reads footers. It does not assume
+  one partition per object. ADR 0008 follows that.
 - A bug that puts twice to the same key will surface as 429s, not as
   silent corruption. Treat 429 on a data key as a defect, not as backpressure.
 - MinIO does not reproduce the 429 rule. A unit test can mock it. An
   integration test against real R2 is optional and not required for Phase 0.
+- A single-partition topic pays the same Class A cost as a wide topic at
+  the same total byte rate. That is the point of bundling.
 
 ## Alternatives
 
+- One object per partition per flush. Rejected for ingest. At 1,000
+  partitions producing every 250ms it is about 4,000 puts/s, roughly $1.6
+  per hour in Class A, for the same bytes one bundled put stream would
+  write. Compaction still produces per-partition segments, where the extra
+  put buys cheaper historical reads.
 - Mutable segment keys (`.../segment-0`, rewritten). Rejected. Fights the
   per-key write limit and last-writer-wins.
 - SQLite or a manifest object rewritten every flush. Rejected for the same
   reason. The extent list lives in the metadata Raft log.
-- `aws-sdk-s3` instead of `object_store`. Rejected for Phase 0.
-  `object_store` already speaks R2 conditional puts and ranged gets, and it
-  keeps the storage crate smaller. Revisit if we need an S3 feature it
-  cannot express.
+- `aws-sdk-s3` instead of `object_store`. Rejected.
+  `object_store` is Apache-2.0, speaks R2 conditional puts and ranged gets,
+  and keeps the storage crate smaller. Revisit only if we need an S3
+  feature it cannot express.

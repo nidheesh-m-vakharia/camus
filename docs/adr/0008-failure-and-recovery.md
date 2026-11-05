@@ -1,6 +1,6 @@
 # ADR 0008: Failure and recovery
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-05
 
 ## Context
@@ -83,8 +83,8 @@ starts a new metadata group and loads the newest snapshot under
 Bound, with the default snapshot interval of 30 seconds or 10,000 entries:
 
 - **Sealed log bytes** are recoverable even when they are newer than the
-  snapshot. The recovery tool lists `log/{topic_id}/p{partition}/` (R2 list
-  is strongly consistent), reads each object's footer, and rebuilds extents
+  snapshot. The recovery tool lists `bundle/` and `seg/` (R2 list is
+  strongly consistent), reads each object's footer, and rebuilds extents
   whose offset ranges form a gap-free prefix from the snapshot's sealed end
   or from offset 0. Overlapping uploads of the same range: keep the object
   named by the snapshot if there is one, otherwise the lexicographically

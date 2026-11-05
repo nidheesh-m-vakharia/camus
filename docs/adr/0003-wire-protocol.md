@@ -1,6 +1,6 @@
 # ADR 0003: Wire protocol
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-05
 
 ## Context

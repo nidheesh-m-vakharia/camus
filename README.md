@@ -4,8 +4,8 @@ A Kafka-compatible streaming broker written in Rust. Producers, consumers, and
 admin clients speak the Apache Kafka wire protocol. Long-term data lives in
 Cloudflare R2. There is no JVM, no ZooKeeper, and no external database.
 
-Status: **design review**. The plan and ADRs are in `docs/`. No broker code
-has been written. Phase 0 starts only after these documents are accepted.
+Status: **design accepted, not implemented**. The plan and ADRs are in
+`docs/`. No broker code has been written. License: Apache-2.0.
 
 ## What a client changes
 
@@ -27,8 +27,8 @@ seconds, then it is uploaded and truncated.
 
 ## Read this first
 
-1. [docs/PLAN.md](docs/PLAN.md) — scope, decisions waiting on review, what Phase 0 will and will not do.
-2. [docs/adr/](docs/adr/) — the decisions. Each one is proposed, not implemented.
+1. [docs/PLAN.md](docs/PLAN.md) — accepted decisions, and what Phase 0 will and will not do.
+2. [docs/adr/](docs/adr/) — the decisions, in detail.
 3. [docs/compatibility.md](docs/compatibility.md) — pinned Kafka tag and the API matrix. Everything is unimplemented.
 
 ## Layout that Phase 0 will create

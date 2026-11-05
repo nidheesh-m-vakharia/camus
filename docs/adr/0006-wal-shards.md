@@ -1,6 +1,6 @@
 # ADR 0006: WAL shards
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-05
 
 ## Context

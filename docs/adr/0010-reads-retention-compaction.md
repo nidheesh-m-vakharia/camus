@@ -1,6 +1,6 @@
 # ADR 0010: Reads, retention, and compaction
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-05
 
 ## Context

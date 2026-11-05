@@ -1,6 +1,6 @@
 # ADR 0013: Delivery phases
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-05
 
 ## Context
@@ -23,8 +23,10 @@ Acceptance:
 - Three processes form a metadata Raft group and survive killing one voter.
 - Put, ranged get, and delete work against MinIO through `object_store`.
 - Prometheus endpoint answers a scrape.
-- ADR 0011 benchmark has numbers appended, and the log format is still not
-  locked unless the review accepts the result in the same breath.
+- The ADR 0011 benchmark has numbers appended. The log format is the
+  append-only segment file, and the state machine store is `redb`. A miss
+  of the p99 bar is a bug in that implementation, not a reason to reopen
+  the engine choice inside Phase 0.
 - `docs/compatibility.md` exists and lists later APIs as unimplemented.
 
 No produce, no fetch, no client compatibility suite yet.
