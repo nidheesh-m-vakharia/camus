@@ -1,0 +1,15 @@
+Camus
+Copyright 2026 Nidheesh Vakharia
+
+This product includes logic and test cases translated from Apache Kafka
+(https://kafka.apache.org/), licensed under the Apache License, Version 2.0.
+
+  Copyright 2012-2026 The Apache Software Foundation
+
+The reference tree is pinned in docs/compatibility.md. Code that closely
+follows Kafka carries a comment pointing at the source file and the pinned
+tag. Translation is limited to behavior that Camus actually implements.
+
+Third-party crates keep their own licenses (MIT, Apache-2.0, or dual).
+The Camus project license is not chosen yet. Do not treat this NOTICE as a
+grant of license for Camus's original code.
