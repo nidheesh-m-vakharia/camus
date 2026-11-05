@@ -134,3 +134,39 @@ process uses when it is given a data directory.
 - Waiting for benchmark numbers before writing the format. Rejected once
   the access pattern was clear. The benchmark remains a Phase 0 check on
   the implementation.
+
+## Measurement
+
+2026-11-05, Apple M4 Pro, 24 GiB RAM, APFS on the internal 494 GB SSD.
+One thread. Measured for 5 seconds after 1 second of warmup
+(`CAMUS_BENCH_SECONDS=5`, `CAMUS_BENCH_WARMUP=1`). That is shorter than
+the 60s / 10s protocol above, so these percentiles are a short sample.
+Eight threads were not run.
+
+| Engine | Workload | p50 | p99 | MiB/s |
+| --- | --- | ---: | ---: | ---: |
+| segment | 1 KiB | 4.0 ms | 5.0 ms | 0.25 |
+| redb | 1 KiB | 4.0 ms | 5.1 ms | 0.25 |
+| fjall | 1 KiB | 4.0 ms | 5.9 ms | 0.24 |
+| segment | 64 KiB | 4.1 ms | 8.3 ms | 13.9 |
+| redb | 64 KiB | 4.9 ms | 6.3 ms | 13.9 |
+| fjall | 64 KiB | 4.9 ms | 9.3 ms | 13.1 |
+| segment | 1 MiB | 8.1 ms | 13.0 ms | 119 |
+| redb | 1 MiB | 7.0 ms | 12.0 ms | 140 |
+| fjall | 1 MiB | 6.3 ms | 29.9 ms | 110 |
+| segment | 32 KiB × 16, one fsync | 7.9 ms | 16.0 ms | 62 |
+| redb | 32 KiB × 16, one fsync | 7.0 ms | 14.9 ms | 67 |
+| fjall | 32 KiB × 16, one fsync | 6.4 ms | 25.8 ms | 62 |
+
+The 5 ms group-commit bar is not met on this machine. A 1 KiB append is
+already one fsync at about 4.0 ms p50 and 5.0 ms p99 in every engine, so
+the floor is the disk. The group-commit workload writes 512 KiB and then
+fsyncs once. None of the three engines is under 5 ms. The segment file
+matches that floor and is not the slow outlier (`fjall` p99 is), so the
+engine choice stays. A 60 second run on a faster volume can replace this
+table.
+
+The crash check is `append_reopen_and_torn_tail`: two synced records, a
+short tail written after them, reopen, the prefix still reads, and a
+further append lands after that prefix. `truncate_and_purge` cuts a tail,
+appends again, drops a prefix, and reopens.

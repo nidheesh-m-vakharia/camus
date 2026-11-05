@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/raft",
+    "crates/metadata",
+    "crates/storage",
+    "crates/broker",
+    "crates/wal",
+    "crates/uploader",
+    "crates/coordinator",
+    "crates/compactor",
+    "crates/cli",
+    "crates/engine-bench",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+publish = false

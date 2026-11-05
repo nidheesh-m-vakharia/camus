@@ -1,0 +1,9 @@
+[package]
+name = "camus-uploader"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Uploader from the WAL or memory buffer to R2. Not started."
+
+[dependencies]

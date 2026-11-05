@@ -1,0 +1,74 @@
+name: camus
+
+# Local stand-in for Cloudflare R2, plus three broker processes.
+# Community MinIO images are no longer published, so `minio` is built from
+# the archived release in deploy/minio.
+# `docker compose up -d minio create-bucket` is enough for the storage test.
+# The broker services build the release binary. They do not form the Raft
+# group until `init` runs.
+
+services:
+  minio:
+    build: deploy/minio
+    image: camus-minio:RELEASE.2025-10-15T17-29-55Z
+    command: server /data --console-address ":9001"
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    environment:
+      MINIO_ROOT_USER: camus
+      MINIO_ROOT_PASSWORD: camus-dev-secret
+    volumes:
+      - minio:/data
+
+  create-bucket:
+    image: camus-minio:RELEASE.2025-10-15T17-29-55Z
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until mc alias set local http://minio:9000 camus camus-dev-secret; do sleep 1; done
+        mc mb -p local/camus || true
+
+  broker-1:
+    build: .
+    profiles: ["brokers"]
+    command: ["--node-id", "1", "--http-addr", "0.0.0.0:18001", "--data-dir", "/data"]
+    ports: ["18001:18001"]
+    volumes: ["broker1:/data"]
+    depends_on: [minio]
+
+  broker-2:
+    build: .
+    profiles: ["brokers"]
+    command: ["--node-id", "2", "--http-addr", "0.0.0.0:18002", "--data-dir", "/data"]
+    ports: ["18002:18002"]
+    volumes: ["broker2:/data"]
+    depends_on: [minio]
+
+  broker-3:
+    build: .
+    profiles: ["brokers"]
+    command: ["--node-id", "3", "--http-addr", "0.0.0.0:18003", "--data-dir", "/data"]
+    ports: ["18003:18003"]
+    volumes: ["broker3:/data"]
+    depends_on: [minio]
+
+  init:
+    image: curlimages/curl:8.16.0
+    profiles: ["brokers"]
+    depends_on: [broker-1, broker-2, broker-3]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sleep 2
+        curl -sf -X POST http://broker-1:18001/admin/init \
+          -H 'content-type: application/json' \
+          -d '[{"id":1,"addr":"broker-1:18001"},{"id":2,"addr":"broker-2:18002"},{"id":3,"addr":"broker-3:18003"}]'
+
+volumes:
+  minio:
+  broker1:
+  broker2:
+  broker3:

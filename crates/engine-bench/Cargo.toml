@@ -1,0 +1,17 @@
+[package]
+name = "camus-engine-bench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Compare segment files, redb, and fjall on fsync latency."
+
+[[bin]]
+name = "camus-engine-bench"
+path = "src/main.rs"
+
+[dependencies]
+camus-raft = { path = "../raft" }
+fjall = "2"
+redb = "2"
+tempfile = "3"

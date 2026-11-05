@@ -1,0 +1,16 @@
+[package]
+name = "camus-storage"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "R2/S3 object storage. MinIO is the local stand-in."
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+object_store = { version = "0.12", features = ["aws"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

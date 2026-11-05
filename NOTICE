@@ -13,6 +13,11 @@ tag. Translation is limited to behavior that Camus actually implements.
 Camus's own code is licensed under the Apache License, Version 2.0.
 The full text is in the LICENSE file.
 
+The `protocol` crate is a regeneration of kafka-protocol-rs
+(https://github.com/kafka-protocol-rs/kafka-protocol-rs), MIT OR Apache-2.0,
+from the Kafka 4.4.0 message schemas. Copyright of that generated code
+remains with its authors. Camus added the frame codec.
+
 Third-party crates keep their own licenses. Dependencies must be
 OSI-approved open source. The state-machine store, redb, is MIT OR
-Apache-2.0.
+Apache-2.0. The Raft library, openraft, is Apache-2.0.

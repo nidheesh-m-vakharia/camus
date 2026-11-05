@@ -13,6 +13,13 @@ Behavior reference: Apache Kafka **4.4.0**.
 Where a KIP and this commit disagree, this commit wins. Note the
 disagreement in `docs/adr/0002-kafka-compatibility-pin.md`.
 
+The `protocol` crate is generated from this tag's JSON schemas, not from
+the crates.io `kafka-protocol` 0.18.0 release (that crate is Kafka 4.1.0).
+`ApiVersions` request versions in the schema are 0–5. Phase 0 does not
+advertise any key. A known key gets `UNSUPPORTED_VERSION` (35). An unknown
+key gets `INVALID_REQUEST` (42). The broker process does not speak Kafka
+TCP yet.
+
 Kafka source is Apache-2.0. See `NOTICE`.
 
 ## Deliberate differences
@@ -34,7 +41,8 @@ Until then the API returns an error rather than a partial imitation.
 
 Status values: `unimplemented`, `partial`, `implemented`.
 
-Nothing is implemented yet. Unimplemented keys are absent from `ApiVersions`
+No Kafka API is implemented. The codec can round-trip messages, and the
+implemented-key set is empty. Unimplemented keys are absent from `ApiVersions`
 once that API exists, and a client that sends them anyway receives
 `UNSUPPORTED_VERSION` (35) or `INVALID_REQUEST` (42) as in ADR 0003.
 

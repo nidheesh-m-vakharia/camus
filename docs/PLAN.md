@@ -2,9 +2,9 @@
 
 Status: accepted. Date: 2026-11-05.
 
-Phase 0 implementation has not started. The ADRs under `docs/adr/` are
-accepted. This file is the map of those decisions and of what Phase 0 is
-allowed to touch.
+Phase 0 foundations are in the workspace. Produce, Fetch, groups, and the
+uploader are not. The ADRs under `docs/adr/` are accepted. This file is
+the map of those decisions and of what Phase 0 is allowed to touch.
 
 ## Product
 
