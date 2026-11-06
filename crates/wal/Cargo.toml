@@ -8,6 +8,7 @@ description = "WAL shard: a Raft group that acknowledges produce before the R2 u
 
 [dependencies]
 anyhow = "1"
+bytes = { version = "1", features = ["serde"] }
 camus-protocol = { path = "../protocol" }
 camus-raft = { path = "../raft" }
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }

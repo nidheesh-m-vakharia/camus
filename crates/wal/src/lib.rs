@@ -61,9 +61,9 @@ pub struct Append {
     pub topic_id: [u8; 16],
     /// Leader epoch written into the batch.
     pub epoch: i32,
-    /// Client bytes, checked before they are proposed.
-    #[serde(with = "serde_bytes")]
-    pub raw: Vec<u8>,
+    /// Client bytes, checked before they are proposed. A view of the
+    /// request buffer, not a copy; encoded as one byte string.
+    pub raw: bytes::Bytes,
     /// Records in `raw`.
     pub records: i32,
     /// First timestamp.
@@ -332,7 +332,7 @@ impl Shard {
         let config = Arc::new(config.validate()?);
         let log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
         let log_stats = log.stats();
-        let machine = Arc::new(Machine::open(&dir.join("state.redb"))?);
+        let machine = Arc::new(Machine::open(&dir.join("state.redb"), log.clone())?);
         let raft = Raft::new(node_id, config, network, log, machine.clone()).await?;
         let storage_failed = Arc::new(AtomicBool::new(false));
         let (queue, waiting) = tokio::sync::mpsc::unbounded_channel();
@@ -483,20 +483,25 @@ impl Shard {
         self.machine.unsealed_bytes()
     }
 
-    /// Committed batches not yet sealed.
-    pub fn pending(&self) -> Vec<Batch> {
-        self.machine.pending()
+    /// Committed batches not yet sealed, with their bytes read from the log.
+    pub async fn pending(&self) -> anyhow::Result<Vec<Batch>> {
+        Ok(self.machine.pending().await?)
     }
 
-    /// Unsealed batches for a fetch.
-    pub fn read(
+    /// Unsealed batches of one partition from `offset`, up to about `limit`
+    /// bytes (at least one batch), read from the log.
+    pub async fn read(
         &self,
         topic_id: &[u8; 16],
         partition: i32,
         sealed_end: i64,
         offset: i64,
-    ) -> Vec<u8> {
-        self.machine.read(topic_id, partition, sealed_end, offset)
+        limit: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        Ok(self
+            .machine
+            .read(topic_id, partition, sealed_end, offset, limit)
+            .await?)
     }
 }
 
@@ -515,7 +520,7 @@ mod tests {
                 partition: 0,
                 topic_id: [1; 16],
                 epoch: 0,
-                raw: vec![0; 8],
+                raw: vec![0; 8].into(),
                 records: 1,
                 base_timestamp: 1,
                 max_timestamp: 1,
@@ -566,7 +571,7 @@ mod tests {
             partition: 0,
             topic_id: [1; 16],
             epoch: 0,
-            raw: record_batch(value),
+            raw: record_batch(value).into(),
             records: 1,
             base_timestamp: 1,
             max_timestamp: 1,
@@ -635,7 +640,7 @@ mod tests {
         let response = survivor.append(append_of(b"d")).await.unwrap();
         assert_eq!(response.base_offset, 3, "acked offsets 0..3 survive");
         assert_eq!(survivor.end_offset(&[1; 16], 0), 4);
-        let tail = survivor.read(&[1; 16], 0, 0, 0);
+        let tail = survivor.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
         let info = camus_protocol::batch::inspect(&tail, 1024 * 1024).unwrap();
         assert_eq!(info.len(), 4);
     }
@@ -675,7 +680,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "log not re-applied");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let tail = shard.read(&[1; 16], 0, 0, 0);
+        let tail = shard.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
         assert_eq!(
             camus_protocol::batch::inspect(&tail, 1 << 20)
                 .unwrap()
@@ -714,12 +719,177 @@ mod tests {
             "64 concurrent appends took {} fsyncs",
             fsyncs - fsyncs_before
         );
-        let tail = shard.read(&[1; 16], 0, 0, 0);
+        let tail = shard.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
         assert_eq!(
             camus_protocol::batch::inspect(&tail, 1 << 20)
                 .unwrap()
                 .len(),
             64
+        );
+    }
+
+    async fn wait_purged(shard: &Shard, index: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let purged = shard.raft.metrics().borrow().purged.map(|log| log.index);
+            if purged >= Some(index) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log never purged to {index}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsealed_batches_survive_a_snapshot_purge_and_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let last = {
+            let shard = Shard::open(1, dir.path()).await.unwrap();
+            shard.ensure_voter().await.unwrap();
+            for value in [b"a", b"b", b"c"] {
+                shard.append(append_of(value)).await.unwrap();
+            }
+            let last = shard.raft.metrics().borrow().last_applied.unwrap().index;
+            shard.raft.trigger().snapshot().await.unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while shard.raft.metrics().borrow().snapshot.map(|log| log.index) < Some(last) {
+                assert!(std::time::Instant::now() < deadline, "no snapshot");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            shard.raft.trigger().purge_log(last).await.unwrap();
+            wait_purged(&shard, last).await;
+            // The entries are gone from the log; the bytes come from the copy
+            // the snapshot made.
+            let tail = shard.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
+            assert_eq!(
+                camus_protocol::batch::inspect(&tail, 1 << 20)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            shard.raft.shutdown().await.unwrap();
+            last
+        };
+        let shard = Shard::open(1, dir.path()).await.unwrap();
+        shard.ensure_voter().await.unwrap();
+        assert!(shard.raft.metrics().borrow().purged.map(|log| log.index) >= Some(last));
+        let tail = shard.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
+        assert_eq!(
+            camus_protocol::batch::inspect(&tail, 1 << 20)
+                .unwrap()
+                .len(),
+            3
+        );
+        let pending = shard.pending().await.unwrap();
+        assert_eq!(
+            pending.iter().map(|batch| batch.start).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        // Sealing drops the detached copies with the heads.
+        shard
+            .seal(
+                pending
+                    .iter()
+                    .map(|batch| SealDrop {
+                        topic: batch.topic.clone(),
+                        topic_id: batch.topic_id,
+                        partition: batch.partition,
+                        start: batch.start,
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shard.unsealed_bytes(), 0);
+        assert!(shard
+            .read(&[1; 16], 0, 0, 0, usize::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_behind_a_purge_gets_unsealed_bytes_by_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = Arc::new(Router::default());
+        let path = |id: u64| dir.path().join(format!("n{id}"));
+        let mut shards = Vec::new();
+        for id in 1..=3 {
+            shards.push(Some(
+                Shard::open_in_process(id, &path(id), router.clone())
+                    .await
+                    .unwrap(),
+            ));
+        }
+        let nodes: BTreeMap<_, _> = (1..=3)
+            .map(|id| {
+                (
+                    id,
+                    BasicNode {
+                        addr: format!("wal-{id}"),
+                    },
+                )
+            })
+            .collect();
+        shards[0].as_ref().unwrap().initialize(nodes).await.unwrap();
+        let live: Vec<&Shard> = shards.iter().flatten().collect();
+        let leader = wait_leader(&live).await;
+        let lagging = (1..=3).find(|id| *id != leader).unwrap();
+
+        // Take one follower down; the other two still commit.
+        let down = shards[(lagging - 1) as usize].take().unwrap();
+        down.raft.shutdown().await.unwrap();
+        drop(down);
+        let lead = shards[(leader - 1) as usize].as_ref().unwrap();
+        for value in [b"a", b"b", b"c"] {
+            lead.append(append_of(value)).await.unwrap();
+        }
+        let last = lead.raft.metrics().borrow().last_applied.unwrap().index;
+        lead.raft.trigger().snapshot().await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while lead.raft.metrics().borrow().snapshot.map(|log| log.index) < Some(last) {
+            assert!(std::time::Instant::now() < deadline, "no snapshot");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        lead.raft.trigger().purge_log(last).await.unwrap();
+        wait_purged(lead, last).await;
+
+        // The follower comes back with an empty log past its old end. The
+        // leader no longer has those entries, so it sends the snapshot.
+        let back = Shard::open_in_process(lagging, &path(lagging), router.clone())
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while back.end_offset(&[1; 16], 0) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "follower never caught up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Metrics are published after the install; wait for them.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while back.raft.metrics().borrow().snapshot.map(|log| log.index) < Some(last) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "caught up without a snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let tail = back.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
+        assert_eq!(
+            camus_protocol::batch::inspect(&tail, 1 << 20)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            tail,
+            lead.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap(),
+            "the follower serves the same bytes"
         );
     }
 }

@@ -929,7 +929,7 @@ impl Kafka {
             partition,
             topic_id: topic_id(topic),
             epoch: topic.leader_epoch,
-            raw: raw.to_vec(),
+            raw: raw.clone(),
             records: info.iter().map(|batch| batch.records).sum(),
             base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
             max_timestamp: info.last().map(|batch| batch.max_timestamp).unwrap_or(-1),
@@ -992,7 +992,13 @@ impl Kafka {
         if !wal.is_leader() {
             return true;
         }
-        let pending = wal.pending();
+        let pending = match wal.pending().await {
+            Ok(pending) => pending,
+            Err(err) => {
+                tracing::error!(%err, "reading unsealed wal batches");
+                return false;
+            }
+        };
         if pending.is_empty() {
             return true;
         }
@@ -1337,9 +1343,24 @@ impl Kafka {
             }
         }
         if offset < high_watermark {
-            let extra = self
+            let remaining = limit.saturating_sub(out.len());
+            let extra = match self
                 .wal()
-                .read(&topic_id(topic), partition, state.next_offset, offset);
+                .read(
+                    &topic_id(topic),
+                    partition,
+                    state.next_offset,
+                    offset,
+                    remaining,
+                )
+                .await
+            {
+                Ok(extra) => extra,
+                Err(_) => {
+                    row.error_code = STORAGE;
+                    return row;
+                }
+            };
             if !extra.is_empty() && (out.is_empty() || out.len() + extra.len() <= limit) {
                 out.extend_from_slice(&extra);
             }

@@ -135,17 +135,49 @@ After steps 1–3, same machine and benchmark:
 | 8 | 4.6 | 24.3 | 62.1 | 0.26 | 1.07 |
 | 32 | 16.5 | 27.7 | 61.9 | 0.06 | 1.07 |
 
-Remaining steps:
+4. **Store each batch once.** Done. The state machine keeps a header per
+   unsealed batch (offsets, log index and position, length, epoch); fetch
+   and the uploader read the bytes from the log entry and re-seal them.
+   Before openraft builds a snapshot, which lets it purge the log, every
+   unsealed batch is copied to a `detached` table and into the snapshot,
+   so a purge or a follower install keeps them. Memory now holds headers,
+   not up to `wal.disk.limit` of bytes. Throughput did not change: the
+   second write was not fsynced, so it was not the bottleneck.
+5. **Fewer copies.** Done for the produce path: `Append.raw` is a `Bytes`
+   view of the request buffer.
 
-4. **Store each batch once.** The state machine keeps offsets and the log
-   position of each unsealed batch; the bytes stay in the log until the
-   seal purges them. Removes the second disk write per batch.
-5. **Fewer copies.** Carry `Bytes` from the socket to the log without
-   `to_vec`.
-6. **Later:** a persistent binary stream for shard Raft instead of one HTTP
-   request per message, and tail fetches served from the log file.
+After steps 1–5:
 
-Steps 3 and 4 change the WAL's on-disk format. Before launch that means a
+| Brokers | Producers | MiB/s | p50 ms | p99 ms | fsyncs/ack |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 | 1 | 1.2 | 12.0 | 33.2 | 1.04 |
+| 3 | 8 | 4.4 | 26.6 | 57.5 | 0.26 |
+| 3 | 32 | 15.9 | 29.5 | 57.6 | 0.06 |
+| 1 | 1 | 2.9 | 5.0 | 11.5 | 1.02 |
+| 1 | 8 | 12.5 | 9.4 | 19.9 | 0.25 |
+| 1 | 32 | 41.4 | 11.1 | 25.2 | 0.06 |
+
+Tried and reverted: syncing the log on a background thread so `append`
+returns before the `fsync`. openraft 0.9 does not submit the next append
+until the previous one reports flushed, so nothing overlapped, and the
+handoff cost a single producer 2ms. With that, more than one packed
+entry in flight only made groups smaller (0.67 fsyncs per ack at 8
+producers instead of 0.26).
+
+What is left between one broker and three is serial: leader `fsync`, then
+the follower's `fsync` behind an HTTP round trip, and on this laptop all
+three brokers share one SSD. Next, in order of expected gain:
+
+6. **Overlap the leader's and follower's `fsync`.** Needs openraft to send
+   entries before the local flush finishes, which 0.9 does not; check
+   openraft 0.10's IO pipeline before writing our own.
+7. **A persistent binary stream** for shard Raft instead of one HTTP
+   request per message.
+8. **Tail fetches from the log file** instead of decoding entries.
+9. **Measure on separate disks.** One broker per machine in one region, to
+   see what the laptop's shared SSD hides.
+
+Steps 3 and 4 changed the WAL's on-disk format. Before launch that means a
 fresh data directory, not a migration.
 
 ## What "done" means later

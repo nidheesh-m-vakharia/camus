@@ -10,8 +10,9 @@
 //! CAMUS_MINIO=1 cargo test --release -p camus-broker --test throughput -- --ignored --nocapture
 //! ```
 //!
-//! `CAMUS_BENCH_SECONDS` (default 10) and `CAMUS_BENCH_PRODUCERS` (a comma
-//! list, default `1,8,32`) adjust the run.
+//! `CAMUS_BENCH_SECONDS` (default 10), `CAMUS_BENCH_PRODUCERS` (a comma
+//! list, default `1,8,32`), and `CAMUS_BENCH_BROKERS` (default 3) adjust the
+//! run.
 
 mod support;
 
@@ -105,7 +106,11 @@ fn run(producers: usize, seconds: u64) -> Row {
         eprintln!("keeping {}", base.display());
         std::mem::forget(root);
     }
-    let nodes: Vec<Node> = (1..=3)
+    let brokers: i32 = std::env::var("CAMUS_BENCH_BROKERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    let nodes: Vec<Node> = (1..=brokers)
         .map(|id| {
             Node::with(
                 id,
@@ -114,7 +119,7 @@ fn run(producers: usize, seconds: u64) -> Row {
             )
         })
         .collect();
-    init(&nodes, &[1, 2, 3]);
+    init(&nodes, &(1..=brokers).collect::<Vec<_>>());
     let meta_leader = wait_settled(&nodes.iter().collect::<Vec<_>>());
     let controller = nodes.iter().find(|node| node.id == meta_leader).unwrap();
     create_topic_with(&kafka_addr(controller), "wal", producers as i32);
