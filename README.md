@@ -7,7 +7,8 @@ Cloudflare R2. There is no JVM, no ZooKeeper, and no external database.
 Status: **Phase 1 `r2` produce and fetch are in the tree**. PLAINTEXT and
 SASL_SSL listeners accept create, produce, and fetch. Acks wait until the
 batch is in object storage and the metadata group has committed the offset.
-`kafka-clients` 4.4.0 has passed that path. `wal` mode is not on yet.
+`kafka-clients` 4.4.0, librdkafka, and franz-go have passed that path.
+`wal` mode is not on yet.
 The plan and ADRs are in `docs/`. License: Apache-2.0.
 
 ## What a client changes

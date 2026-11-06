@@ -488,3 +488,89 @@ fn java_kafka_clients_round_trip() {
         assert!(stdout.contains(&format!("ok {codec}")), "{stdout}");
     }
 }
+
+fn assert_client(dir: &Path, ran: std::process::Output, label: &str) {
+    let stdout = String::from_utf8_lossy(&ran.stdout);
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    if !ran.status.success() {
+        let log = std::fs::read_to_string(dir.join("broker.log")).unwrap_or_default();
+        let out = std::fs::read_to_string(dir.join("out.log")).unwrap_or_default();
+        panic!("{label} failed\n{stdout}\n{stderr}\nbroker:\n{log}\n{out}");
+    }
+    for codec in ["none", "gzip", "snappy", "lz4", "zstd"] {
+        assert!(stdout.contains(&format!("ok {codec}")), "{label}\n{stdout}");
+    }
+}
+
+fn boot() -> (tempfile::TempDir, Node, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        )));
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let signed = params.self_signed(&key_pair).unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, signed.pem()).unwrap();
+    std::fs::write(&key, key_pair.serialize_pem()).unwrap();
+    let node = spawn(dir.path(), &cert, &key);
+    let client = reqwest::blocking::Client::new();
+    let init = client
+        .post(format!("http://{}/admin/init", node.http))
+        .json(&serde_json::json!([{"id": 1, "addr": node.http}]))
+        .send()
+        .unwrap();
+    assert!(init.status().is_success(), "{}", init.text().unwrap());
+    wait_leader(&node.http);
+    wait_registered(&node.http);
+    (dir, node, cert)
+}
+
+#[test]
+fn librdkafka_round_trip() {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        eprintln!("skipping librdkafka; set CAMUS_MINIO=1");
+        return;
+    }
+    let python = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pykafka/bin/python");
+    if !python.is_file() {
+        eprintln!("skipping librdkafka; missing {}", python.display());
+        return;
+    }
+    let (dir, node, cert) = boot();
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/python/sasl_roundtrip.py");
+    let ran = Command::new(python)
+        .arg(script)
+        .arg(&node.kafka)
+        .arg(&cert)
+        .output()
+        .unwrap();
+    assert_client(dir.path(), ran, "librdkafka");
+}
+
+#[test]
+fn franz_go_round_trip() {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        eprintln!("skipping franz-go; set CAMUS_MINIO=1");
+        return;
+    }
+    let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
+    if !go.is_file() {
+        eprintln!("skipping franz-go; missing {}", go.display());
+        return;
+    }
+    let (dir, node, cert) = boot();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/go");
+    let ran = Command::new(go)
+        .args(["run", "."])
+        .arg(&node.kafka)
+        .arg(&cert)
+        .current_dir(&source)
+        .env("GOTOOLCHAIN", "local")
+        .output()
+        .unwrap();
+    assert_client(dir.path(), ran, "franz-go");
+}
