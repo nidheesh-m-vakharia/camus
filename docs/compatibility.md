@@ -46,9 +46,11 @@ Phase 1 answers `ApiVersions`, `Metadata`, `Produce`, `Fetch`, `ListOffsets`,
 `SaslAuthenticate`. `ApiVersions` advertises only those keys. Produce acks
 in `r2` mode after the object is stored and the extent is committed.
 `wal` topics are stored and then rejected on produce until Phase 2.
-Unimplemented keys are absent from `ApiVersions`
-once that API exists, and a client that sends them anyway receives
-`UNSUPPORTED_VERSION` (35) or `INVALID_REQUEST` (42) as in ADR 0003.
+Unimplemented keys are absent from `ApiVersions`.
+A client that sends a known key at a version the schema can encode receives
+`UNSUPPORTED_VERSION` (35), and the connection stays open. A version the
+schema cannot encode, or a key the schema does not name, still closes that
+connection because there is no response body to put `INVALID_REQUEST` (42) in.
 
 Tested-client columns are filled when a real client has passed the phase
 acceptance test. `-` means not run.

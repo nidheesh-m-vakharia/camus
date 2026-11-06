@@ -112,6 +112,7 @@ pub mod frame;
 pub mod messages;
 pub mod protocol;
 pub mod records;
+pub mod unsupported;
 
 pub use error::ResponseError;
 pub use indexmap;

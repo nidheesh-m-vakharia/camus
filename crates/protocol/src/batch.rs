@@ -85,7 +85,9 @@ pub fn inspect(bytes: &[u8], max_batch: usize) -> Result<Vec<BatchInfo>, BatchEr
         out.push(BatchInfo {
             len: total,
             records,
-            base_timestamp: i64::from_be_bytes(batch[BASE_TS_AT..BASE_TS_AT + 8].try_into().unwrap()),
+            base_timestamp: i64::from_be_bytes(
+                batch[BASE_TS_AT..BASE_TS_AT + 8].try_into().unwrap(),
+            ),
             max_timestamp: i64::from_be_bytes(batch[MAX_TS_AT..MAX_TS_AT + 8].try_into().unwrap()),
         });
         offset += total;
@@ -97,7 +99,12 @@ pub fn inspect(bytes: &[u8], max_batch: usize) -> Result<Vec<BatchInfo>, BatchEr
 /// by each batch's record count. `epoch` is written into every batch.
 ///
 /// The CRC-covered suffix of each batch is identical to the input.
-pub fn seal(bytes: &[u8], base_offset: i64, epoch: i32, max_batch: usize) -> Result<Bytes, BatchError> {
+pub fn seal(
+    bytes: &[u8],
+    base_offset: i64,
+    epoch: i32,
+    max_batch: usize,
+) -> Result<Bytes, BatchError> {
     let info = inspect(bytes, max_batch)?;
     let mut out = BytesMut::from(bytes);
     let mut cursor = 0;
@@ -115,8 +122,8 @@ pub fn seal(bytes: &[u8], base_offset: i64, epoch: i32, max_batch: usize) -> Res
 mod tests {
     use super::*;
     use crate::records::{
-        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType, NO_PARTITION_LEADER_EPOCH,
-        NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+        NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
     };
     use bytes::BytesMut;
 
@@ -151,13 +158,21 @@ mod tests {
 
     #[test]
     fn seal_keeps_the_crc_covered_bytes() {
-        for compression in [Compression::None, Compression::Gzip, Compression::Snappy, Compression::Lz4, Compression::Zstd]
-        {
+        for compression in [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Snappy,
+            Compression::Lz4,
+            Compression::Zstd,
+        ] {
             let raw = sample(compression);
             let sealed = seal(&raw, 40, 7, 1024 * 1024).unwrap();
             assert_eq!(&raw[CONTENT_AT..], &sealed[CONTENT_AT..]);
             assert_eq!(i64::from_be_bytes(sealed[0..8].try_into().unwrap()), 40);
-            assert_eq!(i32::from_be_bytes(sealed[EPOCH_AT..EPOCH_AT + 4].try_into().unwrap()), 7);
+            assert_eq!(
+                i32::from_be_bytes(sealed[EPOCH_AT..EPOCH_AT + 4].try_into().unwrap()),
+                7
+            );
             inspect(&sealed, 1024 * 1024).unwrap();
         }
     }

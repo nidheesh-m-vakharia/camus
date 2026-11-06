@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use camus_protocol::frame::{self, Unimplemented};
 use camus_protocol::messages::metadata_request::MetadataRequestTopic;
-use camus_protocol::messages::{ApiKey, ApiVersionsRequest, MetadataRequest, RequestHeader, TopicName};
+use camus_protocol::messages::{
+    ApiKey, ApiVersionsRequest, MetadataRequest, RequestHeader, TopicName,
+};
 use camus_protocol::protocol::{Message, StrBytes};
 use camus_protocol::ResponseError;
 
@@ -60,7 +62,10 @@ fn metadata_v13_preserves_unknown_tagged_fields() {
     let topics = decoded.topics.expect("topics");
     assert_eq!(topics.len(), 1);
     assert_eq!(topics[0].name.as_ref().unwrap().0.as_str(), "events");
-    assert_eq!(topics[0].unknown_tagged_fields.get(&7).unwrap().as_ref(), b"kept");
+    assert_eq!(
+        topics[0].unknown_tagged_fields.get(&7).unwrap().as_ref(),
+        b"kept"
+    );
 }
 
 #[test]
@@ -73,7 +78,9 @@ fn known_unimplemented_keys_are_unsupported_version() {
         Unimplemented::UnsupportedVersion
     );
     assert_eq!(
-        frame::reject_unimplemented(ApiKey::JoinGroup as i16).unwrap_err().code(),
+        frame::reject_unimplemented(ApiKey::JoinGroup as i16)
+            .unwrap_err()
+            .code(),
         ResponseError::UnsupportedVersion.code()
     );
     assert_eq!(

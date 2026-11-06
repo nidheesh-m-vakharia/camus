@@ -34,16 +34,56 @@ pub fn implemented_apis() -> &'static [ImplementedApi] {
 }
 
 const IMPLEMENTED: &[ImplementedApi] = &[
-    ImplementedApi { key: ApiKey::Produce, min: 3, max: 13 },
-    ImplementedApi { key: ApiKey::Fetch, min: 4, max: 18 },
-    ImplementedApi { key: ApiKey::ListOffsets, min: 1, max: 11 },
-    ImplementedApi { key: ApiKey::Metadata, min: 0, max: 13 },
-    ImplementedApi { key: ApiKey::SaslHandshake, min: 0, max: 1 },
-    ImplementedApi { key: ApiKey::ApiVersions, min: 0, max: 5 },
-    ImplementedApi { key: ApiKey::CreateTopics, min: 2, max: 7 },
-    ImplementedApi { key: ApiKey::DeleteTopics, min: 1, max: 6 },
-    ImplementedApi { key: ApiKey::DescribeConfigs, min: 1, max: 4 },
-    ImplementedApi { key: ApiKey::SaslAuthenticate, min: 0, max: 2 },
+    ImplementedApi {
+        key: ApiKey::Produce,
+        min: 3,
+        max: 13,
+    },
+    ImplementedApi {
+        key: ApiKey::Fetch,
+        min: 4,
+        max: 18,
+    },
+    ImplementedApi {
+        key: ApiKey::ListOffsets,
+        min: 1,
+        max: 11,
+    },
+    ImplementedApi {
+        key: ApiKey::Metadata,
+        min: 0,
+        max: 13,
+    },
+    ImplementedApi {
+        key: ApiKey::SaslHandshake,
+        min: 0,
+        max: 1,
+    },
+    ImplementedApi {
+        key: ApiKey::ApiVersions,
+        min: 0,
+        max: 5,
+    },
+    ImplementedApi {
+        key: ApiKey::CreateTopics,
+        min: 2,
+        max: 7,
+    },
+    ImplementedApi {
+        key: ApiKey::DeleteTopics,
+        min: 1,
+        max: 6,
+    },
+    ImplementedApi {
+        key: ApiKey::DescribeConfigs,
+        min: 1,
+        max: 4,
+    },
+    ImplementedApi {
+        key: ApiKey::SaslAuthenticate,
+        min: 0,
+        max: 2,
+    },
 ];
 
 /// Keys in [`implemented_apis`], for callers that only need the key.
@@ -155,7 +195,10 @@ pub fn decode_request<M: Decodable>(frame: &[u8]) -> Result<(RequestHeader, M), 
     }
     let size = size as usize;
     if buf.remaining() != size {
-        anyhow::bail!("frame size {size} does not match the {} bytes that follow", buf.remaining());
+        anyhow::bail!(
+            "frame size {size} does not match the {} bytes that follow",
+            buf.remaining()
+        );
     }
     let header = decode_request_header_from_buffer(&mut buf)?;
     let message = M::decode(&mut buf, header.request_api_version)?;

@@ -33,10 +33,9 @@ use camus_protocol::messages::metadata_response::{
 use camus_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use camus_protocol::messages::{
     ApiKey, ApiVersionsRequest, BrokerId, CreateTopicsRequest, DeleteTopicsRequest,
-    DescribeConfigsRequest, FetchRequest, FetchResponse, JoinGroupResponse, ListOffsetsRequest,
-    ListOffsetsResponse, MetadataRequest, ProduceRequest, ProduceResponse, RequestHeader,
-    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
-    TopicName,
+    DescribeConfigsRequest, FetchRequest, FetchResponse, ListOffsetsRequest, ListOffsetsResponse,
+    MetadataRequest, ProduceRequest, ProduceResponse, RequestHeader, SaslAuthenticateRequest,
+    SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, TopicName,
 };
 use camus_protocol::protocol::{decode_request_header_from_buffer, Decodable, StrBytes};
 use camus_storage::Bucket;
@@ -302,7 +301,7 @@ impl Kafka {
             response.responses.push(topic_response);
             return frame_of(version, correlation, &response);
         }
-        unsupported(key, version, correlation)
+        error_frame(key, version, correlation, ILLEGAL_SASL)
     }
 
     fn api_versions(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
@@ -1091,12 +1090,19 @@ where
 }
 
 fn unsupported(key: ApiKey, version: i16, correlation: i32) -> Reply {
-    if key == ApiKey::JoinGroup && (0..=9).contains(&version) {
-        let mut response = JoinGroupResponse::default();
-        response.error_code = ResponseError::UnsupportedVersion.code();
-        return frame_of(version, correlation, &response);
+    error_frame(
+        key,
+        version,
+        correlation,
+        ResponseError::UnsupportedVersion.code(),
+    )
+}
+
+fn error_frame(key: ApiKey, version: i16, correlation: i32, code: i16) -> Reply {
+    match camus_protocol::unsupported::error_response(key, version, correlation, code) {
+        Some(frame) => Reply::Frame(frame),
+        None => Reply::Close,
     }
-    Reply::Close
 }
 
 fn constant_eq(left: &[u8], right: &[u8]) -> bool {
