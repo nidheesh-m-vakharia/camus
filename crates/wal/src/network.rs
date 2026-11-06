@@ -1,15 +1,19 @@
-//! In-process Raft RPC for one WAL shard.
+//! Raft RPC for one WAL shard. Brokers use HTTP. Tests use an in-process router.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
+use openraft::error::{
+    InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
+};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
 use openraft::BasicNode;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use crate::{NodeId, TypeConfig};
 
@@ -99,5 +103,89 @@ impl Conn {
             .ok_or_else(|| {
                 RPCError::Unreachable(Unreachable::new(&std::io::Error::other("missing wal node")))
             })
+    }
+}
+
+/// HTTP RPC factory. `BasicNode.addr` is the broker HTTP `host:port`; shard
+/// RPC lives under `/wal/` so it does not collide with the metadata group.
+#[derive(Clone, Default)]
+pub struct HttpFactory;
+
+pub struct HttpConn {
+    target: NodeId,
+    addr: String,
+    client: reqwest::Client,
+}
+
+impl RaftNetworkFactory<TypeConfig> for HttpFactory {
+    type Network = HttpConn;
+
+    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
+        HttpConn {
+            target,
+            addr: node.addr.clone(),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl RaftNetwork<TypeConfig> for HttpConn {
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<AppendEntriesResponse<NodeId>, RpcError> {
+        self.send("raft-append", rpc, option).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        rpc: InstallSnapshotRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<InstallSnapshotResponse<NodeId>, RpcError<InstallSnapshotError>> {
+        self.send("raft-snapshot", rpc, option).await
+    }
+
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<NodeId>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<NodeId>, RpcError> {
+        self.send("raft-vote", rpc, option).await
+    }
+}
+
+impl HttpConn {
+    async fn send<Req, Resp, E>(
+        &self,
+        path: &str,
+        req: Req,
+        option: RPCOption,
+    ) -> Result<Resp, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+        E: std::error::Error + DeserializeOwned,
+    {
+        let url = format!("http://{}/wal/{path}", self.addr);
+        let response = self
+            .client
+            .post(&url)
+            .timeout(option.hard_ttl())
+            .json(&req)
+            .send()
+            .await
+            .map_err(|err| {
+                if err.is_connect() {
+                    RPCError::Unreachable(Unreachable::new(&err))
+                } else {
+                    RPCError::Network(NetworkError::new(&err))
+                }
+            })?;
+        let body: Result<Resp, RaftError<NodeId, E>> = response
+            .json()
+            .await
+            .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
+        body.map_err(|err| RPCError::RemoteError(RemoteError::new(self.target, err)))
     }
 }

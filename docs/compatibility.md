@@ -45,9 +45,17 @@ Phase 1 answers `ApiVersions`, `Metadata`, `Produce`, `Fetch`, `ListOffsets`,
 `CreateTopics`, `DeleteTopics`, `DescribeConfigs`, `SaslHandshake`, and
 `SaslAuthenticate`. `ApiVersions` advertises only those keys. Produce acks
 in `r2` mode after the object is stored and the extent is committed.
-`wal` produce on a single broker acks after that broker's shard Raft
-commit. The upload to object storage follows the ack. A multi-broker shard,
-`truncate-to-sealed`, and the latency table are not in yet.
+`wal` produce acks after the WAL shard commits, which means a majority of
+its voters has fsynced the batch. Every broker is a voter. Metadata reports
+the shard leader as the leader of each `wal` partition and the voters as
+replicas and ISR. A broker that is not the shard leader answers produce,
+fetch, and list-offsets with `NOT_LEADER_OR_FOLLOWER` (6). A produce that
+cannot commit within `timeout_ms`, for example with no quorum, gets
+`REQUEST_TIMED_OUT` (7); the entry may still commit later, so a client
+without idempotence can duplicate on retry. The upload to object storage
+follows the ack. The partition `leader_epoch` does not yet change with the
+shard term. `truncate-to-sealed`, R2 backpressure, and the latency table
+are not in yet.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the

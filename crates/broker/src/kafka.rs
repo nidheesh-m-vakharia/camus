@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use camus_metadata::{MetadataNode, PublishPart, Topic};
+use camus_metadata::{MetadataNode, NodeId, PublishPart, Topic};
 use camus_protocol::batch::{self, BatchError};
 use camus_protocol::error::ResponseError;
 use camus_protocol::frame::{self, encode_response};
@@ -42,7 +42,7 @@ use camus_protocol::messages::{
 use camus_protocol::protocol::{decode_request_header_from_buffer, Decodable, StrBytes};
 use camus_storage::Bucket;
 use camus_uploader::{self, Piece};
-use camus_wal::{Append, SealDrop, Shard};
+use camus_wal::{Append, SealDrop, Shard, WriteError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
@@ -59,6 +59,7 @@ const CORRUPT: i16 = 2;
 const UNKNOWN_TOPIC: i16 = 3;
 const LEADER_NOT_AVAILABLE: i16 = 5;
 const NOT_LEADER: i16 = 6;
+const REQUEST_TIMED_OUT: i16 = 7;
 const TOO_LARGE: i16 = 10;
 const SASL_MECHANISM: i16 = 33;
 const ILLEGAL_SASL: i16 = 34;
@@ -118,6 +119,7 @@ pub struct Kafka {
     sasl_pass: String,
     tls: Option<TlsAcceptor>,
     wal: Arc<Shard>,
+    http: reqwest::Client,
     buf: Mutex<Vec<Item>>,
     flush_lock: Mutex<()>,
 }
@@ -152,6 +154,10 @@ impl Kafka {
             sasl_pass,
             tls,
             wal,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("http client"),
             buf: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
         }
@@ -159,6 +165,60 @@ impl Kafka {
 
     fn leader(&self) -> bool {
         self.node.raft.metrics().borrow().current_leader == Some(self.node_id as u64)
+    }
+
+    /// HTTP address of the metadata leader, when another broker leads.
+    fn leader_http(&self) -> Option<String> {
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let leader = metrics.current_leader?;
+        if leader == self.node_id as u64 {
+            return None;
+        }
+        metrics
+            .membership_config
+            .membership()
+            .get_node(&leader)
+            .map(|node| node.addr.clone())
+    }
+
+    /// Commit a put here when this broker leads metadata, else on the leader.
+    async fn meta_write(&self, key: String, value: String) -> anyhow::Result<()> {
+        if self.leader() {
+            self.node.write(key, value).await?;
+            return Ok(());
+        }
+        let addr = self
+            .leader_http()
+            .ok_or_else(|| anyhow::anyhow!("no metadata leader"))?;
+        let response = self
+            .http
+            .post(format!("http://{addr}/admin/write"))
+            .json(&serde_json::json!({ "key": key, "value": value }))
+            .send()
+            .await?;
+        anyhow::ensure!(response.status().is_success(), "forwarded write failed");
+        Ok(())
+    }
+
+    /// Commit extents here when this broker leads metadata, else on the leader.
+    async fn meta_publish(
+        &self,
+        parts: Vec<PublishPart>,
+    ) -> anyhow::Result<camus_metadata::Response> {
+        if self.leader() {
+            return self.node.publish(parts).await;
+        }
+        let addr = self
+            .leader_http()
+            .ok_or_else(|| anyhow::anyhow!("no metadata leader"))?;
+        let response = self
+            .http
+            .post(format!("http://{addr}/admin/publish"))
+            .json(&parts)
+            .send()
+            .await?;
+        anyhow::ensure!(response.status().is_success(), "forwarded publish failed");
+        Ok(response.json().await?)
     }
 
     fn topic(&self, name: &str) -> Option<Topic> {
@@ -195,21 +255,12 @@ impl Kafka {
         });
         let register = Arc::clone(&self);
         tokio::spawn(async move {
+            let key = format!("broker/{}", register.node_id);
+            let addr = format!("{}:{}", register.host, register.port);
             loop {
-                if register.leader() {
-                    let addr = format!("{}:{}", register.host, register.port);
-                    let _ = register
-                        .node
-                        .write(format!("broker/{}", register.node_id), &addr)
-                        .await;
-                    let _ = register
-                        .node
-                        .write(
-                            "brokers",
-                            serde_json::to_string(&vec![register.node_id])
-                                .unwrap_or_else(|_| "[]".into()),
-                        )
-                        .await;
+                let stored = register.node.read_local(&key).ok().flatten();
+                if stored.as_deref() != Some(addr.as_str()) {
+                    let _ = register.meta_write(key.clone(), addr.clone()).await;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -379,12 +430,18 @@ impl Kafka {
     }
 
     fn broker_list(&self) -> Vec<MetadataResponseBroker> {
-        let Ok(Some(raw)) = self.node.read_local("brokers") else {
-            return Vec::new();
-        };
-        let ids: Vec<i32> = serde_json::from_str(&raw).unwrap_or_default();
+        let ids: Vec<NodeId> = self
+            .node
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect();
         ids.into_iter()
             .filter_map(|id| {
+                let id = i32::try_from(id).ok()?;
                 let raw = self.node.read_local(&format!("broker/{id}")).ok()??;
                 let (host, port) = raw.rsplit_once(':')?;
                 let port = port.parse().ok()?;
@@ -406,6 +463,19 @@ impl Kafka {
             return topic;
         };
         topic.topic_id = Uuid::parse_str(&stored.id).unwrap_or_else(|_| Uuid::nil());
+        // A `wal` partition is led by its shard leader (ADR 0006), not by the
+        // metadata leader.
+        let (leader, replicas) = if stored.durability == "wal" {
+            let replicas: Vec<BrokerId> = self
+                .wal
+                .voters()
+                .into_iter()
+                .filter_map(|id| i32::try_from(id).ok().map(BrokerId))
+                .collect();
+            (self.wal.leader().map(|id| id as i32), replicas)
+        } else {
+            (leader, leader.map(BrokerId).into_iter().collect())
+        };
         let leader_id = leader.unwrap_or(-1);
         let error = if leader.is_some() {
             0
@@ -419,8 +489,8 @@ impl Kafka {
             partition.leader_id = BrokerId(leader_id);
             partition.leader_epoch = stored.leader_epoch;
             if leader.is_some() {
-                partition.replica_nodes = vec![BrokerId(leader_id)];
-                partition.isr_nodes = vec![BrokerId(leader_id)];
+                partition.replica_nodes = replicas.clone();
+                partition.isr_nodes = replicas.clone();
             }
             topic.partitions.push(partition);
         }
@@ -578,9 +648,6 @@ impl Kafka {
         if request.transactional_id.is_some() {
             return self.produce_all_error(&request, header, TXN);
         }
-        if !self.leader() {
-            return self.produce_all_error(&request, header, NOT_LEADER);
-        }
         let mut response = ProduceResponse::default();
         let mut waiters = Vec::new();
         for topic in request.topic_data {
@@ -602,6 +669,7 @@ impl Kafka {
                         &partition.records,
                         partition.index,
                         request.acks,
+                        request.timeout_ms,
                     )
                     .await
                 {
@@ -674,15 +742,21 @@ impl Kafka {
         records: &Option<Bytes>,
         partition: i32,
         acks: i16,
+        timeout_ms: i32,
     ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
         let Some(topic) = topic else {
             return Err(UNKNOWN_TOPIC);
         };
         if topic.durability == "wal" {
-            return self.write_wal(name, topic, records, partition, acks).await;
+            return self
+                .write_wal(name, topic, records, partition, acks, timeout_ms)
+                .await;
         }
         if topic.durability != "r2" {
             return Err(INVALID_CONFIG);
+        }
+        if !self.leader() {
+            return Err(NOT_LEADER);
         }
         if partition < 0 || partition >= topic.partitions {
             return Err(UNKNOWN_TOPIC);
@@ -724,6 +798,7 @@ impl Kafka {
         records: &Option<Bytes>,
         partition: i32,
         acks: i16,
+        timeout_ms: i32,
     ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
         if !self.wal.is_leader() {
             return Err(NOT_LEADER);
@@ -763,7 +838,17 @@ impl Kafka {
             });
             return Ok(None);
         }
-        let response = self.wal.append(append).await.map_err(|_| STORAGE)?;
+        // Without a quorum the commit never comes. Kafka answers a produce
+        // that outlives `timeout_ms` with REQUEST_TIMED_OUT; the entry may
+        // still commit later, as in Kafka.
+        let wait = Duration::from_millis(timeout_ms.max(0) as u64);
+        let response = match tokio::time::timeout(wait, self.wal.append(append)).await {
+            Err(_) => return Err(REQUEST_TIMED_OUT),
+            Ok(Err(WriteError::NotLeader)) => return Err(NOT_LEADER),
+            Ok(Err(WriteError::Other(_))) if !self.wal.is_leader() => return Err(NOT_LEADER),
+            Ok(Err(WriteError::Other(_))) => return Err(STORAGE),
+            Ok(Ok(response)) => response,
+        };
         let (tx, rx) = oneshot::channel();
         let settled = if response.error_code == 0 {
             Ok(response.base_offset)
@@ -775,7 +860,7 @@ impl Kafka {
     }
 
     async fn upload_wal(&self) {
-        if !self.leader() || !self.wal.is_leader() {
+        if !self.wal.is_leader() {
             return;
         }
         let pending = self.wal.pending();
@@ -841,7 +926,8 @@ impl Kafka {
                         },
                     )
                     .collect();
-                if self.node.publish(parts).await.is_ok() {
+                let published = self.meta_publish(parts).await;
+                if published.is_ok_and(|response| response.error_code == 0) {
                     drops.extend(upload.into_iter().map(|batch| SealDrop {
                         topic: batch.topic,
                         partition: batch.partition,
@@ -1034,6 +1120,10 @@ impl Kafka {
             row.error_code = UNKNOWN_TOPIC;
             return row;
         };
+        if topic.durability == "wal" && !self.wal.is_leader() {
+            row.error_code = NOT_LEADER;
+            return row;
+        }
         let Some(state) = self.partition_state(topic, partition) else {
             row.error_code = UNKNOWN_TOPIC;
             return row;
@@ -1133,6 +1223,11 @@ impl Kafka {
             row.offset = -1;
             return row;
         };
+        if topic.durability == "wal" && !self.wal.is_leader() {
+            row.error_code = NOT_LEADER;
+            row.offset = -1;
+            return row;
+        }
         let Some(state) = self.partition_state(topic, partition) else {
             row.error_code = UNKNOWN_TOPIC;
             row.offset = -1;

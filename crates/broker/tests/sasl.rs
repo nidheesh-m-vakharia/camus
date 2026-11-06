@@ -408,14 +408,14 @@ fn wait_registered(http: &str) {
     while Instant::now() < deadline {
         if let Ok(body) = client
             .get(format!("http://{http}/admin/read"))
-            .query(&[("key", "brokers")])
+            .query(&[("key", "broker/1")])
             .send()
         {
             if let Ok(json) = body.json::<serde_json::Value>() {
                 if json
                     .get("value")
                     .and_then(|value| value.as_str())
-                    .is_some_and(|value| value.contains('1'))
+                    .is_some_and(|value| !value.is_empty())
                 {
                     return;
                 }

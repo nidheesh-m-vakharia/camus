@@ -402,10 +402,12 @@ name = "camus-wal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "camus-protocol",
  "camus-raft",
  "openraft",
  "redb",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

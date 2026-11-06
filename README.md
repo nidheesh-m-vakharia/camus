@@ -8,7 +8,9 @@ Status: **Phase 1 `r2` produce and fetch are in the tree**. PLAINTEXT and
 SASL_SSL listeners accept create, produce, and fetch. Acks wait until the
 batch is in object storage and the metadata group has committed the offset.
 `kafka-clients` 4.4.0, librdkafka, and franz-go have passed the `r2` path.
-`wal` produce acks after a local shard commit; the R2 upload follows.
+`wal` produce acks after a majority of brokers has fsynced the batch to the
+WAL shard; the R2 upload follows. Losing the shard leader or one follower
+loses no acknowledged offset.
 The plan and ADRs are in `docs/`. License: Apache-2.0.
 
 ## What a client changes

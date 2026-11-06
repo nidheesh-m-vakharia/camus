@@ -1,8 +1,8 @@
 //! One WAL shard.
 //!
-//! Produce waits for this Raft group to commit and fsync. The R2 upload
-//! happens after the ack. A single broker initializes a one-voter shard,
-//! which is a quorum of one.
+//! Produce waits for this Raft group to commit and fsync on a majority of
+//! voters. The R2 upload happens after the ack. Brokers reach each other over
+//! HTTP; a single broker is a one-voter shard, which is a quorum of one.
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 pub use machine::Batch;
 use machine::Machine;
 pub use network::Router;
-use openraft::BasicNode;
+use openraft::error::{ClientWriteError, RaftError};
+pub use openraft::BasicNode;
 
 /// Voter id. Same numbering as the metadata group.
 pub type NodeId = u64;
@@ -86,6 +87,35 @@ pub struct Response {
     pub error_code: i16,
 }
 
+/// Why a proposal did not commit.
+#[derive(Debug)]
+pub enum WriteError {
+    /// This node is not the shard leader. The entry was not appended here.
+    NotLeader,
+    /// Anything else: shutdown, storage, or a lost quorum.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLeader => f.write_str("not the wal shard leader"),
+            Self::Other(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+impl From<RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>> for WriteError {
+    fn from(err: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> Self {
+        match err {
+            RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => Self::NotLeader,
+            other => Self::Other(other.into()),
+        }
+    }
+}
+
 /// A running shard.
 pub struct Shard {
     /// Raft handle.
@@ -95,8 +125,35 @@ pub struct Shard {
 }
 
 impl Shard {
-    /// Open the log and state machine. Call [`Shard::ensure_voter`] once.
+    /// Open the log and state machine with HTTP RPC between brokers. A fresh
+    /// shard waits for [`Shard::initialize`]; a restarted one rejoins from
+    /// its stored membership.
     pub async fn open(node_id: NodeId, dir: &Path) -> anyhow::Result<Self> {
+        Self::start(node_id, dir, network::HttpFactory).await
+    }
+
+    /// Open a shard whose RPC stays in this process, for tests.
+    pub async fn open_in_process(
+        node_id: NodeId,
+        dir: &Path,
+        router: Arc<Router>,
+    ) -> anyhow::Result<Self> {
+        let shard = Self::start(
+            node_id,
+            dir,
+            network::Factory {
+                router: router.clone(),
+            },
+        )
+        .await?;
+        router.insert(node_id, shard.raft.clone());
+        Ok(shard)
+    }
+
+    async fn start<N>(node_id: NodeId, dir: &Path, network: N) -> anyhow::Result<Self>
+    where
+        N: openraft::RaftNetworkFactory<TypeConfig>,
+    {
         let config = Config {
             heartbeat_interval: 50,
             election_timeout_min: 150,
@@ -106,23 +163,35 @@ impl Shard {
         let config = Arc::new(config.validate()?);
         let log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
         let machine = Arc::new(Machine::open(&dir.join("state.redb"))?);
-        let router = Arc::new(Router::default());
-        let raft = Raft::new(
-            node_id,
-            config,
-            network::Factory {
-                router: router.clone(),
-            },
-            log,
-            machine.clone(),
-        )
-        .await?;
-        router.insert(node_id, raft.clone());
+        let raft = Raft::new(node_id, config, network, log, machine.clone()).await?;
         Ok(Self {
             raft,
             machine,
             node_id,
         })
+    }
+
+    /// Create the shard with these voters. Call once, on one voter. Fails when
+    /// this log already has a membership.
+    pub async fn initialize(&self, nodes: BTreeMap<NodeId, BasicNode>) -> anyhow::Result<()> {
+        self.raft.initialize(nodes).await?;
+        Ok(())
+    }
+
+    /// Current shard leader, if this node knows one.
+    pub fn leader(&self) -> Option<NodeId> {
+        self.raft.metrics().borrow().current_leader
+    }
+
+    /// Voter ids in the latest membership this node has seen.
+    pub fn voters(&self) -> Vec<NodeId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
     }
 
     /// Initialize a one-voter group when this log has no membership yet, then
@@ -161,14 +230,15 @@ impl Shard {
         self.raft.metrics().borrow().current_leader == Some(self.node_id)
     }
 
-    /// Propose a batch and wait for the commit.
-    pub async fn append(&self, batch: Append) -> anyhow::Result<Response> {
+    /// Propose a batch and wait until a majority has it on disk and this
+    /// leader has applied it.
+    pub async fn append(&self, batch: Append) -> Result<Response, WriteError> {
         let response = self.raft.client_write(Command::Append(batch)).await?;
         Ok(response.data)
     }
 
     /// Drop published batches and return the log index of that commit.
-    pub async fn seal(&self, drops: Vec<SealDrop>) -> anyhow::Result<u64> {
+    pub async fn seal(&self, drops: Vec<SealDrop>) -> Result<u64, WriteError> {
         let response = self.raft.client_write(Command::Seal { drops }).await?;
         Ok(response.log_id.index)
     }
@@ -219,5 +289,117 @@ mod tests {
             .unwrap();
         assert_eq!(response.error_code, 2, "a short buffer is not a batch");
         drop(shard);
+    }
+
+    fn record_batch(value: &[u8]) -> Vec<u8> {
+        use camus_protocol::records::{
+            Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+            NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+        };
+        let records = vec![Record {
+            transactional: false,
+            control: false,
+            delete_horizon: false,
+            partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+            producer_id: NO_PRODUCER_ID,
+            producer_epoch: NO_PRODUCER_EPOCH,
+            sequence: 0,
+            timestamp_type: TimestampType::Creation,
+            offset: 0,
+            timestamp: 1,
+            key: None,
+            value: Some(bytes::Bytes::copy_from_slice(value)),
+            headers: Default::default(),
+        }];
+        let mut buf = bytes::BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            &records,
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .unwrap();
+        buf.to_vec()
+    }
+
+    fn append_of(value: &[u8]) -> Append {
+        Append {
+            topic: "events".into(),
+            partition: 0,
+            topic_id: [1; 16],
+            epoch: 0,
+            raw: record_batch(value),
+            records: 1,
+            base_timestamp: 1,
+            max_timestamp: 1,
+        }
+    }
+
+    async fn wait_leader(shards: &[&Shard]) -> NodeId {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            for shard in shards {
+                if shard.is_leader() {
+                    return shard.node_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no wal leader");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_voters_keep_acked_batches_after_losing_the_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = Arc::new(Router::default());
+        let mut shards = Vec::new();
+        for id in 1..=3 {
+            let path = dir.path().join(format!("n{id}"));
+            shards.push(Some(
+                Shard::open_in_process(id, &path, router.clone())
+                    .await
+                    .unwrap(),
+            ));
+        }
+        let nodes: BTreeMap<_, _> = (1..=3)
+            .map(|id| {
+                (
+                    id,
+                    BasicNode {
+                        addr: format!("wal-{id}"),
+                    },
+                )
+            })
+            .collect();
+        shards[0].as_ref().unwrap().initialize(nodes).await.unwrap();
+        let live: Vec<&Shard> = shards.iter().flatten().collect();
+        let leader = wait_leader(&live).await;
+        let first = live.iter().find(|shard| shard.node_id == leader).unwrap();
+        assert_eq!(first.voters(), vec![1, 2, 3]);
+        let follower = live.iter().find(|shard| shard.node_id != leader).unwrap();
+        assert!(matches!(
+            follower.append(append_of(b"x")).await,
+            Err(WriteError::NotLeader)
+        ));
+        for (offset, value) in [b"a", b"b", b"c"].iter().enumerate() {
+            let response = first.append(append_of(*value)).await.unwrap();
+            assert_eq!(response.base_offset, offset as i64);
+        }
+
+        let gone = shards[(leader - 1) as usize].take().unwrap();
+        gone.raft.shutdown().await.unwrap();
+        drop(gone);
+        let live: Vec<&Shard> = shards.iter().flatten().collect();
+        let next = wait_leader(&live).await;
+        assert_ne!(next, leader);
+        let survivor = live.iter().find(|shard| shard.node_id == next).unwrap();
+        let response = survivor.append(append_of(b"d")).await.unwrap();
+        assert_eq!(response.base_offset, 3, "acked offsets 0..3 survive");
+        assert_eq!(survivor.end_offset("events", 0), 4);
+        let tail = survivor.read("events", 0, 0, 0);
+        let info = camus_protocol::batch::inspect(&tail, 1024 * 1024).unwrap();
+        assert_eq!(info.len(), 4);
     }
 }
