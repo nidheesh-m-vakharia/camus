@@ -42,9 +42,13 @@ pub struct Batch {
     pub start: i64,
     pub end: i64,
     pub log_index: u64,
+    /// Position inside a packed entry. `0` for a single append.
+    #[serde(default)]
+    pub pos: u32,
     pub topic_id: [u8; 16],
     pub base_timestamp: i64,
     pub max_timestamp: i64,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
 }
 
@@ -231,10 +235,10 @@ fn persist(
             };
             let json = serde_json::to_string(&head).map_err(|e| err(&e))?;
             heads
-                .insert(batch.log_index, json.as_str())
+                .insert(batch.storage_key(), json.as_str())
                 .map_err(|e| err(&e))?;
             bytes
-                .insert(batch.log_index, batch.bytes.as_slice())
+                .insert(batch.storage_key(), batch.bytes.as_slice())
                 .map_err(|e| err(&e))?;
         }
     }
@@ -262,8 +266,43 @@ fn persist_all(db: &Database, state: &State) -> Result<(), StorageError<NodeId>>
     persist(db, state, &delta, true)
 }
 
+/// Most batches one packed entry may hold; the storage key reserves 12 bits.
+pub const MAX_PACKED: usize = 4096;
+
+impl Batch {
+    /// redb key: the log index with the position in its entry.
+    fn storage_key(&self) -> u64 {
+        (self.log_index << 12) | u64::from(self.pos)
+    }
+}
+
 fn apply_one(state: &mut State, command: Command, log_index: u64, delta: &mut Delta) -> Response {
+    apply_at(state, command, log_index, 0, delta)
+}
+
+fn apply_at(
+    state: &mut State,
+    command: Command,
+    log_index: u64,
+    pos: u32,
+    delta: &mut Delta,
+) -> Response {
     match command {
+        Command::Appends(batches) => {
+            let each = batches
+                .into_iter()
+                .take(MAX_PACKED)
+                .enumerate()
+                .map(|(pos, batch)| {
+                    apply_at(state, Command::Append(batch), log_index, pos as u32, delta)
+                })
+                .collect();
+            Response {
+                base_offset: -1,
+                error_code: 0,
+                each,
+            }
+        }
         Command::Append(batch) => {
             let key = part_key(&batch.topic_id, batch.partition);
             let start = state.next.get(&key).copied().unwrap_or(0).max(batch.floor);
@@ -274,6 +313,7 @@ fn apply_one(state: &mut State, command: Command, log_index: u64, delta: &mut De
                         return Response {
                             base_offset: -1,
                             error_code: 2,
+                            each: Vec::new(),
                         }
                     }
                 };
@@ -285,6 +325,7 @@ fn apply_one(state: &mut State, command: Command, log_index: u64, delta: &mut De
                 start,
                 end,
                 log_index,
+                pos,
                 topic_id: batch.topic_id,
                 base_timestamp: batch.base_timestamp,
                 max_timestamp: batch.max_timestamp,
@@ -295,6 +336,7 @@ fn apply_one(state: &mut State, command: Command, log_index: u64, delta: &mut De
             Response {
                 base_offset: start,
                 error_code: 0,
+                each: Vec::new(),
             }
         }
         Command::Seal { drops } => {
@@ -305,7 +347,7 @@ fn apply_one(state: &mut State, command: Command, log_index: u64, delta: &mut De
                         && drop.start == batch.start
                 });
                 if sealed {
-                    delta.removed.push(batch.log_index);
+                    delta.removed.push(batch.storage_key());
                 }
                 !sealed
             });
@@ -313,10 +355,11 @@ fn apply_one(state: &mut State, command: Command, log_index: u64, delta: &mut De
             // the tables.
             delta
                 .added
-                .retain(|batch| !delta.removed.contains(&batch.log_index));
+                .retain(|batch| !delta.removed.contains(&batch.storage_key()));
             Response {
                 base_offset: -1,
                 error_code: 0,
+                each: Vec::new(),
             }
         }
     }
@@ -409,6 +452,7 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
                 EntryPayload::Blank => Response {
                     base_offset: -1,
                     error_code: 0,
+                    each: Vec::new(),
                 },
                 EntryPayload::Normal(command) => {
                     apply_one(&mut state, command, entry.log_id.index, &mut delta)
@@ -419,6 +463,7 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
                     Response {
                         base_offset: -1,
                         error_code: 0,
+                        each: Vec::new(),
                     }
                 }
             };

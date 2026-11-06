@@ -184,16 +184,36 @@ where
 {
     let url = format!("http://{addr}/{path}");
     let client = reqwest::Client::new();
-    let response = client.post(&url).json(&req).send().await.map_err(|err| {
-        if err.is_connect() {
-            RPCError::Unreachable(Unreachable::new(&err))
-        } else {
-            RPCError::Network(NetworkError::new(&err))
-        }
-    })?;
-    let body: Result<Resp, RaftError<NodeId, E>> = response
-        .json()
+    let body = camus_raft::codec::encode(&req)
+        .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
+    let response = client
+        .post(&url)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            camus_raft::codec::CONTENT_TYPE,
+        )
+        .body(body)
+        .send()
         .await
+        .map_err(|err| {
+            if err.is_connect() {
+                RPCError::Unreachable(Unreachable::new(&err))
+            } else {
+                RPCError::Network(NetworkError::new(&err))
+            }
+        })?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
+    if !status.is_success() {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        return Err(RPCError::Network(NetworkError::new(
+            &std::io::Error::other(format!("{status}: {text}")),
+        )));
+    }
+    let body: Result<Resp, RaftError<NodeId, E>> = camus_raft::codec::decode(&bytes)
         .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
     body.map_err(|err| RPCError::RemoteError(RemoteError::new(target, err)))
 }

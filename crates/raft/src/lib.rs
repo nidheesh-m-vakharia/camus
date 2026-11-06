@@ -6,8 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod codec;
 mod segment;
 mod store;
 
 pub use segment::{SegmentLog, DEFAULT_SEGMENT_BYTES};
-pub use store::SegmentLogStore;
+pub use store::{AppendStats, SegmentLogStore};

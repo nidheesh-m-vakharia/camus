@@ -622,10 +622,15 @@ pub fn create_wal_topic(controller: &str) {
 
 /// Create `TOPIC` with the given `durability.mode` through the controller.
 pub fn create_topic(controller: &str, durability_mode: &'static str) {
+    create_topic_with(controller, durability_mode, 1);
+}
+
+/// Create `TOPIC` with `partitions` partitions.
+pub fn create_topic_with(controller: &str, durability_mode: &'static str, partitions: i32) {
     let mut stream = connect(controller);
     let mut created = CreatableTopic::default();
     created.name = TopicName(StrBytes::from_static_str(TOPIC));
-    created.num_partitions = 1;
+    created.num_partitions = partitions;
     created.replication_factor = 3;
     let mut durability = CreatableTopicConfig::default();
     durability.name = StrBytes::from_static_str("durability.mode");

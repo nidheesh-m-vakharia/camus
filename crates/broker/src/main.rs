@@ -64,6 +64,9 @@ struct Args {
     require_sasl: bool,
 }
 
+/// Largest Raft RPC body the HTTP routes accept.
+const RAFT_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
 #[derive(Deserialize)]
 struct Peer {
     id: NodeId,
@@ -163,6 +166,10 @@ async fn main() -> anyhow::Result<()> {
     let bound = listener.local_addr()?;
     std::fs::write(args.data_dir.join("listen-addr"), bound.to_string())?;
     info!(node_id = args.node_id, %bound, "metadata broker listening");
+    // AppendEntries carries produce batches. axum's default 2 MB body limit
+    // rejected a single 1 MiB client batch once JSON-encoded, and replication
+    // stalled until followers elected. The shard caps an RPC well under this.
+    let app = app.layer(axum::extract::DefaultBodyLimit::max(RAFT_BODY_LIMIT));
     // Raft RPCs are small request/response pairs; Nagle plus delayed ACK
     // would add tens of milliseconds to every quorum round trip.
     let listener = listener.tap_io(|tcp| {
@@ -215,6 +222,9 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "wal_leader": wal.leader(),
         "wal_voters": wal.voters(),
         "wal_unsealed_bytes": wal.unsealed_bytes(),
+        "wal_log_fsyncs": wal.log_stats().0,
+        "wal_log_entries": wal.log_stats().1,
+        "wal_log_bytes": wal.log_stats().2,
         "wal_storage_failed": wal.storage_failed(),
     }))
 }
@@ -378,58 +388,96 @@ async fn read(
     Ok(Json(serde_json::json!({ "value": value })))
 }
 
+/// Decode a postcard Raft RPC body, or answer 400.
+fn rpc_body<T: serde::de::DeserializeOwned>(
+    body: &axum::body::Bytes,
+) -> Result<T, axum::response::Response> {
+    camus_raft::codec::decode(body).map_err(|err| {
+        axum::response::IntoResponse::into_response((StatusCode::BAD_REQUEST, err.to_string()))
+    })
+}
+
+/// Encode a Raft RPC result as postcard.
+fn rpc_reply<T: serde::Serialize>(value: &T) -> axum::response::Response {
+    match camus_raft::codec::encode(value) {
+        Ok(bytes) => axum::response::IntoResponse::into_response((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                camus_raft::codec::CONTENT_TYPE,
+            )],
+            bytes,
+        )),
+        Err(err) => axum::response::IntoResponse::into_response((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err.to_string(),
+        )),
+    }
+}
+
 async fn vote(
     State(node): State<Arc<MetadataNode>>,
-    Json(req): Json<VoteRequest<NodeId>>,
-) -> Json<Result<openraft::raft::VoteResponse<NodeId>, openraft::error::RaftError<NodeId>>> {
-    Json(node.raft.vote(req).await)
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let req: VoteRequest<NodeId> = match rpc_body(&body) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    rpc_reply(&node.raft.vote(req).await)
 }
 
 async fn append(
     State(node): State<Arc<MetadataNode>>,
-    Json(req): Json<AppendEntriesRequest<camus_metadata::TypeConfig>>,
-) -> Json<Result<openraft::raft::AppendEntriesResponse<NodeId>, openraft::error::RaftError<NodeId>>>
-{
-    Json(node.raft.append_entries(req).await)
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let req: AppendEntriesRequest<camus_metadata::TypeConfig> = match rpc_body(&body) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    rpc_reply(&node.raft.append_entries(req).await)
 }
 
 async fn snapshot(
     State(node): State<Arc<MetadataNode>>,
-    Json(req): Json<InstallSnapshotRequest<camus_metadata::TypeConfig>>,
-) -> Json<
-    Result<
-        openraft::raft::InstallSnapshotResponse<NodeId>,
-        openraft::error::RaftError<NodeId, openraft::error::InstallSnapshotError>,
-    >,
-> {
-    Json(node.raft.install_snapshot(req).await)
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let req: InstallSnapshotRequest<camus_metadata::TypeConfig> = match rpc_body(&body) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    rpc_reply(&node.raft.install_snapshot(req).await)
 }
 
 async fn wal_vote(
     State(wal): State<Arc<WalSlot>>,
-    Json(req): Json<VoteRequest<NodeId>>,
-) -> Json<Result<openraft::raft::VoteResponse<NodeId>, openraft::error::RaftError<NodeId>>> {
-    Json(wal.get().raft.vote(req).await)
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let req: VoteRequest<NodeId> = match rpc_body(&body) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    rpc_reply(&wal.get().raft.vote(req).await)
 }
 
 async fn wal_append(
     State(wal): State<Arc<WalSlot>>,
-    Json(req): Json<AppendEntriesRequest<camus_wal::TypeConfig>>,
-) -> Json<Result<openraft::raft::AppendEntriesResponse<NodeId>, openraft::error::RaftError<NodeId>>>
-{
-    Json(wal.get().raft.append_entries(req).await)
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let req: AppendEntriesRequest<camus_wal::TypeConfig> = match rpc_body(&body) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    rpc_reply(&wal.get().raft.append_entries(req).await)
 }
 
 async fn wal_snapshot(
     State(wal): State<Arc<WalSlot>>,
-    Json(req): Json<InstallSnapshotRequest<camus_wal::TypeConfig>>,
-) -> Json<
-    Result<
-        openraft::raft::InstallSnapshotResponse<NodeId>,
-        openraft::error::RaftError<NodeId, openraft::error::InstallSnapshotError>,
-    >,
-> {
-    Json(wal.get().raft.install_snapshot(req).await)
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let req: InstallSnapshotRequest<camus_wal::TypeConfig> = match rpc_body(&body) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    rpc_reply(&wal.get().raft.install_snapshot(req).await)
 }
 
 async fn start_kafka(

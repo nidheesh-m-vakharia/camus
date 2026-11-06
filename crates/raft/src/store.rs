@@ -54,6 +54,18 @@ where
     C: RaftTypeConfig,
 {
     inner: Arc<Mutex<Inner<C>>>,
+    stats: Arc<AppendStats>,
+}
+
+/// Counters for the append path. Clones of a store share them.
+#[derive(Default, Debug)]
+pub struct AppendStats {
+    /// `append` calls, each one fsync.
+    pub fsyncs: std::sync::atomic::AtomicU64,
+    /// Entries written across those calls.
+    pub entries: std::sync::atomic::AtomicU64,
+    /// Encoded entry bytes written.
+    pub bytes: std::sync::atomic::AtomicU64,
 }
 
 impl<C> SegmentLogStore<C>
@@ -70,7 +82,13 @@ where
         let log = SegmentLog::open(&dir).map_err(|err| io_err::<C>(None, &err))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner { log, dir, meta })),
+            stats: Arc::new(AppendStats::default()),
         })
+    }
+
+    /// Append counters: fsyncs, entries, and bytes since open.
+    pub fn stats(&self) -> Arc<AppendStats> {
+        self.stats.clone()
     }
 }
 
@@ -96,7 +114,7 @@ where
             records
                 .into_iter()
                 .map(|(_, bytes)| {
-                    serde_json::from_slice(&bytes).map_err(|err| io_err::<C>(None, &err))
+                    crate::codec::decode(&bytes).map_err(|err| io_err::<C>(None, &err))
                 })
                 .collect()
         })
@@ -127,7 +145,7 @@ where
                             io_err::<C>(None, &std::io::Error::other("missing last record"))
                         })?;
                     let entry: C::Entry =
-                        serde_json::from_slice(&bytes).map_err(|err| io_err::<C>(None, &err))?;
+                        crate::codec::decode(&bytes).map_err(|err| io_err::<C>(None, &err))?;
                     Some(entry.get_log_id().clone())
                 }
                 None => guard.meta.last_purged.clone(),
@@ -197,10 +215,12 @@ where
         let mut payloads = Vec::new();
         for entry in entries {
             let index = entry.get_log_id().index;
-            let bytes = serde_json::to_vec(&entry)
+            let bytes = crate::codec::encode(&entry)
                 .map_err(|err| io_err::<C>(Some(entry.get_log_id().clone()), &err))?;
             payloads.push((index, bytes));
         }
+        let entries = payloads.len() as u64;
+        let bytes: u64 = payloads.iter().map(|(_, bytes)| bytes.len() as u64).sum();
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             let mut guard = lock(&inner)?;
@@ -215,6 +235,10 @@ where
         })
         .await
         .map_err(|err| io_err::<C>(None, &err))??;
+        use std::sync::atomic::Ordering::Relaxed;
+        self.stats.fsyncs.fetch_add(1, Relaxed);
+        self.stats.entries.fetch_add(entries, Relaxed);
+        self.stats.bytes.fetch_add(bytes, Relaxed);
         callback.log_io_completed(Ok(()));
         Ok(())
     }

@@ -40,6 +40,9 @@ openraft::declare_raft_types!(
 pub enum Command {
     /// Append one sealed-later batch.
     Append(Append),
+    /// Append several batches in one entry: group commit (ADR 0006). They
+    /// take offsets in this order.
+    Appends(Vec<Append>),
     /// Drop batches that metadata has published.
     Seal {
         /// Identity of each dropped batch.
@@ -59,6 +62,7 @@ pub struct Append {
     /// Leader epoch written into the batch.
     pub epoch: i32,
     /// Client bytes, checked before they are proposed.
+    #[serde(with = "serde_bytes")]
     pub raw: Vec<u8>,
     /// Records in `raw`.
     pub records: i32,
@@ -87,12 +91,15 @@ pub struct SealDrop {
 }
 
 /// Applied result.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Response {
     /// Assigned base offset. `-1` when the command is not an append.
     pub base_offset: i64,
     /// Kafka error code.
     pub error_code: i16,
+    /// For [`Command::Appends`]: one result per batch, in order.
+    #[serde(default)]
+    pub each: Vec<Response>,
 }
 
 /// Why a proposal did not commit.
@@ -126,7 +133,160 @@ pub struct Shard {
     pub raft: Raft<TypeConfig>,
     machine: Arc<Machine>,
     node_id: NodeId,
-    storage_failed: AtomicBool,
+    storage_failed: Arc<AtomicBool>,
+    log_stats: Arc<camus_raft::AppendStats>,
+    queue: tokio::sync::mpsc::UnboundedSender<Queued>,
+}
+
+/// One produce batch waiting for the committer.
+type Queued = (
+    Append,
+    tokio::sync::oneshot::Sender<Result<Response, Failure>>,
+);
+
+/// A [`WriteError`] that can be handed to every batch in a failed group.
+#[derive(Clone, Debug)]
+enum Failure {
+    NotLeader,
+    Storage,
+    Other(String),
+}
+
+impl From<Failure> for WriteError {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::NotLeader => WriteError::NotLeader,
+            Failure::Storage => WriteError::Storage,
+            Failure::Other(text) => WriteError::Other(anyhow::anyhow!(text)),
+        }
+    }
+}
+
+/// Bytes one packed entry may carry before the committer starts another.
+const GROUP_BYTES: usize = 1024 * 1024;
+
+/// Packed entries that may be committing at once. One: openraft writes the
+/// log one append at a time, so more in flight only split the same traffic
+/// into smaller entries with an fsync each. Measured with
+/// `broker/tests/throughput.rs` at 32 producers: 4 in flight gave 10.4 MiB/s
+/// and 0.18 fsyncs per ack; 1 gave 14.9 MiB/s and 0.07.
+const IN_FLIGHT: usize = 1;
+
+/// Group commit (ADR 0006). Batches that arrive while entries are being
+/// committed wait here and go into the next entry together, so concurrent
+/// producers share one quorum fsync. Entries are submitted to Raft in arrival
+/// order, which is the order offsets are assigned.
+async fn commit_loop(
+    raft: Raft<TypeConfig>,
+    storage_failed: Arc<AtomicBool>,
+    mut queue: tokio::sync::mpsc::UnboundedReceiver<Queued>,
+) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT));
+    while let Some(first) = queue.recv().await {
+        // Waiting for a slot is what lets the next group fill up.
+        let Ok(slot) = slots.clone().acquire_owned().await else {
+            return;
+        };
+        let mut size = first.0.raw.len();
+        let mut group = vec![first];
+        while size < GROUP_BYTES && group.len() < machine::MAX_PACKED {
+            let Ok(next) = queue.try_recv() else { break };
+            size += next.0.raw.len();
+            group.push(next);
+        }
+        let (appends, waiters): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+        let command = if appends.len() == 1 {
+            Command::Append(appends.into_iter().next().expect("one append"))
+        } else {
+            Command::Appends(appends)
+        };
+        let submitted = raft.client_write_ff(command).await;
+        let raft = raft.clone();
+        let flag = storage_failed.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let failure = |failure: Failure, waiters: Vec<_>| {
+                for waiter in waiters {
+                    let _: Result<(), _> =
+                        tokio::sync::oneshot::Sender::send(waiter, Err(failure.clone()));
+                }
+            };
+            let rx = match submitted {
+                Ok(rx) => rx,
+                Err(fatal) => {
+                    let code = match classify(&raft, &flag, RaftError::Fatal(fatal)) {
+                        WriteError::Storage => Failure::Storage,
+                        other => Failure::Other(other.to_string()),
+                    };
+                    return failure(code, waiters);
+                }
+            };
+            let written = match rx.await {
+                Ok(Ok(written)) => written,
+                Ok(Err(err)) => {
+                    let code = match classify(&raft, &flag, RaftError::APIError(err)) {
+                        WriteError::NotLeader => Failure::NotLeader,
+                        WriteError::Storage => Failure::Storage,
+                        WriteError::Other(err) => Failure::Other(err.to_string()),
+                    };
+                    return failure(code, waiters);
+                }
+                Err(_) => {
+                    let code = if storage_has_failed(&raft, &flag) {
+                        Failure::Storage
+                    } else {
+                        Failure::Other("raft stopped".into())
+                    };
+                    return failure(code, waiters);
+                }
+            };
+            if written.data.each.is_empty() {
+                if let Some(waiter) = waiters.into_iter().next() {
+                    let _ = waiter.send(Ok(written.data));
+                }
+                return;
+            }
+            let mut each = written.data.each.into_iter();
+            for waiter in waiters {
+                let result = each
+                    .next()
+                    .ok_or_else(|| Failure::Other("no result for packed batch".into()));
+                let _ = waiter.send(result);
+            }
+        });
+    }
+}
+
+fn storage_has_failed(raft: &Raft<TypeConfig>, flag: &AtomicBool) -> bool {
+    if flag.load(Ordering::SeqCst) {
+        return true;
+    }
+    // A writer waiting on the entry may only see `Stopped`; the cause is in
+    // the metrics.
+    let failed = matches!(
+        raft.metrics().borrow().running_state,
+        Err(Fatal::StorageError(_))
+    );
+    if failed {
+        flag.store(true, Ordering::SeqCst);
+    }
+    failed
+}
+
+fn classify(
+    raft: &Raft<TypeConfig>,
+    flag: &AtomicBool,
+    err: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>,
+) -> WriteError {
+    match err {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => WriteError::NotLeader,
+        RaftError::Fatal(Fatal::StorageError(_)) => {
+            flag.store(true, Ordering::SeqCst);
+            WriteError::Storage
+        }
+        RaftError::Fatal(_) if storage_has_failed(raft, flag) => WriteError::Storage,
+        other => WriteError::Other(other.into()),
+    }
 }
 
 impl Shard {
@@ -163,17 +323,27 @@ impl Shard {
             heartbeat_interval: 50,
             election_timeout_min: 150,
             election_timeout_max: 300,
+            // An entry is a packed group of up to `GROUP_BYTES` (plus one
+            // client batch). Eight per AppendEntries keeps an RPC far below
+            // the broker's HTTP body limit even with JSON encoding.
+            max_payload_entries: 8,
             ..Default::default()
         };
         let config = Arc::new(config.validate()?);
         let log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
+        let log_stats = log.stats();
         let machine = Arc::new(Machine::open(&dir.join("state.redb"))?);
         let raft = Raft::new(node_id, config, network, log, machine.clone()).await?;
+        let storage_failed = Arc::new(AtomicBool::new(false));
+        let (queue, waiting) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(commit_loop(raft.clone(), storage_failed.clone(), waiting));
         Ok(Self {
             raft,
             machine,
             node_id,
-            storage_failed: AtomicBool::new(false),
+            storage_failed,
+            log_stats,
+            queue,
         })
     }
 
@@ -248,43 +418,30 @@ impl Shard {
     }
 
     /// Propose a batch and wait until a majority has it on disk and this
-    /// leader has applied it.
+    /// leader has applied it. Concurrent calls share one entry and one
+    /// quorum fsync.
     pub async fn append(&self, batch: Append) -> Result<Response, WriteError> {
-        let response = self
-            .raft
-            .client_write(Command::Append(batch))
-            .await
-            .map_err(|err| self.classify(err))?;
-        Ok(response.data)
+        if !self.is_leader() {
+            return Err(WriteError::NotLeader);
+        }
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.queue
+            .send((batch, done))
+            .map_err(|_| WriteError::Other(anyhow::anyhow!("wal committer stopped")))?;
+        match wait.await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(failure)) => Err(failure.into()),
+            Err(_) => Err(WriteError::Other(anyhow::anyhow!("wal committer stopped"))),
+        }
     }
 
     /// Whether a log or state-machine write has failed on this shard.
     pub fn storage_failed(&self) -> bool {
-        if self.storage_failed.load(Ordering::SeqCst) {
-            return true;
-        }
-        // A writer waiting on the entry may only see `Stopped`; the cause is
-        // in the metrics.
-        let failed = matches!(
-            self.raft.metrics().borrow().running_state,
-            Err(Fatal::StorageError(_))
-        );
-        if failed {
-            self.storage_failed.store(true, Ordering::SeqCst);
-        }
-        failed
+        storage_has_failed(&self.raft, &self.storage_failed)
     }
 
     fn classify(&self, err: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> WriteError {
-        match err {
-            RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => WriteError::NotLeader,
-            RaftError::Fatal(Fatal::StorageError(_)) => {
-                self.storage_failed.store(true, Ordering::SeqCst);
-                WriteError::Storage
-            }
-            RaftError::Fatal(_) if self.storage_failed() => WriteError::Storage,
-            other => WriteError::Other(other.into()),
-        }
+        classify(&self.raft, &self.storage_failed, err)
     }
 
     /// Drop published batches and return the log index of that commit.
@@ -309,6 +466,15 @@ impl Shard {
     /// Next offset for a partition. `0` when the shard has not appended.
     pub fn end_offset(&self, topic_id: &[u8; 16], partition: i32) -> i64 {
         self.machine.end_offset(topic_id, partition)
+    }
+
+    /// Log append counters for this shard: `(fsyncs, entries, bytes)`.
+    pub fn log_stats(&self) -> (u64, u64, u64) {
+        (
+            self.log_stats.fsyncs.load(Ordering::Relaxed),
+            self.log_stats.entries.load(Ordering::Relaxed),
+            self.log_stats.bytes.load(Ordering::Relaxed),
+        )
     }
 
     /// Bytes of committed batches not yet sealed. The disk limit is checked
@@ -517,5 +683,43 @@ mod tests {
             3
         );
         assert_eq!(shard.append(append_of(b"d")).await.unwrap().base_offset, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_appends_share_fsyncs_and_keep_offsets_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = Arc::new(Shard::open(1, dir.path()).await.unwrap());
+        shard.ensure_voter().await.unwrap();
+        let (fsyncs_before, _, _) = shard.log_stats();
+        let tasks: Vec<_> = (0..64)
+            .map(|index| {
+                let shard = shard.clone();
+                tokio::spawn(async move {
+                    let value = format!("v{index}");
+                    shard.append(append_of(value.as_bytes())).await.unwrap()
+                })
+            })
+            .collect();
+        let mut offsets = Vec::new();
+        for task in tasks {
+            let response = task.await.unwrap();
+            assert_eq!(response.error_code, 0);
+            offsets.push(response.base_offset);
+        }
+        offsets.sort();
+        assert_eq!(offsets, (0..64).collect::<Vec<i64>>());
+        let (fsyncs, _, _) = shard.log_stats();
+        assert!(
+            fsyncs - fsyncs_before < 64,
+            "64 concurrent appends took {} fsyncs",
+            fsyncs - fsyncs_before
+        );
+        let tail = shard.read(&[1; 16], 0, 0, 0);
+        assert_eq!(
+            camus_protocol::batch::inspect(&tail, 1 << 20)
+                .unwrap()
+                .len(),
+            64
+        );
     }
 }

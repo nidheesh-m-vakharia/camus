@@ -173,11 +173,17 @@ impl HttpConn {
         E: std::error::Error + DeserializeOwned,
     {
         let url = format!("http://{}/wal/{path}", self.addr);
+        let body = camus_raft::codec::encode(&req)
+            .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
         let response = self
             .client
             .post(&url)
             .timeout(option.hard_ttl())
-            .json(&req)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                camus_raft::codec::CONTENT_TYPE,
+            )
+            .body(body)
             .send()
             .await
             .map_err(|err| {
@@ -187,9 +193,18 @@ impl HttpConn {
                     RPCError::Network(NetworkError::new(&err))
                 }
             })?;
-        let body: Result<Resp, RaftError<NodeId, E>> = response
-            .json()
+        let status = response.status();
+        let bytes = response
+            .bytes()
             .await
+            .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
+        if !status.is_success() {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            return Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other(format!("{status}: {text}")),
+            )));
+        }
+        let body: Result<Resp, RaftError<NodeId, E>> = camus_raft::codec::decode(&bytes)
             .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
         body.map_err(|err| RPCError::RemoteError(RemoteError::new(self.target, err)))
     }

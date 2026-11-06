@@ -94,6 +94,60 @@ Phase 0 is foundations only. No Produce or Fetch handler that accepts data.
 Phase 0 will not implement Produce, Fetch, consumer groups, or the WAL
 uploader. Those are Phases 1 and 2.
 
+## Write path
+
+Added 2026-11-05, after Phase 2. Kafka's write path is one sequential
+append of the client's bytes, with batching and zero-copy reads. Camus's
+`wal` path still has stages that cost more than the quorum fsync it is
+built around. This track removes them before Phase 3 adds more load. Each
+step lands with `broker/tests/throughput.rs` numbers before and after.
+
+The fsync before each ack is not on the list. ADR 0005 chose it; it is the
+latency floor, not overhead.
+
+Baseline, three brokers on one laptop SSD, 16 × 1 KiB records per batch:
+
+| Producers | MiB/s | p50 ms | p99 ms | fsyncs/ack | log bytes / payload byte |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.1 | 12.9 | 32.8 | 1.04 | 4.20 |
+| 8 | 2.4 | 48.0 | 108.2 | 1.02 | 4.20 |
+| 32 | failed: shard leadership flapped under load | | | | |
+
+Steps, in order:
+
+1. **Throughput benchmark.** Done. `broker/tests/throughput.rs`, with fsync
+   and byte counters on the shard log (`wal_log_*` in `/admin/metrics`).
+2. **Group commit.** Done. A committer task packs batches that arrive
+   while an entry commits into the next entry (up to 1 MiB). One entry in
+   flight: more split groups and cost throughput (measured, see
+   `IN_FLIGHT` in `crates/wal`). The 32-producer failure was not load: the
+   follower's HTTP route refused bodies over axum's 2 MB default, which one
+   1 MiB client batch already exceeded once JSON-encoded. The Raft routes
+   now take 64 MB and an AppendEntries carries at most 8 entries.
+3. **Binary entries.** Done. Log entries and both groups' Raft RPC bodies
+   are postcard (`camus_raft::codec`); batch bytes are `serde_bytes`.
+
+After steps 1–3, same machine and benchmark:
+
+| Producers | MiB/s | p50 ms | p99 ms | fsyncs/ack | log bytes / payload byte |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.2 | 11.9 | 37.0 | 1.04 | 1.07 |
+| 8 | 4.6 | 24.3 | 62.1 | 0.26 | 1.07 |
+| 32 | 16.5 | 27.7 | 61.9 | 0.06 | 1.07 |
+
+Remaining steps:
+
+4. **Store each batch once.** The state machine keeps offsets and the log
+   position of each unsealed batch; the bytes stay in the log until the
+   seal purges them. Removes the second disk write per batch.
+5. **Fewer copies.** Carry `Bytes` from the socket to the log without
+   `to_vec`.
+6. **Later:** a persistent binary stream for shard Raft instead of one HTTP
+   request per message, and tail fetches served from the log file.
+
+Steps 3 and 4 change the WAL's on-disk format. Before launch that means a
+fresh data directory, not a migration.
+
 ## What "done" means later
 
 Each phase ends with a build that can be demoed and a green acceptance

@@ -31,6 +31,7 @@ tokio-rustls = "0.26"
 uuid = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+camus-raft = { version = "0.1.0", path = "../raft" }
 
 [dev-dependencies]
 bytes = "1"

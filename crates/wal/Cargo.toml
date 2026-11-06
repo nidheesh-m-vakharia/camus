@@ -14,6 +14,7 @@ openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 redb = "2"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
