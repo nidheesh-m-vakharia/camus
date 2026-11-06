@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use camus_coordinator::{codes, Coordinator, JoinRequest, JoinResponse, Store, SyncResponse};
+use camus_coordinator::{
+    codes, Coordinator, JoinRequest, JoinResponse, Leaving, Store, SyncResponse,
+};
 use camus_metadata::groups::{self, GroupRecord, OffsetCommit, OffsetRecord};
 use camus_metadata::{Command, MetadataNode};
 use camus_protocol::messages::delete_groups_response::DeletableGroupResult;
@@ -237,6 +239,7 @@ impl Kafka {
                         request.session_timeout_ms
                     },
                     require_known_member_id: version >= 4,
+                    supports_skip_assignment: version >= 9,
                 };
                 let member = join.member_id.clone();
                 self.coordinator
@@ -252,6 +255,7 @@ impl Kafka {
         response.protocol_name = Some(text(&answer.protocol_name.unwrap_or_default()));
         response.leader = text(&answer.leader);
         response.member_id = text(&answer.member_id);
+        response.skip_assignment = answer.skip_assignment;
         response.members = answer
             .members
             .into_iter()
@@ -283,6 +287,7 @@ impl Kafka {
                     .sync(
                         request.group_id.0.as_str(),
                         request.member_id.as_str(),
+                        request.group_instance_id.as_ref().map(|id| id.as_str()),
                         request.generation_id,
                         request.protocol_type.as_ref().map(|value| value.as_str()),
                         request.protocol_name.as_ref().map(|value| value.as_str()),
@@ -310,6 +315,7 @@ impl Kafka {
             Ok(()) => self.coordinator.heartbeat(
                 request.group_id.0.as_str(),
                 request.member_id.as_str(),
+                request.group_instance_id.as_ref().map(|id| id.as_str()),
                 request.generation_id,
                 Instant::now(),
             ),
@@ -325,41 +331,39 @@ impl Kafka {
         };
         let version = header.request_api_version;
         let group = request.group_id.0.to_string();
-        let leaving: Vec<(String, Option<String>)> = if version >= 3 {
+        let leaving: Vec<Leaving> = if version >= 3 {
             request
                 .members
                 .iter()
-                .map(|member| {
-                    (
-                        member.member_id.to_string(),
-                        member.group_instance_id.as_ref().map(|id| id.to_string()),
-                    )
+                .map(|member| Leaving {
+                    member_id: member.member_id.to_string(),
+                    group_instance_id: member.group_instance_id.as_ref().map(|id| id.to_string()),
                 })
                 .collect()
         } else {
-            vec![(request.member_id.to_string(), None)]
+            vec![Leaving {
+                member_id: request.member_id.to_string(),
+                group_instance_id: None,
+            }]
         };
         let mut response = LeaveGroupResponse::default();
-        match self.coordinating().await {
+        let answered = match self.coordinating().await {
+            Err(code) => Err(code),
+            Ok(()) => self.coordinator.leave(&group, &leaving, Instant::now()),
+        };
+        match answered {
             Err(code) => response.error_code = code,
-            Ok(()) => {
-                let mut codes_seen = Vec::new();
-                for (member_id, instance) in leaving {
-                    let code = self.coordinator.leave(
-                        &group,
-                        &member_id,
-                        instance.as_deref(),
-                        Instant::now(),
-                    );
-                    codes_seen.push(code);
-                    let mut out = MemberResponse::default();
-                    out.member_id = text(&member_id);
-                    out.group_instance_id = instance.map(|id| text(&id));
-                    out.error_code = code;
-                    response.members.push(out);
-                }
+            Ok(codes_seen) => {
                 if version < 3 {
                     response.error_code = codes_seen.first().copied().unwrap_or(0);
+                } else {
+                    for (one, code) in leaving.into_iter().zip(codes_seen) {
+                        let mut out = MemberResponse::default();
+                        out.member_id = text(&one.member_id);
+                        out.group_instance_id = one.group_instance_id.map(|id| text(&id));
+                        out.error_code = code;
+                        response.members.push(out);
+                    }
                 }
             }
         }
@@ -376,9 +380,12 @@ impl Kafka {
         let member_id = request.member_id.to_string();
         let gate = match self.coordinating().await {
             Err(code) => code,
-            Ok(()) => self
-                .coordinator
-                .check_commit(&group, &member_id, generation),
+            Ok(()) => self.coordinator.check_commit(
+                &group,
+                &member_id,
+                request.group_instance_id.as_ref().map(|id| id.as_str()),
+                generation,
+            ),
         };
         // Resolve each topic to its id; unknown topics and partitions fail
         // on their own without failing the rest.

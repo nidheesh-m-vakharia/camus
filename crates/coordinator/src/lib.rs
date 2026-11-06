@@ -3,18 +3,19 @@
 //! The metadata leader coordinates every group. Live membership is kept here
 //! in memory; what must survive a failover goes through the metadata group
 //! via [`Store`]: the record of each new generation before anyone hears of
-//! it, and the assignment before any member receives it. A new coordinator
-//! loads those records, so members of a stable group keep their generation
-//! across a failover and the group does not split.
+//! it, the assignment before any member receives it, and a static member's
+//! new member id. A new coordinator loads those records, so members of a
+//! stable group keep their generation across a failover and the group does
+//! not split.
 //!
-//! Behavior follows the classic group protocol of Kafka 4.4.0: MEMBER_ID_
-//! REQUIRED on first join from v4, the initial rebalance delay for an empty
-//! group, rebalance and session timeouts, protocol selection by vote, and
-//! the error codes in [`codes`].
+//! Behavior follows the classic group protocol of Kafka 4.4.0
+//! (`GroupMetadataManager` and `ClassicGroup`); `src/tests` ports the cases
+//! from its test suite that apply here, and `docs/kafka-coordinator-port.md`
+//! lists every case and what happened to it.
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -61,6 +62,9 @@ pub struct Config {
     pub max_session_timeout: Duration,
     /// `group.max.size`.
     pub max_size: usize,
+    /// How long a member that joined during a rebalance may wait for it
+    /// without heartbeating (Kafka's `classicGroupNewMemberJoinTimeoutMs`).
+    pub new_member_join_timeout: Duration,
 }
 
 impl Default for Config {
@@ -70,6 +74,7 @@ impl Default for Config {
             min_session_timeout: Duration::from_millis(6_000),
             max_session_timeout: Duration::from_millis(1_800_000),
             max_size: usize::MAX,
+            new_member_join_timeout: Duration::from_millis(300_000),
         }
     }
 }
@@ -111,6 +116,8 @@ pub struct JoinRequest {
     pub rebalance_timeout_ms: i32,
     /// JoinGroup v4+: an unknown member gets MEMBER_ID_REQUIRED first.
     pub require_known_member_id: bool,
+    /// JoinGroup v9+: a static leader that rejoins may skip reassignment.
+    pub supports_skip_assignment: bool,
 }
 
 /// One member as the leader's JoinGroup response lists it.
@@ -130,6 +137,7 @@ pub struct JoinResponse {
     pub protocol_name: Option<String>,
     pub leader: String,
     pub member_id: String,
+    pub skip_assignment: bool,
     /// Only the leader's response lists the members.
     pub members: Vec<JoinMember>,
 }
@@ -178,6 +186,14 @@ impl<T> Reply<T> {
             Reply::Later(rx) => rx.await.unwrap_or_else(|_| lost()),
         }
     }
+
+    /// The answer if it is already here.
+    pub fn now(&self) -> Option<&T> {
+        match self {
+            Reply::Now(value) => Some(value),
+            Reply::Later(_) => None,
+        }
+    }
 }
 
 /// One member as DescribeGroups reports it.
@@ -200,17 +216,48 @@ pub struct Described {
     pub members: Vec<DescribedMember>,
 }
 
+/// One member to remove in a LeaveGroup.
+#[derive(Clone, Debug, Default)]
+pub struct Leaving {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+}
+
 struct Member {
     record: MemberRecord,
     protocols: Vec<(String, Vec<u8>)>,
     last_seen: Instant,
     join: Option<oneshot::Sender<JoinResponse>>,
     sync: Option<oneshot::Sender<SyncResponse>>,
-    /// Joined since the current rebalance began.
-    rejoined: bool,
-    /// Sent SyncGroup for the current generation.
-    synced: bool,
+    /// Joined during the current rebalance; not yet in a completed one.
+    new_since: Option<Instant>,
     join_order: u64,
+}
+
+impl Member {
+    fn session(&self) -> Duration {
+        Duration::from_millis(self.record.session_timeout_ms.max(0) as u64)
+    }
+
+    fn is_static(&self) -> bool {
+        self.record.group_instance_id.is_some()
+    }
+
+    fn metadata(&self, protocol: Option<&String>) -> Vec<u8> {
+        protocol
+            .and_then(|name| self.protocols.iter().find(|(theirs, _)| theirs == name))
+            .map(|(_, metadata)| metadata.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// The initial-rebalance delay of an empty group (Kafka's
+/// `InitialDelayedJoin`): when it ends, it extends by one more delay, measured
+/// from then, if a new member joined meanwhile and the rebalance timeout has
+/// budget left beyond the first delay.
+struct InitialDelay {
+    remaining: Duration,
+    joined: bool,
 }
 
 struct Group {
@@ -220,12 +267,14 @@ struct Group {
     protocol: Option<String>,
     leader: Option<String>,
     members: BTreeMap<String, Member>,
-    /// Member ids handed out with MEMBER_ID_REQUIRED, not yet joined.
-    pending: HashMap<String, Instant>,
-    /// When the current join or sync phase gives up on stragglers.
-    deadline: Option<Instant>,
-    /// The latest point the initial delay may extend to.
-    initial_cap: Option<Instant>,
+    /// Member ids handed out with MEMBER_ID_REQUIRED, not yet joined, and
+    /// the session that expires them.
+    pending: HashMap<String, (Instant, Duration)>,
+    /// Members of the latest generation that have not sent SyncGroup.
+    pending_sync: HashSet<String>,
+    sync_deadline: Option<Instant>,
+    join_deadline: Option<Instant>,
+    initial: Option<InitialDelay>,
     /// A save is in flight; the phase ends when it lands.
     saving: bool,
     next_order: u64,
@@ -241,8 +290,10 @@ impl Group {
             leader: None,
             members: BTreeMap::new(),
             pending: HashMap::new(),
-            deadline: None,
-            initial_cap: None,
+            pending_sync: HashSet::new(),
+            sync_deadline: None,
+            join_deadline: None,
+            initial: None,
             saving: false,
             next_order: 0,
         }
@@ -269,8 +320,7 @@ impl Group {
                     last_seen: now,
                     join: None,
                     sync: None,
-                    rejoined: false,
-                    synced: true,
+                    new_since: None,
                     join_order: order as u64,
                     record: member,
                 },
@@ -288,9 +338,6 @@ impl Group {
         } else {
             // The generation started but its assignment was not stored: the
             // old coordinator died between join and sync. Rebalance.
-            for member in group.members.values_mut() {
-                member.synced = false;
-            }
             State::PreparingRebalance
         };
         group
@@ -308,17 +355,46 @@ impl Group {
                 .into_iter()
                 .map(|member| {
                     let mut record = member.record.clone();
-                    if let Some(protocol) = &self.protocol {
-                        if let Some((_, metadata)) =
-                            member.protocols.iter().find(|(name, _)| name == protocol)
-                        {
-                            record.subscription = metadata.clone();
-                        }
+                    if self.protocol.is_some() {
+                        record.subscription = member.metadata(self.protocol.as_ref());
                     }
                     record
                 })
                 .collect(),
         }
+    }
+
+    fn static_member(&self, instance: &str) -> Option<String> {
+        self.members
+            .values()
+            .find(|member| member.record.group_instance_id.as_deref() == Some(instance))
+            .map(|member| member.record.member_id.clone())
+    }
+
+    /// Kafka's `validateMember`: an instance id must name this member id; a
+    /// member id must be in the group.
+    fn validate_member(&self, member_id: &str, instance: Option<&str>) -> Result<(), i16> {
+        match instance {
+            Some(instance) => match self.static_member(instance) {
+                None => Err(codes::UNKNOWN_MEMBER_ID),
+                Some(existing) if existing != member_id => Err(codes::FENCED_INSTANCE_ID),
+                Some(_) => Ok(()),
+            },
+            None if self.members.contains_key(member_id) => Ok(()),
+            None => Err(codes::UNKNOWN_MEMBER_ID),
+        }
+    }
+
+    fn awaiting_join(&self) -> usize {
+        self.members
+            .values()
+            .filter(|member| member.join.is_some())
+            .count()
+    }
+
+    /// Kafka's `hasAllMembersJoined`.
+    fn all_joined(&self) -> bool {
+        self.awaiting_join() == self.members.len() && self.pending.is_empty()
     }
 
     fn rebalance_timeout(&self) -> Duration {
@@ -331,11 +407,13 @@ impl Group {
         Duration::from_millis(ms as u64)
     }
 
-    /// The protocol every member supports that gets the most first-choice
-    /// votes; ties go to the leader's preference order.
+    /// The protocol every member supports with the most first-choice votes.
+    /// Ties go to the earliest joined member's preference.
     fn select_protocol(&self) -> Option<String> {
         let mut candidates: Option<Vec<String>> = None;
-        for member in self.members.values() {
+        let mut ordered: Vec<&Member> = self.members.values().collect();
+        ordered.sort_by_key(|member| member.join_order);
+        for member in &ordered {
             let names: Vec<String> = member
                 .protocols
                 .iter()
@@ -351,7 +429,7 @@ impl Group {
         }
         let candidates = candidates?;
         let mut votes: BTreeMap<String, usize> = BTreeMap::new();
-        for member in self.members.values() {
+        for member in &ordered {
             if let Some((name, _)) = member
                 .protocols
                 .iter()
@@ -361,12 +439,8 @@ impl Group {
             }
         }
         let best = votes.values().copied().max()?;
-        let first = self
-            .leader
-            .as_ref()
-            .and_then(|leader| self.members.get(leader))
-            .or_else(|| self.members.values().min_by_key(|member| member.join_order));
-        first
+        ordered
+            .first()
             .and_then(|member| {
                 member
                     .protocols
@@ -382,6 +456,8 @@ impl Group {
             })
     }
 
+    /// Kafka's `supportsProtocols`: the type matches and at least one of the
+    /// protocols is one every member supports.
     fn supports(&self, protocol_type: &str, protocols: &[(String, Vec<u8>)]) -> bool {
         if protocol_type.is_empty() || protocols.is_empty() {
             return false;
@@ -398,6 +474,38 @@ impl Group {
                 .all(|member| member.protocols.iter().any(|(theirs, _)| theirs == name))
         })
     }
+
+    fn roster(&self) -> Vec<JoinMember> {
+        let mut listed: Vec<&Member> = self.members.values().collect();
+        listed.sort_by_key(|member| member.join_order);
+        listed
+            .into_iter()
+            .map(|member| JoinMember {
+                member_id: member.record.member_id.clone(),
+                group_instance_id: member.record.group_instance_id.clone(),
+                metadata: member.metadata(self.protocol.as_ref()),
+            })
+            .collect()
+    }
+
+    /// The current generation's answer to a member's JoinGroup.
+    fn current_join(&self, member_id: &str) -> JoinResponse {
+        let leader = self.leader.clone().unwrap_or_default();
+        JoinResponse {
+            error: codes::NONE,
+            generation: self.generation,
+            protocol_type: self.protocol_type.clone(),
+            protocol_name: self.protocol.clone(),
+            members: if leader == member_id {
+                self.roster()
+            } else {
+                Vec::new()
+            },
+            leader,
+            member_id: member_id.to_string(),
+            skip_assignment: false,
+        }
+    }
 }
 
 /// What the caller must do after releasing the lock.
@@ -408,12 +516,24 @@ enum After {
         group: String,
         generation: i32,
         record: GroupRecord,
+        at: Instant,
     },
     /// The leader synced: store the assignment, then answer syncs.
     SaveSync {
         group: String,
         generation: i32,
         record: GroupRecord,
+    },
+    /// A static member got a new id in a stable group: store it, then answer
+    /// its join, or undo the replacement if the store fails.
+    SaveReplace {
+        group: String,
+        record: GroupRecord,
+        instance: String,
+        old_id: String,
+        new_id: String,
+        old_protocols: Vec<(String, Vec<u8>)>,
+        response: Box<JoinResponse>,
     },
 }
 
@@ -441,7 +561,7 @@ impl Coordinator {
         for (id, record) in records {
             let mut group = Group::from_record(record, now);
             if group.state == State::PreparingRebalance {
-                group.deadline = Some(now + group.rebalance_timeout());
+                group.join_deadline = Some(now + group.rebalance_timeout());
             }
             groups.insert(id, group);
         }
@@ -451,6 +571,46 @@ impl Coordinator {
     pub fn unload(&self) {
         let mut groups = self.groups.lock().expect("groups");
         drop_all(&mut groups);
+    }
+
+    /// Mark a group Dead, as a deletion does. Waiting members are answered
+    /// COORDINATOR_NOT_AVAILABLE.
+    pub fn kill(&self, id: &str) {
+        let mut groups = self.groups.lock().expect("groups");
+        if let Some(group) = groups.get_mut(id) {
+            for member in group.members.values_mut() {
+                if let Some(tx) = member.join.take() {
+                    let _ = tx.send(JoinResponse::error(
+                        codes::COORDINATOR_NOT_AVAILABLE,
+                        &member.record.member_id,
+                    ));
+                }
+                if let Some(tx) = member.sync.take() {
+                    let _ = tx.send(SyncResponse::error(codes::COORDINATOR_NOT_AVAILABLE));
+                }
+            }
+            group.members.clear();
+            group.pending.clear();
+            group.state = State::Dead;
+        }
+    }
+
+    /// Kafka's `acceptJoiningMember`: whether `group.max.size` lets this
+    /// member in now.
+    fn accepts(&self, group: &Group, member_id: &str) -> bool {
+        match group.state {
+            State::Empty | State::Dead => true,
+            State::PreparingRebalance => {
+                group
+                    .members
+                    .get(member_id)
+                    .is_some_and(|member| member.join.is_some())
+                    || group.awaiting_join() < self.config.max_size
+            }
+            State::CompletingRebalance | State::Stable => {
+                group.members.contains_key(member_id) || group.members.len() < self.config.max_size
+            }
+        }
     }
 
     /// JoinGroup.
@@ -469,12 +629,27 @@ impl Coordinator {
             ));
         }
         let mut groups = self.groups.lock().expect("groups");
-        let group = groups
-            .entry(request.group.clone())
-            .or_insert_with(Group::new);
+        let unknown = request.member_id.is_empty();
+        if !groups.contains_key(&request.group) {
+            if !unknown {
+                return Reply::Now(JoinResponse::error(
+                    codes::UNKNOWN_MEMBER_ID,
+                    &request.member_id,
+                ));
+            }
+            groups.insert(request.group.clone(), Group::new());
+        }
+        let group = groups.get_mut(&request.group).expect("group");
         if group.state == State::Dead {
             return Reply::Now(JoinResponse::error(
                 codes::COORDINATOR_NOT_AVAILABLE,
+                &request.member_id,
+            ));
+        }
+        if !self.accepts(group, &request.member_id) {
+            group.pending.remove(&request.member_id);
+            return Reply::Now(JoinResponse::error(
+                codes::GROUP_MAX_SIZE_REACHED,
                 &request.member_id,
             ));
         }
@@ -484,210 +659,325 @@ impl Coordinator {
                 &request.member_id,
             ));
         }
-
-        let mut member_id = request.member_id.clone();
-        // Static membership (KIP-345): a known instance id takes over its
-        // member; a different member id for it is fenced.
-        if let Some(instance) = &request.group_instance_id {
-            let previous = group
-                .members
-                .values()
-                .find(|member| member.record.group_instance_id.as_ref() == Some(instance))
-                .map(|member| member.record.member_id.clone());
-            if let Some(previous) = previous {
-                if !member_id.is_empty() && member_id != previous {
-                    return Reply::Now(JoinResponse::error(codes::FENCED_INSTANCE_ID, &member_id));
-                }
-                member_id = previous;
-            }
-        }
-        if member_id.is_empty() {
-            if group.members.len() + group.pending.len() >= self.config.max_size {
-                return Reply::Now(JoinResponse::error(codes::GROUP_MAX_SIZE_REACHED, ""));
-            }
-            let fresh = format!("{}-{}", request.client_id, uuid::Uuid::new_v4());
-            if request.require_known_member_id && request.group_instance_id.is_none() {
-                group.pending.insert(fresh.clone(), now);
-                return Reply::Now(JoinResponse::error(codes::MEMBER_ID_REQUIRED, &fresh));
-            }
-            member_id = fresh;
-        } else if !group.members.contains_key(&member_id)
-            && group.pending.remove(&member_id).is_none()
-        {
-            return Reply::Now(JoinResponse::error(codes::UNKNOWN_MEMBER_ID, &member_id));
-        }
-
-        let existing = group.members.contains_key(&member_id);
-        // A stable follower rejoining with the same subscription gets the
-        // current generation back without a rebalance.
-        if existing && group.state == State::Stable {
-            let is_leader = group.leader.as_deref() == Some(member_id.as_str());
-            let member = group.members.get_mut(&member_id).expect("member");
-            if member.protocols == request.protocols && !is_leader {
-                member.last_seen = now;
-                return Reply::Now(JoinResponse {
-                    error: codes::NONE,
-                    generation: group.generation,
-                    protocol_type: group.protocol_type.clone(),
-                    protocol_name: group.protocol.clone(),
-                    leader: group.leader.clone().unwrap_or_default(),
-                    member_id,
-                    members: Vec::new(),
-                });
-            }
-        }
-
-        let (tx, rx) = oneshot::channel();
-        let order = group.next_order;
-        if !existing {
-            group.next_order += 1;
-        }
-        let member = group
-            .members
-            .entry(member_id.clone())
-            .or_insert_with(|| Member {
-                record: MemberRecord::default(),
-                protocols: Vec::new(),
-                last_seen: now,
-                join: None,
-                sync: None,
-                rejoined: false,
-                synced: false,
-                join_order: order,
-            });
-        member.record.member_id = member_id.clone();
-        member.record.group_instance_id = request.group_instance_id.clone();
-        member.record.client_id = request.client_id.clone();
-        member.record.client_host = request.client_host.clone();
-        member.record.session_timeout_ms = request.session_timeout_ms;
-        member.record.rebalance_timeout_ms = request.rebalance_timeout_ms;
-        member.protocols = request.protocols.clone();
-        member.last_seen = now;
-        member.rejoined = true;
-        if let Some(old) = member.join.replace(tx) {
-            let _ = old.send(JoinResponse::error(codes::UNKNOWN_MEMBER_ID, &member_id));
-        }
-        if group.members.len() == 1 || group.protocol_type.is_none() {
-            group.protocol_type = Some(request.protocol_type.clone());
-        }
-
-        match group.state {
-            State::Empty => self.prepare(group, now, true),
-            State::Stable | State::CompletingRebalance => self.prepare(group, now, false),
-            State::PreparingRebalance => {
-                if let Some(cap) = group.initial_cap {
-                    // Initial delay: a new member pushes the end out by one
-                    // delay, up to the cap.
-                    if !existing {
-                        let pushed = now + self.config.initial_rebalance_delay;
-                        group.deadline = Some(pushed.min(cap));
-                    }
-                }
-            }
-            State::Dead => {}
-        }
-        let after = self.maybe_complete_join(&request.group, group, now);
+        let id = request.group.clone();
+        let (reply, after) = if unknown {
+            self.join_new(&id, group, request, now)
+        } else {
+            self.join_existing(&id, group, request, now)
+        };
         drop(groups);
         self.run(after);
-        Reply::Later(rx)
+        reply
     }
 
-    /// Start a rebalance. Members who do not rejoin before the deadline are
-    /// dropped.
-    fn prepare(&self, group: &mut Group, now: Instant, initial: bool) {
+    fn join_new(
+        &self,
+        id: &str,
+        group: &mut Group,
+        request: JoinRequest,
+        now: Instant,
+    ) -> (Reply<JoinResponse>, After) {
+        let fresh = format!("{}-{}", request.client_id, uuid::Uuid::new_v4());
+        if let Some(instance) = request.group_instance_id.clone() {
+            if group.static_member(&instance).is_some() {
+                return self.replace_static(id, group, request, &instance, fresh, now);
+            }
+            return self.add_and_join(id, group, request, fresh, now);
+        }
+        if request.require_known_member_id {
+            group.pending.insert(
+                fresh.clone(),
+                (
+                    now,
+                    Duration::from_millis(request.session_timeout_ms.max(0) as u64),
+                ),
+            );
+            return (
+                Reply::Now(JoinResponse::error(codes::MEMBER_ID_REQUIRED, &fresh)),
+                After::Nothing,
+            );
+        }
+        self.add_and_join(id, group, request, fresh, now)
+    }
+
+    fn join_existing(
+        &self,
+        id: &str,
+        group: &mut Group,
+        request: JoinRequest,
+        now: Instant,
+    ) -> (Reply<JoinResponse>, After) {
+        let member_id = request.member_id.clone();
+        if let Some(instance) = &request.group_instance_id {
+            match group.static_member(instance) {
+                Some(existing) if existing != member_id => {
+                    return (
+                        Reply::Now(JoinResponse::error(codes::FENCED_INSTANCE_ID, &member_id)),
+                        After::Nothing,
+                    );
+                }
+                None if !group.pending.contains_key(&member_id) => {
+                    return (
+                        Reply::Now(JoinResponse::error(codes::UNKNOWN_MEMBER_ID, &member_id)),
+                        After::Nothing,
+                    );
+                }
+                _ => {}
+            }
+        }
+        if group.pending.remove(&member_id).is_some() {
+            return self.add_and_join(id, group, request, member_id, now);
+        }
+        if !group.members.contains_key(&member_id) {
+            return (
+                Reply::Now(JoinResponse::error(codes::UNKNOWN_MEMBER_ID, &member_id)),
+                After::Nothing,
+            );
+        }
+        let is_leader = group.leader.as_deref() == Some(member_id.as_str());
+        let matches = group.members[&member_id].protocols == request.protocols;
+        match group.state {
+            State::Stable if matches && !is_leader => {
+                group.members.get_mut(&member_id).expect("member").last_seen = now;
+                (Reply::Now(group.current_join(&member_id)), After::Nothing)
+            }
+            State::CompletingRebalance if matches => {
+                group.members.get_mut(&member_id).expect("member").last_seen = now;
+                (Reply::Now(group.current_join(&member_id)), After::Nothing)
+            }
+            State::Empty => (
+                Reply::Now(JoinResponse::error(codes::UNKNOWN_MEMBER_ID, &member_id)),
+                After::Nothing,
+            ),
+            _ => {
+                let (tx, rx) = oneshot::channel();
+                let member = group.members.get_mut(&member_id).expect("member");
+                update_member(member, &request, now);
+                if let Some(old) = member.join.replace(tx) {
+                    let _ = old.send(JoinResponse::error(codes::UNKNOWN_MEMBER_ID, &member_id));
+                }
+                if group.state != State::PreparingRebalance {
+                    self.prepare(group, now);
+                }
+                (Reply::Later(rx), self.maybe_complete_join(id, group, now))
+            }
+        }
+    }
+
+    /// Add a new member that waits for the join phase.
+    fn add_and_join(
+        &self,
+        id: &str,
+        group: &mut Group,
+        request: JoinRequest,
+        member_id: String,
+        now: Instant,
+    ) -> (Reply<JoinResponse>, After) {
+        let (tx, rx) = oneshot::channel();
+        let mut member = Member {
+            record: MemberRecord::default(),
+            protocols: Vec::new(),
+            last_seen: now,
+            join: Some(tx),
+            sync: None,
+            new_since: Some(now),
+            join_order: group.next_order,
+        };
+        group.next_order += 1;
+        member.record.member_id = member_id.clone();
+        update_member(&mut member, &request, now);
+        if group.members.is_empty() {
+            group.protocol_type = Some(request.protocol_type.clone());
+        }
+        group.members.insert(member_id, member);
+        if let Some(initial) = group.initial.as_mut() {
+            initial.joined = true;
+        }
+        if group.state != State::PreparingRebalance {
+            self.prepare(group, now);
+        }
+        (Reply::Later(rx), self.maybe_complete_join(id, group, now))
+    }
+
+    /// A static member rejoined without a member id: it gets a new one and
+    /// the old one is fenced (Kafka's `updateStaticMemberThenRebalanceOrCompleteJoin`).
+    fn replace_static(
+        &self,
+        id: &str,
+        group: &mut Group,
+        request: JoinRequest,
+        instance: &str,
+        new_id: String,
+        now: Instant,
+    ) -> (Reply<JoinResponse>, After) {
+        let old_id = group.static_member(instance).expect("static member");
+        let mut member = group.members.remove(&old_id).expect("member");
+        if let Some(tx) = member.join.take() {
+            let _ = tx.send(JoinResponse::error(codes::FENCED_INSTANCE_ID, &old_id));
+        }
+        if let Some(tx) = member.sync.take() {
+            let _ = tx.send(SyncResponse::error(codes::FENCED_INSTANCE_ID));
+        }
+        if group.pending_sync.remove(&old_id) {
+            group.pending_sync.insert(new_id.clone());
+        }
+        let old_protocols = member.protocols.clone();
+        member.record.member_id = new_id.clone();
+        update_member(&mut member, &request, now);
+        let was_leader = group.leader.as_deref() == Some(old_id.as_str());
+        group.members.insert(new_id.clone(), member);
+
+        match group.state {
+            State::Stable if group.select_protocol() == group.protocol => {
+                let skip = request.supports_skip_assignment && was_leader;
+                if skip {
+                    group.leader = Some(new_id.clone());
+                }
+                let mut response = group.current_join(&new_id);
+                response.skip_assignment = skip;
+                if !skip {
+                    // Kafka reports the leader it has; a replaced leader's
+                    // old id stays there until the next rebalance.
+                    response.members = Vec::new();
+                }
+                let (tx, rx) = oneshot::channel();
+                group.members.get_mut(&new_id).expect("member").join = Some(tx);
+                let after = After::SaveReplace {
+                    group: id.to_string(),
+                    record: group.record(),
+                    instance: instance.to_string(),
+                    old_id,
+                    new_id,
+                    old_protocols,
+                    response: Box::new(response),
+                };
+                (Reply::Later(rx), after)
+            }
+            _ => {
+                let (tx, rx) = oneshot::channel();
+                group.members.get_mut(&new_id).expect("member").join = Some(tx);
+                if group.state != State::PreparingRebalance {
+                    self.prepare(group, now);
+                }
+                (Reply::Later(rx), self.maybe_complete_join(id, group, now))
+            }
+        }
+    }
+
+    /// Start a rebalance (Kafka's `prepareRebalance`).
+    fn prepare(&self, group: &mut Group, now: Instant) {
         if group.state == State::CompletingRebalance {
-            // Members waiting on SyncGroup learn the generation is over.
             for member in group.members.values_mut() {
                 if let Some(tx) = member.sync.take() {
                     let _ = tx.send(SyncResponse::error(codes::REBALANCE_IN_PROGRESS));
                 }
             }
         }
-        group.state = State::PreparingRebalance;
+        group.pending_sync.clear();
+        group.sync_deadline = None;
         group.saving = false;
-        for member in group.members.values_mut() {
-            if member.join.is_none() {
-                member.rejoined = false;
-            }
-            member.synced = false;
-        }
-        if initial {
-            let cap = group
+        if group.state == State::Empty {
+            let remaining = group
                 .rebalance_timeout()
-                .max(self.config.initial_rebalance_delay);
-            group.initial_cap = Some(now + cap);
-            group.deadline = Some(now + self.config.initial_rebalance_delay);
+                .saturating_sub(self.config.initial_rebalance_delay);
+            group.initial = Some(InitialDelay {
+                remaining,
+                joined: false,
+            });
+            group.join_deadline = Some(now + self.config.initial_rebalance_delay);
         } else {
-            group.initial_cap = None;
-            group.deadline = Some(now + group.rebalance_timeout());
+            group.initial = None;
+            group.join_deadline = Some(now + group.rebalance_timeout());
         }
+        group.state = State::PreparingRebalance;
     }
 
-    /// End the join phase when every member has rejoined (not during the
-    /// initial delay) or the deadline passed.
+    /// End the join phase early once every member and pending member has
+    /// joined (not during the initial delay).
     fn maybe_complete_join(&self, id: &str, group: &mut Group, now: Instant) -> After {
-        if group.state != State::PreparingRebalance || group.saving {
+        if group.state != State::PreparingRebalance || group.saving || group.initial.is_some() {
             return After::Nothing;
         }
-        let all_in = group.members.values().all(|member| member.rejoined);
-        let due = group.deadline.is_some_and(|deadline| now >= deadline);
-        if !(due || (all_in && group.initial_cap.is_none())) {
-            return After::Nothing;
+        if group.all_joined() {
+            return self.complete_join(id, group, now);
         }
-        group.members.retain(|_, member| member.rejoined);
-        group.pending.clear();
-        group.initial_cap = None;
-        group.generation += 1;
+        After::Nothing
+    }
+
+    /// Kafka's `completeClassicGroupJoin`.
+    fn complete_join(&self, id: &str, group: &mut Group, now: Instant) -> After {
+        // Dynamic members that did not rejoin are dropped; static ones stay.
+        group
+            .members
+            .retain(|_, member| member.join.is_some() || member.is_static());
         if group.members.is_empty() {
+            group.generation += 1;
             group.state = State::Empty;
             group.protocol = None;
             group.leader = None;
-            group.deadline = None;
+            group.join_deadline = None;
             return After::SaveJoin {
                 group: id.to_string(),
                 generation: group.generation,
                 record: group.record(),
+                at: now,
             };
         }
+        if group.awaiting_join() == 0 {
+            // Only static members that have not rejoined: wait longer.
+            group.join_deadline = Some(now + group.rebalance_timeout());
+            return After::Nothing;
+        }
+        group.generation += 1;
         group.protocol = group.select_protocol();
-        let leader_kept = group
+        let leader_joined = group
             .leader
             .as_ref()
-            .is_some_and(|leader| group.members.contains_key(leader));
-        if !leader_kept {
+            .and_then(|leader| group.members.get(leader))
+            .is_some_and(|member| member.join.is_some());
+        if !leader_joined {
             group.leader = group
                 .members
                 .values()
+                .filter(|member| member.join.is_some())
                 .min_by_key(|member| member.join_order)
                 .map(|member| member.record.member_id.clone());
         }
+        group.pending_sync = group
+            .members
+            .values()
+            .filter(|member| member.join.is_some())
+            .map(|member| member.record.member_id.clone())
+            .collect();
         for member in group.members.values_mut() {
             member.record.assignment.clear();
-            member.last_seen = now;
         }
         group.state = State::CompletingRebalance;
-        group.deadline = Some(now + group.rebalance_timeout());
+        group.join_deadline = None;
+        group.sync_deadline = Some(now + group.rebalance_timeout());
         group.saving = true;
         After::SaveJoin {
             group: id.to_string(),
             generation: group.generation,
             record: group.record(),
+            at: now,
         }
     }
 
     fn run(self: &Arc<Self>, after: After) {
+        let this = Arc::clone(self);
         match after {
             After::Nothing => {}
             After::SaveJoin {
                 group,
                 generation,
                 record,
+                at,
             } => {
-                let this = Arc::clone(self);
                 let save = self.store.save(group.clone(), record);
                 tokio::spawn(async move {
                     let result = save.await;
-                    this.joined(&group, generation, result);
+                    this.joined(&group, generation, result, at);
                 });
             }
             After::SaveSync {
@@ -695,18 +985,41 @@ impl Coordinator {
                 generation,
                 record,
             } => {
-                let this = Arc::clone(self);
                 let save = self.store.save(group.clone(), record);
                 tokio::spawn(async move {
                     let result = save.await;
                     this.synced(&group, generation, result);
                 });
             }
+            After::SaveReplace {
+                group,
+                record,
+                instance,
+                old_id,
+                new_id,
+                old_protocols,
+                response,
+            } => {
+                let save = self.store.save(group.clone(), record);
+                tokio::spawn(async move {
+                    let result = save.await;
+                    this.replaced(
+                        &group,
+                        &instance,
+                        &old_id,
+                        &new_id,
+                        old_protocols,
+                        *response,
+                        result,
+                    );
+                });
+            }
         }
     }
 
-    /// The new generation is stored: answer every member's JoinGroup.
-    fn joined(&self, id: &str, generation: i32, result: Result<(), i16>) {
+    /// The new generation is stored: answer every waiting JoinGroup.
+    /// `at` is when the join phase completed: sessions restart from then.
+    fn joined(&self, id: &str, generation: i32, result: Result<(), i16>, at: Instant) {
         let mut groups = self.groups.lock().expect("groups");
         let Some(group) = groups.get_mut(id) else {
             return;
@@ -723,40 +1036,70 @@ impl Coordinator {
             }
             return;
         }
-        let leader = group.leader.clone().unwrap_or_default();
-        let protocol = group.protocol.clone();
-        let mut listed: Vec<&Member> = group.members.values().collect();
-        listed.sort_by_key(|member| member.join_order);
-        let roster: Vec<JoinMember> = listed
-            .iter()
-            .map(|member| JoinMember {
-                member_id: member.record.member_id.clone(),
-                group_instance_id: member.record.group_instance_id.clone(),
-                metadata: protocol
-                    .as_ref()
-                    .and_then(|name| member.protocols.iter().find(|(theirs, _)| theirs == name))
-                    .map(|(_, metadata)| metadata.clone())
-                    .unwrap_or_default(),
-            })
+        let now = at;
+        let ids: Vec<String> = group
+            .members
+            .values()
+            .filter(|member| member.join.is_some())
+            .map(|member| member.record.member_id.clone())
             .collect();
-        let protocol_type = group.protocol_type.clone();
-        for member in group.members.values_mut() {
-            member.rejoined = false;
+        for member_id in ids {
+            let response = group.current_join(&member_id);
+            let member = group.members.get_mut(&member_id).expect("member");
+            member.new_since = None;
+            member.last_seen = now;
             if let Some(tx) = member.join.take() {
-                let is_leader = member.record.member_id == leader;
-                let _ = tx.send(JoinResponse {
-                    error: codes::NONE,
-                    generation,
-                    protocol_type: protocol_type.clone(),
-                    protocol_name: protocol.clone(),
-                    leader: leader.clone(),
-                    member_id: member.record.member_id.clone(),
-                    members: if is_leader {
-                        roster.clone()
+                let _ = tx.send(response);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replaced(
+        &self,
+        id: &str,
+        instance: &str,
+        old_id: &str,
+        new_id: &str,
+        old_protocols: Vec<(String, Vec<u8>)>,
+        response: JoinResponse,
+        result: Result<(), i16>,
+    ) {
+        let mut groups = self.groups.lock().expect("groups");
+        let Some(group) = groups.get_mut(id) else {
+            return;
+        };
+        let Some(mut member) = group.members.remove(new_id) else {
+            return;
+        };
+        let tx = member.join.take();
+        match result {
+            Ok(()) => {
+                group.members.insert(new_id.to_string(), member);
+                if let Some(tx) = tx {
+                    let _ = tx.send(response);
+                }
+            }
+            Err(code) => {
+                // Undo: the old member id and protocols come back.
+                member.record.member_id = old_id.to_string();
+                member.protocols = old_protocols;
+                debug_assert_eq!(member.record.group_instance_id.as_deref(), Some(instance));
+                if group.leader.as_deref() == Some(new_id) {
+                    group.leader = Some(old_id.to_string());
+                }
+                if group.pending_sync.remove(new_id) {
+                    group.pending_sync.insert(old_id.to_string());
+                }
+                group.members.insert(old_id.to_string(), member);
+                if let Some(tx) = tx {
+                    let code = if code == codes::NOT_COORDINATOR {
+                        code
                     } else {
-                        Vec::new()
-                    },
-                });
+                        codes::COORDINATOR_NOT_AVAILABLE
+                    };
+                    let _ = tx.send(JoinResponse::error(code, new_id));
+                }
             }
         }
     }
@@ -767,6 +1110,7 @@ impl Coordinator {
         self: &Arc<Self>,
         id: &str,
         member_id: &str,
+        instance: Option<&str>,
         generation: i32,
         protocol_type: Option<&str>,
         protocol_name: Option<&str>,
@@ -780,8 +1124,8 @@ impl Coordinator {
         if group.state == State::Dead {
             return Reply::Now(SyncResponse::error(codes::COORDINATOR_NOT_AVAILABLE));
         }
-        if !group.members.contains_key(member_id) {
-            return Reply::Now(SyncResponse::error(codes::UNKNOWN_MEMBER_ID));
+        if let Err(code) = group.validate_member(member_id, instance) {
+            return Reply::Now(SyncResponse::error(code));
         }
         if generation != group.generation {
             return Reply::Now(SyncResponse::error(codes::ILLEGAL_GENERATION));
@@ -790,6 +1134,10 @@ impl Coordinator {
             || protocol_name.is_some_and(|value| Some(value) != group.protocol.as_deref())
         {
             return Reply::Now(SyncResponse::error(codes::INCONSISTENT_GROUP_PROTOCOL));
+        }
+        group.pending_sync.remove(member_id);
+        if group.pending_sync.is_empty() {
+            group.sync_deadline = None;
         }
         let protocol_type = group.protocol_type.clone();
         let protocol = group.protocol.clone();
@@ -814,7 +1162,6 @@ impl Coordinator {
                 {
                     let member = group.members.get_mut(member_id).expect("member");
                     member.last_seen = now;
-                    member.synced = true;
                     if let Some(old) = member.sync.replace(tx) {
                         let _ = old.send(SyncResponse::error(codes::REBALANCE_IN_PROGRESS));
                     }
@@ -853,6 +1200,11 @@ impl Coordinator {
         }
         group.saving = false;
         if let Err(code) = result {
+            let code = if code == codes::NOT_COORDINATOR {
+                code
+            } else {
+                codes::COORDINATOR_NOT_AVAILABLE
+            };
             for member in group.members.values_mut() {
                 if let Some(tx) = member.sync.take() {
                     let _ = tx.send(SyncResponse::error(code));
@@ -861,7 +1213,6 @@ impl Coordinator {
             return;
         }
         group.state = State::Stable;
-        group.deadline = None;
         let protocol_type = group.protocol_type.clone();
         let protocol = group.protocol.clone();
         for member in group.members.values_mut() {
@@ -876,8 +1227,15 @@ impl Coordinator {
         }
     }
 
-    /// Heartbeat.
-    pub fn heartbeat(&self, id: &str, member_id: &str, generation: i32, now: Instant) -> i16 {
+    /// Heartbeat (Kafka's `classicGroupHeartbeat`).
+    pub fn heartbeat(
+        &self,
+        id: &str,
+        member_id: &str,
+        instance: Option<&str>,
+        generation: i32,
+        now: Instant,
+    ) -> i16 {
         let mut groups = self.groups.lock().expect("groups");
         let Some(group) = groups.get_mut(id) else {
             return codes::UNKNOWN_MEMBER_ID;
@@ -885,79 +1243,93 @@ impl Coordinator {
         if group.state == State::Dead {
             return codes::COORDINATOR_NOT_AVAILABLE;
         }
-        let state = group.state;
-        let current = group.generation;
-        let Some(member) = group.members.get_mut(member_id) else {
-            return codes::UNKNOWN_MEMBER_ID;
-        };
-        if generation != current {
+        if let Err(code) = group.validate_member(member_id, instance) {
+            return code;
+        }
+        if generation != group.generation {
             return codes::ILLEGAL_GENERATION;
         }
-        member.last_seen = now;
+        let state = group.state;
+        group.members.get_mut(member_id).expect("member").last_seen = now;
         match state {
-            State::Stable => codes::NONE,
-            State::PreparingRebalance | State::CompletingRebalance => codes::REBALANCE_IN_PROGRESS,
+            State::PreparingRebalance => codes::REBALANCE_IN_PROGRESS,
+            State::CompletingRebalance | State::Stable => codes::NONE,
             State::Empty | State::Dead => codes::UNKNOWN_MEMBER_ID,
         }
     }
 
-    /// LeaveGroup for one member, by member id or (v3+) instance id.
+    /// LeaveGroup. `Err` is a group-level error; otherwise one code per
+    /// member, in order.
     pub fn leave(
         self: &Arc<Self>,
         id: &str,
-        member_id: &str,
-        instance: Option<&str>,
+        leaving: &[Leaving],
         now: Instant,
-    ) -> i16 {
+    ) -> Result<Vec<i16>, i16> {
         let mut groups = self.groups.lock().expect("groups");
         let Some(group) = groups.get_mut(id) else {
-            return codes::UNKNOWN_MEMBER_ID;
+            return Err(codes::UNKNOWN_MEMBER_ID);
         };
-        let target = match instance {
-            Some(instance) => {
-                let found = group
-                    .members
-                    .values()
-                    .find(|member| member.record.group_instance_id.as_deref() == Some(instance))
-                    .map(|member| member.record.member_id.clone());
-                match found {
-                    Some(found) if member_id.is_empty() || found == member_id => found,
-                    Some(_) => return codes::FENCED_INSTANCE_ID,
-                    None => return codes::UNKNOWN_MEMBER_ID,
-                }
-            }
-            None => member_id.to_string(),
-        };
-        let Some(mut member) = group.members.remove(&target) else {
-            return if group.pending.remove(&target).is_some() {
-                codes::NONE
-            } else {
-                codes::UNKNOWN_MEMBER_ID
+        if group.state == State::Dead {
+            return Err(codes::COORDINATOR_NOT_AVAILABLE);
+        }
+        let mut answers = Vec::with_capacity(leaving.len());
+        let mut removed = false;
+        let mut unblocked = false;
+        for one in leaving {
+            let target = match &one.group_instance_id {
+                Some(instance) => match group.static_member(instance) {
+                    None => {
+                        answers.push(codes::UNKNOWN_MEMBER_ID);
+                        continue;
+                    }
+                    Some(found) if !one.member_id.is_empty() && found != one.member_id => {
+                        answers.push(codes::FENCED_INSTANCE_ID);
+                        continue;
+                    }
+                    Some(found) => found,
+                },
+                None => one.member_id.clone(),
             };
+            if group.pending.remove(&target).is_some() {
+                // A pending member is not in the generation; it only
+                // matters to a join phase waiting on it.
+                answers.push(codes::NONE);
+                unblocked = true;
+                continue;
+            }
+            let Some(mut member) = group.members.remove(&target) else {
+                answers.push(codes::UNKNOWN_MEMBER_ID);
+                continue;
+            };
+            if let Some(tx) = member.join.take() {
+                let _ = tx.send(JoinResponse::error(codes::UNKNOWN_MEMBER_ID, &target));
+            }
+            if let Some(tx) = member.sync.take() {
+                let _ = tx.send(SyncResponse::error(codes::UNKNOWN_MEMBER_ID));
+            }
+            group.pending_sync.remove(&target);
+            answers.push(codes::NONE);
+            removed = true;
+        }
+        let after = if removed {
+            self.members_left(id, group, now)
+        } else if unblocked {
+            self.maybe_complete_join(id, group, now)
+        } else {
+            After::Nothing
         };
-        if let Some(tx) = member.join.take() {
-            let _ = tx.send(JoinResponse::error(codes::UNKNOWN_MEMBER_ID, &target));
-        }
-        if let Some(tx) = member.sync.take() {
-            let _ = tx.send(SyncResponse::error(codes::UNKNOWN_MEMBER_ID));
-        }
-        let after = self.member_left(id, group, now);
         drop(groups);
         self.run(after);
-        codes::NONE
+        Ok(answers)
     }
 
-    fn member_left(&self, id: &str, group: &mut Group, now: Instant) -> After {
-        if group
-            .leader
-            .as_ref()
-            .is_some_and(|leader| !group.members.contains_key(leader))
-        {
-            group.leader = None;
-        }
+    /// After members left or expired (Kafka's
+    /// `removeMemberAndUpdateClassicGroup`).
+    fn members_left(&self, id: &str, group: &mut Group, now: Instant) -> After {
         match group.state {
             State::Stable | State::CompletingRebalance => {
-                self.prepare(group, now, false);
+                self.prepare(group, now);
                 self.maybe_complete_join(id, group, now)
             }
             State::PreparingRebalance => self.maybe_complete_join(id, group, now),
@@ -965,53 +1337,90 @@ impl Coordinator {
         }
     }
 
-    /// Advance timers: end join phases whose deadline passed, rebalance when
-    /// members never synced, and expire members whose session lapsed. Call
-    /// every ~100ms.
+    /// Advance timers. Call every ~100ms.
     pub fn tick(self: &Arc<Self>, now: Instant) {
         let mut afters = Vec::new();
         {
             let mut groups = self.groups.lock().expect("groups");
             for (id, group) in groups.iter_mut() {
+                if group.state == State::Dead {
+                    continue;
+                }
+                // Pending members expire on their own session.
+                let before = group.pending.len();
                 group
                     .pending
-                    .retain(|_, since| now.duration_since(*since) < Duration::from_secs(300));
-                if group.state != State::PreparingRebalance {
-                    // A member waiting on join or sync is alive; one that is
-                    // not rejoining is handled by the join deadline instead.
-                    let expired: Vec<String> = group
-                        .members
-                        .values()
-                        .filter(|member| {
-                            member.join.is_none()
-                                && member.sync.is_none()
-                                && now.duration_since(member.last_seen)
-                                    > Duration::from_millis(
-                                        member.record.session_timeout_ms.max(0) as u64
-                                    )
-                        })
-                        .map(|member| member.record.member_id.clone())
-                        .collect();
-                    if !expired.is_empty() {
-                        for member_id in expired {
-                            group.members.remove(&member_id);
+                    .retain(|_, (since, session)| now.duration_since(*since) <= *session);
+                let unblocked = group.pending.len() != before;
+                let mut changed = false;
+
+                // Heartbeats (Kafka's `onClassicGroupHeartbeatExpiration`): a
+                // member awaiting join or sync is alive, unless it is new and
+                // the new-member join timeout passed.
+                let expired: Vec<String> = group
+                    .members
+                    .values()
+                    .filter(|member| {
+                        if let Some(since) = member.new_since {
+                            if member.join.is_some() {
+                                return now.duration_since(since)
+                                    > self.config.new_member_join_timeout;
+                            }
                         }
-                        afters.push(self.member_left(id, group, now));
-                        continue;
+                        member.join.is_none()
+                            && member.sync.is_none()
+                            && now.duration_since(member.last_seen) > member.session()
+                    })
+                    .map(|member| member.record.member_id.clone())
+                    .collect();
+                for member_id in &expired {
+                    if let Some(mut member) = group.members.remove(member_id) {
+                        if let Some(tx) = member.join.take() {
+                            let _ =
+                                tx.send(JoinResponse::error(codes::UNKNOWN_MEMBER_ID, member_id));
+                        }
+                    }
+                    group.pending_sync.remove(member_id);
+                    changed = true;
+                }
+
+                // Members that never sent SyncGroup for the generation.
+                if group.sync_deadline.is_some_and(|deadline| now >= deadline)
+                    && matches!(group.state, State::CompletingRebalance | State::Stable)
+                    && !group.saving
+                {
+                    let unsynced: Vec<String> = group.pending_sync.drain().collect();
+                    group.sync_deadline = None;
+                    for member_id in unsynced {
+                        group.members.remove(&member_id);
+                        changed = true;
                     }
                 }
-                let due = group.deadline.is_some_and(|deadline| now >= deadline);
-                match group.state {
-                    State::PreparingRebalance if due => {
-                        afters.push(self.maybe_complete_join(id, group, now));
+
+                if changed {
+                    afters.push(self.members_left(id, group, now));
+                    continue;
+                }
+                if unblocked {
+                    afters.push(self.maybe_complete_join(id, group, now));
+                }
+
+                if group.state == State::PreparingRebalance
+                    && !group.saving
+                    && group.join_deadline.is_some_and(|deadline| now >= deadline)
+                {
+                    let delay = self.config.initial_rebalance_delay;
+                    if let Some(initial) = group.initial.as_mut() {
+                        if initial.joined && !initial.remaining.is_zero() {
+                            let next = delay.min(initial.remaining);
+                            initial.remaining -= next;
+                            initial.joined = false;
+                            group.join_deadline = Some(now + next);
+                            continue;
+                        }
                     }
-                    State::CompletingRebalance if due && !group.saving => {
-                        // Members that never synced are dropped, then the
-                        // group rebalances without them.
-                        group.members.retain(|_, member| member.synced);
-                        afters.push(self.member_left(id, group, now));
-                    }
-                    _ => {}
+                    group.initial = None;
+                    afters.push(self.complete_join(id, group, now));
                 }
             }
         }
@@ -1020,9 +1429,16 @@ impl Coordinator {
         }
     }
 
-    /// Check an offset commit from a member against live state. The metadata
-    /// group checks it again against the stored generation.
-    pub fn check_commit(&self, id: &str, member_id: &str, generation: i32) -> i16 {
+    /// Check an offset commit against live state (Kafka's
+    /// `validateOffsetCommit`). The metadata group checks it again against
+    /// the stored generation.
+    pub fn check_commit(
+        &self,
+        id: &str,
+        member_id: &str,
+        instance: Option<&str>,
+        generation: i32,
+    ) -> i16 {
         let groups = self.groups.lock().expect("groups");
         let Some(group) = groups.get(id) else {
             return if generation < 0 {
@@ -1031,14 +1447,16 @@ impl Coordinator {
                 codes::ILLEGAL_GENERATION
             };
         };
-        if generation < 0 {
-            return if group.members.is_empty() {
-                codes::NONE
-            } else {
-                codes::UNKNOWN_MEMBER_ID
-            };
+        if group.state == State::Dead {
+            return codes::COORDINATOR_NOT_AVAILABLE;
         }
-        if !group.members.contains_key(member_id) {
+        if generation < 0 && group.state == State::Empty {
+            return codes::NONE;
+        }
+        if let Err(code) = group.validate_member(member_id, instance) {
+            return code;
+        }
+        if group.pending.contains_key(member_id) {
             return codes::UNKNOWN_MEMBER_ID;
         }
         if generation != group.generation {
@@ -1068,16 +1486,18 @@ impl Coordinator {
         out
     }
 
-    /// DescribeGroups for one group, or `None` if unknown.
+    /// DescribeGroups for one group, or `None` if unknown. Outside Stable,
+    /// Kafka reports no protocol and no member metadata.
     pub fn describe(&self, id: &str) -> Option<Described> {
         let groups = self.groups.lock().expect("groups");
         let group = groups.get(id)?;
+        let stable = group.state == State::Stable;
         let mut members: Vec<&Member> = group.members.values().collect();
         members.sort_by_key(|member| member.join_order);
         Some(Described {
             state: group.state,
             protocol_type: group.protocol_type.clone().unwrap_or_default(),
-            protocol: if group.state == State::Stable {
+            protocol: if stable {
                 group.protocol.clone().unwrap_or_default()
             } else {
                 String::new()
@@ -1089,12 +1509,11 @@ impl Coordinator {
                     group_instance_id: member.record.group_instance_id.clone(),
                     client_id: member.record.client_id.clone(),
                     client_host: member.record.client_host.clone(),
-                    metadata: group
-                        .protocol
-                        .as_ref()
-                        .and_then(|name| member.protocols.iter().find(|(theirs, _)| theirs == name))
-                        .map(|(_, metadata)| metadata.clone())
-                        .unwrap_or_default(),
+                    metadata: if stable {
+                        member.metadata(group.protocol.as_ref())
+                    } else {
+                        Vec::new()
+                    },
                     assignment: member.record.assignment.clone(),
                 })
                 .collect(),
@@ -1120,6 +1539,16 @@ impl Coordinator {
             .entry(id.to_string())
             .or_insert_with(Group::new);
     }
+}
+
+fn update_member(member: &mut Member, request: &JoinRequest, now: Instant) {
+    member.record.group_instance_id = request.group_instance_id.clone();
+    member.record.client_id = request.client_id.clone();
+    member.record.client_host = request.client_host.clone();
+    member.record.session_timeout_ms = request.session_timeout_ms;
+    member.record.rebalance_timeout_ms = request.rebalance_timeout_ms;
+    member.protocols = request.protocols.clone();
+    member.last_seen = now;
 }
 
 fn drop_all(groups: &mut HashMap<String, Group>) {
