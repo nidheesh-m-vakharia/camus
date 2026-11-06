@@ -13,7 +13,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{
+    BackoffConfig, ClientOptions, ObjectStore, PutMode, PutOptions, PutPayload, RetryConfig,
+};
 
 /// An S3-compatible bucket.
 #[derive(Clone)]
@@ -45,8 +47,25 @@ impl Bucket {
             .with_region(&config.region)
             .with_access_key_id(&config.access_key)
             .with_secret_access_key(&config.secret_key)
-            .with_allow_http(true)
             .with_conditional_put(S3ConditionalPut::ETagMatch)
+            // A few quick retries per call. The uploader keeps its own
+            // jittered backoff across calls, so an outage ends in seconds,
+            // not after object_store's three-minute default.
+            .with_retry(RetryConfig {
+                backoff: BackoffConfig {
+                    init_backoff: std::time::Duration::from_millis(50),
+                    max_backoff: std::time::Duration::from_millis(500),
+                    base: 2.0,
+                },
+                max_retries: 2,
+                retry_timeout: std::time::Duration::from_secs(5),
+            })
+            .with_client_options(
+                ClientOptions::new()
+                    .with_allow_http(true)
+                    .with_connect_timeout(std::time::Duration::from_secs(2))
+                    .with_timeout(std::time::Duration::from_secs(30)),
+            )
             .build()?;
         Ok(Self {
             store: Arc::new(store),

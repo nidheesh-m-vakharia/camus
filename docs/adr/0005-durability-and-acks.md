@@ -91,6 +91,51 @@ A cluster may mix topic modes. `wal` topics use shards. `r2` topics use the
 memory buffer. They share the metadata group and the uploader's R2 client.
 A topic's mode is part of the metadata record so every broker agrees.
 
+### As built (Phase 2)
+
+- `wal.disk.limit` is `CAMUS_WAL_DISK_LIMIT`, in bytes. It is measured as
+  committed, unsealed batch bytes in the shard state machine, not as the
+  size of the directory. The Raft log under those batches is about the same
+  size and is purged after each seal.
+- A held produce is not appended. It waits for the uploader to seal enough,
+  or for `timeout_ms`, whichever comes first. `throttle_time_ms` carries
+  the time held. `r2` reports its buffer wait the same way.
+- The uploader retries a failed put or publish after 100ms, doubling to
+  5s, plus up to half again as jitter. `object_store` itself makes at most
+  two quick retries per call, so recovery after an outage takes seconds.
+- A log or state-machine write error stops the shard (openraft treats it as
+  fatal). Every later `wal` produce on that broker answers
+  `KAFKA_STORAGE_ERROR` (56). The other voters elect a new leader.
+  `--wal-dir` puts the WAL on its own volume so a full WAL disk does not
+  also stop metadata.
+- Apply does not fsync. The produce ack is the Raft log fsync on a quorum;
+  the state machine commits without fsync and is made durable before the
+  log is purged or a snapshot is built. The Raft log store no longer fsyncs
+  the committed index on every commit. Those two changes took a one-broker
+  ack from 18ms to 5ms p50.
+
+### Measurement (Phase 2)
+
+2026-11-05, Apple M4 Pro, APFS on the internal SSD, release build, MinIO on
+the same machine. Three brokers on one machine, one producer sending 1 KiB
+`acks=all` batches one at a time over one connection, upload interval
+250ms. `CAMUS_MINIO=1 cargo test --release -p camus-broker --test latency
+-- --ignored --nocapture` reproduces it.
+
+| Mode | Samples | p50 ms | p99 ms | max ms |
+| --- | ---: | ---: | ---: | ---: |
+| `wal` | 2000 | 11.76 | 33.91 | 45.37 |
+| `r2` | 100 | 275.49 | 347.18 | 488.46 |
+
+The 20ms p99 target is met at p50, not at p99, on this machine. The three
+brokers share one SSD, and macOS `fsync` is a full device flush. Three
+processes doing 1 KiB fsyncs at once on this disk measure 8ms p50 and 16ms
+p99 each (one alone: 4.0 / 4.1ms), and an ack needs a leader fsync and a
+follower fsync. With one broker, so no disk sharing, `wal` is 4.9ms p50 and
+11.9ms p99 (`CAMUS_BENCH_BROKERS=1`). A run with one disk per broker, in one
+region, is what can confirm or refute the target, and should replace this
+table.
+
 ## Consequences
 
 - Clients written to expect `acks=1` to be faster and weaker than `acks=all`

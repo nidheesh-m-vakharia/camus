@@ -60,8 +60,17 @@ leader for about a second, and clients recover through the usual
 `NOT_LEADER_OR_FOLLOWER` retry. After a shard loses a majority, its
 partitions stay offline until a lost voter returns or an operator runs
 `camus admin truncate-to-sealed`, which resumes them at the sealed end and
-drops acknowledged offsets past it (ADR 0008). R2 backpressure and the
-latency table are not in yet.
+drops acknowledged offsets past it (ADR 0008).
+A topic created without `durability.mode` is `wal` (`CAMUS_DEFAULT_DURABILITY`
+changes the cluster default). When unsealed WAL bytes pass `wal.disk.limit`
+(`CAMUS_WAL_DISK_LIMIT`, default 8 GiB), produce is held and the response's
+`throttle_time_ms` is the time held; it is answered with `REQUEST_TIMED_OUT`
+only when the client's `timeout_ms` runs out, and a held batch is not
+appended, so nothing acknowledged is lost. Kafka 4.4.0 answers a quota
+breach at once and lets the client wait out `throttle_time_ms`; Camus holds
+first, so a client that also honors the throttle waits twice. A failed WAL
+write (for example a full disk) answers `KAFKA_STORAGE_ERROR` (56) and stops
+that broker's shard until restart.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use axum::{Json, Router};
 use camus_metadata::{BasicNode, MetadataNode, NodeId, PublishPart};
 use camus_storage::{Bucket, BucketConfig};
@@ -37,6 +38,10 @@ struct Args {
     /// Directory for the Raft log and the redb state machine.
     #[arg(long)]
     data_dir: PathBuf,
+    /// WAL shard directory. Defaults to `{data_dir}/wal`. Put it on its own
+    /// volume to keep a full WAL disk from stopping metadata.
+    #[arg(long)]
+    wal_dir: Option<PathBuf>,
     /// Kafka listener. PLAINTEXT needs `--dev-plaintext`. SASL_SSL needs
     /// `--tls-cert` and `--tls-key`.
     #[arg(long)]
@@ -84,7 +89,7 @@ struct Admin {
     node: Arc<MetadataNode>,
     wal: Arc<WalSlot>,
     node_id: NodeId,
-    data_dir: PathBuf,
+    wal_dir: PathBuf,
     http: reqwest::Client,
     truncating: tokio::sync::Mutex<()>,
 }
@@ -108,14 +113,16 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir)?;
     let node = Arc::new(MetadataNode::open(args.node_id, &args.data_dir, &args.http_addr).await?);
-    let wal = Arc::new(WalSlot::new(
-        Shard::open(args.node_id, &args.data_dir.join("wal")).await?,
-    ));
+    let wal_dir = args
+        .wal_dir
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join("wal"));
+    let wal = Arc::new(WalSlot::new(Shard::open(args.node_id, &wal_dir).await?));
     let admin = Arc::new(Admin {
         node: Arc::clone(&node),
         wal: Arc::clone(&wal),
         node_id: args.node_id,
-        data_dir: args.data_dir.clone(),
+        wal_dir,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?,
@@ -156,6 +163,11 @@ async fn main() -> anyhow::Result<()> {
     let bound = listener.local_addr()?;
     std::fs::write(args.data_dir.join("listen-addr"), bound.to_string())?;
     info!(node_id = args.node_id, %bound, "metadata broker listening");
+    // Raft RPCs are small request/response pairs; Nagle plus delayed ACK
+    // would add tens of milliseconds to every quorum round trip.
+    let listener = listener.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -202,6 +214,8 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "state": format!("{:?}", metrics.state),
         "wal_leader": wal.leader(),
         "wal_voters": wal.voters(),
+        "wal_unsealed_bytes": wal.unsealed_bytes(),
+        "wal_storage_failed": wal.storage_failed(),
     }))
 }
 
@@ -308,12 +322,16 @@ async fn truncate_to_sealed(
         .ok_or_else(|| (StatusCode::CONFLICT, format!("node {me} has no address")))?;
     let internal = |err: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     let _ = old.raft.shutdown().await;
-    let dir = admin.data_dir.join("wal");
+    let dir = admin.wal_dir.clone();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or_default();
-    let aside = admin.data_dir.join(format!("wal.truncated-{stamp}"));
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wal".into());
+    let aside = dir.with_file_name(format!("{name}.truncated-{stamp}"));
     std::fs::rename(&dir, &aside).map_err(|err| internal(err.into()))?;
     let fresh = Shard::open(me, &dir).await.map_err(internal)?;
     fresh

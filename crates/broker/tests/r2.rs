@@ -62,6 +62,7 @@ impl Node {
             ])
             .env("RUST_LOG", "info")
             .env("CAMUS_FLUSH_MS", "40")
+            .env("CAMUS_DEFAULT_DURABILITY", "r2")
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()

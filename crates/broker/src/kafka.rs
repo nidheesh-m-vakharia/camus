@@ -56,6 +56,7 @@ const MAX_FRAME: usize = 100 * 1024 * 1024;
 const MAX_BATCH: usize = 1024 * 1024;
 const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 const BUFFER_LIMIT: usize = 256 * 1024 * 1024;
+const WAL_DISK_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 
 const CORRUPT: i16 = 2;
 const UNKNOWN_TOPIC: i16 = 3;
@@ -125,12 +126,18 @@ pub struct Kafka {
     host: String,
     port: i32,
     flush_ms: u64,
+    /// `wal.disk.limit`: unsealed bytes past which produce is held.
+    wal_limit: u64,
+    /// `durability.mode` for a topic created without one. `wal` per ADR 0005.
+    default_durability: String,
     require_sasl: bool,
     sasl_user: String,
     sasl_pass: String,
     tls: Option<TlsAcceptor>,
     wal: Arc<WalSlot>,
     http: reqwest::Client,
+    /// Topic ids seen in the WAL with no topic in metadata, and since when.
+    unknown: std::sync::Mutex<BTreeMap<[u8; 16], Instant>>,
     buf: Mutex<Vec<Item>>,
     flush_lock: Mutex<()>,
 }
@@ -149,6 +156,10 @@ impl Kafka {
         tls: Option<TlsAcceptor>,
         wal: Arc<WalSlot>,
     ) -> Self {
+        let wal_limit = std::env::var("CAMUS_WAL_DISK_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(WAL_DISK_LIMIT);
         let flush_ms = std::env::var("CAMUS_FLUSH_MS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -160,6 +171,9 @@ impl Kafka {
             host,
             port,
             flush_ms,
+            wal_limit,
+            default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
+                .unwrap_or_else(|_| "wal".into()),
             require_sasl,
             sasl_user,
             sasl_pass,
@@ -169,6 +183,7 @@ impl Kafka {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("http client"),
+            unknown: std::sync::Mutex::new(BTreeMap::new()),
             buf: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
         }
@@ -181,6 +196,12 @@ impl Kafka {
     /// The shard serving requests now.
     fn wal(&self) -> Arc<Shard> {
         self.wal.get()
+    }
+
+    fn gone_long_enough(&self, id: [u8; 16]) -> bool {
+        let mut unknown = self.unknown.lock().expect("unknown topics");
+        let since = *unknown.entry(id).or_insert_with(Instant::now);
+        since.elapsed() >= Duration::from_secs(30)
     }
 
     /// HTTP address of the metadata leader, when another broker leads.
@@ -305,9 +326,20 @@ impl Kafka {
         });
         let upload = Arc::clone(&self);
         tokio::spawn(async move {
+            let mut failures = 0u32;
             loop {
-                tokio::time::sleep(Duration::from_millis(upload.flush_ms)).await;
-                upload.upload_wal().await;
+                let delay = if failures == 0 {
+                    Duration::from_millis(upload.flush_ms)
+                } else {
+                    retry_delay(failures)
+                };
+                tokio::time::sleep(delay).await;
+                if upload.upload_wal().await {
+                    failures = 0;
+                } else {
+                    failures = failures.saturating_add(1);
+                    tracing::warn!(failures, "wal upload failed; retrying");
+                }
             }
         });
         let register = Arc::clone(&self);
@@ -327,6 +359,7 @@ impl Kafka {
             let Ok((tcp, _)) = listener.accept().await else {
                 break;
             };
+            let _ = tcp.set_nodelay(true);
             let kafka = Arc::clone(&self);
             tokio::spawn(async move {
                 let socket = if let Some(acceptor) = &kafka.tls {
@@ -581,7 +614,7 @@ impl Kafka {
                         .map(|value| value.to_string())
                         .unwrap_or_default()
                 })
-                .unwrap_or_else(|| "r2".into());
+                .unwrap_or_else(|| self.default_durability.clone());
             let code = if request.validate_only {
                 if self.topic(&name).is_some() {
                     36
@@ -708,6 +741,7 @@ impl Kafka {
         }
         let mut response = ProduceResponse::default();
         let mut waiters = Vec::new();
+        let mut held = Duration::ZERO;
         for topic in request.topic_data {
             let name = self.resolve_topic(
                 topic.name.0.as_str(),
@@ -728,6 +762,7 @@ impl Kafka {
                         partition.index,
                         request.acks,
                         request.timeout_ms,
+                        &mut held,
                     )
                     .await
                 {
@@ -769,6 +804,7 @@ impl Kafka {
                 Err(code) => row.error_code = code,
             }
         }
+        response.throttle_time_ms = i32::try_from(held.as_millis()).unwrap_or(i32::MAX);
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
@@ -801,13 +837,14 @@ impl Kafka {
         partition: i32,
         acks: i16,
         timeout_ms: i32,
+        held: &mut Duration,
     ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
         let Some(topic) = topic else {
             return Err(UNKNOWN_TOPIC);
         };
         if topic.durability == "wal" {
             return self
-                .write_wal(name, topic, records, partition, acks, timeout_ms)
+                .write_wal(name, topic, records, partition, acks, timeout_ms, held)
                 .await;
         }
         if topic.durability != "r2" {
@@ -832,16 +869,19 @@ impl Kafka {
             Err(BatchError::Corrupt) => return Err(CORRUPT),
         };
         let (tx, rx) = oneshot::channel();
-        self.enqueue(Item {
-            topic: name.to_string(),
-            partition,
-            raw: raw.clone(),
-            records: info.iter().map(|batch| batch.records).sum(),
-            base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
-            max_timestamp: info.last().map(|batch| batch.max_timestamp).unwrap_or(-1),
-            ack: if acks == 0 { None } else { Some(tx) },
-        })
-        .await;
+        let waited = self
+            .enqueue(Item {
+                topic: name.to_string(),
+                partition,
+                raw: raw.clone(),
+                records: info.iter().map(|batch| batch.records).sum(),
+                base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
+                max_timestamp: info.last().map(|batch| batch.max_timestamp).unwrap_or(-1),
+                ack: if acks == 0 { None } else { Some(tx) },
+            })
+            .await;
+        // A full `r2.buffer.limit` holds the produce in `enqueue`; report it.
+        *held = (*held).max(waited);
         if acks == 0 {
             Ok(None)
         } else {
@@ -857,8 +897,12 @@ impl Kafka {
         partition: i32,
         acks: i16,
         timeout_ms: i32,
+        held: &mut Duration,
     ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
         let wal = self.wal();
+        if wal.storage_failed() {
+            return Err(STORAGE);
+        }
         if !wal.is_leader() {
             return Err(NOT_LEADER);
         }
@@ -880,13 +924,10 @@ impl Kafka {
             Err(BatchError::Transactional) => return Err(TXN),
             Err(BatchError::Corrupt) => return Err(CORRUPT),
         };
-        let topic_id = Uuid::parse_str(&topic.id)
-            .map(|id| *id.as_bytes())
-            .unwrap_or([0; 16]);
         let append = Append {
             topic: name.to_string(),
             partition,
-            topic_id,
+            topic_id: topic_id(topic),
             epoch: topic.leader_epoch,
             raw: raw.to_vec(),
             records: info.iter().map(|batch| batch.records).sum(),
@@ -900,13 +941,34 @@ impl Kafka {
             });
             return Ok(None);
         }
+        // ADR 0005 backpressure: past the disk limit, hold the produce until
+        // an upload seals enough, and report the hold as throttle time. The
+        // batch is not appended while held, so a timeout loses nothing that
+        // was acknowledged.
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
+        let size = append.raw.len() as u64;
+        let hold_start = Instant::now();
+        loop {
+            let unsealed = wal.unsealed_bytes();
+            if unsealed == 0 || unsealed + size <= self.wal_limit {
+                break;
+            }
+            if Instant::now() >= deadline {
+                *held = (*held).max(hold_start.elapsed());
+                return Err(REQUEST_TIMED_OUT);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        *held = (*held).max(hold_start.elapsed());
         // Without a quorum the commit never comes. Kafka answers a produce
         // that outlives `timeout_ms` with REQUEST_TIMED_OUT; the entry may
         // still commit later, as in Kafka.
-        let wait = Duration::from_millis(timeout_ms.max(0) as u64);
+        let wait = deadline.saturating_duration_since(Instant::now());
         let response = match tokio::time::timeout(wait, wal.append(append)).await {
             Err(_) => return Err(REQUEST_TIMED_OUT),
             Ok(Err(WriteError::NotLeader)) => return Err(NOT_LEADER),
+            Ok(Err(WriteError::Storage)) => return Err(STORAGE),
+            Ok(Err(_)) if wal.storage_failed() => return Err(STORAGE),
             Ok(Err(WriteError::Other(_))) if !wal.is_leader() => return Err(NOT_LEADER),
             Ok(Err(WriteError::Other(_))) => return Err(STORAGE),
             Ok(Ok(response)) => response,
@@ -921,22 +983,39 @@ impl Kafka {
         Ok(Some(rx))
     }
 
-    async fn upload_wal(&self) {
+    /// One upload pass. `false` when the put or the publish failed, so the
+    /// caller backs off.
+    async fn upload_wal(&self) -> bool {
         // One shard for the whole pass, so a truncate mid-upload cannot seal
         // into the shard that replaced it.
         let wal = self.wal();
         if !wal.is_leader() {
-            return;
+            return true;
         }
         let pending = wal.pending();
         if pending.is_empty() {
-            return;
+            return true;
         }
+        let mut ok = true;
         let mut drops = Vec::new();
         let mut upload = Vec::new();
         let mut cursor: BTreeMap<(String, i32), i64> = BTreeMap::new();
         for batch in pending {
-            let Some(topic) = self.topic(&batch.topic) else {
+            let topic = self
+                .topic_name_by_id(&Uuid::from_bytes(batch.topic_id))
+                .and_then(|name| self.topic(&name))
+                .filter(|topic| topic_id(topic) == batch.topic_id);
+            let Some(topic) = topic else {
+                // A deleted topic's batches are dropped once the id has been
+                // unknown long enough that a lagging replica is not the cause.
+                if self.gone_long_enough(batch.topic_id) {
+                    drops.push(SealDrop {
+                        topic: batch.topic,
+                        topic_id: batch.topic_id,
+                        partition: batch.partition,
+                        start: batch.start,
+                    });
+                }
                 continue;
             };
             let Some(state) = self.partition_state(&topic, batch.partition) else {
@@ -945,6 +1024,7 @@ impl Kafka {
             if batch.end <= state.next_offset {
                 drops.push(SealDrop {
                     topic: batch.topic,
+                    topic_id: batch.topic_id,
                     partition: batch.partition,
                     start: batch.start,
                 });
@@ -973,7 +1053,11 @@ impl Kafka {
                 .collect();
             let (index, body) = camus_uploader::encode(&pieces);
             let key = camus_uploader::object_key();
-            if self.bucket.put_new(&key, body).await.is_ok() {
+            let put = self.bucket.put_new(&key, body).await;
+            if put.is_err() {
+                ok = false;
+            }
+            if put.is_ok() {
                 let parts = upload
                     .iter()
                     .zip(&index)
@@ -992,9 +1076,21 @@ impl Kafka {
                     )
                     .collect();
                 let published = self.meta_publish(parts).await;
-                if published.is_ok_and(|response| response.error_code == 0) {
+                let accepted = published.is_ok_and(|response| response.error_code == 0);
+                if !accepted {
+                    ok = false;
+                }
+                if accepted && std::env::var("CAMUS_FAILPOINT").as_deref() == Ok("after-publish") {
+                    // Test hook: die between the metadata commit and the WAL
+                    // seal, the window ADR 0006 says a restart must survive
+                    // without publishing an extent twice.
+                    tracing::warn!("failpoint after-publish: aborting");
+                    std::process::abort();
+                }
+                if accepted {
                     drops.extend(upload.into_iter().map(|batch| SealDrop {
                         topic: batch.topic,
+                        topic_id: batch.topic_id,
                         partition: batch.partition,
                         start: batch.start,
                     }));
@@ -1002,14 +1098,17 @@ impl Kafka {
             }
         }
         if drops.is_empty() {
-            return;
+            return ok;
         }
         if let Ok(index) = wal.seal(drops).await {
             let _ = wal.purge(index).await;
         }
+        ok
     }
 
-    async fn enqueue(&self, item: Item) {
+    /// Buffer one `r2` batch. Returns how long it waited for buffer space.
+    async fn enqueue(&self, item: Item) -> Duration {
+        let started = Instant::now();
         loop {
             let held = self
                 .buf
@@ -1023,6 +1122,7 @@ impl Kafka {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let waited = started.elapsed();
         let mut buf = self.buf.lock().await;
         let size = buf.iter().map(|queued| queued.raw.len()).sum::<usize>() + item.raw.len();
         buf.push(item);
@@ -1030,6 +1130,7 @@ impl Kafka {
         if size >= FLUSH_BYTES {
             self.flush().await;
         }
+        waited
     }
 
     async fn flush(&self) {
@@ -1193,7 +1294,7 @@ impl Kafka {
             row.error_code = UNKNOWN_TOPIC;
             return row;
         };
-        let wal_end = self.wal().end_offset(&topic.name, partition);
+        let wal_end = self.wal().end_offset(&topic_id(topic), partition);
         let high_watermark = state.next_offset.max(wal_end);
         row.high_watermark = high_watermark;
         row.last_stable_offset = high_watermark;
@@ -1238,7 +1339,7 @@ impl Kafka {
         if offset < high_watermark {
             let extra = self
                 .wal()
-                .read(&topic.name, partition, state.next_offset, offset);
+                .read(&topic_id(topic), partition, state.next_offset, offset);
             if !extra.is_empty() && (out.is_empty() || out.len() + extra.len() <= limit) {
                 out.extend_from_slice(&extra);
             }
@@ -1306,7 +1407,7 @@ impl Kafka {
         if timestamp == -1 {
             row.offset = state
                 .next_offset
-                .max(self.wal().end_offset(&topic.name, partition));
+                .max(self.wal().end_offset(&topic_id(topic), partition));
             return row;
         }
         for extent in &state.extents {
@@ -1380,6 +1481,24 @@ impl Kafka {
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
+}
+
+/// Exponential backoff from 100ms to 5s, with up to half again as jitter so
+/// several brokers do not retry R2 in step.
+fn retry_delay(failures: u32) -> Duration {
+    let base = 100u64.saturating_mul(1 << failures.min(6)).min(5_000);
+    let noise = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()))
+        .unwrap_or(0)
+        % (base / 2 + 1);
+    Duration::from_millis(base + noise)
+}
+
+fn topic_id(topic: &Topic) -> [u8; 16] {
+    Uuid::parse_str(&topic.id)
+        .map(|id| *id.as_bytes())
+        .unwrap_or([0; 16])
 }
 
 fn topic_name(name: &str) -> TopicName {

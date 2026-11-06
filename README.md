@@ -4,13 +4,14 @@ A Kafka-compatible streaming broker written in Rust. Producers, consumers, and
 admin clients speak the Apache Kafka wire protocol. Long-term data lives in
 Cloudflare R2. There is no JVM, no ZooKeeper, and no external database.
 
-Status: **Phase 1 `r2` produce and fetch are in the tree**. PLAINTEXT and
-SASL_SSL listeners accept create, produce, and fetch. Acks wait until the
-batch is in object storage and the metadata group has committed the offset.
-`kafka-clients` 4.4.0, librdkafka, and franz-go have passed the `r2` path.
-`wal` produce acks after a majority of brokers has fsynced the batch to the
-WAL shard; the R2 upload follows. Losing the shard leader or one follower
-loses no acknowledged offset.
+Status: **Phase 2 is done: `wal` and `r2` produce and fetch are in the
+tree.** Topics default to `wal`: a produce acks once a majority of the WAL
+shard's voters has fsynced the batch, and the R2 upload follows. `r2` topics
+ack after the object is stored and the metadata group has committed the
+offset. `kafka-clients` 4.4.0, librdkafka, and franz-go pass both, over
+PLAINTEXT and SASL_SSL. Losing the shard leader or a follower loses no
+acknowledged offset; R2 outages throttle produce instead of dropping acks.
+Consumer groups are Phase 3.
 The plan and ADRs are in `docs/`. License: Apache-2.0.
 
 ## What a client changes

@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 pub use machine::Batch;
 use machine::Machine;
 pub use network::Router;
-use openraft::error::{ClientWriteError, RaftError};
+use openraft::error::{ClientWriteError, Fatal, RaftError};
 pub use openraft::BasicNode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Voter id. Same numbering as the metadata group.
 pub type NodeId = u64;
@@ -75,8 +76,10 @@ pub struct Append {
 /// One batch the uploader has published.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SealDrop {
-    /// Topic name.
+    /// Topic name, for logs.
     pub topic: String,
+    /// Topic id. Matching uses this, not the name.
+    pub topic_id: [u8; 16],
     /// Partition.
     pub partition: i32,
     /// Base offset.
@@ -97,6 +100,10 @@ pub struct Response {
 pub enum WriteError {
     /// This node is not the shard leader. The entry was not appended here.
     NotLeader,
+    /// The log or state machine could not write, for example a full disk.
+    /// openraft stops the shard on the first such error; every later write
+    /// reports this too.
+    Storage,
     /// Anything else: shutdown, storage, or a lost quorum.
     Other(anyhow::Error),
 }
@@ -105,6 +112,7 @@ impl std::fmt::Display for WriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotLeader => f.write_str("not the wal shard leader"),
+            Self::Storage => f.write_str("wal storage failed"),
             Self::Other(err) => err.fmt(f),
         }
     }
@@ -112,21 +120,13 @@ impl std::fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
-impl From<RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>> for WriteError {
-    fn from(err: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> Self {
-        match err {
-            RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => Self::NotLeader,
-            other => Self::Other(other.into()),
-        }
-    }
-}
-
 /// A running shard.
 pub struct Shard {
     /// Raft handle.
     pub raft: Raft<TypeConfig>,
     machine: Arc<Machine>,
     node_id: NodeId,
+    storage_failed: AtomicBool,
 }
 
 impl Shard {
@@ -173,6 +173,7 @@ impl Shard {
             raft,
             machine,
             node_id,
+            storage_failed: AtomicBool::new(false),
         })
     }
 
@@ -249,25 +250,71 @@ impl Shard {
     /// Propose a batch and wait until a majority has it on disk and this
     /// leader has applied it.
     pub async fn append(&self, batch: Append) -> Result<Response, WriteError> {
-        let response = self.raft.client_write(Command::Append(batch)).await?;
+        let response = self
+            .raft
+            .client_write(Command::Append(batch))
+            .await
+            .map_err(|err| self.classify(err))?;
         Ok(response.data)
+    }
+
+    /// Whether a log or state-machine write has failed on this shard.
+    pub fn storage_failed(&self) -> bool {
+        if self.storage_failed.load(Ordering::SeqCst) {
+            return true;
+        }
+        // A writer waiting on the entry may only see `Stopped`; the cause is
+        // in the metrics.
+        let failed = matches!(
+            self.raft.metrics().borrow().running_state,
+            Err(Fatal::StorageError(_))
+        );
+        if failed {
+            self.storage_failed.store(true, Ordering::SeqCst);
+        }
+        failed
+    }
+
+    fn classify(&self, err: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> WriteError {
+        match err {
+            RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => WriteError::NotLeader,
+            RaftError::Fatal(Fatal::StorageError(_)) => {
+                self.storage_failed.store(true, Ordering::SeqCst);
+                WriteError::Storage
+            }
+            RaftError::Fatal(_) if self.storage_failed() => WriteError::Storage,
+            other => WriteError::Other(other.into()),
+        }
     }
 
     /// Drop published batches and return the log index of that commit.
     pub async fn seal(&self, drops: Vec<SealDrop>) -> Result<u64, WriteError> {
-        let response = self.raft.client_write(Command::Seal { drops }).await?;
+        let response = self
+            .raft
+            .client_write(Command::Seal { drops })
+            .await
+            .map_err(|err| self.classify(err))?;
         Ok(response.log_id.index)
     }
 
     /// Purge the shard log through `index`, inclusive.
     pub async fn purge(&self, index: u64) -> anyhow::Result<()> {
+        // Apply commits do not fsync; the log is what recovers them. Make
+        // the state durable before the log under it goes away.
+        self.machine.flush()?;
         self.raft.trigger().purge_log(index).await?;
         Ok(())
     }
 
     /// Next offset for a partition. `0` when the shard has not appended.
-    pub fn end_offset(&self, topic: &str, partition: i32) -> i64 {
-        self.machine.end_offset(topic, partition)
+    pub fn end_offset(&self, topic_id: &[u8; 16], partition: i32) -> i64 {
+        self.machine.end_offset(topic_id, partition)
+    }
+
+    /// Bytes of committed batches not yet sealed. The disk limit is checked
+    /// against this.
+    pub fn unsealed_bytes(&self) -> u64 {
+        self.machine.unsealed_bytes()
     }
 
     /// Committed batches not yet sealed.
@@ -276,8 +323,14 @@ impl Shard {
     }
 
     /// Unsealed batches for a fetch.
-    pub fn read(&self, topic: &str, partition: i32, sealed_end: i64, offset: i64) -> Vec<u8> {
-        self.machine.read(topic, partition, sealed_end, offset)
+    pub fn read(
+        &self,
+        topic_id: &[u8; 16],
+        partition: i32,
+        sealed_end: i64,
+        offset: i64,
+    ) -> Vec<u8> {
+        self.machine.read(topic_id, partition, sealed_end, offset)
     }
 }
 
@@ -415,8 +468,8 @@ mod tests {
         let survivor = live.iter().find(|shard| shard.node_id == next).unwrap();
         let response = survivor.append(append_of(b"d")).await.unwrap();
         assert_eq!(response.base_offset, 3, "acked offsets 0..3 survive");
-        assert_eq!(survivor.end_offset("events", 0), 4);
-        let tail = survivor.read("events", 0, 0, 0);
+        assert_eq!(survivor.end_offset(&[1; 16], 0), 4);
+        let tail = survivor.read(&[1; 16], 0, 0, 0);
         let info = camus_protocol::batch::inspect(&tail, 1024 * 1024).unwrap();
         assert_eq!(info.len(), 4);
     }
@@ -436,5 +489,33 @@ mod tests {
             8,
             "the floor never moves the end backward"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopened_shard_recovers_batches_from_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let shard = Shard::open(1, dir.path()).await.unwrap();
+            shard.ensure_voter().await.unwrap();
+            for value in [b"a", b"b", b"c"] {
+                shard.append(append_of(value)).await.unwrap();
+            }
+            shard.raft.shutdown().await.unwrap();
+        }
+        let shard = Shard::open(1, dir.path()).await.unwrap();
+        shard.ensure_voter().await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while shard.end_offset(&[1; 16], 0) < 3 {
+            assert!(std::time::Instant::now() < deadline, "log not re-applied");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let tail = shard.read(&[1; 16], 0, 0, 0);
+        assert_eq!(
+            camus_protocol::batch::inspect(&tail, 1 << 20)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(shard.append(append_of(b"d")).await.unwrap().base_offset, 3);
     }
 }

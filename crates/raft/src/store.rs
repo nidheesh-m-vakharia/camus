@@ -168,14 +168,12 @@ where
         &mut self,
         committed: Option<LogId<C::NodeId>>,
     ) -> Result<(), StorageError<C::NodeId>> {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = lock(&inner)?;
-            guard.meta.committed = committed;
-            write_meta(&guard.dir, &guard.meta)
-        })
-        .await
-        .map_err(|err| io_err::<C>(None, &err))?
+        // Not fsynced on its own. openraft treats the committed id as a
+        // hint: on restart the state machine's last applied id is the floor,
+        // and the leader re-sends the commit index. It reaches disk with the
+        // next vote or purge. Syncing it here cost two fsyncs per commit.
+        lock(&self.inner)?.meta.committed = committed;
+        Ok(())
     }
 
     async fn read_committed(

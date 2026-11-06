@@ -63,6 +63,21 @@ Acceptance:
 - Disk limit throttles. ENOSPC returns `KAFKA_STORAGE_ERROR`.
 - Restart resumes upload without duplicating extents.
 
+Done 2026-11-05. Each acceptance item and its test:
+
+| Item | Test |
+| --- | --- |
+| `wal` latency next to `r2` | `broker/tests/latency.rs` (ignored; numbers in ADR 0005) |
+| Kill leader, kill a follower | `broker/tests/wal_cluster.rs`, `wal/src/lib.rs` |
+| Kill a majority, `truncate-to-sealed` | `broker/tests/wal_majority.rs` |
+| R2 delay, 5xx, outage; throttle; catch up | `broker/tests/wal_faults.rs` (`slow_and_failing_r2…`, `r2_outage_throttles…`) |
+| Disk limit throttles, ENOSPC is `KAFKA_STORAGE_ERROR` | `wal_faults.rs` (`r2_outage_throttles…`, `full_wal_disk…`) |
+| Restart resumes upload without duplicate extents | `wal_faults.rs` (`crash_after_publish…`) |
+
+The real-client suites (`broker/tests/sasl.rs`) run on `wal` topics now
+that it is the default. The p99 target is not shown on the laptop the
+benchmark ran on; ADR 0005 says why and what run would settle it.
+
 ### Phase 3 — Consumer groups
 
 Classic protocol first: `FindCoordinator`, `JoinGroup`, `SyncGroup`,

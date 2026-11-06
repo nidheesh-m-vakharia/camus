@@ -2,13 +2,12 @@
 
 Status: accepted. Date: 2026-11-05.
 
-Phase 0 foundations and Phase 1 `r2` produce and fetch are in the workspace.
-SASL_SSL is covered by a Rust test and by Java, librdkafka, and franz-go.
-`wal` produce acks after a majority of the WAL shard's voters has the batch
-on disk. The shard spans every broker, and its leader leads `wal`
-partitions. After a majority loss, `camus admin truncate-to-sealed` resumes a shard at
-its sealed end. Consumer groups, R2 backpressure, and the latency table are
-not in yet. The ADRs under
+Phases 0, 1, and 2 are done; ADR 0013 lists the test for each Phase 2
+acceptance item. Topics default to `wal`, which acks after a majority of the
+WAL shard's voters has the batch on disk. SASL_SSL is covered by a Rust test
+and by Java, librdkafka, and franz-go, which now run on `wal` topics. After a
+majority loss, `camus admin truncate-to-sealed` resumes a shard at its
+sealed end. Phase 3 (consumer groups) is next. The ADRs under
 `docs/adr/` are accepted.
 This file is the map of those decisions and of what Phase 0 is allowed to touch.
 

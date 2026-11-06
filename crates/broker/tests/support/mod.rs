@@ -4,9 +4,10 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -31,12 +32,238 @@ use camus_protocol::records::{
 
 pub const TOPIC: &str = "orders";
 
+/// What the [`Proxy`] does to object-storage traffic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fault {
+    /// Pass bytes through.
+    None,
+    /// Drop open connections and refuse new ones.
+    Cut,
+    /// Hold every chunk this long before forwarding it.
+    Delay(Duration),
+    /// Answer every request with `503 Service Unavailable`.
+    Unavailable,
+}
+
+/// TCP proxy in front of MinIO, so a test can make R2 slow, failing, or gone
+/// for the brokers without touching the shared MinIO.
+pub struct Proxy {
+    pub addr: String,
+    fault: Arc<Mutex<Fault>>,
+    open: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl Proxy {
+    pub fn start(upstream: &'static str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let fault = Arc::new(Mutex::new(Fault::None));
+        let open = Arc::new(Mutex::new(Vec::new()));
+        let (mode, streams) = (fault.clone(), open.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(mut client) = client else { continue };
+                let now = *mode.lock().unwrap();
+                match now {
+                    Fault::Cut => {
+                        let _ = client.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    Fault::Unavailable => {
+                        std::thread::spawn(move || answer_503(&mut client));
+                        continue;
+                    }
+                    _ => {}
+                }
+                let Ok(server) = TcpStream::connect(upstream) else {
+                    continue;
+                };
+                {
+                    let mut open = streams.lock().unwrap();
+                    open.push(client.try_clone().unwrap());
+                    open.push(server.try_clone().unwrap());
+                }
+                pipe(
+                    client.try_clone().unwrap(),
+                    server.try_clone().unwrap(),
+                    mode.clone(),
+                );
+                pipe(server, client, mode.clone());
+            }
+        });
+        Self { addr, fault, open }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Switch fault mode. Any mode other than `None` and `Delay` also drops
+    /// pooled connections so clients see it at once.
+    pub fn set(&self, fault: Fault) {
+        *self.fault.lock().unwrap() = fault;
+        if matches!(fault, Fault::Cut | Fault::Unavailable) {
+            for stream in self.open.lock().unwrap().drain(..) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    pub fn cut(&self) {
+        self.set(Fault::Cut);
+    }
+
+    pub fn restore(&self) {
+        self.set(Fault::None);
+    }
+}
+
+fn answer_503(client: &mut TcpStream) {
+    let _ = client.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        // Read the request head, then answer; any body is discarded.
+        match client.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf[..n].windows(4).any(|window| window == b"\r\n\r\n") {
+                    let _ = client.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    let _ = client.shutdown(Shutdown::Both);
+}
+
+fn pipe(mut from: TcpStream, mut to: TcpStream, mode: Arc<Mutex<Fault>>) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match from.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Fault::Delay(by) = *mode.lock().unwrap() {
+                        std::thread::sleep(by);
+                    }
+                    if to.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = to.shutdown(Shutdown::Both);
+    });
+}
+
+pub fn read_key(http: &str, key: &str) -> Option<String> {
+    let body: serde_json::Value = reqwest::blocking::Client::new()
+        .get(format!("http://{http}/admin/read"))
+        .query(&[("key", key)])
+        .send()
+        .ok()?
+        .json()
+        .ok()?;
+    body["value"].as_str().map(str::to_string)
+}
+
+/// Partition 0's sealed end as `http`'s metadata replica has it.
+pub fn sealed_end(http: &str) -> i64 {
+    let topic: serde_json::Value =
+        serde_json::from_str(&read_key(http, &format!("topic/{TOPIC}")).unwrap()).unwrap();
+    let id = topic["id"].as_str().unwrap();
+    let part: serde_json::Value =
+        serde_json::from_str(&read_key(http, &format!("part/{id}/0")).unwrap()).unwrap();
+    part["next_offset"].as_i64().unwrap()
+}
+
+/// Partition 0's extents as `(start, end)` from `http`'s metadata replica.
+pub fn extents(http: &str) -> Vec<(i64, i64)> {
+    let topic: serde_json::Value =
+        serde_json::from_str(&read_key(http, &format!("topic/{TOPIC}")).unwrap()).unwrap();
+    let id = topic["id"].as_str().unwrap();
+    let part: serde_json::Value =
+        serde_json::from_str(&read_key(http, &format!("part/{id}/0")).unwrap()).unwrap();
+    part["extents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|extent| {
+            (
+                extent["start"].as_i64().unwrap(),
+                extent["end"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+pub fn wait_sealed(http: &str, end: i64) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if sealed_end(http) == end {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("sealed end never reached {end}");
+}
+
+pub fn fetch_code(addr: &str, offset: i64) -> i16 {
+    let mut stream = connect(addr);
+    let mut part = FetchPartition::default();
+    part.partition = 0;
+    part.fetch_offset = offset;
+    part.partition_max_bytes = 1024 * 1024;
+    let mut topic = FetchTopic::default();
+    topic.topic = TopicName(StrBytes::from_static_str(TOPIC));
+    topic.partitions = vec![part];
+    send(
+        &mut stream,
+        ApiKey::Fetch,
+        11,
+        &FetchRequest::default()
+            .with_max_wait_ms(0)
+            .with_topics(vec![topic]),
+    );
+    recv::<FetchResponse>(&mut stream, 11).responses[0].partitions[0].error_code
+}
+
+/// How to start a broker. Kept on the node so a restart uses the same.
+#[derive(Clone, Default)]
+pub struct Opts {
+    /// Object storage endpoint (`http://…`), e.g. a [`Proxy`].
+    pub s3: Option<String>,
+    /// Extra environment, applied after the defaults.
+    pub env: Vec<(String, String)>,
+    /// Extra command-line arguments.
+    pub args: Vec<String>,
+}
+
+impl Opts {
+    pub fn s3(mut self, url: &str) -> Self {
+        self.s3 = Some(url.to_string());
+        self
+    }
+
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.env.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn arg(mut self, value: &str) -> Self {
+        self.args.push(value.to_string());
+        self
+    }
+}
+
 pub struct Node {
     pub id: i32,
     pub child: Child,
     pub dir: PathBuf,
     pub http: String,
-    s3: Option<String>,
+    pub opts: Opts,
 }
 
 impl Drop for Node {
@@ -48,24 +275,35 @@ impl Drop for Node {
 
 impl Node {
     pub fn spawn(id: i32, dir: &Path) -> Self {
-        Self::spawn_at(id, dir, "127.0.0.1:0", "127.0.0.1:0", None)
+        Self::with(id, dir, Opts::default())
     }
 
     /// Spawn with object storage reached through `s3` (an `http://` URL).
     pub fn spawn_via(id: i32, dir: &Path, s3: &str) -> Self {
-        Self::spawn_at(id, dir, "127.0.0.1:0", "127.0.0.1:0", Some(s3.to_string()))
+        Self::with(id, dir, Opts::default().s3(s3))
+    }
+
+    pub fn with(id: i32, dir: &Path, opts: Opts) -> Self {
+        Self::spawn_at(id, dir, "127.0.0.1:0", "127.0.0.1:0", opts)
     }
 
     /// Restart on the addresses the node had: its peers know it by them.
     pub fn restart(&mut self) {
+        let opts = self.opts.clone();
+        self.restart_with(opts);
+    }
+
+    /// Restart on the same addresses with different options.
+    pub fn restart_with(&mut self, opts: Opts) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         let http = self.http.clone();
         let kafka = kafka_addr(self);
         let dir = self.dir.clone();
-        let s3 = self.s3.clone();
-        *self = Self::spawn_at(self.id, &dir, &http, &kafka, s3);
+        *self = Self::spawn_at(self.id, &dir, &http, &kafka, opts);
     }
 
-    fn spawn_at(id: i32, dir: &Path, http: &str, kafka: &str, s3: Option<String>) -> Self {
+    fn spawn_at(id: i32, dir: &Path, http: &str, kafka: &str, opts: Opts) -> Self {
         std::fs::create_dir_all(dir).unwrap();
         let _ = std::fs::remove_file(dir.join("listen-addr"));
         let _ = std::fs::remove_file(dir.join("kafka-addr"));
@@ -75,10 +313,7 @@ impl Node {
             .open(dir.join("broker.log"))
             .unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_camus-broker"));
-        if let Some(s3) = &s3 {
-            command.env("CAMUS_S3_ENDPOINT", s3);
-        }
-        let child = command
+        command
             .args([
                 "--node-id",
                 &id.to_string(),
@@ -90,8 +325,16 @@ impl Node {
                 kafka,
                 "--dev-plaintext",
             ])
+            .args(&opts.args)
             .env("CAMUS_FLUSH_MS", "40")
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", "info");
+        if let Some(s3) = &opts.s3 {
+            command.env("CAMUS_S3_ENDPOINT", s3);
+        }
+        for (key, value) in &opts.env {
+            command.env(key, value);
+        }
+        let child = command
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
@@ -103,7 +346,7 @@ impl Node {
             child,
             dir: dir.to_path_buf(),
             http,
-            s3,
+            opts,
         }
     }
 
@@ -270,7 +513,17 @@ pub fn batch(value: &str) -> Bytes {
 
 /// Produce one batch with `acks=all`. Returns the partition error and offset.
 pub fn produce(addr: &str, value: &str) -> (i16, i64) {
+    let (code, offset, _) = produce_full(addr, value, 5_000);
+    (code, offset)
+}
+
+/// Produce one batch with `acks=all` and `timeout_ms`. Returns the partition
+/// error, the base offset, and the response's `throttle_time_ms`.
+pub fn produce_full(addr: &str, value: &str, timeout_ms: i32) -> (i16, i64, i32) {
     let mut stream = connect(addr);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(timeout_ms as u64 + 15_000)))
+        .unwrap();
     let mut topic = TopicProduceData::default();
     topic.name = TopicName(StrBytes::from_static_str(TOPIC));
     topic.partition_data = vec![PartitionProduceData::default()
@@ -282,12 +535,12 @@ pub fn produce(addr: &str, value: &str) -> (i16, i64) {
         9,
         &ProduceRequest::default()
             .with_acks(-1)
-            .with_timeout_ms(5_000)
+            .with_timeout_ms(timeout_ms)
             .with_topic_data(vec![topic]),
     );
     let produced = recv::<ProduceResponse>(&mut stream, 9);
     let part = &produced.responses[0].partition_responses[0];
-    (part.error_code, part.base_offset)
+    (part.error_code, part.base_offset, produced.throttle_time_ms)
 }
 
 /// Produce as a client does: on a retriable error, refresh metadata through
@@ -364,6 +617,11 @@ pub fn read_all(addr: &str, end: i64) -> Vec<String> {
 
 /// Create `TOPIC` with `durability.mode=wal` through the controller.
 pub fn create_wal_topic(controller: &str) {
+    create_topic(controller, "wal");
+}
+
+/// Create `TOPIC` with the given `durability.mode` through the controller.
+pub fn create_topic(controller: &str, durability_mode: &'static str) {
     let mut stream = connect(controller);
     let mut created = CreatableTopic::default();
     created.name = TopicName(StrBytes::from_static_str(TOPIC));
@@ -371,7 +629,7 @@ pub fn create_wal_topic(controller: &str) {
     created.replication_factor = 3;
     let mut durability = CreatableTopicConfig::default();
     durability.name = StrBytes::from_static_str("durability.mode");
-    durability.value = Some(StrBytes::from_static_str("wal"));
+    durability.value = Some(StrBytes::from_static_str(durability_mode));
     created.configs = vec![durability];
     send(
         &mut stream,
@@ -384,6 +642,16 @@ pub fn create_wal_topic(controller: &str) {
 }
 
 /// Initialize the cluster through `nodes[0]`. `wal` names the shard voters.
+/// Start one broker, initialize it alone, and create `TOPIC` as `wal`.
+pub fn single(dir: &Path, opts: Opts) -> Node {
+    let node = Node::with(1, dir, opts);
+    init(std::slice::from_ref(&node), &[1]);
+    wait_settled(&[&node]);
+    create_wal_topic(&kafka_addr(&node));
+    partition_leader(&kafka_addr(&node), None);
+    node
+}
+
 pub fn init(nodes: &[Node], wal: &[i32]) {
     let peers: Vec<_> = nodes
         .iter()
