@@ -89,9 +89,45 @@ work was deferred. With uploads keeping pace, MinIO's writes share the one
 SSD with every WAL `fsync`, and the follower's AppendEntries went from 8.5
 to 9.9 ms. The new numbers are the sustained rate on this machine.
 
+## Allocator: mimalloc
+
+Tried behind a build feature and removed. On macOS it changed peaks by
+-8 to +30 MiB and roughly doubled follower peaks. On Linux idle rose from
+25 to 50–77 MiB and every peak was higher. It is also C, and the default
+build is meant to be pure Rust.
+
+## Linux
+
+`raw/linux-orbstack.md`. Linux 7.0 (aarch64) in an OrbStack VM on the same
+Mac, 12 CPUs, 12 GiB, broker data on a Docker volume, MinIO on the Mac
+reached over host networking, system allocator, same commit. The VM's
+virtual disk may not pass every `fsync` through to the SSD, so these
+latencies can be optimistic.
+
+| Run | p50 ms | p99 ms | MiB/s |
+| --- | ---: | ---: | ---: |
+| latency `wal`, 3 brokers | 7.10 | 16.55 | |
+| latency `r2`, 3 brokers | 293.81 | 576.16 | |
+| 3 brokers, 1 producer | 9.27 | 22.08 | 1.6 |
+| 3 brokers, 8 producers | 21.41 | 53.58 | 5.5 |
+| 3 brokers, 32 producers | 34.13 | 130.03 | 10.7 |
+| 1 broker, 1 producer | 4.08 | 14.93 | 3.5 |
+| 1 broker, 8 producers | 8.77 | 42.28 | 12.6 |
+| 1 broker, 32 producers | 15.32 | 136.03 | 24.7 |
+
+The `wal` latency run had one 211 ms outlier in 2000.
+
+| Run (broker serving produce) | Idle MiB | Peak MiB | After MiB |
+| --- | ---: | ---: | ---: |
+| 3 brokers, 32 producers, leader | 42.3 | 123.6 | 116.2 |
+| 3 brokers, 32 producers, followers | 24.7 | 44.6 | 44.1 |
+| 1 broker, 32 producers | 25.0 | 200.3 | 188.8 |
+
+Followers idle at about 25 MiB on Linux, the leader at about 40 MiB.
+
 ## Next
 
-- Try mimalloc or jemalloc, which return freed memory sooner.
-- Repeat on Linux with one disk per broker and R2 instead of a local MinIO.
+- Repeat on Linux machines with one disk per broker and R2 instead of a
+  local MinIO.
 - `fdatasync` with preallocated segments, measured on Linux; on macOS both
   calls do a full device flush.

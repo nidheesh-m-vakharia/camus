@@ -340,6 +340,11 @@ version = "0.1.0"
 [[package]]
 name = "camus-coordinator"
 version = "0.1.0"
+dependencies = [
+ "camus-metadata",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "camus-engine-bench"
