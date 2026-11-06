@@ -18,6 +18,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::catalog::{self, Outcome};
 use crate::{Command, NodeId, Response, TypeConfig};
 
 const KV: TableDefinition<&str, &str> = TableDefinition::new("kv");
@@ -147,6 +148,54 @@ fn read_applied(
     Ok((last_applied, membership))
 }
 
+fn apply_command(
+    kv: &mut redb::Table<&str, &str>,
+    command: Command,
+) -> Result<Response, StorageError<NodeId>> {
+    if let Command::Put { key, value } = command {
+        let previous = kv
+            .insert(key.as_str(), value.as_str())
+            .map_err(|err| io(ErrorSubject::StateMachine, &err))?
+            .map(|old| old.value().to_owned());
+        return Ok(Response::ok(previous));
+    }
+    let outcome = {
+        let read = |key: &str| -> Result<Option<String>, String> {
+            match kv.get(key) {
+                Ok(Some(guard)) => Ok(Some(guard.value().to_string())),
+                Ok(None) => Ok(None),
+                Err(err) => Err(err.to_string()),
+            }
+        };
+        match command {
+            Command::Put { .. } => unreachable!("handled above"),
+            Command::CreateTopic {
+                name,
+                partitions,
+                durability,
+            } => catalog::create_topic(&read, &name, partitions, &durability),
+            Command::DeleteTopic { name } => catalog::delete_topic(&read, &name),
+            Command::Publish { parts } => catalog::publish(&read, &parts),
+        }
+    };
+    let outcome =
+        outcome.map_err(|err| io(ErrorSubject::StateMachine, &std::io::Error::other(err)))?;
+    match outcome {
+        Outcome::Reject(code) => Ok(Response::reject(code)),
+        Outcome::Change { put, del } => {
+            for (key, value) in put {
+                kv.insert(key.as_str(), value.as_str())
+                    .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+            }
+            for key in del {
+                kv.remove(key.as_str())
+                    .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+            }
+            Ok(Response::ok(None))
+        }
+    }
+}
+
 fn io(subject: ErrorSubject<NodeId>, err: &dyn std::error::Error) -> StorageError<NodeId> {
     StorageError::IO {
         source: StorageIOError::new(subject, ErrorVerb::Write, AnyError::error(err.to_string())),
@@ -250,13 +299,9 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
                 meta.insert(LAST_APPLIED, applied.as_str())
                     .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
                 match entry.payload {
-                    EntryPayload::Blank => responses.push(Response { value: None }),
-                    EntryPayload::Normal(Command::Put { key, value }) => {
-                        let previous = kv
-                            .insert(key.as_str(), value.as_str())
-                            .map_err(|err| io(ErrorSubject::StateMachine, &err))?
-                            .map(|old| old.value().to_owned());
-                        responses.push(Response { value: previous });
+                    EntryPayload::Blank => responses.push(Response::ok(None)),
+                    EntryPayload::Normal(command) => {
+                        responses.push(apply_command(&mut kv, command)?);
                     }
                     EntryPayload::Membership(mem) => {
                         let membership = StoredMembership::new(Some(entry.log_id), mem);
@@ -264,7 +309,7 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
                             .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
                         meta.insert(MEMBERSHIP, json.as_str())
                             .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-                        responses.push(Response { value: None });
+                        responses.push(Response::ok(None));
                     }
                 }
             }

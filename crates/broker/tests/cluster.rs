@@ -25,6 +25,7 @@ impl Node {
     fn spawn(id: u64, dir: &Path) -> Self {
         let dir = dir.join(format!("node-{id}"));
         std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("listen-addr"));
         let bin = env!("CARGO_BIN_EXE_camus-broker");
         let log = std::fs::File::create(dir.join("broker.log")).unwrap();
         let child = Command::new(bin)

@@ -2,23 +2,60 @@
 //!
 //! Message bodies are the types generated from the Apache Kafka 4.4.0 schemas.
 //! This module only adds the `int32` size prefix and the rule for which error
-//! to return when a key is not implemented. Phase 0 implements no API, so every
-//! known key is [`ResponseError::UnsupportedVersion`].
+//! to return when a key is not implemented.
 
 use std::collections::BTreeMap;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::ResponseError;
-use crate::messages::ApiKey;
+use crate::messages::{ApiKey, RequestHeader, ResponseHeader};
 use crate::protocol::{
     decode_request_header_from_buffer, encode_request_header_into_buffer, Decodable, Encodable,
+    HeaderVersion,
 };
-use crate::messages::RequestHeader;
 
-/// APIs this broker will answer with success. Empty until a later phase.
-pub fn implemented_api_keys() -> &'static [ApiKey] {
-    &[]
+/// An API key and the versions this build will answer with success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImplementedApi {
+    /// Kafka API key.
+    pub key: ApiKey,
+    /// Lowest version the handler encodes.
+    pub min: i16,
+    /// Highest version the handler encodes.
+    pub max: i16,
+}
+
+/// APIs the broker answers with success.
+///
+/// Anything else that the schema knows is [`Unimplemented::UnsupportedVersion`].
+pub fn implemented_apis() -> &'static [ImplementedApi] {
+    &IMPLEMENTED
+}
+
+const IMPLEMENTED: &[ImplementedApi] = &[
+    ImplementedApi { key: ApiKey::Produce, min: 3, max: 13 },
+    ImplementedApi { key: ApiKey::Fetch, min: 4, max: 18 },
+    ImplementedApi { key: ApiKey::ListOffsets, min: 1, max: 11 },
+    ImplementedApi { key: ApiKey::Metadata, min: 0, max: 13 },
+    ImplementedApi { key: ApiKey::SaslHandshake, min: 0, max: 1 },
+    ImplementedApi { key: ApiKey::ApiVersions, min: 0, max: 5 },
+    ImplementedApi { key: ApiKey::CreateTopics, min: 2, max: 7 },
+    ImplementedApi { key: ApiKey::DeleteTopics, min: 1, max: 6 },
+    ImplementedApi { key: ApiKey::DescribeConfigs, min: 1, max: 4 },
+    ImplementedApi { key: ApiKey::SaslAuthenticate, min: 0, max: 2 },
+];
+
+/// Keys in [`implemented_apis`], for callers that only need the key.
+pub fn implemented_api_keys() -> Vec<ApiKey> {
+    IMPLEMENTED.iter().map(|api| api.key).collect()
+}
+
+/// Whether `version` of `key` has a success handler.
+pub fn is_implemented(key: ApiKey, version: i16) -> bool {
+    IMPLEMENTED
+        .iter()
+        .any(|api| api.key == key && version >= api.min && version <= api.max)
 }
 
 /// Why a request does not get a successful handler.
@@ -53,11 +90,27 @@ pub fn reject_unimplemented(api_key: i16) -> Result<(), Unimplemented> {
     let Ok(key) = ApiKey::try_from(api_key) else {
         return Err(Unimplemented::InvalidRequest);
     };
-    if implemented_api_keys().contains(&key) {
+    if implemented_apis().iter().any(|api| api.key == key) {
         Ok(())
     } else {
         Err(Unimplemented::UnsupportedVersion)
     }
+}
+
+/// Encode `size || response header || body`.
+pub fn encode_response<M: Encodable + HeaderVersion>(
+    version: i16,
+    correlation_id: i32,
+    message: &M,
+) -> Result<Bytes, anyhow::Error> {
+    let mut body = BytesMut::new();
+    let header = ResponseHeader::default().with_correlation_id(correlation_id);
+    header.encode(&mut body, M::header_version(version))?;
+    message.encode(&mut body, version)?;
+    let mut frame = BytesMut::with_capacity(4 + body.len());
+    frame.put_i32(i32::try_from(body.len()).map_err(|_| anyhow::anyhow!("response exceeds i32"))?);
+    frame.extend_from_slice(&body);
+    Ok(frame.freeze())
 }
 
 /// Correlation id from the first eight header bytes.

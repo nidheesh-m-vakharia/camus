@@ -13,16 +13,23 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+bytes = "1"
 camus-metadata = { path = "../metadata" }
+camus-protocol = { path = "../protocol" }
+camus-storage = { path = "../storage" }
+camus-uploader = { path = "../uploader" }
 clap = { version = "4", features = ["derive"] }
 openraft = { version = "=0.9.25", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "io-util", "sync", "time"] }
+uuid = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+bytes = "1"
+camus-protocol = { path = "../protocol" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"] }
 serde_json = "1"
 tempfile = "3"

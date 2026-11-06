@@ -55,7 +55,7 @@ use std::convert::TryFrom;
 #[inline]
 /// Kafka record batches use CRC32C (Castagnoli), which maps to
 /// `crc_fast::crc32_iscsi`.
-fn crc32c(data: &[u8]) -> u32 {
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
     crc32_iscsi(data)
 }
 

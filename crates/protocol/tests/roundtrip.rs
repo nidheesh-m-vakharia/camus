@@ -64,14 +64,16 @@ fn metadata_v13_preserves_unknown_tagged_fields() {
 }
 
 #[test]
-fn nothing_is_implemented_and_unknown_keys_are_invalid() {
-    assert!(frame::implemented_api_keys().is_empty());
+fn known_unimplemented_keys_are_unsupported_version() {
+    assert!(frame::is_implemented(ApiKey::Produce, 9));
+    assert!(!frame::is_implemented(ApiKey::Produce, 2));
+    assert!(frame::reject_unimplemented(ApiKey::Produce as i16).is_ok());
     assert_eq!(
-        frame::reject_unimplemented(ApiKey::Produce as i16).unwrap_err(),
+        frame::reject_unimplemented(ApiKey::JoinGroup as i16).unwrap_err(),
         Unimplemented::UnsupportedVersion
     );
     assert_eq!(
-        frame::reject_unimplemented(ApiKey::ApiVersions as i16).unwrap_err().code(),
+        frame::reject_unimplemented(ApiKey::JoinGroup as i16).unwrap_err().code(),
         ResponseError::UnsupportedVersion.code()
     );
     assert_eq!(

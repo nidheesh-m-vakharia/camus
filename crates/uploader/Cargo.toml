@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "Uploader from the WAL or memory buffer to R2. Not started."
+description = "Bundle sealed record batches into one R2 object."
 
 [dependencies]
+bytes = "1"
+crc = "3"
+ulid = "1"

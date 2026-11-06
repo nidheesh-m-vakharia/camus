@@ -41,8 +41,12 @@ Until then the API returns an error rather than a partial imitation.
 
 Status values: `unimplemented`, `partial`, `implemented`.
 
-No Kafka API is implemented. The codec can round-trip messages, and the
-implemented-key set is empty. Unimplemented keys are absent from `ApiVersions`
+Phase 1 answers `ApiVersions`, `Metadata`, `Produce`, `Fetch`, `ListOffsets`,
+`CreateTopics`, `DeleteTopics`, `DescribeConfigs`, `SaslHandshake`, and
+`SaslAuthenticate`. `ApiVersions` advertises only those keys. Produce acks
+in `r2` mode after the object is stored and the extent is committed.
+`wal` topics are stored and then rejected on produce until Phase 2.
+Unimplemented keys are absent from `ApiVersions`
 once that API exists, and a client that sends them anyway receives
 `UNSUPPORTED_VERSION` (35) or `INVALID_REQUEST` (42) as in ADR 0003.
 
@@ -51,10 +55,10 @@ acceptance test. `-` means not run.
 
 | API | Key | Phase | Versions (intended) | Status | Java | librdkafka | franz-go |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Produce | 0 | 1 | TBD from 4.4.0 schema, subset | unimplemented | - | - | - |
-| Fetch | 1 | 1 | TBD | unimplemented | - | - | - |
-| ListOffsets | 2 | 1 | TBD | unimplemented | - | - | - |
-| Metadata | 3 | 1 | TBD | unimplemented | - | - | - |
+| Produce | 0 | 1 | 3-13 | implemented (`r2` only) | - | - | - |
+| Fetch | 1 | 1 | 4-18 | implemented | - | - | - |
+| ListOffsets | 2 | 1 | 1-11 | implemented | - | - | - |
+| Metadata | 3 | 1 | 0-13 | implemented | - | - | - |
 | OffsetCommit | 8 | 3 | TBD | unimplemented | - | - | - |
 | OffsetFetch | 9 | 3 | TBD | unimplemented | - | - | - |
 | FindCoordinator | 10 | 3 | TBD | unimplemented | - | - | - |
@@ -64,10 +68,10 @@ acceptance test. `-` means not run.
 | SyncGroup | 14 | 3 | TBD | unimplemented | - | - | - |
 | DescribeGroups | 15 | 3 | TBD | unimplemented | - | - | - |
 | ListGroups | 16 | 3 | TBD | unimplemented | - | - | - |
-| SaslHandshake | 17 | 1 | TBD | unimplemented | - | - | - |
-| ApiVersions | 18 | 1 | TBD | unimplemented | - | - | - |
-| CreateTopics | 19 | 1 | TBD | unimplemented | - | - | - |
-| DeleteTopics | 20 | 1 | TBD | unimplemented | - | - | - |
+| SaslHandshake | 17 | 1 | 0-1 | implemented (PLAIN) | - | - | - |
+| ApiVersions | 18 | 1 | 0-5 | implemented | - | - | - |
+| CreateTopics | 19 | 1 | 2-7 | implemented | - | - | - |
+| DeleteTopics | 20 | 1 | 1-6 | implemented | - | - | - |
 | DeleteRecords | 21 | 4 | TBD | unimplemented | - | - | - |
 | InitProducerId | 22 | 4 | TBD | unimplemented | - | - | - |
 | OffsetForLeaderEpoch | 23 | | not planned for phases 0–5 | unimplemented | - | - | - |
@@ -79,11 +83,11 @@ acceptance test. `-` means not run.
 | DescribeAcls | 29 | 5 | TBD | unimplemented | - | - | - |
 | CreateAcls | 30 | 5 | TBD | unimplemented | - | - | - |
 | DeleteAcls | 31 | 5 | TBD | unimplemented | - | - | - |
-| DescribeConfigs | 32 | 1 | TBD | unimplemented | - | - | - |
+| DescribeConfigs | 32 | 1 | 1-4 | implemented | - | - | - |
 | AlterConfigs | 33 | 4 | TBD | unimplemented | - | - | - |
 | AlterReplicaLogDirs | 34 | | not planned | unimplemented | - | - | - |
 | DescribeLogDirs | 35 | | not planned | unimplemented | - | - | - |
-| SaslAuthenticate | 36 | 1 | TBD | unimplemented | - | - | - |
+| SaslAuthenticate | 36 | 1 | 0-2 | implemented (PLAIN) | - | - | - |
 | CreatePartitions | 37 | 4 | TBD | unimplemented | - | - | - |
 | CreateDelegationToken | 38 | | not planned | unimplemented | - | - | - |
 | RenewDelegationToken | 39 | | not planned | unimplemented | - | - | - |

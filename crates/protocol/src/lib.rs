@@ -104,6 +104,7 @@
 // Display required features for items when rendering for docs.rs
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod batch;
 pub mod compression;
 pub mod error;
 pub mod frame;

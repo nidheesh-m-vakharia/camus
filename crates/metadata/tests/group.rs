@@ -38,7 +38,8 @@ async fn single_node_write_survives_restart() {
         .await
         .unwrap();
     node.initialize(voters(&[1])).await.unwrap();
-    node.write("topic", "events").await.unwrap();
+    let wrote = wait_until(|| async { node.write("topic", "events").await.is_ok() }).await;
+    assert!(wrote, "leader did not accept a write");
     assert_eq!(node.read_local("topic").unwrap().as_deref(), Some("events"));
     node.shutdown().await.unwrap();
     drop(node);

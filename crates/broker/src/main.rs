@@ -1,9 +1,12 @@
-//! Camus broker. Phase 0 serves the metadata Raft group and Prometheus.
-//! Kafka produce and fetch are not accepted here.
+//! Camus broker. The HTTP port is the metadata Raft group. `--kafka-addr`
+//! accepts the Kafka protocol in `r2` mode.
 
 #![forbid(unsafe_code)]
 
+mod kafka;
+
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,6 +15,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use camus_metadata::{BasicNode, MetadataNode, NodeId};
+use camus_storage::{Bucket, BucketConfig};
 use clap::Parser;
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use serde::Deserialize;
@@ -30,6 +34,19 @@ struct Args {
     /// Directory for the Raft log and the redb state machine.
     #[arg(long)]
     data_dir: PathBuf,
+    /// Kafka listener. Requires `--dev-plaintext` until the TLS listener is used.
+    #[arg(long)]
+    kafka_addr: Option<String>,
+    /// Allow a PLAINTEXT Kafka listener. Refused for a non-loopback bind unless
+    /// `--allow-non-loopback` is also set.
+    #[arg(long, default_value_t = false)]
+    dev_plaintext: bool,
+    /// Allow the PLAINTEXT listener to bind outside the loopback interface.
+    #[arg(long, default_value_t = false)]
+    allow_non_loopback: bool,
+    /// Require SASL/PLAIN before any API other than ApiVersions and the SASL pair.
+    #[arg(long, default_value_t = false)]
+    require_sasl: bool,
 }
 
 #[derive(Deserialize)]
@@ -68,7 +85,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/raft-vote", post(vote))
         .route("/raft-append", post(append))
         .route("/raft-snapshot", post(snapshot))
-        .with_state(node);
+        .with_state(Arc::clone(&node));
+
+    if let Some(kafka_addr) = &args.kafka_addr {
+        start_kafka(node.clone(), args.node_id, kafka_addr, &args).await?;
+    }
 
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
     let bound = listener.local_addr()?;
@@ -180,4 +201,49 @@ async fn snapshot(
     >,
 > {
     Json(node.raft.install_snapshot(req).await)
+}
+
+async fn start_kafka(
+    node: Arc<MetadataNode>,
+    node_id: NodeId,
+    kafka_addr: &str,
+    args: &Args,
+) -> anyhow::Result<()> {
+    if !args.dev_plaintext {
+        anyhow::bail!("Kafka listener requires --dev-plaintext");
+    }
+    let bind: SocketAddr = kafka_addr.parse()?;
+    if !bind.ip().is_loopback() && !args.allow_non_loopback {
+        anyhow::bail!("non-loopback PLAINTEXT requires --allow-non-loopback");
+    }
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let bound = listener.local_addr()?;
+    std::fs::write(args.data_dir.join("kafka-addr"), bound.to_string())?;
+    let host = if bind.ip().is_unspecified() {
+        "127.0.0.1".to_string()
+    } else {
+        bound.ip().to_string()
+    };
+    let bucket = Bucket::connect(&BucketConfig {
+        endpoint: std::env::var("CAMUS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),
+        bucket: std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into()),
+        region: "us-east-1".into(),
+        access_key: std::env::var("CAMUS_S3_ACCESS_KEY").unwrap_or_else(|_| "camus".into()),
+        secret_key: std::env::var("CAMUS_S3_SECRET_KEY")
+            .unwrap_or_else(|_| "camus-dev-secret".into()),
+    })?;
+    let kafka = Arc::new(kafka::Kafka::new(
+        node,
+        bucket,
+        i32::try_from(node_id)?,
+        host,
+        bound.port() as i32,
+        args.require_sasl,
+        std::env::var("CAMUS_SASL_USER").unwrap_or_default(),
+        std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default(),
+    ));
+    info!(%bound, "kafka listener");
+    tokio::spawn(async move { kafka.run(listener).await });
+    Ok(())
 }

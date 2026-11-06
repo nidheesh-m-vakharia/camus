@@ -4,9 +4,10 @@ A Kafka-compatible streaming broker written in Rust. Producers, consumers, and
 admin clients speak the Apache Kafka wire protocol. Long-term data lives in
 Cloudflare R2. There is no JVM, no ZooKeeper, and no external database.
 
-Status: **Phase 0 foundations are in the tree**. The broker process runs a
-metadata Raft group and serves Prometheus. It does not accept Kafka
-produce or fetch. The plan and ADRs are in `docs/`. License: Apache-2.0.
+Status: **Phase 1 `r2` produce and fetch are in the tree**. A PLAINTEXT
+listener accepts create, produce, and fetch. Acks wait until the batch is
+in object storage and the metadata group has committed the offset.
+`wal` mode is not on yet. The plan and ADRs are in `docs/`. License: Apache-2.0.
 
 ## What a client changes
 

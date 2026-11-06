@@ -7,8 +7,14 @@
 
 #![forbid(unsafe_code)]
 
+mod catalog;
 mod machine;
 mod network;
+
+pub use catalog::{
+    parse_partition, parse_topic, partition_storage_key, topic_index_key, topic_storage_key,
+    Extent, Partition, PublishPart, Topic,
+};
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -38,13 +44,54 @@ openraft::declare_raft_types!(
 pub enum Command {
     /// Insert or replace one key.
     Put { key: String, value: String },
+    /// Create a topic and its partitions at offset 0.
+    CreateTopic {
+        /// Topic name.
+        name: String,
+        /// Partition count, at least 1.
+        partitions: i32,
+        /// `r2` or `wal`.
+        durability: String,
+    },
+    /// Delete a topic by name.
+    DeleteTopic {
+        /// Topic name.
+        name: String,
+    },
+    /// Publish sealed extents. Each part must start at the partition's next offset.
+    Publish {
+        /// Slices in commit order.
+        parts: Vec<PublishPart>,
+    },
 }
 
 /// State-machine response for [`Command`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     /// Previous value, when the command replaced one.
+    #[serde(default)]
     pub value: Option<String>,
+    /// Kafka error code. `0` means the command was applied.
+    #[serde(default)]
+    pub error_code: i16,
+}
+
+impl Response {
+    /// A command that was applied.
+    pub fn ok(value: Option<String>) -> Self {
+        Self {
+            value,
+            error_code: 0,
+        }
+    }
+
+    /// A command that was rejected. The map is unchanged.
+    pub fn reject(error_code: i16) -> Self {
+        Self {
+            value: None,
+            error_code,
+        }
+    }
 }
 
 /// One broker's metadata Raft node.
@@ -119,6 +166,39 @@ impl MetadataNode {
                 value: value.into(),
             })
             .await?;
+        Ok(response.data)
+    }
+
+    /// Commit a topic create. `error_code` is a Kafka code when the name is taken or the config is invalid.
+    pub async fn create_topic(
+        &self,
+        name: impl Into<String>,
+        partitions: i32,
+        durability: impl Into<String>,
+    ) -> anyhow::Result<Response> {
+        let response = self
+            .raft
+            .client_write(Command::CreateTopic {
+                name: name.into(),
+                partitions,
+                durability: durability.into(),
+            })
+            .await?;
+        Ok(response.data)
+    }
+
+    /// Commit a topic delete.
+    pub async fn delete_topic(&self, name: impl Into<String>) -> anyhow::Result<Response> {
+        let response = self
+            .raft
+            .client_write(Command::DeleteTopic { name: name.into() })
+            .await?;
+        Ok(response.data)
+    }
+
+    /// Commit extent metadata. The object itself is already in the bucket.
+    pub async fn publish(&self, parts: Vec<PublishPart>) -> anyhow::Result<Response> {
+        let response = self.raft.client_write(Command::Publish { parts }).await?;
         Ok(response.data)
     }
 
