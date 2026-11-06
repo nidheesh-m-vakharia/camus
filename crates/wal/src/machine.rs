@@ -178,12 +178,22 @@ impl Machine {
         state.heads.iter().map(|head| head.len).sum()
     }
 
-    /// Every unsealed batch with its bytes, ordered by partition and offset.
-    pub async fn pending(&self) -> Result<Vec<Batch>, StorageError<NodeId>> {
+    /// The oldest unsealed batches in commit order, with their bytes, up to
+    /// `limit` bytes (at least one batch). Commit order keeps each
+    /// partition's batches in offset order and lets no partition starve.
+    pub async fn pending(&self, limit: u64) -> Result<Vec<Batch>, StorageError<NodeId>> {
         let mut heads = self.state.lock().expect("wal state").heads.clone();
-        heads.sort_by(|a, b| {
-            (&a.topic_id, a.partition, a.start).cmp(&(&b.topic_id, b.partition, b.start))
-        });
+        heads.sort_by_key(Head::key);
+        let mut size = 0u64;
+        let mut taken = 0;
+        for head in &heads {
+            if taken > 0 && size + head.len > limit {
+                break;
+            }
+            size += head.len;
+            taken += 1;
+        }
+        heads.truncate(taken);
         self.materialize(heads).await
     }
 

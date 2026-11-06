@@ -70,8 +70,28 @@ Followers peaked at 52–58 MiB in the heaviest runs.
   backlog into one object, with no cap. ADR 0006 says 8 MiB. During the run
   the backlog reached 60 MiB, and each pass allocates it more than once.
 
+## After the upload changes
+
+The uploader now takes at most 32 MiB per pass, in commit order, as up to
+four objects of at most 8 MiB put in parallel, then one publish and one
+seal. Same machine, 32 producers:
+
+| | Before | Single 8 MiB object | Parallel objects |
+| --- | ---: | ---: | ---: |
+| 1 broker, peak MiB | 652.0 | 277.0 | 320.0 |
+| 1 broker, upload backlog | up to ~60 MiB | 160 MiB and growing | 10–22 MiB, steady |
+| 1 broker, MiB/s | 42.2 | 35.4 | 35.0 |
+| 3-broker leader, peak MiB | 232.1 | 185.0 | 206.2 |
+| 3 brokers, MiB/s | 15.3 | 13.8 | 11.9 |
+
+The earlier throughput was higher only because uploads fell behind and the
+work was deferred. With uploads keeping pace, MinIO's writes share the one
+SSD with every WAL `fsync`, and the follower's AppendEntries went from 8.5
+to 9.9 ms. The new numbers are the sustained rate on this machine.
+
 ## Next
 
-- Enforce the 8 MiB upload cap, then rerun the memory numbers.
 - Try mimalloc or jemalloc, which return freed memory sooner.
-- Repeat on Linux with one disk per broker.
+- Repeat on Linux with one disk per broker and R2 instead of a local MinIO.
+- `fdatasync` with preallocated segments, measured on Linux; on macOS both
+  calls do a full device flush.

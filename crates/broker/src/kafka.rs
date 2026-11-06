@@ -55,6 +55,9 @@ use uuid::Uuid;
 const MAX_FRAME: usize = 100 * 1024 * 1024;
 const MAX_BATCH: usize = 1024 * 1024;
 const FLUSH_BYTES: usize = 8 * 1024 * 1024;
+/// Most unsealed bytes one upload pass takes: up to four objects of
+/// `FLUSH_BYTES`, put in parallel, then one publish and one seal for all.
+const UPLOAD_PASS_BYTES: usize = 4 * FLUSH_BYTES;
 const BUFFER_LIMIT: usize = 256 * 1024 * 1024;
 const WAL_DISK_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -327,18 +330,28 @@ impl Kafka {
         let upload = Arc::clone(&self);
         tokio::spawn(async move {
             let mut failures = 0u32;
+            let mut backlog = false;
             loop {
-                let delay = if failures == 0 {
-                    Duration::from_millis(upload.flush_ms)
-                } else {
+                // A pass that filled its object leaves more behind; start the
+                // next one at once so a backlog drains at R2's pace.
+                let delay = if failures > 0 {
                     retry_delay(failures)
+                } else if backlog {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(upload.flush_ms)
                 };
                 tokio::time::sleep(delay).await;
-                if upload.upload_wal().await {
-                    failures = 0;
-                } else {
-                    failures = failures.saturating_add(1);
-                    tracing::warn!(failures, "wal upload failed; retrying");
+                match upload.upload_wal().await {
+                    Upload::Failed => {
+                        failures = failures.saturating_add(1);
+                        backlog = false;
+                        tracing::warn!(failures, "wal upload failed; retrying");
+                    }
+                    pass => {
+                        failures = 0;
+                        backlog = pass == Upload::Full;
+                    }
                 }
             }
         });
@@ -983,25 +996,120 @@ impl Kafka {
         Ok(Some(rx))
     }
 
-    /// One upload pass. `false` when the put or the publish failed, so the
-    /// caller backs off.
-    async fn upload_wal(&self) -> bool {
+    /// Split `upload` (commit order) into objects of at most `FLUSH_BYTES`,
+    /// put them in parallel, and return the publish parts and seals for the
+    /// objects that were stored, in order, up to the first failure. That
+    /// prefix keeps every partition's ranges contiguous. The third value is
+    /// `false` when any put failed; a stored object past the failure is left
+    /// for the orphan sweep (ADR 0007).
+    async fn put_objects(
+        &self,
+        upload: Vec<camus_wal::Batch>,
+    ) -> (Vec<PublishPart>, Vec<SealDrop>, bool) {
+        let mut chunks: Vec<Vec<camus_wal::Batch>> = Vec::new();
+        let mut size = 0usize;
+        for batch in upload {
+            if chunks.is_empty() || size + batch.bytes.len() > FLUSH_BYTES {
+                chunks.push(Vec::new());
+                size = 0;
+            }
+            size += batch.bytes.len();
+            chunks.last_mut().expect("chunk").push(batch);
+        }
+        let mut puts = tokio::task::JoinSet::new();
+        for (slot, chunk) in chunks.into_iter().enumerate() {
+            let bucket = self.bucket.clone();
+            puts.spawn(async move {
+                let mut heads = Vec::with_capacity(chunk.len());
+                let mut pieces = Vec::with_capacity(chunk.len());
+                for batch in chunk {
+                    heads.push((
+                        batch.topic,
+                        batch.topic_id,
+                        batch.partition,
+                        batch.start,
+                        batch.end,
+                        batch.base_timestamp,
+                        batch.max_timestamp,
+                    ));
+                    pieces.push(Piece {
+                        topic_id: batch.topic_id,
+                        partition: batch.partition,
+                        start: batch.start,
+                        end: batch.end,
+                        base_timestamp: batch.base_timestamp,
+                        max_timestamp: batch.max_timestamp,
+                        bytes: Bytes::from(batch.bytes),
+                    });
+                }
+                let (index, body) = camus_uploader::encode(&pieces);
+                drop(pieces);
+                let key = camus_uploader::object_key();
+                let stored = bucket.put_new(&key, body).await.is_ok();
+                (slot, key, heads, index, stored)
+            });
+        }
+        let mut done = Vec::new();
+        while let Some(joined) = puts.join_next().await {
+            if let Ok(result) = joined {
+                done.push(result);
+            }
+        }
+        done.sort_by_key(|(slot, ..)| *slot);
+        let mut parts = Vec::new();
+        let mut seals = Vec::new();
+        let mut all_put = true;
+        for (expected, (slot, key, heads, index, stored)) in done.into_iter().enumerate() {
+            if !stored || slot != expected || !all_put {
+                all_put = false;
+                continue;
+            }
+            for ((topic, topic_id, partition, start, end, base, max), (file_offset, length)) in
+                heads.into_iter().zip(index)
+            {
+                parts.push(PublishPart {
+                    topic: topic.clone(),
+                    partition,
+                    start,
+                    end,
+                    object_key: key.clone(),
+                    file_offset,
+                    length,
+                    base_timestamp: base,
+                    max_timestamp: max,
+                });
+                seals.push(SealDrop {
+                    topic,
+                    topic_id,
+                    partition,
+                    start,
+                });
+            }
+        }
+        (parts, seals, all_put)
+    }
+
+    /// One upload pass: at most `upload.flush.bytes` (8 MiB, ADR 0006) of
+    /// the oldest unsealed batches go into one object.
+    async fn upload_wal(&self) -> Upload {
         // One shard for the whole pass, so a truncate mid-upload cannot seal
         // into the shard that replaced it.
         let wal = self.wal();
         if !wal.is_leader() {
-            return true;
+            return Upload::Done;
         }
-        let pending = match wal.pending().await {
+        let pending = match wal.pending(UPLOAD_PASS_BYTES as u64).await {
             Ok(pending) => pending,
             Err(err) => {
                 tracing::error!(%err, "reading unsealed wal batches");
-                return false;
+                return Upload::Failed;
             }
         };
         if pending.is_empty() {
-            return true;
+            return Upload::Done;
         }
+        let taken: usize = pending.iter().map(|batch| batch.bytes.len()).sum();
+        let full = taken >= UPLOAD_PASS_BYTES;
         let mut ok = true;
         let mut drops = Vec::new();
         let mut upload = Vec::new();
@@ -1045,42 +1153,11 @@ impl Kafka {
             upload.push(batch);
         }
         if !upload.is_empty() {
-            let pieces: Vec<Piece> = upload
-                .iter()
-                .map(|batch| Piece {
-                    topic_id: batch.topic_id,
-                    partition: batch.partition,
-                    start: batch.start,
-                    end: batch.end,
-                    base_timestamp: batch.base_timestamp,
-                    max_timestamp: batch.max_timestamp,
-                    bytes: Bytes::from(batch.bytes.clone()),
-                })
-                .collect();
-            let (index, body) = camus_uploader::encode(&pieces);
-            let key = camus_uploader::object_key();
-            let put = self.bucket.put_new(&key, body).await;
-            if put.is_err() {
+            let (parts, seals, all_put) = self.put_objects(upload).await;
+            if !all_put {
                 ok = false;
             }
-            if put.is_ok() {
-                let parts = upload
-                    .iter()
-                    .zip(&index)
-                    .map(
-                        |(batch, (file_offset, length))| camus_metadata::PublishPart {
-                            topic: batch.topic.clone(),
-                            partition: batch.partition,
-                            start: batch.start,
-                            end: batch.end,
-                            object_key: key.clone(),
-                            file_offset: *file_offset,
-                            length: *length,
-                            base_timestamp: batch.base_timestamp,
-                            max_timestamp: batch.max_timestamp,
-                        },
-                    )
-                    .collect();
+            if !parts.is_empty() {
                 let published = self.meta_publish(parts).await;
                 let accepted = published.is_ok_and(|response| response.error_code == 0);
                 if !accepted {
@@ -1094,22 +1171,24 @@ impl Kafka {
                     std::process::abort();
                 }
                 if accepted {
-                    drops.extend(upload.into_iter().map(|batch| SealDrop {
-                        topic: batch.topic,
-                        topic_id: batch.topic_id,
-                        partition: batch.partition,
-                        start: batch.start,
-                    }));
+                    drops.extend(seals);
                 }
             }
         }
+        let done = if !ok {
+            Upload::Failed
+        } else if full {
+            Upload::Full
+        } else {
+            Upload::Done
+        };
         if drops.is_empty() {
-            return ok;
+            return done;
         }
         if let Ok(index) = wal.seal(drops).await {
             let _ = wal.purge(index).await;
         }
-        ok
+        done
     }
 
     /// Buffer one `r2` batch. Returns how long it waited for buffer space.
@@ -1502,6 +1581,17 @@ impl Kafka {
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
+}
+
+/// How an upload pass ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Upload {
+    /// Nothing left, or everything taken fit in one object.
+    Done,
+    /// The object reached the size cap; more is waiting.
+    Full,
+    /// The put or the publish failed; back off.
+    Failed,
 }
 
 /// Exponential backoff from 100ms to 5s, with up to half again as jitter so

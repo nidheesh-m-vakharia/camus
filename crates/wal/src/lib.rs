@@ -487,9 +487,9 @@ impl Shard {
 
     /// Purge the shard log through `index`, inclusive.
     pub async fn purge(&self, index: u64) -> anyhow::Result<()> {
-        // Apply commits do not fsync; the log is what recovers them. Make
-        // the state durable before the log under it goes away.
-        self.machine.flush()?;
+        // openraft purges only entries a snapshot covers, and building a
+        // snapshot makes the applied state durable first, so no flush here.
+        // One here cost an fsync per upload pass.
         self.raft.trigger().purge_log(index).await?;
         Ok(())
     }
@@ -514,9 +514,10 @@ impl Shard {
         self.machine.unsealed_bytes()
     }
 
-    /// Committed batches not yet sealed, with their bytes read from the log.
-    pub async fn pending(&self) -> anyhow::Result<Vec<Batch>> {
-        Ok(self.machine.pending().await?)
+    /// The oldest committed batches not yet sealed, up to about `limit`
+    /// bytes, with their bytes read from the log.
+    pub async fn pending(&self, limit: u64) -> anyhow::Result<Vec<Batch>> {
+        Ok(self.machine.pending(limit).await?)
     }
 
     /// Unsealed batches of one partition from `offset`, up to about `limit`
@@ -814,7 +815,7 @@ mod tests {
                 .len(),
             3
         );
-        let pending = shard.pending().await.unwrap();
+        let pending = shard.pending(u64::MAX).await.unwrap();
         assert_eq!(
             pending.iter().map(|batch| batch.start).collect::<Vec<_>>(),
             [0, 1, 2]
@@ -922,5 +923,21 @@ mod tests {
             lead.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap(),
             "the follower serves the same bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_takes_the_oldest_batches_up_to_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = Shard::open(1, dir.path()).await.unwrap();
+        shard.ensure_voter().await.unwrap();
+        for value in [b"a", b"b", b"c", b"d"] {
+            shard.append(append_of(value)).await.unwrap();
+        }
+        let one = shard.pending(u64::MAX).await.unwrap()[0].bytes.len() as u64;
+        let starts = |batches: Vec<Batch>| batches.iter().map(|b| b.start).collect::<Vec<_>>();
+        assert_eq!(starts(shard.pending(0).await.unwrap()), [0], "at least one");
+        assert_eq!(starts(shard.pending(2 * one).await.unwrap()), [0, 1]);
+        assert_eq!(starts(shard.pending(2 * one + 1).await.unwrap()), [0, 1]);
+        assert_eq!(starts(shard.pending(u64::MAX).await.unwrap()), [0, 1, 2, 3]);
     }
 }

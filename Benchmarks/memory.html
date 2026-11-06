@@ -26,6 +26,12 @@ td,th{padding:4px 10px;border-bottom:1px solid var(--grid);text-align:right}td:f
 <p>Only 71 MiB is live heap. The rest is memory already freed that macOS malloc keeps resident for reuse (from vmmap and heap on the process).</p>
 <div class="chart"><svg id="split" viewBox="0 0 880 90" width="100%" role="img" aria-label="Breakdown of 546 MiB resident memory"></svg></div></section>
 
+<section><h2>After capping uploads, 32 producers</h2>
+<p>Uploads now take 32 MiB per pass as up to four 8 MiB objects put in parallel. The backlog stays at 10–22 MiB instead of growing.</p>
+<div class="chart"><table><tr><th>Run</th><th>Broker</th><th>Peak before</th><th>Peak now</th><th>MiB/s before</th><th>MiB/s now</th></tr>
+<tr><td>1 broker</td><td>1</td><td>652.0</td><td>320.0</td><td>42.2</td><td>35.0</td></tr>
+<tr><td>3 brokers</td><td>1 (leader)</td><td>232.1</td><td>206.2</td><td>15.3</td><td>11.9</td></tr></table></div></section>
+
 <section><h2>Every broker, MiB</h2><div class="chart"><table id="tbl"></table></div></section>
 </main>
 <script>
