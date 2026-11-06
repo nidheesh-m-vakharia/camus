@@ -1,0 +1,53 @@
+<title>Camus Broker Memory</title>
+<style>
+:root{--bg:#f7f8fa;--ink:#14171c;--ink2:#4d5560;--grid:#dfe3e8;--idle:#2a78d6;--peak:#eb6834;--after:#1baf7a;--card:#ffffff}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#16191d;--ink:#f2f4f6;--ink2:#a9b1bb;--grid:#2c3238;--idle:#3987e5;--peak:#d95926;--after:#199e70;--card:#1d2126}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#16191d;--ink:#f2f4f6;--ink2:#a9b1bb;--grid:#2c3238;--idle:#3987e5;--peak:#d95926;--after:#199e70;--card:#1d2126}
+body{background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,system-ui,sans-serif;padding-inline:16px;padding-block:24px}
+main{max-width:920px;margin:0 auto;display:grid;gap:28px}
+h1{font-size:26px;font-weight:600;margin:0}h2{font-size:17px;font-weight:600;margin:0 0 4px}
+p{margin:0;color:var(--ink2);max-width:68ch}
+.chart{background:var(--card);border-radius:8px;padding:16px;overflow-x:auto}
+svg text{fill:var(--ink2);font-size:12px;font-variant-numeric:tabular-nums}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--ink2);margin-bottom:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+table{border-collapse:collapse;font-variant-numeric:tabular-nums;font-size:13px;width:100%}
+td,th{padding:4px 10px;border-bottom:1px solid var(--grid);text-align:right}td:first-child,th:first-child,td:nth-child(2),th:nth-child(2){text-align:left}
+</style>
+<main>
+<div><h1>Camus broker memory</h1>
+<p>Resident memory (RSS) per broker. Idle = cluster formed, topic created, nothing produced. Peak = highest 20ms sample during load. After = 3s after load stopped. Apple M4 Pro, macOS 26.6, release build, commit 97cd9f3.</p></div>
+
+<section><h2>Memory per run, MiB (the broker serving produce)</h2>
+<div class="legend"><span><i style="background:var(--idle)"></i>Idle</span><span><i style="background:var(--peak)"></i>Peak</span><span><i style="background:var(--after)"></i>After load</span></div>
+<div class="chart"><svg id="mem" viewBox="0 0 880 470" width="100%" role="img" aria-label="Idle, peak and after-load memory per benchmark run"></svg></div></section>
+
+<section><h2>What the 546 MiB after a 1-broker, 32-producer run is</h2>
+<p>Only 71 MiB is live heap. The rest is memory already freed that macOS malloc keeps resident for reuse (from vmmap and heap on the process).</p>
+<div class="chart"><svg id="split" viewBox="0 0 880 90" width="100%" role="img" aria-label="Breakdown of 546 MiB resident memory"></svg></div></section>
+
+<section><h2>Every broker, MiB</h2><div class="chart"><table id="tbl"></table></div></section>
+</main>
+<script>
+const runs=[
+["latency wal (3)",20.5,30.8,30.9],["latency r2 (3)",20.5,22.6,22.6],
+["3 brokers, 1 prod",20.6,29.9,27.5],["3 brokers, 8 prod",21.4,47.0,47.1],["3 brokers, 32 prod",20.7,232.1,159.5],
+["1 broker, 1 prod",19.4,34.5,34.5],["1 broker, 8 prod",19.4,202.4,174.2],["1 broker, 32 prod",20.2,652.0,144.4]];
+const all=[
+["latency wal","1 (leader)",20.5,30.8,30.9],["latency wal","2",19.1,57.0,57.2],["latency wal","3",19.1,57.9,58.3],
+["latency r2","1 (leader)",20.5,22.6,22.6],["latency r2","2",20.1,20.7,20.7],["latency r2","3",19.0,19.5,19.5],
+["3b · 1 prod","1 (leader)",20.6,29.9,27.5],["3b · 1 prod","2",19.1,33.4,29.4],["3b · 1 prod","3",19.1,33.9,29.9],
+["3b · 8 prod","1 (leader)",21.4,47.0,47.1],["3b · 8 prod","2",19.0,36.4,36.4],["3b · 8 prod","3",19.8,37.0,37.0],
+["3b · 32 prod","1 (leader)",20.7,232.1,159.5],["3b · 32 prod","2",19.9,53.6,52.6],["3b · 32 prod","3",19.8,51.9,51.1],
+["1b · 1 prod","1",19.4,34.5,34.5],["1b · 8 prod","1",19.4,202.4,174.2],["1b · 32 prod","1",20.2,652.0,144.4]];
+const NS="http://www.w3.org/2000/svg",el=(t,a,p)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);p.appendChild(e);return e};
+const svg=document.getElementById("mem"),L=150,R=860,max=700,x=v=>L+(R-L)*v/max,rowH=52,y0=10;
+for(let v=0;v<=max;v+=100){el("line",{x1:x(v),x2:x(v),y1:y0,y2:y0+rowH*runs.length,stroke:"var(--grid)"},svg);el("text",{x:x(v),y:y0+rowH*runs.length+16,"text-anchor":"middle"},svg).textContent=v}
+const cols=["var(--idle)","var(--peak)","var(--after)"],names=["Idle","Peak","After"];
+runs.forEach((r,i)=>{const y=y0+i*rowH+6;el("text",{x:L-10,y:y+22,"text-anchor":"end"},svg).textContent=r[0];
+[1,2,3].forEach((k,j)=>{const b=el("rect",{x:L,y:y+j*13,width:Math.max(2,x(r[k])-L),height:11,rx:3,fill:cols[j]},svg);el("title",{},b).textContent=`${r[0]} · ${names[j]}: ${r[k]} MiB`});
+el("text",{x:x(r[2])+6,y:y+23},svg).textContent=r[2]+" peak"});
+const s=document.getElementById("split"),parts=[["Live heap",71,"var(--idle)"],["Freed large blocks kept",322,"var(--peak)"],["Freed small blocks kept",97,"var(--after)"],["Other",56,"var(--grid)"]];let cx=10;const sc=860/546;
+parts.forEach(p=>{const w=p[1]*sc;const r=el("rect",{x:cx,y:10,width:w-2,height:34,rx:3,fill:p[2]},s);el("title",{},r).textContent=`${p[0]}: ${p[1]} MiB`;el("text",{x:cx,y:64},s).textContent=`${p[0]} ${p[1]}`;cx+=w});
+document.getElementById("tbl").innerHTML="<tr><th>Run</th><th>Broker</th><th>Idle</th><th>Peak</th><th>After</th></tr>"+all.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td>${r[3]}</td><td>${r[4]}</td></tr>`).join("");
+</script>

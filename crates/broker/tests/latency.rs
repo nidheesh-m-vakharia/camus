@@ -46,7 +46,12 @@ fn produce_on(stream: &mut TcpStream, value: &str) -> i16 {
     recv::<ProduceResponse>(stream, 9).responses[0].partition_responses[0].error_code
 }
 
-fn run(mode: &'static str, warmup: usize, samples: usize, opts: Opts) -> Vec<Duration> {
+fn run(
+    mode: &'static str,
+    warmup: usize,
+    samples: usize,
+    opts: Opts,
+) -> (Vec<Duration>, Memory, i32) {
     let root = tempfile::tempdir().unwrap();
     let brokers = count("CAMUS_BENCH_BROKERS", 3) as i32;
     let nodes: Vec<Node> = (1..=brokers)
@@ -56,7 +61,11 @@ fn run(mode: &'static str, warmup: usize, samples: usize, opts: Opts) -> Vec<Dur
     let meta_leader = wait_settled(&nodes.iter().collect::<Vec<_>>());
     let controller = nodes.iter().find(|node| node.id == meta_leader).unwrap();
     create_topic(&kafka_addr(controller), mode);
-    let (_, leader) = partition_leader(&kafka_addr(&nodes[0]), None);
+    let (leader_id, leader) = partition_leader(&kafka_addr(&nodes[0]), None);
+    let pids: Vec<u32> = nodes.iter().map(|node| node.child.id()).collect();
+    // Empty: the cluster and topic exist, nothing has been produced.
+    let idle = steady_rss(&pids, Duration::from_secs(3));
+    let sampler = MemorySampler::start(pids.clone());
     let mut stream = connect(&leader);
     stream.set_nodelay(true).unwrap();
     let value = "x".repeat(1024);
@@ -69,8 +78,17 @@ fn run(mode: &'static str, warmup: usize, samples: usize, opts: Opts) -> Vec<Dur
         assert_eq!(produce_on(&mut stream, &value), 0);
         out.push(started.elapsed());
     }
+    let peak = sampler.finish();
+    std::thread::sleep(Duration::from_secs(3));
+    let after = steady_rss(&pids, Duration::from_secs(2));
     out.sort();
-    out
+    let memory = Memory {
+        ids: nodes.iter().map(|node| node.id).collect(),
+        idle,
+        peak,
+        after,
+    };
+    (out, memory, leader_id)
 }
 
 fn pct(sorted: &[Duration], p: f64) -> f64 {
@@ -101,7 +119,7 @@ fn wal_versus_r2_produce_latency() {
     );
     println!("| Mode | Samples | p50 ms | p99 ms | max ms |");
     println!("| --- | --- | --- | --- | --- |");
-    for (mode, sorted) in [("wal", &wal), ("r2", &r2)] {
+    for (mode, (sorted, _, _)) in [("wal", &wal), ("r2", &r2)] {
         println!(
             "| `{mode}` | {} | {:.2} | {:.2} | {:.2} |",
             sorted.len(),
@@ -109,5 +127,13 @@ fn wal_versus_r2_produce_latency() {
             pct(sorted, 0.99),
             sorted.last().unwrap().as_secs_f64() * 1000.0,
         );
+    }
+    println!();
+    println!("| Run | Broker | Idle MiB | Peak MiB | After MiB |");
+    println!("| --- | --- | ---: | ---: | ---: |");
+    for (mode, (_, memory, leader)) in [("wal", &wal), ("r2", &r2)] {
+        for row in memory.rows(&format!("latency `{mode}`"), Some(*leader)) {
+            println!("{row}");
+        }
     }
 }

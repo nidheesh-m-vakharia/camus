@@ -32,6 +32,95 @@ use camus_protocol::records::{
 
 pub const TOPIC: &str = "orders";
 
+/// Resident set size of a process in KiB, from `ps`. `None` once it exits.
+pub fn rss_kib(pid: u32) -> Option<u64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Polls broker RSS on a thread and keeps each process's highest reading.
+/// Sampling every 20ms can miss a spike shorter than that.
+pub struct MemorySampler {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<Vec<u64>>>,
+}
+
+impl MemorySampler {
+    pub fn start(pids: Vec<u32>) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut peak = vec![0u64; pids.len()];
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                for (slot, pid) in peak.iter_mut().zip(&pids) {
+                    if let Some(kib) = rss_kib(*pid) {
+                        *slot = (*slot).max(kib);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            peak
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stop and return each process's peak RSS in KiB, in `start` order.
+    pub fn finish(mut self) -> Vec<u64> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+/// Mean RSS in KiB of each process over `window`, sampled every 100ms.
+pub fn steady_rss(pids: &[u32], window: Duration) -> Vec<u64> {
+    let mut sums = vec![0u64; pids.len()];
+    let mut samples = 0u64;
+    let until = Instant::now() + window;
+    while Instant::now() < until {
+        for (sum, pid) in sums.iter_mut().zip(pids) {
+            *sum += rss_kib(*pid).unwrap_or(0);
+        }
+        samples += 1;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    sums.into_iter().map(|sum| sum / samples.max(1)).collect()
+}
+
+/// Idle, peak, and after-load RSS per broker, in KiB.
+#[derive(Debug, Clone)]
+pub struct Memory {
+    pub ids: Vec<i32>,
+    pub idle: Vec<u64>,
+    pub peak: Vec<u64>,
+    pub after: Vec<u64>,
+}
+
+impl Memory {
+    /// One markdown row per broker: `| label | id | idle | peak | after |` in MiB.
+    pub fn rows(&self, label: &str, leader: Option<i32>) -> Vec<String> {
+        let mib = |kib: u64| kib as f64 / 1024.0;
+        self.ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let role = if Some(*id) == leader { " (leader)" } else { "" };
+                format!(
+                    "| {label} | {id}{role} | {:.1} | {:.1} | {:.1} |",
+                    mib(self.idle[index]),
+                    mib(self.peak[index]),
+                    mib(self.after[index]),
+                )
+            })
+            .collect()
+    }
+}
+
 /// What the [`Proxy`] does to object-storage traffic.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Fault {

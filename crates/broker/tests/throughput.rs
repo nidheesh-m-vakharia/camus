@@ -96,6 +96,8 @@ struct Row {
     p99: f64,
     fsyncs_per_ack: f64,
     log_bytes_per_payload_byte: f64,
+    memory: Memory,
+    leader: i32,
 }
 
 fn run(producers: usize, seconds: u64) -> Row {
@@ -131,6 +133,10 @@ fn run(producers: usize, seconds: u64) -> Row {
         .http
         .clone();
     let batch = records_batch();
+    let pids: Vec<u32> = nodes.iter().map(|node| node.child.id()).collect();
+    // Empty: the cluster and topic exist, nothing has been produced.
+    let idle = steady_rss(&pids, Duration::from_secs(3));
+    let sampler = MemorySampler::start(pids.clone());
 
     // Warm up every connection, then measure.
     let mut streams: Vec<TcpStream> = (0..producers)
@@ -190,6 +196,9 @@ fn run(producers: usize, seconds: u64) -> Row {
         );
     }
     let log_bytes = counter(&leader_http, "wal_log_bytes") - bytes_before;
+    let peak = sampler.finish();
+    std::thread::sleep(Duration::from_secs(3));
+    let after = steady_rss(&pids, Duration::from_secs(2));
     latencies.sort();
     let acks = latencies.len();
     let payload = (acks * RECORDS * RECORD_BYTES) as f64;
@@ -202,6 +211,13 @@ fn run(producers: usize, seconds: u64) -> Row {
         p99: pct(0.99),
         fsyncs_per_ack: fsyncs as f64 / acks as f64,
         log_bytes_per_payload_byte: log_bytes as f64 / payload,
+        memory: Memory {
+            ids: nodes.iter().map(|node| node.id).collect(),
+            idle,
+            peak,
+            after,
+        },
+        leader,
     }
 }
 
@@ -226,6 +242,7 @@ fn wal_produce_throughput() {
         "| Producers | Acks | MiB/s | p50 ms | p99 ms | fsyncs/ack | log bytes/payload byte |"
     );
     println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let mut memory = Vec::new();
     for count in producers {
         let row = run(count, seconds);
         println!(
@@ -238,5 +255,15 @@ fn wal_produce_throughput() {
             row.fsyncs_per_ack,
             row.log_bytes_per_payload_byte,
         );
+        memory.extend(
+            row.memory
+                .rows(&format!("{} producers", row.producers), Some(row.leader)),
+        );
+    }
+    println!();
+    println!("| Run | Broker | Idle MiB | Peak MiB | After MiB |");
+    println!("| --- | --- | ---: | ---: | ---: |");
+    for line in memory {
+        println!("{line}");
     }
 }
