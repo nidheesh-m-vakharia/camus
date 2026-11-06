@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// A topic row.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,19 +115,25 @@ fn names(raw: Option<String>) -> Result<Vec<String>, String> {
 }
 
 /// Create a topic. `partitions` must be at least 1. `durability` is `r2` or `wal`.
+/// `id` is chosen by the proposer and carried in the command, so every
+/// replica stores the same one.
 pub fn create_topic(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     name: &str,
+    id: &str,
     partitions: i32,
     durability: &str,
 ) -> Result<Outcome, String> {
+    if id.is_empty() {
+        return Ok(Outcome::Reject(42));
+    }
     if name.is_empty() || partitions < 1 || (durability != "r2" && durability != "wal") {
         return Ok(Outcome::Reject(40));
     }
     if get(&topic_key(name))?.is_some() {
         return Ok(Outcome::Reject(36));
     }
-    let id = Uuid::new_v4().to_string();
+    let id = id.to_string();
     let topic = Topic {
         name: name.to_string(),
         id: id.clone(),
@@ -281,7 +286,9 @@ mod tests {
         let mut map = HashMap::new();
         let put = {
             let get = |key: &str| Ok(map.get(key).cloned());
-            let Outcome::Change { put, .. } = create_topic(&get, "events", 1, "r2").unwrap() else {
+            let Outcome::Change { put, .. } =
+                create_topic(&get, "events", &uuid::Uuid::new_v4().to_string(), 1, "r2").unwrap()
+            else {
                 panic!("create");
             };
             put

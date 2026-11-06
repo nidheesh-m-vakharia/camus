@@ -91,3 +91,46 @@ async fn two_groups_do_not_share_writes() {
         .any(|(_, _, node)| node.read_local("only-alpha").unwrap().is_some());
     assert!(!beta_has_it);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_replica_stores_the_same_topic_id() {
+    let root = tempfile::tempdir().unwrap();
+    let router = Arc::new(SharedRouter::default());
+    let mut nodes = Vec::new();
+    for id in [1, 2, 3] {
+        let dir = root.path().join(format!("n{id}"));
+        let node = MetadataNode::open_in_process(id, &dir, "meta", router.clone())
+            .await
+            .unwrap();
+        node.register_in_process("meta", id, &router);
+        nodes.push(node);
+    }
+    nodes[0].initialize(voters(&[1, 2, 3])).await.unwrap();
+    let created = wait_until(|| async {
+        for node in &nodes {
+            if node.create_topic("events", 1, "wal").await.is_ok() {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(created, "no leader took the create");
+    let key = camus_metadata::topic_storage_key("events");
+    let all_applied = wait_until(|| async {
+        nodes
+            .iter()
+            .all(|node| node.read_local(&key).unwrap().is_some())
+    })
+    .await;
+    assert!(all_applied);
+    let ids: std::collections::BTreeSet<String> = nodes
+        .iter()
+        .map(|node| {
+            camus_metadata::parse_topic(&node.read_local(&key).unwrap().unwrap())
+                .unwrap()
+                .id
+        })
+        .collect();
+    assert_eq!(ids.len(), 1, "replicas disagree on the topic id: {ids:?}");
+}
