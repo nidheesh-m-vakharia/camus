@@ -225,6 +225,10 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "wal_log_fsyncs": wal.log_stats().0,
         "wal_log_entries": wal.log_stats().1,
         "wal_log_bytes": wal.log_stats().2,
+        "wal_rpc_sent_count": camus_wal::RPC_TIMES.sent_count.load(std::sync::atomic::Ordering::Relaxed),
+        "wal_rpc_sent_us": camus_wal::RPC_TIMES.sent_us.load(std::sync::atomic::Ordering::Relaxed),
+        "wal_rpc_handled_count": camus_wal::RPC_TIMES.handled_count.load(std::sync::atomic::Ordering::Relaxed),
+        "wal_rpc_handled_us": camus_wal::RPC_TIMES.handled_us.load(std::sync::atomic::Ordering::Relaxed),
         "wal_storage_failed": wal.storage_failed(),
     }))
 }
@@ -466,7 +470,13 @@ async fn wal_append(
         Ok(req) => req,
         Err(reply) => return reply,
     };
-    rpc_reply(&wal.get().raft.append_entries(req).await)
+    let carries = !req.entries.is_empty();
+    let started = std::time::Instant::now();
+    let result = wal.get().raft.append_entries(req).await;
+    if carries {
+        camus_wal::RPC_TIMES.handled(started.elapsed());
+    }
+    rpc_reply(&result)
 }
 
 async fn wal_snapshot(

@@ -169,13 +169,20 @@ the follower's `fsync` behind an HTTP round trip, and on this laptop all
 three brokers share one SSD. Next, in order of expected gain:
 
 6. **Overlap the leader's and follower's `fsync`.** Needs openraft to send
-   entries before the local flush finishes, which 0.9 does not; check
-   openraft 0.10's IO pipeline before writing our own.
-7. **A persistent binary stream** for shard Raft instead of one HTTP
-   request per message.
-8. **Tail fetches from the log file** instead of decoding entries.
+   entries before the local flush finishes, which 0.9 does not. openraft
+   0.10 is still `0.10.0-alpha.37` (2026-10-10), so this waits for a 0.10
+   release rather than putting an alpha under both Raft groups.
+7. **A persistent binary stream** for shard Raft. Measured first and set
+   aside: the leader sees an AppendEntries take 6.42 ms (1 producer) and
+   8.97 ms (32), of which the follower spends 6.06 and 8.51 ms in its own
+   `append_entries`, which is its `fsync`. HTTP adds under 0.5 ms. The
+   counters stay (`wal_rpc_*` in `/admin/metrics`, printed by
+   `throughput.rs`); revisit if that difference grows.
+8. **Tail fetches from the log file** instead of decoding entries. Not
+   measured yet; needs a consumer side to `throughput.rs`.
 9. **Measure on separate disks.** One broker per machine in one region, to
-   see what the laptop's shared SSD hides.
+   see what the laptop's shared SSD hides. This is now the measurement
+   that decides what to do next for produce.
 
 Steps 3 and 4 changed the WAL's on-disk format. Before launch that means a
 fresh data directory, not a migration.

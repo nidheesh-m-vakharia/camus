@@ -25,6 +25,37 @@ use openraft::error::{ClientWriteError, Fatal, RaftError};
 pub use openraft::BasicNode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Time spent on AppendEntries RPCs that carry entries, in this process.
+/// `sent` is measured by the leader around the whole request; `handled` by a
+/// follower around its own `append_entries`. The difference is transport.
+pub static RPC_TIMES: RpcTimes = RpcTimes::new();
+
+/// Counters behind [`RPC_TIMES`].
+pub struct RpcTimes {
+    pub sent_count: std::sync::atomic::AtomicU64,
+    pub sent_us: std::sync::atomic::AtomicU64,
+    pub handled_count: std::sync::atomic::AtomicU64,
+    pub handled_us: std::sync::atomic::AtomicU64,
+}
+
+impl RpcTimes {
+    const fn new() -> Self {
+        Self {
+            sent_count: std::sync::atomic::AtomicU64::new(0),
+            sent_us: std::sync::atomic::AtomicU64::new(0),
+            handled_count: std::sync::atomic::AtomicU64::new(0),
+            handled_us: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Record a follower's handling time for a request with entries.
+    pub fn handled(&self, elapsed: Duration) {
+        self.handled_count.fetch_add(1, Ordering::Relaxed);
+        self.handled_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Voter id. Same numbering as the metadata group.
 pub type NodeId = u64;
 

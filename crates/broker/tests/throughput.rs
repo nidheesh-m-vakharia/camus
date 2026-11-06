@@ -170,6 +170,25 @@ fn run(producers: usize, seconds: u64) -> Row {
         .collect();
     let elapsed = started.elapsed().as_secs_f64();
     let fsyncs = counter(&leader_http, "wal_log_fsyncs") - fsyncs_before;
+    let sent = counter(&leader_http, "wal_rpc_sent_us") as f64
+        / counter(&leader_http, "wal_rpc_sent_count").max(1) as f64;
+    let followers: Vec<&Node> = nodes.iter().filter(|node| node.id != leader).collect();
+    let handled = followers
+        .iter()
+        .map(|node| counter(&node.http, "wal_rpc_handled_us"))
+        .sum::<u64>() as f64
+        / followers
+            .iter()
+            .map(|node| counter(&node.http, "wal_rpc_handled_count"))
+            .sum::<u64>()
+            .max(1) as f64;
+    if !followers.is_empty() {
+        eprintln!(
+            "producers={producers}: append RPC {:.2} ms on the leader, {:.2} ms handling on a follower",
+            sent / 1000.0,
+            handled / 1000.0
+        );
+    }
     let log_bytes = counter(&leader_http, "wal_log_bytes") - bytes_before;
     latencies.sort();
     let acks = latencies.len();

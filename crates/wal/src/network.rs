@@ -135,7 +135,17 @@ impl RaftNetwork<TypeConfig> for HttpConn {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RpcError> {
-        self.send("raft-append", rpc, option).await
+        let carries = !rpc.entries.is_empty();
+        let started = std::time::Instant::now();
+        let result = self.send("raft-append", rpc, option).await;
+        if carries {
+            use std::sync::atomic::Ordering::Relaxed;
+            crate::RPC_TIMES.sent_count.fetch_add(1, Relaxed);
+            crate::RPC_TIMES
+                .sent_us
+                .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        }
+        result
     }
 
     async fn install_snapshot(
