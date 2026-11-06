@@ -1,8 +1,10 @@
-//! Kafka TCP listener for `r2` durability.
+//! Kafka TCP listener.
 //!
-//! Produce buffers batches in memory. A flush writes one object, then commits
-//! the extent in the metadata group. The produce response is sent only after
-//! that commit. `acks=0` does not wait and gets no response.
+//! `r2` produce buffers batches in memory. A flush writes one object, then
+//! commits the extent in the metadata group. The produce response is sent
+//! only after that commit. `wal` produce waits for the shard Raft commit,
+//! which fsyncs, and the upload to object storage happens after the ack.
+//! `acks=0` does not wait and gets no response.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -40,6 +42,7 @@ use camus_protocol::messages::{
 use camus_protocol::protocol::{decode_request_header_from_buffer, Decodable, StrBytes};
 use camus_storage::Bucket;
 use camus_uploader::{self, Piece};
+use camus_wal::{Append, SealDrop, Shard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
@@ -114,6 +117,7 @@ pub struct Kafka {
     sasl_user: String,
     sasl_pass: String,
     tls: Option<TlsAcceptor>,
+    wal: Arc<Shard>,
     buf: Mutex<Vec<Item>>,
     flush_lock: Mutex<()>,
 }
@@ -130,6 +134,7 @@ impl Kafka {
         sasl_user: String,
         sasl_pass: String,
         tls: Option<TlsAcceptor>,
+        wal: Arc<Shard>,
     ) -> Self {
         let flush_ms = std::env::var("CAMUS_FLUSH_MS")
             .ok()
@@ -146,6 +151,7 @@ impl Kafka {
             sasl_user,
             sasl_pass,
             tls,
+            wal,
             buf: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
         }
@@ -178,6 +184,13 @@ impl Kafka {
             loop {
                 tokio::time::sleep(Duration::from_millis(flush.flush_ms)).await;
                 flush.flush().await;
+            }
+        });
+        let upload = Arc::clone(&self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(upload.flush_ms)).await;
+                upload.upload_wal().await;
             }
         });
         let register = Arc::clone(&self);
@@ -665,6 +678,9 @@ impl Kafka {
         let Some(topic) = topic else {
             return Err(UNKNOWN_TOPIC);
         };
+        if topic.durability == "wal" {
+            return self.write_wal(name, topic, records, partition, acks).await;
+        }
         if topic.durability != "r2" {
             return Err(INVALID_CONFIG);
         }
@@ -698,6 +714,147 @@ impl Kafka {
             Ok(None)
         } else {
             Ok(Some(rx))
+        }
+    }
+
+    async fn write_wal(
+        &self,
+        name: &str,
+        topic: &Topic,
+        records: &Option<Bytes>,
+        partition: i32,
+        acks: i16,
+    ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
+        if !self.wal.is_leader() {
+            return Err(NOT_LEADER);
+        }
+        if partition < 0 || partition >= topic.partitions {
+            return Err(UNKNOWN_TOPIC);
+        }
+        let Some(raw) = records else {
+            return Ok(None);
+        };
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let info = match batch::inspect(raw, MAX_BATCH) {
+            Ok(info) => info,
+            Err(BatchError::TooLarge) => return Err(TOO_LARGE),
+            Err(BatchError::Transactional) => return Err(TXN),
+            Err(BatchError::Corrupt) => return Err(CORRUPT),
+        };
+        let topic_id = Uuid::parse_str(&topic.id)
+            .map(|id| *id.as_bytes())
+            .unwrap_or([0; 16]);
+        let append = Append {
+            topic: name.to_string(),
+            partition,
+            topic_id,
+            epoch: topic.leader_epoch,
+            raw: raw.to_vec(),
+            records: info.iter().map(|batch| batch.records).sum(),
+            base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
+            max_timestamp: info.last().map(|batch| batch.max_timestamp).unwrap_or(-1),
+        };
+        if acks == 0 {
+            let wal = Arc::clone(&self.wal);
+            tokio::spawn(async move {
+                let _ = wal.append(append).await;
+            });
+            return Ok(None);
+        }
+        let response = self.wal.append(append).await.map_err(|_| STORAGE)?;
+        let (tx, rx) = oneshot::channel();
+        let settled = if response.error_code == 0 {
+            Ok(response.base_offset)
+        } else {
+            Err(response.error_code)
+        };
+        let _ = tx.send(settled);
+        Ok(Some(rx))
+    }
+
+    async fn upload_wal(&self) {
+        if !self.leader() || !self.wal.is_leader() {
+            return;
+        }
+        let pending = self.wal.pending();
+        if pending.is_empty() {
+            return;
+        }
+        let mut drops = Vec::new();
+        let mut upload = Vec::new();
+        let mut cursor: BTreeMap<(String, i32), i64> = BTreeMap::new();
+        for batch in pending {
+            let Some(topic) = self.topic(&batch.topic) else {
+                continue;
+            };
+            let Some(state) = self.partition_state(&topic, batch.partition) else {
+                continue;
+            };
+            if batch.end <= state.next_offset {
+                drops.push(SealDrop {
+                    topic: batch.topic,
+                    partition: batch.partition,
+                    start: batch.start,
+                });
+                continue;
+            }
+            let key = (batch.topic.clone(), batch.partition);
+            let next = cursor.get(&key).copied().unwrap_or(state.next_offset);
+            if batch.start != next {
+                continue;
+            }
+            cursor.insert(key, batch.end);
+            upload.push(batch);
+        }
+        if !upload.is_empty() {
+            let pieces: Vec<Piece> = upload
+                .iter()
+                .map(|batch| Piece {
+                    topic_id: batch.topic_id,
+                    partition: batch.partition,
+                    start: batch.start,
+                    end: batch.end,
+                    base_timestamp: batch.base_timestamp,
+                    max_timestamp: batch.max_timestamp,
+                    bytes: Bytes::from(batch.bytes.clone()),
+                })
+                .collect();
+            let (index, body) = camus_uploader::encode(&pieces);
+            let key = camus_uploader::object_key();
+            if self.bucket.put_new(&key, body).await.is_ok() {
+                let parts = upload
+                    .iter()
+                    .zip(&index)
+                    .map(
+                        |(batch, (file_offset, length))| camus_metadata::PublishPart {
+                            topic: batch.topic.clone(),
+                            partition: batch.partition,
+                            start: batch.start,
+                            end: batch.end,
+                            object_key: key.clone(),
+                            file_offset: *file_offset,
+                            length: *length,
+                            base_timestamp: batch.base_timestamp,
+                            max_timestamp: batch.max_timestamp,
+                        },
+                    )
+                    .collect();
+                if self.node.publish(parts).await.is_ok() {
+                    drops.extend(upload.into_iter().map(|batch| SealDrop {
+                        topic: batch.topic,
+                        partition: batch.partition,
+                        start: batch.start,
+                    }));
+                }
+            }
+        }
+        if drops.is_empty() {
+            return;
+        }
+        if let Ok(index) = self.wal.seal(drops).await {
+            let _ = self.wal.purge(index).await;
         }
     }
 
@@ -881,10 +1038,12 @@ impl Kafka {
             row.error_code = UNKNOWN_TOPIC;
             return row;
         };
-        row.high_watermark = state.next_offset;
-        row.last_stable_offset = state.next_offset;
+        let wal_end = self.wal.end_offset(&topic.name, partition);
+        let high_watermark = state.next_offset.max(wal_end);
+        row.high_watermark = high_watermark;
+        row.last_stable_offset = high_watermark;
         row.log_start_offset = state.log_start;
-        if offset < state.log_start || offset > state.next_offset {
+        if offset < state.log_start || offset > high_watermark {
             row.error_code = 1;
             return row;
         }
@@ -919,6 +1078,14 @@ impl Kafka {
                 }
                 cursor += batch.len;
                 batch_offset = next;
+            }
+        }
+        if offset < high_watermark {
+            let extra = self
+                .wal
+                .read(&topic.name, partition, state.next_offset, offset);
+            if !extra.is_empty() && (out.is_empty() || out.len() + extra.len() <= limit) {
+                out.extend_from_slice(&extra);
             }
         }
         if !out.is_empty() {
@@ -977,7 +1144,9 @@ impl Kafka {
             return row;
         }
         if timestamp == -1 {
-            row.offset = state.next_offset;
+            row.offset = state
+                .next_offset
+                .max(self.wal.end_offset(&topic.name, partition));
             return row;
         }
         for extent in &state.extents {

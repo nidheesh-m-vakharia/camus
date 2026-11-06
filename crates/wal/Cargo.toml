@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "WAL shards. Phase 2. This crate has no success path."
+description = "WAL shard: a Raft group that acknowledges produce before the R2 upload."
 
 [dependencies]
+anyhow = "1"
+camus-protocol = { path = "../protocol" }
+camus-raft = { path = "../raft" }
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
+redb = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

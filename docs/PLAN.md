@@ -3,8 +3,10 @@
 Status: accepted. Date: 2026-11-05.
 
 Phase 0 foundations and Phase 1 `r2` produce and fetch are in the workspace.
-SASL_SSL is covered by a Rust test and by Java, librdkafka, and franz-go. Consumer
-groups and `wal` produce are not. The ADRs under `docs/adr/` are accepted.
+SASL_SSL is covered by a Rust test and by Java, librdkafka, and franz-go.
+`wal` produce acks after a one-voter shard commit. Consumer groups, a
+multi-broker shard, and `truncate-to-sealed` are not. The ADRs under
+`docs/adr/` are accepted.
 This file is the map of those decisions and of what Phase 0 is allowed to touch.
 
 ## Product

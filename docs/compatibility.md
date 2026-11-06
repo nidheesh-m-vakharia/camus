@@ -45,7 +45,9 @@ Phase 1 answers `ApiVersions`, `Metadata`, `Produce`, `Fetch`, `ListOffsets`,
 `CreateTopics`, `DeleteTopics`, `DescribeConfigs`, `SaslHandshake`, and
 `SaslAuthenticate`. `ApiVersions` advertises only those keys. Produce acks
 in `r2` mode after the object is stored and the extent is committed.
-`wal` topics are stored and then rejected on produce until Phase 2.
+`wal` produce on a single broker acks after that broker's shard Raft
+commit. The upload to object storage follows the ack. A multi-broker shard,
+`truncate-to-sealed`, and the latency table are not in yet.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the

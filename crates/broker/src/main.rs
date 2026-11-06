@@ -251,6 +251,8 @@ async fn start_kafka(
     if require_sasl && (user.is_empty() || password.is_empty()) {
         anyhow::bail!("SASL requires CAMUS_SASL_USER and CAMUS_SASL_PASSWORD");
     }
+    let wal = Arc::new(camus_wal::Shard::open(node_id, &args.data_dir.join("wal")).await?);
+    wal.ensure_voter().await?;
     let kafka = Arc::new(kafka::Kafka::new(
         node,
         bucket,
@@ -261,6 +263,7 @@ async fn start_kafka(
         user,
         password,
         tls,
+        wal,
     ));
     info!(%bound, sasl = require_sasl, "kafka listener");
     tokio::spawn(async move { kafka.run(listener).await });

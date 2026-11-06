@@ -18,6 +18,7 @@ camus-metadata = { path = "../metadata" }
 camus-protocol = { path = "../protocol" }
 camus-storage = { path = "../storage" }
 camus-uploader = { path = "../uploader" }
+camus-wal = { path = "../wal" }
 clap = { version = "4", features = ["derive"] }
 openraft = { version = "=0.9.25", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

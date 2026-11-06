@@ -293,6 +293,7 @@ dependencies = [
  "camus-protocol",
  "camus-storage",
  "camus-uploader",
+ "camus-wal",
  "clap",
  "openraft",
  "rcgen",
@@ -399,6 +400,18 @@ dependencies = [
 [[package]]
 name = "camus-wal"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camus-protocol",
+ "camus-raft",
+ "openraft",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cc"
