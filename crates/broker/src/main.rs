@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod kafka;
+mod slot;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -20,6 +21,7 @@ use camus_wal::Shard;
 use clap::Parser;
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use serde::Deserialize;
+use slot::WalSlot;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -61,6 +63,30 @@ struct Args {
 struct Peer {
     id: NodeId,
     addr: String,
+    /// Whether this broker is a WAL shard voter. Defaults to yes. Every
+    /// broker is a metadata voter.
+    #[serde(default = "yes")]
+    wal: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct Truncate {
+    #[serde(default)]
+    i_accept_data_loss: bool,
+}
+
+/// State for routes that touch both groups.
+struct Admin {
+    node: Arc<MetadataNode>,
+    wal: Arc<WalSlot>,
+    node_id: NodeId,
+    data_dir: PathBuf,
+    http: reqwest::Client,
+    truncating: tokio::sync::Mutex<()>,
 }
 
 #[derive(Deserialize)]
@@ -82,7 +108,19 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir)?;
     let node = Arc::new(MetadataNode::open(args.node_id, &args.data_dir, &args.http_addr).await?);
-    let wal = Arc::new(Shard::open(args.node_id, &args.data_dir.join("wal")).await?);
+    let wal = Arc::new(WalSlot::new(
+        Shard::open(args.node_id, &args.data_dir.join("wal")).await?,
+    ));
+    let admin = Arc::new(Admin {
+        node: Arc::clone(&node),
+        wal: Arc::clone(&wal),
+        node_id: args.node_id,
+        data_dir: args.data_dir.clone(),
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?,
+        truncating: tokio::sync::Mutex::new(()),
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -98,10 +136,12 @@ async fn main() -> anyhow::Result<()> {
             Router::new()
                 .route("/admin/metrics", get(admin_metrics))
                 .route("/admin/init", post(init))
-                .with_state((Arc::clone(&node), Arc::clone(&wal))),
+                .route("/admin/truncate-to-sealed", post(truncate_to_sealed))
+                .with_state(Arc::clone(&admin)),
         )
         .merge(
             Router::new()
+                .route("/wal/init", post(wal_init))
                 .route("/wal/raft-vote", post(wal_vote))
                 .route("/wal/raft-append", post(wal_append))
                 .route("/wal/raft-snapshot", post(wal_snapshot))
@@ -152,10 +192,9 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
     )
 }
 
-type Both = (Arc<MetadataNode>, Arc<Shard>);
-
-async fn admin_metrics(State((node, wal)): State<Both>) -> Json<serde_json::Value> {
-    let metrics = node.raft.metrics().borrow().clone();
+async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Value> {
+    let metrics = admin.node.raft.metrics().borrow().clone();
+    let wal = admin.wal.get();
     Json(serde_json::json!({
         "id": metrics.id,
         "current_term": metrics.current_term,
@@ -166,23 +205,127 @@ async fn admin_metrics(State((node, wal)): State<Both>) -> Json<serde_json::Valu
     }))
 }
 
-/// Create the metadata group and the WAL shard with the same voters. Each
-/// voter's `addr` is its HTTP address; both groups' RPC goes there.
+/// Create the metadata group from every peer and the WAL shard from the
+/// peers marked `wal`. Each `addr` is that broker's HTTP address; both
+/// groups' RPC goes there. The shard is initialized on its first voter.
 async fn init(
-    State((node, wal)): State<Both>,
+    State(admin): State<Arc<Admin>>,
     Json(peers): Json<Vec<Peer>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let mut nodes = BTreeMap::new();
+    let mut shard = BTreeMap::new();
     for peer in peers {
-        nodes.insert(peer.id, BasicNode { addr: peer.addr });
+        let node = BasicNode { addr: peer.addr };
+        if peer.wal {
+            shard.insert(peer.id, node.clone());
+        }
+        nodes.insert(peer.id, node);
     }
-    node.initialize(nodes.clone())
+    let Some(first) = shard.values().next().cloned() else {
+        return Err((StatusCode::BAD_REQUEST, "no wal voter".into()));
+    };
+    admin
+        .node
+        .initialize(nodes)
         .await
         .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
-    wal.initialize(nodes)
+    let response = admin
+        .http
+        .post(format!("http://{}/wal/init", first.addr))
+        .json(&shard)
+        .send()
         .await
-        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    if !response.status().is_success() {
+        let status =
+            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Err((status, response.text().await.unwrap_or_default()));
+    }
     Ok(StatusCode::OK)
+}
+
+async fn wal_init(
+    State(wal): State<Arc<WalSlot>>,
+    Json(nodes): Json<BTreeMap<NodeId, BasicNode>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    wal.get()
+        .initialize(nodes)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))
+}
+
+/// ADR 0008 majority loss: replace this survivor's shard with a fresh
+/// one-voter shard. Acknowledged entries that metadata had not sealed are
+/// gone; each partition resumes at its sealed end. The old WAL directory is
+/// moved aside, not deleted.
+///
+/// Refused without `i_accept_data_loss`, and refused while the shard still
+/// has a leader that can reach a quorum, because then nothing is lost and a
+/// second shard would split the partitions.
+async fn truncate_to_sealed(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<Truncate>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !body.i_accept_data_loss {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "truncate-to-sealed drops acknowledged offsets that are not sealed; \
+             pass i_accept_data_loss to run it"
+                .into(),
+        ));
+    }
+    let _one = admin.truncating.lock().await;
+    let me = admin.node_id;
+    let old = admin.wal.get();
+    if !old.voters().contains(&me) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("node {me} is not a wal voter"),
+        ));
+    }
+    let leader = old.leader();
+    let healthy = if leader == Some(me) {
+        old.leads_quorum(std::time::Duration::from_secs(2))
+    } else {
+        leader.is_some()
+    };
+    if healthy {
+        return Err((
+            StatusCode::CONFLICT,
+            "the wal shard has a working leader; restore a lost voter instead".into(),
+        ));
+    }
+    let addr = admin
+        .node
+        .raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .get_node(&me)
+        .map(|node| node.addr.clone())
+        .ok_or_else(|| (StatusCode::CONFLICT, format!("node {me} has no address")))?;
+    let internal = |err: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    let _ = old.raft.shutdown().await;
+    let dir = admin.data_dir.join("wal");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let aside = admin.data_dir.join(format!("wal.truncated-{stamp}"));
+    std::fs::rename(&dir, &aside).map_err(|err| internal(err.into()))?;
+    let fresh = Shard::open(me, &dir).await.map_err(internal)?;
+    fresh
+        .initialize(BTreeMap::from([(me, BasicNode { addr })]))
+        .await
+        .map_err(internal)?;
+    admin.wal.replace(fresh);
+    tracing::warn!(node_id = me, aside = %aside.display(), "wal shard truncated to sealed");
+    Ok(Json(serde_json::json!({
+        "voters": [me],
+        "moved_aside": aside.display().to_string(),
+    })))
 }
 
 async fn write(
@@ -245,22 +388,22 @@ async fn snapshot(
 }
 
 async fn wal_vote(
-    State(wal): State<Arc<Shard>>,
+    State(wal): State<Arc<WalSlot>>,
     Json(req): Json<VoteRequest<NodeId>>,
 ) -> Json<Result<openraft::raft::VoteResponse<NodeId>, openraft::error::RaftError<NodeId>>> {
-    Json(wal.raft.vote(req).await)
+    Json(wal.get().raft.vote(req).await)
 }
 
 async fn wal_append(
-    State(wal): State<Arc<Shard>>,
+    State(wal): State<Arc<WalSlot>>,
     Json(req): Json<AppendEntriesRequest<camus_wal::TypeConfig>>,
 ) -> Json<Result<openraft::raft::AppendEntriesResponse<NodeId>, openraft::error::RaftError<NodeId>>>
 {
-    Json(wal.raft.append_entries(req).await)
+    Json(wal.get().raft.append_entries(req).await)
 }
 
 async fn wal_snapshot(
-    State(wal): State<Arc<Shard>>,
+    State(wal): State<Arc<WalSlot>>,
     Json(req): Json<InstallSnapshotRequest<camus_wal::TypeConfig>>,
 ) -> Json<
     Result<
@@ -268,12 +411,12 @@ async fn wal_snapshot(
         openraft::error::RaftError<NodeId, openraft::error::InstallSnapshotError>,
     >,
 > {
-    Json(wal.raft.install_snapshot(req).await)
+    Json(wal.get().raft.install_snapshot(req).await)
 }
 
 async fn start_kafka(
     node: Arc<MetadataNode>,
-    wal: Arc<Shard>,
+    wal: Arc<WalSlot>,
     node_id: NodeId,
     kafka_addr: &str,
     args: &Args,

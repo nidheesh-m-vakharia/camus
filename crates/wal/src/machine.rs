@@ -158,7 +158,7 @@ fn apply_one(state: &mut State, command: Command, log_index: u64) -> Response {
     match command {
         Command::Append(batch) => {
             let key = part_key(&batch.topic, batch.partition);
-            let start = state.next.get(&key).copied().unwrap_or(0);
+            let start = state.next.get(&key).copied().unwrap_or(0).max(batch.floor);
             let sealed =
                 match camus_protocol::batch::seal(&batch.raw, start, batch.epoch, 1024 * 1024) {
                     Ok(bytes) => bytes,

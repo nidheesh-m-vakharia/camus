@@ -153,6 +153,11 @@ impl RaftNetwork<TypeConfig> for HttpConn {
     ) -> Result<VoteResponse<NodeId>, RpcError> {
         self.send("raft-vote", rpc, option).await
     }
+    /// Retry an unreachable peer every 100ms. openraft's default is 500ms,
+    /// which leaves a restarted broker's replica stale for up to a second.
+    fn backoff(&self) -> openraft::network::Backoff {
+        openraft::network::Backoff::new(std::iter::repeat(std::time::Duration::from_millis(100)))
+    }
 }
 
 impl HttpConn {

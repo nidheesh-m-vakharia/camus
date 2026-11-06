@@ -313,6 +313,12 @@ dependencies = [
 [[package]]
 name = "camus-cli"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde_json",
+]
 
 [[package]]
 name = "camus-compactor"

@@ -72,7 +72,34 @@ Idempotent producers (Phase 4) cannot reconstruct batches the cluster no
 longer has. This is data loss, and the operator command is the only way to
 enter it.
 
-Until Phase 2, `wal` mode does not exist, so this command does not exist.
+#### As built (Phase 2)
+
+`camus admin truncate-to-sealed --broker <http host:port> --i-accept-data-loss`
+calls `POST /admin/truncate-to-sealed` on one surviving shard voter.
+
+- It acts on the whole shard, not one partition. Every partition in a shard
+  shares one Raft log, so there is no way to drop one partition's suffix
+  and keep another's. The `--partition` form above is not built.
+- It refuses without the flag (400), on a broker that is not a voter (409),
+  and while the shard has a leader, or this node leads with a quorum ack in
+  the last 2 seconds (409). The last check is what stops it from splitting
+  a healthy shard in two.
+- The survivor shuts down its shard, moves `wal/` to `wal.truncated-<ms>`
+  (kept for forensics, not deleted), and starts a fresh one-voter shard.
+  It is then the shard leader and records that in metadata.
+- Each append carries the partition's sealed end from metadata as a floor
+  for its base offset, so the empty shard resumes at the sealed end and
+  never reissues a sealed offset.
+- Other surviving voters and any lost voter that comes back must have their
+  `wal/` directory removed before they start; they still hold the old
+  membership. Adding voters back to the new shard is not built yet.
+- The survivor's sealed end is its own metadata replica. With a live
+  metadata quorum that replica is current within a heartbeat; the command
+  does not yet wait for a linearizable read.
+
+`crates/broker/tests/wal_majority.rs` is the acceptance test: two
+acknowledged, unsealed offsets survive the loss of two of three voters as
+long as the partition is offline, and are gone only after the command.
 
 ### Whole cluster disk loss
 

@@ -65,6 +65,11 @@ pub struct Append {
     pub base_timestamp: i64,
     /// Last timestamp.
     pub max_timestamp: i64,
+    /// Lowest base offset this batch may take: the partition's sealed end in
+    /// metadata. A shard rebuilt by `truncate-to-sealed` starts empty, and
+    /// this keeps it from reusing offsets that R2 already holds.
+    #[serde(default)]
+    pub floor: i64,
 }
 
 /// One batch the uploader has published.
@@ -183,6 +188,17 @@ impl Shard {
         self.raft.metrics().borrow().current_leader
     }
 
+    /// Whether this node leads and a quorum acknowledged it within `within`.
+    /// A restarted node can report itself leader from its stored vote before
+    /// any peer has confirmed it; this does not.
+    pub fn leads_quorum(&self, within: Duration) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        metrics.current_leader == Some(self.node_id)
+            && metrics
+                .millis_since_quorum_ack
+                .is_some_and(|ms| u128::from(ms) < within.as_millis())
+    }
+
     /// Voter ids in the latest membership this node has seen.
     pub fn voters(&self) -> Vec<NodeId> {
         self.raft
@@ -284,6 +300,7 @@ mod tests {
                 records: 1,
                 base_timestamp: 1,
                 max_timestamp: 1,
+                floor: 0,
             })
             .await
             .unwrap();
@@ -334,6 +351,7 @@ mod tests {
             records: 1,
             base_timestamp: 1,
             max_timestamp: 1,
+            floor: 0,
         }
     }
 
@@ -401,5 +419,22 @@ mod tests {
         let tail = survivor.read("events", 0, 0, 0);
         let info = camus_protocol::batch::inspect(&tail, 1024 * 1024).unwrap();
         assert_eq!(info.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_shard_starts_at_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = Shard::open(1, dir.path()).await.unwrap();
+        shard.ensure_voter().await.unwrap();
+        let mut append = append_of(b"after-truncate");
+        append.floor = 7;
+        assert_eq!(shard.append(append).await.unwrap().base_offset, 7);
+        let mut lower = append_of(b"next");
+        lower.floor = 2;
+        assert_eq!(
+            shard.append(lower).await.unwrap().base_offset,
+            8,
+            "the floor never moves the end backward"
+        );
     }
 }

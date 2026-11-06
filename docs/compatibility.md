@@ -54,8 +54,14 @@ cannot commit within `timeout_ms`, for example with no quorum, gets
 `REQUEST_TIMED_OUT` (7); the entry may still commit later, so a client
 without idempotence can duplicate on retry. The upload to object storage
 follows the ack. The partition `leader_epoch` does not yet change with the
-shard term. `truncate-to-sealed`, R2 backpressure, and the latency table
-are not in yet.
+shard term. The shard leader records itself in metadata so every broker
+names the same leader; a broker that has just restarted can name a stale
+leader for about a second, and clients recover through the usual
+`NOT_LEADER_OR_FOLLOWER` retry. After a shard loses a majority, its
+partitions stay offline until a lost voter returns or an operator runs
+`camus admin truncate-to-sealed`, which resumes them at the sealed end and
+drops acknowledged offsets past it (ADR 0008). R2 backpressure and the
+latency table are not in yet.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the

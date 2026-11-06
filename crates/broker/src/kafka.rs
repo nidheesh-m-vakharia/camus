@@ -43,6 +43,8 @@ use camus_protocol::protocol::{decode_request_header_from_buffer, Decodable, Str
 use camus_storage::Bucket;
 use camus_uploader::{self, Piece};
 use camus_wal::{Append, SealDrop, Shard, WriteError};
+
+use crate::slot::WalSlot;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
@@ -106,6 +108,15 @@ impl Socket {
     }
 }
 
+/// Metadata key for shard 0's leader and voters. Phase 2 runs one shard.
+const SHARD_KEY: &str = "wal/0";
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+struct ShardView {
+    leader: Option<NodeId>,
+    voters: Vec<NodeId>,
+}
+
 /// One broker's Kafka endpoint.
 pub struct Kafka {
     node: Arc<MetadataNode>,
@@ -118,7 +129,7 @@ pub struct Kafka {
     sasl_user: String,
     sasl_pass: String,
     tls: Option<TlsAcceptor>,
-    wal: Arc<Shard>,
+    wal: Arc<WalSlot>,
     http: reqwest::Client,
     buf: Mutex<Vec<Item>>,
     flush_lock: Mutex<()>,
@@ -136,7 +147,7 @@ impl Kafka {
         sasl_user: String,
         sasl_pass: String,
         tls: Option<TlsAcceptor>,
-        wal: Arc<Shard>,
+        wal: Arc<WalSlot>,
     ) -> Self {
         let flush_ms = std::env::var("CAMUS_FLUSH_MS")
             .ok()
@@ -165,6 +176,11 @@ impl Kafka {
 
     fn leader(&self) -> bool {
         self.node.raft.metrics().borrow().current_leader == Some(self.node_id as u64)
+    }
+
+    /// The shard serving requests now.
+    fn wal(&self) -> Arc<Shard> {
+        self.wal.get()
     }
 
     /// HTTP address of the metadata leader, when another broker leads.
@@ -221,6 +237,47 @@ impl Kafka {
         Ok(response.json().await?)
     }
 
+    /// Shard leader and voters as clients should see them. The shard leader
+    /// records itself in metadata so brokers outside the shard can answer
+    /// Metadata; until it has, this broker's own view is used.
+    fn shard_view(&self) -> ShardView {
+        self.node
+            .read_local(SHARD_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_else(|| self.local_shard_view())
+    }
+
+    fn local_shard_view(&self) -> ShardView {
+        let wal = self.wal();
+        ShardView {
+            leader: wal.leader(),
+            voters: wal.voters(),
+        }
+    }
+
+    /// Record this broker as shard leader in metadata when it leads and the
+    /// stored view differs.
+    async fn announce_shard(&self) {
+        if !self.wal().leads_quorum(Duration::from_millis(500)) {
+            return;
+        }
+        let mine = self.local_shard_view();
+        let stored: Option<ShardView> = self
+            .node
+            .read_local(SHARD_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        if stored.as_ref() == Some(&mine) {
+            return;
+        }
+        if let Ok(raw) = serde_json::to_string(&mine) {
+            let _ = self.meta_write(SHARD_KEY.to_string(), raw).await;
+        }
+    }
+
     fn topic(&self, name: &str) -> Option<Topic> {
         let raw = self
             .node
@@ -262,6 +319,7 @@ impl Kafka {
                 if stored.as_deref() != Some(addr.as_str()) {
                     let _ = register.meta_write(key.clone(), addr.clone()).await;
                 }
+                register.announce_shard().await;
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         });
@@ -466,13 +524,13 @@ impl Kafka {
         // A `wal` partition is led by its shard leader (ADR 0006), not by the
         // metadata leader.
         let (leader, replicas) = if stored.durability == "wal" {
-            let replicas: Vec<BrokerId> = self
-                .wal
-                .voters()
+            let view = self.shard_view();
+            let replicas: Vec<BrokerId> = view
+                .voters
                 .into_iter()
                 .filter_map(|id| i32::try_from(id).ok().map(BrokerId))
                 .collect();
-            (self.wal.leader().map(|id| id as i32), replicas)
+            (view.leader.map(|id| id as i32), replicas)
         } else {
             (leader, leader.map(BrokerId).into_iter().collect())
         };
@@ -800,12 +858,16 @@ impl Kafka {
         acks: i16,
         timeout_ms: i32,
     ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
-        if !self.wal.is_leader() {
+        let wal = self.wal();
+        if !wal.is_leader() {
             return Err(NOT_LEADER);
         }
         if partition < 0 || partition >= topic.partitions {
             return Err(UNKNOWN_TOPIC);
         }
+        let Some(state) = self.partition_state(topic, partition) else {
+            return Err(UNKNOWN_TOPIC);
+        };
         let Some(raw) = records else {
             return Ok(None);
         };
@@ -830,9 +892,9 @@ impl Kafka {
             records: info.iter().map(|batch| batch.records).sum(),
             base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
             max_timestamp: info.last().map(|batch| batch.max_timestamp).unwrap_or(-1),
+            floor: state.next_offset,
         };
         if acks == 0 {
-            let wal = Arc::clone(&self.wal);
             tokio::spawn(async move {
                 let _ = wal.append(append).await;
             });
@@ -842,10 +904,10 @@ impl Kafka {
         // that outlives `timeout_ms` with REQUEST_TIMED_OUT; the entry may
         // still commit later, as in Kafka.
         let wait = Duration::from_millis(timeout_ms.max(0) as u64);
-        let response = match tokio::time::timeout(wait, self.wal.append(append)).await {
+        let response = match tokio::time::timeout(wait, wal.append(append)).await {
             Err(_) => return Err(REQUEST_TIMED_OUT),
             Ok(Err(WriteError::NotLeader)) => return Err(NOT_LEADER),
-            Ok(Err(WriteError::Other(_))) if !self.wal.is_leader() => return Err(NOT_LEADER),
+            Ok(Err(WriteError::Other(_))) if !wal.is_leader() => return Err(NOT_LEADER),
             Ok(Err(WriteError::Other(_))) => return Err(STORAGE),
             Ok(Ok(response)) => response,
         };
@@ -860,10 +922,13 @@ impl Kafka {
     }
 
     async fn upload_wal(&self) {
-        if !self.wal.is_leader() {
+        // One shard for the whole pass, so a truncate mid-upload cannot seal
+        // into the shard that replaced it.
+        let wal = self.wal();
+        if !wal.is_leader() {
             return;
         }
-        let pending = self.wal.pending();
+        let pending = wal.pending();
         if pending.is_empty() {
             return;
         }
@@ -939,8 +1004,8 @@ impl Kafka {
         if drops.is_empty() {
             return;
         }
-        if let Ok(index) = self.wal.seal(drops).await {
-            let _ = self.wal.purge(index).await;
+        if let Ok(index) = wal.seal(drops).await {
+            let _ = wal.purge(index).await;
         }
     }
 
@@ -1120,7 +1185,7 @@ impl Kafka {
             row.error_code = UNKNOWN_TOPIC;
             return row;
         };
-        if topic.durability == "wal" && !self.wal.is_leader() {
+        if topic.durability == "wal" && !self.wal().is_leader() {
             row.error_code = NOT_LEADER;
             return row;
         }
@@ -1128,7 +1193,7 @@ impl Kafka {
             row.error_code = UNKNOWN_TOPIC;
             return row;
         };
-        let wal_end = self.wal.end_offset(&topic.name, partition);
+        let wal_end = self.wal().end_offset(&topic.name, partition);
         let high_watermark = state.next_offset.max(wal_end);
         row.high_watermark = high_watermark;
         row.last_stable_offset = high_watermark;
@@ -1172,7 +1237,7 @@ impl Kafka {
         }
         if offset < high_watermark {
             let extra = self
-                .wal
+                .wal()
                 .read(&topic.name, partition, state.next_offset, offset);
             if !extra.is_empty() && (out.is_empty() || out.len() + extra.len() <= limit) {
                 out.extend_from_slice(&extra);
@@ -1223,7 +1288,7 @@ impl Kafka {
             row.offset = -1;
             return row;
         };
-        if topic.durability == "wal" && !self.wal.is_leader() {
+        if topic.durability == "wal" && !self.wal().is_leader() {
             row.error_code = NOT_LEADER;
             row.offset = -1;
             return row;
@@ -1241,7 +1306,7 @@ impl Kafka {
         if timestamp == -1 {
             row.offset = state
                 .next_offset
-                .max(self.wal.end_offset(&topic.name, partition));
+                .max(self.wal().end_offset(&topic.name, partition));
             return row;
         }
         for extent in &state.extents {
