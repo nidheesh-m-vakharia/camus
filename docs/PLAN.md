@@ -2,9 +2,10 @@
 
 Status: accepted. Date: 2026-11-05.
 
-Phase 0 foundations are in the workspace. Produce, Fetch, groups, and the
-uploader are not. The ADRs under `docs/adr/` are accepted. This file is
-the map of those decisions and of what Phase 0 is allowed to touch.
+Phase 0 foundations and Phase 1 `r2` produce and fetch are in the workspace.
+SASL_SSL is covered by a Rust test and by `kafka-clients` 4.4.0. Consumer
+groups and `wal` produce are not. The ADRs under `docs/adr/` are accepted.
+This file is the map of those decisions and of what Phase 0 is allowed to touch.
 
 ## Product
 

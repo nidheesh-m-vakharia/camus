@@ -34,9 +34,16 @@ struct Args {
     /// Directory for the Raft log and the redb state machine.
     #[arg(long)]
     data_dir: PathBuf,
-    /// Kafka listener. Requires `--dev-plaintext` until the TLS listener is used.
+    /// Kafka listener. PLAINTEXT needs `--dev-plaintext`. SASL_SSL needs
+    /// `--tls-cert` and `--tls-key`.
     #[arg(long)]
     kafka_addr: Option<String>,
+    /// PEM certificate for the SASL_SSL listener.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for the SASL_SSL listener.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
     /// Allow a PLAINTEXT Kafka listener. Refused for a non-loopback bind unless
     /// `--allow-non-loopback` is also set.
     #[arg(long, default_value_t = false)]
@@ -209,11 +216,16 @@ async fn start_kafka(
     kafka_addr: &str,
     args: &Args,
 ) -> anyhow::Result<()> {
-    if !args.dev_plaintext {
-        anyhow::bail!("Kafka listener requires --dev-plaintext");
+    let tls = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Some(load_tls(cert, key)?),
+        (None, None) => None,
+        _ => anyhow::bail!("--tls-cert and --tls-key are set together"),
+    };
+    if tls.is_none() && !args.dev_plaintext {
+        anyhow::bail!("Kafka listener requires --dev-plaintext or a TLS certificate");
     }
     let bind: SocketAddr = kafka_addr.parse()?;
-    if !bind.ip().is_loopback() && !args.allow_non_loopback {
+    if tls.is_none() && !bind.ip().is_loopback() && !args.allow_non_loopback {
         anyhow::bail!("non-loopback PLAINTEXT requires --allow-non-loopback");
     }
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -233,17 +245,42 @@ async fn start_kafka(
         secret_key: std::env::var("CAMUS_S3_SECRET_KEY")
             .unwrap_or_else(|_| "camus-dev-secret".into()),
     })?;
+    let user = std::env::var("CAMUS_SASL_USER").unwrap_or_default();
+    let password = std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default();
+    let require_sasl = args.require_sasl || tls.is_some();
+    if require_sasl && (user.is_empty() || password.is_empty()) {
+        anyhow::bail!("SASL requires CAMUS_SASL_USER and CAMUS_SASL_PASSWORD");
+    }
     let kafka = Arc::new(kafka::Kafka::new(
         node,
         bucket,
         i32::try_from(node_id)?,
         host,
         bound.port() as i32,
-        args.require_sasl,
-        std::env::var("CAMUS_SASL_USER").unwrap_or_default(),
-        std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default(),
+        require_sasl,
+        user,
+        password,
+        tls,
     ));
-    info!(%bound, "kafka listener");
+    info!(%bound, sasl = require_sasl, "kafka listener");
     tokio::spawn(async move { kafka.run(listener).await });
     Ok(())
+}
+
+fn load_tls(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert_file = std::fs::File::open(cert_path)?;
+    let mut cert_reader = std::io::BufReader::new(cert_file);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader).collect::<Result<_, _>>()?;
+    let key_file = std::fs::File::open(key_path)?;
+    let mut key_reader = std::io::BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or_else(|| anyhow::anyhow!("no private key in {key_path:?}"))?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
 }

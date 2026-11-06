@@ -4,10 +4,11 @@ A Kafka-compatible streaming broker written in Rust. Producers, consumers, and
 admin clients speak the Apache Kafka wire protocol. Long-term data lives in
 Cloudflare R2. There is no JVM, no ZooKeeper, and no external database.
 
-Status: **Phase 1 `r2` produce and fetch are in the tree**. A PLAINTEXT
-listener accepts create, produce, and fetch. Acks wait until the batch is
-in object storage and the metadata group has committed the offset.
-`wal` mode is not on yet. The plan and ADRs are in `docs/`. License: Apache-2.0.
+Status: **Phase 1 `r2` produce and fetch are in the tree**. PLAINTEXT and
+SASL_SSL listeners accept create, produce, and fetch. Acks wait until the
+batch is in object storage and the metadata group has committed the offset.
+`kafka-clients` 4.4.0 has passed that path. `wal` mode is not on yet.
+The plan and ADRs are in `docs/`. License: Apache-2.0.
 
 ## What a client changes
 
@@ -31,7 +32,7 @@ seconds, then it is uploaded and truncated.
 
 1. [docs/PLAN.md](docs/PLAN.md) — accepted decisions, and what Phase 0 will and will not do.
 2. [docs/adr/](docs/adr/) — the decisions, in detail.
-3. [docs/compatibility.md](docs/compatibility.md) — pinned Kafka tag and the API matrix. Every Kafka API is still unimplemented.
+3. [docs/compatibility.md](docs/compatibility.md) — pinned Kafka tag and the API matrix.
 
 ## Phase 0
 

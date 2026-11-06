@@ -55,10 +55,10 @@ acceptance test. `-` means not run.
 
 | API | Key | Phase | Versions (intended) | Status | Java | librdkafka | franz-go |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Produce | 0 | 1 | 3-13 | implemented (`r2` only) | - | - | - |
-| Fetch | 1 | 1 | 4-18 | implemented | - | - | - |
-| ListOffsets | 2 | 1 | 1-11 | implemented | - | - | - |
-| Metadata | 3 | 1 | 0-13 | implemented | - | - | - |
+| Produce | 0 | 1 | 3-13 | implemented (`r2` only) | pass | - | - |
+| Fetch | 1 | 1 | 4-18 | implemented | pass | - | - |
+| ListOffsets | 2 | 1 | 1-11 | implemented | pass | - | - |
+| Metadata | 3 | 1 | 0-13 | implemented | pass | - | - |
 | OffsetCommit | 8 | 3 | TBD | unimplemented | - | - | - |
 | OffsetFetch | 9 | 3 | TBD | unimplemented | - | - | - |
 | FindCoordinator | 10 | 3 | TBD | unimplemented | - | - | - |
@@ -68,9 +68,9 @@ acceptance test. `-` means not run.
 | SyncGroup | 14 | 3 | TBD | unimplemented | - | - | - |
 | DescribeGroups | 15 | 3 | TBD | unimplemented | - | - | - |
 | ListGroups | 16 | 3 | TBD | unimplemented | - | - | - |
-| SaslHandshake | 17 | 1 | 0-1 | implemented (PLAIN) | - | - | - |
-| ApiVersions | 18 | 1 | 0-5 | implemented | - | - | - |
-| CreateTopics | 19 | 1 | 2-7 | implemented | - | - | - |
+| SaslHandshake | 17 | 1 | 0-1 | implemented (PLAIN) | pass | - | - |
+| ApiVersions | 18 | 1 | 0-5 | implemented | pass | - | - |
+| CreateTopics | 19 | 1 | 2-7 | implemented | pass | - | - |
 | DeleteTopics | 20 | 1 | 1-6 | implemented | - | - | - |
 | DeleteRecords | 21 | 4 | TBD | unimplemented | - | - | - |
 | InitProducerId | 22 | 4 | TBD | unimplemented | - | - | - |
@@ -87,7 +87,7 @@ acceptance test. `-` means not run.
 | AlterConfigs | 33 | 4 | TBD | unimplemented | - | - | - |
 | AlterReplicaLogDirs | 34 | | not planned | unimplemented | - | - | - |
 | DescribeLogDirs | 35 | | not planned | unimplemented | - | - | - |
-| SaslAuthenticate | 36 | 1 | 0-2 | implemented (PLAIN) | - | - | - |
+| SaslAuthenticate | 36 | 1 | 0-2 | implemented (PLAIN) | pass | - | - |
 | CreatePartitions | 37 | 4 | TBD | unimplemented | - | - | - |
 | CreateDelegationToken | 38 | | not planned | unimplemented | - | - | - |
 | RenewDelegationToken | 39 | | not planned | unimplemented | - | - | - |
@@ -131,7 +131,7 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 
 | Client | Library | Phase first required |
 | --- | --- | --- |
-| Java | `kafka-clients` matching 4.4.0 | 1 |
+| Java | `kafka-clients` 4.4.0, SASL_SSL, passed | 1 |
 | Python / librdkafka | `confluent-kafka` | 1 |
 | Go | `franz-go` | 1 |
 | kcat | CLI against the dev listener | 1, smoke |
@@ -148,3 +148,9 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 | zstd | pass-through |
 
 Pass-through means the CRC-covered bytes are unchanged (ADR 0009).
+
+`kafka-clients` 4.4.0 passed that check over SASL_SSL on 2026-11-05. The
+program is `crates/broker/tests/java/SaslRoundTrip.java`. It creates a topic,
+produces with `acks=all` and idempotence disabled, and fetches by assigning
+the partition. It does not join a consumer group. Produce requests at version
+13 name the topic by id. librdkafka and franz-go have not been run.

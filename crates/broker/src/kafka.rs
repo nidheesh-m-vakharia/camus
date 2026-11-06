@@ -44,6 +44,8 @@ use camus_uploader::{self, Piece};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 const MAX_FRAME: usize = 100 * 1024 * 1024;
@@ -80,6 +82,27 @@ enum Reply {
     Close,
 }
 
+enum Socket {
+    Plain(TcpStream),
+    Tls(TlsStream<TcpStream>),
+}
+
+impl Socket {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(socket) => socket.read_exact(buf).await.map(|_| ()),
+            Self::Tls(socket) => socket.read_exact(buf).await.map(|_| ()),
+        }
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(socket) => socket.write_all(buf).await,
+            Self::Tls(socket) => socket.write_all(buf).await,
+        }
+    }
+}
+
 /// One broker's Kafka endpoint.
 pub struct Kafka {
     node: Arc<MetadataNode>,
@@ -91,6 +114,7 @@ pub struct Kafka {
     require_sasl: bool,
     sasl_user: String,
     sasl_pass: String,
+    tls: Option<TlsAcceptor>,
     buf: Mutex<Vec<Item>>,
     flush_lock: Mutex<()>,
 }
@@ -106,6 +130,7 @@ impl Kafka {
         require_sasl: bool,
         sasl_user: String,
         sasl_pass: String,
+        tls: Option<TlsAcceptor>,
     ) -> Self {
         let flush_ms = std::env::var("CAMUS_FLUSH_MS")
             .ok()
@@ -121,6 +146,7 @@ impl Kafka {
             require_sasl,
             sasl_user,
             sasl_pass,
+            tls,
             buf: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
         }
@@ -177,17 +203,28 @@ impl Kafka {
             }
         });
         loop {
-            let Ok((socket, _)) = listener.accept().await else {
+            let Ok((tcp, _)) = listener.accept().await else {
                 break;
             };
             let kafka = Arc::clone(&self);
             tokio::spawn(async move {
+                let socket = if let Some(acceptor) = &kafka.tls {
+                    match acceptor.accept(tcp).await {
+                        Ok(stream) => Socket::Tls(stream),
+                        Err(err) => {
+                            tracing::debug!(%err, "tls handshake failed");
+                            return;
+                        }
+                    }
+                } else {
+                    Socket::Plain(tcp)
+                };
                 let _ = kafka.connection(socket).await;
             });
         }
     }
 
-    async fn connection(&self, mut socket: TcpStream) -> anyhow::Result<()> {
+    async fn connection(&self, mut socket: Socket) -> anyhow::Result<()> {
         let mut authed = !self.require_sasl;
         loop {
             let mut size_buf = [0u8; 4];
@@ -225,6 +262,12 @@ impl Kafka {
             return Reply::Close;
         };
         let version = header.request_api_version;
+        tracing::debug!(
+            api = header.request_api_key,
+            version,
+            correlation = header.correlation_id,
+            "kafka request"
+        );
         let allowed_before_auth = matches!(
             key,
             ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate
@@ -289,7 +332,14 @@ impl Kafka {
             None => self.topic_names(),
             Some(topics) => topics
                 .into_iter()
-                .filter_map(|topic| topic.name.map(|name| name.0.to_string()))
+                .filter_map(|topic| {
+                    let named = topic
+                        .name
+                        .as_ref()
+                        .map(|name| name.0.to_string())
+                        .filter(|name| !name.is_empty());
+                    named.or_else(|| self.topic_name_by_id(&topic.topic_id))
+                })
                 .collect(),
         };
         let mut response = MetadataResponse::default();
@@ -471,6 +521,13 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
+    fn resolve_topic(&self, name: &str, id: &Uuid, by_id: bool) -> String {
+        if by_id || name.is_empty() {
+            return self.topic_name_by_id(id).unwrap_or_default();
+        }
+        name.to_string()
+    }
+
     fn topic_name_by_id(&self, id: &Uuid) -> Option<String> {
         self.node.read_local(&format!("id/{id}")).ok().flatten()
     }
@@ -515,7 +572,11 @@ impl Kafka {
         let mut response = ProduceResponse::default();
         let mut waiters = Vec::new();
         for topic in request.topic_data {
-            let name = topic.name.0.to_string();
+            let name = self.resolve_topic(
+                topic.name.0.as_str(),
+                &topic.topic_id,
+                header.request_api_version >= 13,
+            );
             let topic_index = response.responses.len();
             let mut topic_response = TopicProduceResponse::default();
             topic_response.name = topic_name(&name);
@@ -771,7 +832,11 @@ impl Kafka {
             response.responses.clear();
             let mut any = false;
             for topic in &request.topics {
-                let name = topic.topic.0.to_string();
+                let name = self.resolve_topic(
+                    topic.topic.0.as_str(),
+                    &topic.topic_id,
+                    header.request_api_version >= 13,
+                );
                 let mut topic_response = FetchableTopicResponse::default();
                 topic_response.topic = topic_name(&name);
                 topic_response.topic_id = topic.topic_id;
@@ -1018,7 +1083,10 @@ where
 {
     match encode_response(version, correlation, message) {
         Ok(frame) => Reply::Frame(frame),
-        Err(_) => Reply::Close,
+        Err(err) => {
+            tracing::warn!(%err, version, "response encode failed");
+            Reply::Close
+        }
     }
 }
 
