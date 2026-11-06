@@ -100,6 +100,15 @@ The short version: log bytes already sealed to R2 are recoverable from
 object keys; metadata mutations newer than the last snapshot are not,
 unless they were derived from those keys.
 
+### As built: group requests (Phase 3)
+
+A broker that is not the metadata leader answers group requests with
+`NOT_COORDINATOR` instead of forwarding them. `FindCoordinator` names the
+leader, and every Kafka client already rediscovers on that error, so a
+forward would add a hop for no client-visible gain. Group records and
+offsets are `SaveGroup`, `CommitOffsets`, and `DeleteGroup` commands;
+`CommitOffsets` checks the stored generation at apply time.
+
 ## Consequences
 
 - Phase 0 stands up this group and nothing else that looks like Kafka data.

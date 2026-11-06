@@ -45,6 +45,8 @@ use camus_uploader::{self, Piece};
 use camus_wal::{Append, SealDrop, Shard, WriteError};
 
 use crate::slot::WalSlot;
+
+mod groups;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
@@ -139,6 +141,10 @@ pub struct Kafka {
     tls: Option<TlsAcceptor>,
     wal: Arc<WalSlot>,
     http: reqwest::Client,
+    /// Classic consumer groups, coordinated while this broker leads metadata.
+    coordinator: Arc<camus_coordinator::Coordinator>,
+    /// The metadata term the coordinator's groups were loaded in.
+    coordinator_term: Mutex<Option<u64>>,
     /// Topic ids seen in the WAL with no topic in metadata, and since when.
     unknown: std::sync::Mutex<BTreeMap<[u8; 16], Instant>>,
     buf: Mutex<Vec<Item>>,
@@ -167,6 +173,9 @@ impl Kafka {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(250);
+        let store = Arc::new(groups::MetadataStore {
+            node: Arc::clone(&node),
+        });
         Self {
             node,
             bucket,
@@ -187,6 +196,8 @@ impl Kafka {
                 .build()
                 .expect("http client"),
             unknown: std::sync::Mutex::new(BTreeMap::new()),
+            coordinator: camus_coordinator::Coordinator::new(store, groups::coordinator_config()),
+            coordinator_term: Mutex::new(None),
             buf: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
         }
@@ -355,6 +366,10 @@ impl Kafka {
                 }
             }
         });
+        tokio::spawn(groups::tick(
+            Arc::clone(&self),
+            Arc::clone(&self.coordinator),
+        ));
         let register = Arc::clone(&self);
         tokio::spawn(async move {
             let key = format!("broker/{}", register.node_id);
@@ -456,6 +471,16 @@ impl Kafka {
             ApiKey::ListOffsets => self.list_offsets(&header, &mut buf).await,
             ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf),
             ApiKey::SaslAuthenticate => self.sasl_authenticate(&header, &mut buf, authed),
+            ApiKey::FindCoordinator => self.find_coordinator(&header, &mut buf).await,
+            ApiKey::JoinGroup => self.join_group(&header, &mut buf).await,
+            ApiKey::SyncGroup => self.sync_group(&header, &mut buf).await,
+            ApiKey::Heartbeat => self.heartbeat(&header, &mut buf).await,
+            ApiKey::LeaveGroup => self.leave_group(&header, &mut buf).await,
+            ApiKey::OffsetCommit => self.offset_commit(&header, &mut buf).await,
+            ApiKey::OffsetFetch => self.offset_fetch(&header, &mut buf).await,
+            ApiKey::ListGroups => self.list_groups(&header, &mut buf).await,
+            ApiKey::DescribeGroups => self.describe_groups(&header, &mut buf).await,
+            ApiKey::DeleteGroups => self.delete_groups(&header, &mut buf).await,
             _ => unsupported(key, version, header.correlation_id),
         }
     }

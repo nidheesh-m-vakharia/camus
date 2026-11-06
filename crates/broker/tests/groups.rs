@@ -1,0 +1,143 @@
+//! Phase 3 acceptance with real clients: two consumers share a group,
+//! commit, and leave; a third member resumes from the committed offsets.
+//! Three brokers, PLAINTEXT. Needs MinIO (`CAMUS_MINIO=1`) and the client
+//! toolchains the SASL tests use.
+
+mod support;
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+use support::*;
+
+fn cluster(root: &std::path::Path) -> (Vec<Node>, String) {
+    let nodes: Vec<Node> = (1..=3)
+        .map(|id| Node::with(id, &root.join(format!("node-{id}")), Opts::default()))
+        .collect();
+    init(&nodes, &[1, 2, 3]);
+    wait_settled(&nodes.iter().collect::<Vec<_>>());
+    // Every broker registered, so Metadata lists all three.
+    for node in &nodes {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while read_key(&nodes[0].http, &format!("broker/{}", node.id)).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "broker {} never registered",
+                node.id
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    let bootstrap = nodes.iter().map(kafka_addr).collect::<Vec<_>>().join(",");
+    (nodes, bootstrap)
+}
+
+fn check(root: &std::path::Path, ran: Output, client: &str) {
+    let stdout = String::from_utf8_lossy(&ran.stdout);
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    if !ran.status.success() {
+        for id in 1..=3 {
+            let log = std::fs::read_to_string(root.join(format!("node-{id}/broker.log")))
+                .unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(30).collect();
+            eprintln!(
+                "--- node {id} log tail\n{}",
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            );
+        }
+        panic!("{client} failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    }
+    eprintln!("{stdout}");
+}
+
+fn minio() -> bool {
+    let on = std::env::var("CAMUS_MINIO").ok().as_deref() == Some("1");
+    if !on {
+        eprintln!("skipping; set CAMUS_MINIO=1");
+    }
+    on
+}
+
+#[test]
+fn librdkafka_group_commits_and_resumes() {
+    if !minio() {
+        return;
+    }
+    let python = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pykafka/bin/python");
+    if !python.is_file() {
+        eprintln!("skipping librdkafka; missing {}", python.display());
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_nodes, bootstrap) = cluster(root.path());
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/python/group_roundtrip.py");
+    let ran = Command::new(python)
+        .arg(script)
+        .arg(&bootstrap)
+        .output()
+        .unwrap();
+    check(root.path(), ran, "librdkafka");
+}
+
+#[test]
+fn java_group_commits_and_resumes() {
+    if !minio() {
+        return;
+    }
+    let jars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-jars");
+    if !jars.join("kafka-clients-4.4.0.jar").is_file() {
+        eprintln!("skipping java; run the SASL tests once to download the jars");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let classes = root.path().join("classes");
+    std::fs::create_dir_all(&classes).unwrap();
+    let mut cp = vec![classes.display().to_string()];
+    for entry in std::fs::read_dir(&jars).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+            cp.push(path.display().to_string());
+        }
+    }
+    let cp = cp.join(":");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/java/GroupRoundTrip.java");
+    let compiled = Command::new("javac")
+        .args(["--release", "17", "-cp", &cp, "-d"])
+        .arg(&classes)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "javac\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let (_nodes, bootstrap) = cluster(root.path());
+    let ran = Command::new("java")
+        .args(["-cp", &cp, "GroupRoundTrip", &bootstrap])
+        .output()
+        .unwrap();
+    check(root.path(), ran, "java");
+}
+
+#[test]
+fn franz_go_group_commits_and_resumes() {
+    if !minio() {
+        return;
+    }
+    let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
+    if !go.is_file() {
+        eprintln!("skipping franz-go; missing {}", go.display());
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_nodes, bootstrap) = cluster(root.path());
+    let ran = Command::new(go)
+        .args(["run", "."])
+        .arg(&bootstrap)
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gogroup"))
+        .env("GOTOOLCHAIN", "local")
+        .output()
+        .unwrap();
+    check(root.path(), ran, "franz-go");
+}

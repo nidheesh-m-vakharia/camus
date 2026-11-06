@@ -71,6 +71,18 @@ breach at once and lets the client wait out `throttle_time_ms`; Camus holds
 first, so a client that also honors the throttle waits twice. A failed WAL
 write (for example a full disk) answers `KAFKA_STORAGE_ERROR` (56) and stops
 that broker's shard until restart.
+
+Consumer groups use the classic protocol. The metadata leader coordinates
+every group; another broker answers group requests with
+`NOT_COORDINATOR` (16) and clients find the coordinator again. Each new
+generation and each assignment is committed through the metadata group
+before members hear of it, and an offset commit is checked against the
+stored generation when it is applied, so a failover keeps the generation
+and an old generation cannot commit. `FindCoordinator` for transactions
+or share groups answers `INVALID_REQUEST` (42) until those phases.
+`ConsumerGroupHeartbeat` (KIP-848) is not implemented: the Java client
+must use `group.protocol=classic`, which is its default in 4.4.0.
+JoinGroup reports the client host as `/unknown`.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the
@@ -82,19 +94,19 @@ acceptance test. `-` means not run.
 
 | API | Key | Phase | Versions (intended) | Status | Java | librdkafka | franz-go |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Produce | 0 | 1 | 3-13 | implemented (`r2` only) | pass | pass | pass |
+| Produce | 0 | 1 | 3-13 | implemented | pass | pass | pass |
 | Fetch | 1 | 1 | 4-18 | implemented | pass | pass | pass |
 | ListOffsets | 2 | 1 | 1-11 | implemented | pass | pass | pass |
 | Metadata | 3 | 1 | 0-13 | implemented | pass | pass | pass |
-| OffsetCommit | 8 | 3 | TBD | unimplemented | - | - | - |
-| OffsetFetch | 9 | 3 | TBD | unimplemented | - | - | - |
-| FindCoordinator | 10 | 3 | TBD | unimplemented | - | - | - |
-| JoinGroup | 11 | 3 | TBD | unimplemented | - | - | - |
-| Heartbeat | 12 | 3 | TBD | unimplemented | - | - | - |
-| LeaveGroup | 13 | 3 | TBD | unimplemented | - | - | - |
-| SyncGroup | 14 | 3 | TBD | unimplemented | - | - | - |
-| DescribeGroups | 15 | 3 | TBD | unimplemented | - | - | - |
-| ListGroups | 16 | 3 | TBD | unimplemented | - | - | - |
+| OffsetCommit | 8 | 3 | 2-10 | implemented | pass | pass | pass |
+| OffsetFetch | 9 | 3 | 1-10 | implemented | pass | pass | pass |
+| FindCoordinator | 10 | 3 | 0-6 (groups only) | implemented | pass | pass | pass |
+| JoinGroup | 11 | 3 | 0-9 | implemented | pass | pass | pass |
+| Heartbeat | 12 | 3 | 0-4 | implemented | pass | pass | pass |
+| LeaveGroup | 13 | 3 | 0-5 | implemented | pass | pass | pass |
+| SyncGroup | 14 | 3 | 0-5 | implemented | pass | pass | pass |
+| DescribeGroups | 15 | 3 | 0-6 | implemented | - | - | - |
+| ListGroups | 16 | 3 | 0-5 | implemented | - | - | - |
 | SaslHandshake | 17 | 1 | 0-1 | implemented (PLAIN) | pass | pass | pass |
 | ApiVersions | 18 | 1 | 0-5 | implemented | pass | pass | pass |
 | CreateTopics | 19 | 1 | 2-7 | implemented | pass | pass | pass |
@@ -120,7 +132,7 @@ acceptance test. `-` means not run.
 | RenewDelegationToken | 39 | | not planned | unimplemented | - | - | - |
 | ExpireDelegationToken | 40 | | not planned | unimplemented | - | - | - |
 | DescribeDelegationToken | 41 | | not planned | unimplemented | - | - | - |
-| DeleteGroups | 42 | 3 | TBD | unimplemented | - | - | - |
+| DeleteGroups | 42 | 3 | 0-3 | implemented | - | - | - |
 | ElectLeaders | 43 | | internal leader changes follow Raft; API not planned | unimplemented | - | - | - |
 | IncrementalAlterConfigs | 44 | 4 | TBD | unimplemented | - | - | - |
 | AlterPartitionReassignments | 45 | | not planned | unimplemented | - | - | - |

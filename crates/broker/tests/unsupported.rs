@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use camus_protocol::messages::{
-    ApiKey, ApiVersionsRequest, ApiVersionsResponse, HeartbeatRequest, HeartbeatResponse,
+    ApiKey, ApiVersionsRequest, ApiVersionsResponse, InitProducerIdRequest, InitProducerIdResponse,
     RequestHeader,
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
@@ -76,7 +76,7 @@ fn recv<M: Decodable + HeaderVersion>(stream: &mut TcpStream, version: i16) -> (
 }
 
 #[test]
-fn heartbeat_returns_unsupported_version_and_the_connection_stays_up() {
+fn an_unimplemented_api_returns_unsupported_version_and_the_connection_stays_up() {
     let dir = tempfile::tempdir().unwrap();
     let log = std::fs::File::create(dir.path().join("broker.log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
@@ -102,16 +102,17 @@ fn heartbeat_returns_unsupported_version_and_the_connection_stays_up() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
+    // InitProducerId is Phase 4: known to the schema, not served yet.
     send(
         &mut stream,
-        ApiKey::Heartbeat,
+        ApiKey::InitProducerId,
         4,
         4,
-        &HeartbeatRequest::default(),
+        &InitProducerIdRequest::default(),
     );
-    let (correlation, beat) = recv::<HeartbeatResponse>(&mut stream, 4);
+    let (correlation, init) = recv::<InitProducerIdResponse>(&mut stream, 4);
     assert_eq!(correlation, 4);
-    assert_eq!(beat.error_code, ResponseError::UnsupportedVersion.code());
+    assert_eq!(init.error_code, ResponseError::UnsupportedVersion.code());
 
     send(
         &mut stream,
@@ -129,5 +130,5 @@ fn heartbeat_returns_unsupported_version_and_the_connection_stays_up() {
     assert!(versions
         .api_keys
         .iter()
-        .all(|api| api.api_key != ApiKey::Heartbeat as i16));
+        .all(|api| api.api_key != ApiKey::InitProducerId as i16));
 }

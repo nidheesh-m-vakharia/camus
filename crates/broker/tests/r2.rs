@@ -11,12 +11,10 @@ use camus_protocol::messages::create_topics_request::CreatableTopic;
 use camus_protocol::messages::create_topics_response::CreateTopicsResponse;
 use camus_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use camus_protocol::messages::fetch_response::FetchResponse;
-use camus_protocol::messages::join_group_request::JoinGroupRequest;
-use camus_protocol::messages::join_group_response::JoinGroupResponse;
 use camus_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use camus_protocol::messages::produce_response::ProduceResponse;
 use camus_protocol::messages::{
-    ApiKey, ApiVersionsRequest, ApiVersionsResponse, CreateTopicsRequest, FetchRequest, GroupId,
+    ApiKey, ApiVersionsRequest, ApiVersionsResponse, CreateTopicsRequest, FetchRequest,
     ProduceRequest, RequestHeader, TopicName,
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
@@ -306,15 +304,16 @@ fn produce_fetch_and_restart_keep_acked_bytes() {
     let (_, produced) = recv::<ProduceResponse>(&mut stream, 9);
     assert_eq!(produced.responses[0].partition_responses[0].error_code, 48);
 
+    // InitProducerId is Phase 4: known to the schema, not served yet.
     send(
         &mut stream,
-        ApiKey::JoinGroup,
-        5,
+        ApiKey::InitProducerId,
+        4,
         8,
-        &JoinGroupRequest::default().with_group_id(GroupId(StrBytes::from_static_str("g"))),
+        &camus_protocol::messages::InitProducerIdRequest::default(),
     );
-    let (_, joined) = recv::<JoinGroupResponse>(&mut stream, 5);
-    assert_eq!(joined.error_code, ResponseError::UnsupportedVersion.code());
+    let (_, init) = recv::<camus_protocol::messages::InitProducerIdResponse>(&mut stream, 4);
+    assert_eq!(init.error_code, ResponseError::UnsupportedVersion.code());
     drop(stream);
 
     node.child.kill().unwrap();

@@ -301,6 +301,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "camus-coordinator",
  "camus-metadata",
  "camus-protocol",
  "camus-raft",

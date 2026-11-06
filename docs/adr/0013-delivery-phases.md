@@ -89,6 +89,16 @@ committed offsets. A coordinator leader failover does not split-brain the
 group. Cases ported from the 4.4.0 group coordinator tests that apply to
 the classic protocol.
 
+Status 2026-11-06: classic groups done; two items open.
+
+| Item | Status | Test |
+| --- | --- | --- |
+| Three clients rebalance, commit, restart, keep offsets | done | `broker/tests/groups.rs` |
+| Coordinator failover does not split-brain the group | done | `broker/tests/group_failover.rs` |
+| List, describe, delete | done | `broker/tests/group_failover.rs` |
+| Cases ported from the 4.4.0 group coordinator tests | open | `coordinator/src/tests.rs` covers the main transitions; no port yet |
+| KIP-848 `ConsumerGroupHeartbeat` | open | |
+
 ### Phase 4 — Idempotence and admin
 
 `InitProducerId`, `CreatePartitions`, `AlterConfigs`,

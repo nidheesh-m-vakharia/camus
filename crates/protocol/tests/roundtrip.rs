@@ -73,12 +73,13 @@ fn known_unimplemented_keys_are_unsupported_version() {
     assert!(frame::is_implemented(ApiKey::Produce, 9));
     assert!(!frame::is_implemented(ApiKey::Produce, 2));
     assert!(frame::reject_unimplemented(ApiKey::Produce as i16).is_ok());
+    assert!(frame::reject_unimplemented(ApiKey::JoinGroup as i16).is_ok());
     assert_eq!(
-        frame::reject_unimplemented(ApiKey::JoinGroup as i16).unwrap_err(),
+        frame::reject_unimplemented(ApiKey::InitProducerId as i16).unwrap_err(),
         Unimplemented::UnsupportedVersion
     );
     assert_eq!(
-        frame::reject_unimplemented(ApiKey::JoinGroup as i16)
+        frame::reject_unimplemented(ApiKey::InitProducerId as i16)
             .unwrap_err()
             .code(),
         ResponseError::UnsupportedVersion.code()

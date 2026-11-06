@@ -84,6 +84,56 @@ const IMPLEMENTED: &[ImplementedApi] = &[
         min: 0,
         max: 2,
     },
+    ImplementedApi {
+        key: ApiKey::FindCoordinator,
+        min: 0,
+        max: 6,
+    },
+    ImplementedApi {
+        key: ApiKey::JoinGroup,
+        min: 0,
+        max: 9,
+    },
+    ImplementedApi {
+        key: ApiKey::SyncGroup,
+        min: 0,
+        max: 5,
+    },
+    ImplementedApi {
+        key: ApiKey::Heartbeat,
+        min: 0,
+        max: 4,
+    },
+    ImplementedApi {
+        key: ApiKey::LeaveGroup,
+        min: 0,
+        max: 5,
+    },
+    ImplementedApi {
+        key: ApiKey::OffsetCommit,
+        min: 2,
+        max: 10,
+    },
+    ImplementedApi {
+        key: ApiKey::OffsetFetch,
+        min: 1,
+        max: 10,
+    },
+    ImplementedApi {
+        key: ApiKey::ListGroups,
+        min: 0,
+        max: 5,
+    },
+    ImplementedApi {
+        key: ApiKey::DescribeGroups,
+        min: 0,
+        max: 6,
+    },
+    ImplementedApi {
+        key: ApiKey::DeleteGroups,
+        min: 0,
+        max: 3,
+    },
 ];
 
 /// Keys in [`implemented_apis`], for callers that only need the key.

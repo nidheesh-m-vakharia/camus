@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+pub mod groups;
 mod machine;
 mod network;
 
@@ -66,6 +67,31 @@ pub enum Command {
     Publish {
         /// Slices in commit order.
         parts: Vec<PublishPart>,
+    },
+    /// Store a consumer group's record. Rejected with ILLEGAL_GENERATION when
+    /// the stored generation is newer.
+    SaveGroup {
+        /// Group id.
+        group: String,
+        /// The record to store.
+        record: groups::GroupRecord,
+    },
+    /// Commit offsets for a group, all or none. A member's commit must match
+    /// the stored generation and membership (see [`groups::check_commit`]).
+    CommitOffsets {
+        /// Group id.
+        group: String,
+        /// Generation, or -1 for a commit outside group membership.
+        generation: i32,
+        /// Member id, empty with generation -1.
+        member_id: String,
+        /// Offsets to store.
+        offsets: Vec<groups::OffsetCommit>,
+    },
+    /// Delete an empty group's record and offsets.
+    DeleteGroup {
+        /// Group id.
+        group: String,
     },
 }
 
@@ -205,6 +231,26 @@ impl MetadataNode {
     pub async fn publish(&self, parts: Vec<PublishPart>) -> anyhow::Result<Response> {
         let response = self.raft.client_write(Command::Publish { parts }).await?;
         Ok(response.data)
+    }
+
+    /// Commit a group command and return its Kafka error code (0 = applied).
+    pub async fn group_write(&self, command: Command) -> anyhow::Result<i16> {
+        let response = self.raft.client_write(command).await?;
+        Ok(response.data.error_code)
+    }
+
+    /// Wait until this node, as leader, has applied everything committed
+    /// before the call, so a following [`MetadataNode::read_local`] is
+    /// linearizable. Fails when this node is not the leader.
+    pub async fn linearizable(&self) -> anyhow::Result<()> {
+        self.raft.ensure_linearizable().await?;
+        Ok(())
+    }
+
+    /// Applied keys starting with `prefix`, in key order. Not linearizable on
+    /// its own; call [`MetadataNode::linearizable`] first when it must be.
+    pub fn scan_local(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(self.machine.scan(prefix)?)
     }
 
     /// Read the latest applied value on this node. This is not a linearizable read.

@@ -19,6 +19,7 @@ camus-protocol = { path = "../protocol" }
 camus-storage = { path = "../storage" }
 camus-uploader = { path = "../uploader" }
 camus-wal = { path = "../wal" }
+camus-coordinator = { path = "../coordinator" }
 clap = { version = "4", features = ["derive"] }
 openraft = { version = "=0.9.25", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

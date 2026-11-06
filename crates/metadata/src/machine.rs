@@ -68,6 +68,31 @@ impl RedbMachine {
         })
     }
 
+    /// Applied keys starting with `prefix`, in key order.
+    pub fn scan(&self, prefix: &str) -> Result<Vec<(String, String)>, StorageError<NodeId>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+        let table = match txn.open_table(KV) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(io(ErrorSubject::StateMachine, &err)),
+        };
+        let mut out = Vec::new();
+        for row in table
+            .range(prefix..)
+            .map_err(|err| io(ErrorSubject::StateMachine, &err))?
+        {
+            let (key, value) = row.map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+            if !key.value().starts_with(prefix) {
+                break;
+            }
+            out.push((key.value().to_string(), value.value().to_string()));
+        }
+        Ok(out)
+    }
+
     /// Local read of an applied key.
     pub fn get(&self, key: &str) -> Result<Option<String>, StorageError<NodeId>> {
         let txn = self
@@ -152,6 +177,12 @@ fn apply_command(
     kv: &mut redb::Table<&str, &str>,
     command: Command,
 ) -> Result<Response, StorageError<NodeId>> {
+    match command {
+        Command::SaveGroup { .. } | Command::CommitOffsets { .. } | Command::DeleteGroup { .. } => {
+            return apply_group(kv, command);
+        }
+        _ => {}
+    }
     if let Command::Put { key, value } = command {
         let previous = kv
             .insert(key.as_str(), value.as_str())
@@ -177,6 +208,11 @@ fn apply_command(
             } => catalog::create_topic(&read, &name, &id, partitions, &durability),
             Command::DeleteTopic { name } => catalog::delete_topic(&read, &name),
             Command::Publish { parts } => catalog::publish(&read, &parts),
+            Command::SaveGroup { .. }
+            | Command::CommitOffsets { .. }
+            | Command::DeleteGroup { .. } => {
+                unreachable!("handled above")
+            }
         }
     };
     let outcome =
@@ -194,6 +230,97 @@ fn apply_command(
             }
             Ok(Response::ok(None))
         }
+    }
+}
+
+/// Group commands: they need a prefix scan, which the catalog's
+/// get-only helpers do not offer.
+fn apply_group(
+    kv: &mut redb::Table<&str, &str>,
+    command: Command,
+) -> Result<Response, StorageError<NodeId>> {
+    use crate::groups;
+    let err = |err: &dyn std::error::Error| io(ErrorSubject::StateMachine, err);
+    let read_group = |kv: &redb::Table<&str, &str>,
+                      group: &str|
+     -> Result<Option<groups::GroupRecord>, StorageError<NodeId>> {
+        match kv
+            .get(groups::group_key(group).as_str())
+            .map_err(|e| err(&e))?
+        {
+            Some(raw) => Ok(Some(
+                serde_json::from_str(raw.value()).map_err(|e| err(&e))?,
+            )),
+            None => Ok(None),
+        }
+    };
+    match command {
+        Command::SaveGroup { group, record } => {
+            if let Some(stored) = read_group(kv, &group)? {
+                if stored.generation > record.generation {
+                    return Ok(Response::reject(groups::codes::ILLEGAL_GENERATION));
+                }
+            }
+            let raw = serde_json::to_string(&record).map_err(|e| err(&e))?;
+            kv.insert(groups::group_key(&group).as_str(), raw.as_str())
+                .map_err(|e| err(&e))?;
+            Ok(Response::ok(None))
+        }
+        Command::CommitOffsets {
+            group,
+            generation,
+            member_id,
+            offsets,
+        } => {
+            let stored = read_group(kv, &group)?;
+            if let Err(code) = groups::check_commit(stored.as_ref(), generation, &member_id) {
+                return Ok(Response::reject(code));
+            }
+            if stored.is_none() {
+                // A group that only has offsets still lists and describes.
+                let raw =
+                    serde_json::to_string(&groups::GroupRecord::default()).map_err(|e| err(&e))?;
+                kv.insert(groups::group_key(&group).as_str(), raw.as_str())
+                    .map_err(|e| err(&e))?;
+            }
+            for commit in offsets {
+                let raw = serde_json::to_string(&commit.record).map_err(|e| err(&e))?;
+                kv.insert(
+                    groups::offset_key(&group, &commit.topic_id, commit.partition).as_str(),
+                    raw.as_str(),
+                )
+                .map_err(|e| err(&e))?;
+            }
+            Ok(Response::ok(None))
+        }
+        Command::DeleteGroup { group } => {
+            let stored = read_group(kv, &group)?;
+            if stored
+                .as_ref()
+                .is_some_and(|record| !record.members.is_empty())
+            {
+                return Ok(Response::reject(groups::codes::NON_EMPTY_GROUP));
+            }
+            let prefix = groups::offset_prefix(&group);
+            let mut doomed = Vec::new();
+            for row in kv.range(prefix.as_str()..).map_err(|e| err(&e))? {
+                let (key, _) = row.map_err(|e| err(&e))?;
+                if !key.value().starts_with(&prefix) {
+                    break;
+                }
+                doomed.push(key.value().to_string());
+            }
+            if stored.is_none() && doomed.is_empty() {
+                return Ok(Response::reject(groups::codes::GROUP_ID_NOT_FOUND));
+            }
+            for key in doomed {
+                kv.remove(key.as_str()).map_err(|e| err(&e))?;
+            }
+            kv.remove(groups::group_key(&group).as_str())
+                .map_err(|e| err(&e))?;
+            Ok(Response::ok(None))
+        }
+        _ => unreachable!("only group commands"),
     }
 }
 

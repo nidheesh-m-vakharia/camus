@@ -7,7 +7,9 @@ acceptance item. Topics default to `wal`, which acks after a majority of the
 WAL shard's voters has the batch on disk. SASL_SSL is covered by a Rust test
 and by Java, librdkafka, and franz-go, which now run on `wal` topics. After a
 majority loss, `camus admin truncate-to-sealed` resumes a shard at its
-sealed end. Phase 3 (consumer groups) is next. The ADRs under
+sealed end. Phase 3 classic consumer groups work with Java, librdkafka,
+and franz-go and survive a coordinator failover; KIP-848 and the ported
+Kafka coordinator test cases are still open (ADR 0013). The ADRs under
 `docs/adr/` are accepted.
 This file is the map of those decisions and of what Phase 0 is allowed to touch.
 

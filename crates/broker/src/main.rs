@@ -6,7 +6,6 @@
 mod kafka;
 mod slot;
 
-
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;

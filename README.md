@@ -11,7 +11,9 @@ ack after the object is stored and the metadata group has committed the
 offset. `kafka-clients` 4.4.0, librdkafka, and franz-go pass both, over
 PLAINTEXT and SASL_SSL. Losing the shard leader or a follower loses no
 acknowledged offset; R2 outages throttle produce instead of dropping acks.
-Consumer groups are Phase 3.
+Classic consumer groups (join, sync, heartbeat, commit, fetch, list,
+describe, delete) work with the same three clients and survive a
+coordinator failover. KIP-848 groups are not in yet.
 The plan and ADRs are in `docs/`. License: Apache-2.0.
 
 ## What a client changes
