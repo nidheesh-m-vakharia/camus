@@ -1,59 +1,105 @@
 # Camus
 
-A Kafka-compatible streaming broker written in Rust. Producers, consumers, and
-admin clients speak the Apache Kafka wire protocol. Long-term data lives in
-Cloudflare R2. There is no JVM, no ZooKeeper, and no external database.
+Camus is a Kafka broker in one Rust binary. Producers, consumers, and admin
+clients use the Kafka wire protocol. The log is stored in Cloudflare R2, or
+any S3-compatible bucket. Brokers replicate metadata, and a short
+write-ahead log, with Raft. A deployment does not need a JVM, ZooKeeper,
+KRaft, or a separate database.
 
-Status: **Phase 2 is done: `wal` and `r2` produce and fetch are in the
-tree.** Topics default to `wal`: a produce acks once a majority of the WAL
-shard's voters has fsynced the batch, and the R2 upload follows. `r2` topics
-ack after the object is stored and the metadata group has committed the
-offset. `kafka-clients` 4.4.0, librdkafka, and franz-go pass both, over
-PLAINTEXT and SASL_SSL. Losing the shard leader or a follower loses no
-acknowledged offset; R2 outages throttle produce instead of dropping acks.
-Classic consumer groups (join, sync, heartbeat, commit, fetch, list,
-describe, delete) work with the same three clients and survive a
-coordinator failover. KIP-848 `ConsumerGroupHeartbeat` is in: the Java
-client can use `group.protocol=consumer`. `InitProducerId` is in, and a
-retried idempotent batch returns its original offset instead of being
-appended again, including after a WAL leader change. Phase 4 admin APIs
-are in: `DescribeCluster`, `CreatePartitions`, `AlterConfigs`,
-`IncrementalAlterConfigs`, `DeleteRecords`, and `OffsetDelete`.
-A transactional produce stays hidden from `read_committed` until `EndTxn`
-commits it; an abort stays hidden. Java, librdkafka, and franz-go check
-that path, a compacted log, and an ACL denial. The same three clients
-also call the admin APIs their libraries expose (`DescribeCluster`,
-config alter, `CreatePartitions`, `DeleteRecords`, `OffsetDelete`,
-`DeleteTopics`, and ACL delete). `cleanup.policy=compact`
-keeps the latest record for each key. ACL denial on produce or fetch
-returns an authorization error.
-The plan and ADRs are in `docs/`. License: Apache-2.0.
+Kafka compatibility is pinned to Apache Kafka 4.4.0. The API matrix, and
+the places Camus deliberately differs, are in
+[docs/compatibility.md](docs/compatibility.md).
 
-## What a client changes
+## Run one broker
 
-The bootstrap server address. Java `kafka-clients`, librdkafka (Python, Go,
-.NET), franz-go, kafka-python, KafkaJS, and kcat are the compatibility
-targets.
+Docker listens on 18001 (HTTP admin) and 9092 (Kafka PLAINTEXT), then
+initializes a one-node group. Clients use `127.0.0.1:9092`.
 
-## Two durability modes
+```
+docker build -t camus .
+docker run --rm -p 18001:18001 -p 9092:9092 camus
+```
 
-| Mode | Ack barrier | What you trade |
-| --- | --- | --- |
-| `wal` (default) | Quorum fsync of a short write-ahead log | Local disk and intra-region replication, for produce latency aimed under 20ms p99 |
-| `r2` | The batch is in R2 and its offsets are committed in metadata | Brokers hold no log state. Produce latency is hundreds of milliseconds |
+From a checkout, the same shape is:
 
-`acks=0` does not wait, in either mode. See [ADR 0005](docs/adr/0005-durability-and-acks.md).
+```
+cargo run -p camus-broker -- \
+  --node-id 1 \
+  --http-addr 127.0.0.1:18080 \
+  --kafka-addr 127.0.0.1:19092 \
+  --data-dir /tmp/camus \
+  --dev-plaintext
+curl -sf -X POST http://127.0.0.1:18080/admin/init \
+  -H 'content-type: application/json' \
+  -d '[{"id":1,"addr":"127.0.0.1:18080"}]'
+```
 
-R2 is the long-term source of truth in both modes. The WAL is a buffer of
-seconds, then it is uploaded and truncated.
+`--dev-plaintext` is refused on a non-loopback address unless you also pass
+`--allow-non-loopback`. SASL_SSL needs `--tls-cert`, `--tls-key`,
+`CAMUS_SASL_USER`, and `CAMUS_SASL_PASSWORD`.
 
-## Read this first
+The bucket defaults to MinIO at `http://127.0.0.1:9100`, bucket `camus`,
+keys `camus` / `camus-dev-secret`. Override with `CAMUS_S3_ENDPOINT`,
+`CAMUS_S3_BUCKET`, `CAMUS_S3_ACCESS_KEY`, and `CAMUS_S3_SECRET_KEY`. A
+container does not see MinIO on the host at `127.0.0.1`; point
+`CAMUS_S3_ENDPOINT` at the host.
 
-1. [docs/PLAN.md](docs/PLAN.md) — accepted decisions, and what Phase 0 will and will not do.
-2. [docs/adr/](docs/adr/) — the decisions, in detail.
-3. [docs/compatibility.md](docs/compatibility.md) — pinned Kafka tag and the API matrix.
+`GET /admin/metrics` returns JSON, including `current_leader` and
+`wal_leader`. `GET /metrics` is Prometheus.
 
-## Phase 0
+Three brokers plus MinIO: `docker compose --profile brokers up`. The image
+is published from `main` to `ghcr.io/<owner>/camus`, tagged `latest` and
+the commit sha, after the test workflow passes. The GitHub package stays
+private until you change that in the package settings.
+
+## What clients can do
+
+Change the bootstrap server. These clients have been run against Camus:
+`kafka-clients` 4.4.0, librdkafka (confluent-kafka 2.16.1), and franz-go
+v1.22.0.
+
+- Produce and fetch, including idempotent produce. A retried sequence
+  returns the original offset.
+- Consumer groups: classic join, sync, heartbeat, commit, and leave, plus
+  list, describe, and delete. The Java client can use
+  `group.protocol=consumer` (KIP-848 `ConsumerGroupHeartbeat`).
+- Transactions. `read_committed` hides a batch until `EndTxn` commits it.
+  An abort stays hidden. There are no control-batch markers; visibility is
+  the committed and aborted offset ranges.
+- Topic admin that those libraries expose: describe cluster, describe and
+  alter configs, create partitions, delete records, delete topics, and
+  ACLs.
+- `cleanup.policy=compact` keeps the latest record for each key, at its
+  original offset. Compaction runs only when `CAMUS_COMPACT_MS` is greater
+  than 0, and only over sealed extents. Tombstones are kept.
+
+A few Kafka behaviors are different on purpose:
+
+| | Camus |
+| --- | --- |
+| `acks=1` | Same barrier as `acks=all` |
+| `acks=0` | No wait, and the batch may be lost |
+| No ACL on a resource | Allowed. `DENY` beats `ALLOW`. Only host `*` matches |
+| ACL denial on produce or fetch | `TOPIC_AUTHORIZATION_FAILED` (29) |
+| `DeleteRecords` | Deletes through the next whole object, not an arbitrary offset |
+
+The full list is in [docs/compatibility.md](docs/compatibility.md).
+
+## Durability
+
+| Mode | When a produce is acknowledged |
+| --- | --- |
+| `wal` (default) | A majority of the WAL shard has fsynced the batch. The upload to R2 follows, and the WAL is truncated. |
+| `r2` | The batch is in R2 and the metadata group has committed its offsets. |
+
+`wal` keeps a few seconds of log on local disk so acknowledgements are not
+limited by object-storage latency. `r2` keeps no log bytes on the broker.
+See [ADR 0005](docs/adr/0005-durability-and-acks.md).
+
+Set the mode at topic creation with `durability.mode`. The cluster default
+is `CAMUS_DEFAULT_DURABILITY`.
+
+## Develop
 
 ```
 cargo test --workspace
@@ -61,16 +107,24 @@ docker compose up -d minio create-bucket
 CAMUS_MINIO=1 cargo test -p camus-storage --test minio
 ```
 
-`cargo test -p camus-broker --test cluster` starts three broker processes,
-commits a metadata write, kills the leader, and checks that a new write
-commits. The MinIO image is built locally from the archived community
-release (`deploy/minio`), because Docker Hub and dl.min.io no longer serve
-it. `docker compose --profile brokers up` builds the broker image as well.
+`cargo test -p camus-broker --test cluster` starts three processes, commits
+a metadata write, kills the leader, and checks that a new write commits.
+MinIO is built from `deploy/minio` because current community images are no
+longer published. Tests that need a bucket skip unless `CAMUS_MINIO=1`.
 
-## Layout
+GitHub Actions runs `cargo test --workspace --locked` on pull requests and
+on `main`.
 
-A Cargo workspace: `protocol`, `broker`, `raft`, `metadata`, `wal`, `storage`,
-`uploader`, `coordinator`, `compactor`, `cli`, plus `engine-bench`.
-`docker-compose.yml` runs MinIO as the R2 stand-in. The broker exposes
-`/metrics`. `wal`, `uploader`, `coordinator`, and `compactor` are empty
-crates. `camus` (the cli) exits 2.
+## Docs
+
+- [docs/PLAN.md](docs/PLAN.md) — what has been accepted, phase by phase
+- [docs/adr/](docs/adr/) — the decisions
+- [docs/compatibility.md](docs/compatibility.md) — Kafka 4.4.0 pin and the API matrix
+
+The workspace crates are `protocol`, `broker`, `raft`, `metadata`, `wal`,
+`storage`, `uploader`, `coordinator`, `compactor`, `cli`, and
+`engine-bench`. `camus admin truncate-to-sealed` resumes a WAL shard that
+has lost a majority, at its sealed end. That drops acknowledged data that
+was not sealed yet.
+
+License: Apache-2.0.

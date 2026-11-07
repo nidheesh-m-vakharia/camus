@@ -1,0 +1,9 @@
+.git
+.github
+target
+Benchmarks
+docs
+**/*.md
+*.log
+.env
+.env.*
