@@ -9,6 +9,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 func main() {
@@ -20,6 +21,8 @@ func main() {
 		compact(bootstrap)
 	case "acl":
 		acl(bootstrap)
+	case "admin":
+		adminRound(bootstrap)
 	default:
 		panic(mode)
 	}
@@ -137,6 +140,95 @@ func acl(bootstrap string) {
 	err = produceErr(ctx, bootstrap, topic, "k", "3")
 	check(err != nil && err.Error() != "", "DENY WRITE still produced")
 	fmt.Println("franz-go acl ok")
+}
+
+func adminRound(bootstrap string) {
+	ctx := context.Background()
+	topic := fmt.Sprintf("e%d", time.Now().UnixNano()%1_000_000_000)
+	group := fmt.Sprintf("g%d", time.Now().UnixNano()%1_000_000_000)
+	txn := fmt.Sprintf("txn-%d", time.Now().UnixNano()%1_000_000_000)
+	client, err := kgo.NewClient(kgo.SeedBrokers(bootstrap))
+	must(err)
+	defer client.Close()
+	adm := kadm.NewClient(client)
+	created, err := adm.CreateTopic(ctx, 1, 1, nil, topic)
+	must(err)
+	must(created.Err)
+	retention := "1000"
+	altered, err := adm.AlterTopicConfigs(ctx, []kadm.AlterConfig{{
+		Op: kadm.SetConfig, Name: "retention.ms", Value: &retention,
+	}}, topic)
+	must(err)
+	must(altered[0].Err)
+	state := "2000"
+	replaced, err := adm.AlterTopicConfigsState(ctx, []kadm.AlterConfig{{
+		Name: "retention.ms", Value: &state,
+	}}, topic)
+	must(err)
+	must(replaced[0].Err)
+	configs, err := adm.DescribeTopicConfigs(ctx, topic)
+	must(err)
+	found := false
+	for _, resource := range configs {
+		for _, entry := range resource.Configs {
+			if entry.Key == "retention.ms" && entry.Value != nil && *entry.Value == "2000" {
+				found = true
+			}
+		}
+	}
+	check(found, "retention was not 2000")
+	grown, err := adm.UpdatePartitions(ctx, 2, topic)
+	must(err)
+	must(grown[topic].Err)
+	offsets := make(kadm.Offsets)
+	offsets.Add(kadm.Offset{Topic: topic, Partition: 0, At: 0})
+	deleted, err := adm.DeleteRecords(ctx, offsets)
+	must(err)
+	must(deleted.Error())
+	member, err := kgo.NewClient(
+		kgo.SeedBrokers(bootstrap),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.DisableAutoCommit(),
+	)
+	must(err)
+	await(ctx, member)
+	done := make(chan error, 1)
+	member.CommitOffsetsSync(ctx, map[string]map[int32]kgo.EpochOffset{
+		topic: {0: {Offset: 0}},
+	}, func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, _ *kmsg.OffsetCommitResponse, err error) {
+		done <- err
+	})
+	must(<-done)
+	member.Close()
+	removed, err := adm.DeleteOffsets(ctx, group, kadm.TopicsSet{topic: {0: struct{}{}}})
+	must(err)
+	must(removed.Error())
+	producer, err := kgo.NewClient(kgo.SeedBrokers(bootstrap), kgo.TransactionalID(txn), kgo.TransactionTimeout(10*time.Second))
+	must(err)
+	must(producer.BeginTransaction())
+	must(producer.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("x")}).FirstErr())
+	listed, err := adm.ListTransactions(ctx, nil, nil)
+	must(err)
+	_, ok := listed[txn]
+	check(ok, "list transactions missed the id")
+	txns, err := adm.DescribeTransactions(ctx, txn)
+	must(err)
+	check(txns[txn].Err == nil, "describe transaction")
+	must(producer.EndTransaction(ctx, kgo.TryAbort))
+	producer.Close()
+	gone, err := adm.DeleteTopics(ctx, topic)
+	must(err)
+	must(gone[topic].Err)
+	_, err = adm.CreateACLs(ctx, kadm.NewACLs().Topics(topic).Allow("User:ANONYMOUS").Operations(kadm.OpRead))
+	must(err)
+	described, err := adm.DescribeACLs(ctx, kadm.NewACLs().Topics(topic).Allow("User:ANONYMOUS").AllowHosts("*").Operations(kadm.OpRead))
+	must(err)
+	check(len(described) > 0 && len(described[0].Described) > 0, fmt.Sprintf("describe acls: %+v", described))
+	_, err = adm.DeleteACLs(ctx, kadm.NewACLs().Topics(topic).Allow("User:ANONYMOUS").AllowHosts("*").Operations(kadm.OpRead))
+	must(err)
+	fmt.Println("franz-go admin ok")
 }
 
 func produce(ctx context.Context, bootstrap, topic, key, value string) {

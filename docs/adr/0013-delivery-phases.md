@@ -110,8 +110,11 @@ duplicates across a leader change. `DeleteRecords` honors the whole-object
 rule in ADR 0010 and documents it.
 
 Status 2026-11-06: idempotent produce and the admin APIs in this phase are
-in. `DeleteRecords` follows the whole-object rule in ADR 0010. No real
-client has been run against these APIs yet.
+in. `DeleteRecords` follows the whole-object rule in ADR 0010. Java,
+librdkafka, and franz-go exercise create-partitions, config alter,
+delete-records, and (except librdkafka) offset delete. Java and
+librdkafka also call `DescribeCluster`. The Java admin client has no
+non-incremental `AlterConfigs`.
 
 ### Phase 5 — Transactions, log compaction, ACLs
 
@@ -129,7 +132,8 @@ A resource with no ACL stays open. A denial on produce or fetch is
 `TOPIC_AUTHORIZATION_FAILED` (29). `kafka-clients` 4.4.0, librdkafka,
 and franz-go each hide an open batch, keep an abort hidden, read a
 compacted log, and observe an ACL denial. Java and librdkafka also
-commit the consumer offset inside the transaction.
+commit the consumer offset inside the transaction. Java and franz-go
+describe and list transactions. All three delete an ACL.
 
 ### Cross-phase rules
 

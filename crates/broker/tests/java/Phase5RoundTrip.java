@@ -16,6 +16,7 @@ public class Phase5RoundTrip {
     public static void main(String[] args) throws Exception {
         if (args[0].equals("compact")) compact(args[1]);
         else if (args[0].equals("acl")) acl(args[1]);
+        else if (args[0].equals("admin")) adminRound(args[1]);
         else throw new AssertionError(args[0]);
     }
 
@@ -68,6 +69,59 @@ public class Phase5RoundTrip {
         }
         check(denied, "DENY WRITE still produced");
         System.out.println("java acl ok");
+    }
+
+    static void adminRound(String bootstrap) throws Exception {
+        String topic = "e" + UUID.randomUUID().toString().substring(0, 8);
+        String group = "g" + UUID.randomUUID().toString().substring(0, 8);
+        try (Admin client = Admin.create(admin(bootstrap))) {
+            var cluster = client.describeCluster();
+            check("camus".equals(cluster.clusterId().get()), "cluster " + cluster.clusterId().get());
+            check(cluster.controller().get().id() == 1, "controller " + cluster.controller().get().id());
+            client.createTopics(List.of(new NewTopic(topic, 1, (short) 1))).all().get();
+            client.incrementalAlterConfigs(Map.of(
+                    new ConfigResource(ConfigResource.Type.TOPIC, topic),
+                    List.of(new AlterConfigOp(new ConfigEntry("retention.ms", "1000"), AlterConfigOp.OpType.SET))))
+                    .all().get();
+            String retention = client.describeConfigs(List.of(new ConfigResource(ConfigResource.Type.TOPIC, topic)))
+                    .all().get().values().iterator().next().get("retention.ms").value();
+            check("1000".equals(retention), "retention " + retention);
+            client.createPartitions(Map.of(topic, NewPartitions.increaseTo(2))).all().get();
+            client.deleteRecords(Map.of(new TopicPartition(topic, 0), RecordsToDelete.beforeOffset(0))).all().get();
+        }
+        commitOne(bootstrap, topic, group);
+        try (Admin client = Admin.create(admin(bootstrap))) {
+            client.deleteConsumerGroupOffsets(group, Set.of(new TopicPartition(topic, 0))).all().get();
+            client.deleteTopics(List.of(topic)).all().get();
+            client.createAcls(List.of(binding(topic, AclOperation.READ, AclPermissionType.ALLOW))).all().get();
+            client.deleteAcls(List.of(new AclBindingFilter(
+                    new ResourcePatternFilter(ResourceType.TOPIC, topic, PatternType.LITERAL),
+                    new AccessControlEntryFilter("User:ANONYMOUS", "*", AclOperation.READ, AclPermissionType.ALLOW))))
+                    .all().get();
+        }
+        System.out.println("java admin ok");
+    }
+
+    static void commitOne(String bootstrap, String topic, String group) {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, group);
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        try (KafkaConsumer<String, String> consumer =
+                new KafkaConsumer<>(props, new StringDeserializer(), new StringDeserializer())) {
+            consumer.subscribe(List.of(topic));
+            awaitAssignment(consumer);
+            consumer.commitSync(Map.of(new TopicPartition(topic, 0), new OffsetAndMetadata(0)));
+        }
+    }
+
+    static void awaitAssignment(KafkaConsumer<String, String> consumer) {
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (consumer.assignment().isEmpty()) {
+            check(System.currentTimeMillis() < deadline, "assignment did not settle");
+            consumer.poll(Duration.ofMillis(200));
+        }
     }
 
     static AclBinding binding(String topic, AclOperation operation, AclPermissionType permission) {

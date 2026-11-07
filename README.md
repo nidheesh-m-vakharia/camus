@@ -21,7 +21,10 @@ are in: `DescribeCluster`, `CreatePartitions`, `AlterConfigs`,
 `IncrementalAlterConfigs`, `DeleteRecords`, and `OffsetDelete`.
 A transactional produce stays hidden from `read_committed` until `EndTxn`
 commits it; an abort stays hidden. Java, librdkafka, and franz-go check
-that path, a compacted log, and an ACL denial. `cleanup.policy=compact`
+that path, a compacted log, and an ACL denial. The same three clients
+also call the admin APIs their libraries expose (`DescribeCluster`,
+config alter, `CreatePartitions`, `DeleteRecords`, `OffsetDelete`,
+`DeleteTopics`, and ACL delete). `cleanup.policy=compact`
 keeps the latest record for each key. ACL denial on produce or fetch
 returns an authorization error.
 The plan and ADRs are in `docs/`. License: Apache-2.0.

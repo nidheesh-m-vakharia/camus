@@ -7,12 +7,14 @@ import uuid
 from confluent_kafka import Consumer, Producer, TopicPartition
 from confluent_kafka.admin import (
     AclBinding,
+    AclBindingFilter,
     AclOperation,
     AclPermissionType,
     AdminClient,
     AlterConfigOpType,
     ConfigEntry,
     ConfigResource,
+    NewPartitions,
     NewTopic,
     ResourcePatternType,
     ResourceType,
@@ -204,11 +206,55 @@ def AclBindingFilter_any():
     )
 
 
+def admin_round():
+    topic = "e" + uuid.uuid4().hex[:8]
+    group = "g" + uuid.uuid4().hex[:8]
+    client = create_topic(topic)
+    described = client.describe_cluster().result()
+    cluster_id = getattr(described, "cluster_id", None)
+    assert cluster_id == "camus", described
+    resource = ConfigResource(ConfigResource.Type.TOPIC, topic)
+    resource.set_config("retention.ms", "1000")
+    client.alter_configs([resource])[resource].result()
+    resource = ConfigResource(ConfigResource.Type.TOPIC, topic)
+    resource.add_incremental_config(ConfigEntry("retention.ms", "2000", incremental_operation=AlterConfigOpType.SET))
+    client.incremental_alter_configs([resource])[resource].result()
+    futures = client.describe_configs([ConfigResource(ConfigResource.Type.TOPIC, topic)])
+    described = next(iter(futures.values())).result()
+    retention = described["retention.ms"] if isinstance(described, dict) else None
+    assert retention is not None and str(retention.value) == "2000", described
+    next(iter(client.create_partitions([NewPartitions(topic, 2)]).values())).result()
+    next(iter(client.delete_records([TopicPartition(topic, 0, 0)]).values())).result()
+    member = Consumer({
+        **common,
+        "group.id": group,
+        "enable.auto.commit": False,
+        "auto.offset.reset": "earliest",
+    })
+    member.subscribe([topic])
+    deadline = time.time() + 15
+    while not member.assignment():
+        assert time.time() < deadline, "assignment did not settle"
+        member.poll(0.2)
+    member.commit(offsets=[TopicPartition(topic, 0, 0)], asynchronous=False)
+    member.close()
+    next(iter(client.delete_topics([topic]).values())).result()
+    binding = AclBinding(ResourceType.TOPIC, topic, ResourcePatternType.LITERAL, "User:ANONYMOUS", "*", AclOperation.READ, AclPermissionType.ALLOW)
+    for future in client.create_acls([binding]).values():
+        future.result()
+    filt = AclBindingFilter(ResourceType.TOPIC, topic, ResourcePatternType.LITERAL, "User:ANONYMOUS", "*", AclOperation.READ, AclPermissionType.ALLOW)
+    for future in client.delete_acls([filt]).values():
+        future.result()
+    print("librdkafka admin ok")
+
+
 if mode == "txn":
     transaction()
 elif mode == "compact":
     compact()
 elif mode == "acl":
     acl()
+elif mode == "admin":
+    admin_round()
 else:
     raise SystemExit(mode)

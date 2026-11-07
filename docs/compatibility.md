@@ -130,8 +130,8 @@ acceptance test. `-` means not run.
 | SaslHandshake | 17 | 1 | 0-1 | implemented (PLAIN) | pass | pass | pass |
 | ApiVersions | 18 | 1 | 0-5 | implemented | pass | pass | pass |
 | CreateTopics | 19 | 1 | 2-7 | implemented | pass | pass | pass |
-| DeleteTopics | 20 | 1 | 1-6 | implemented | - | - | - |
-| DeleteRecords | 21 | 4 | 0-2 | implemented | - | - | - |
+| DeleteTopics | 20 | 1 | 1-6 | implemented | pass | pass | pass |
+| DeleteRecords | 21 | 4 | 0-2 | implemented | pass | pass | pass |
 | InitProducerId | 22 | 4 | 0-4 | implemented | pass | - | - |
 | OffsetForLeaderEpoch | 23 | | not planned for phases 0–5 | unimplemented | - | - | - |
 | AddPartitionsToTxn | 24 | 5 | 0-3 | implemented | pass | pass | pass |
@@ -139,25 +139,25 @@ acceptance test. `-` means not run.
 | EndTxn | 26 | 5 | 0-3 | implemented | pass | pass | pass |
 | WriteTxnMarkers | 27 | | broker-internal, not a client API | unimplemented | - | - | - |
 | TxnOffsetCommit | 28 | 5 | 0-3 | implemented | pass | pass | - |
-| DescribeAcls | 29 | 5 | 1-3 | implemented | pass | pass | - |
+| DescribeAcls | 29 | 5 | 1-3 | implemented | pass | pass | pass |
 | CreateAcls | 30 | 5 | 1-3 | implemented | pass | pass | pass |
-| DeleteAcls | 31 | 5 | 1-3 | implemented | - | - | - |
-| DescribeConfigs | 32 | 1 | 1-4 | implemented | - | - | - |
-| AlterConfigs | 33 | 4 | 0-2 | implemented | - | - | - |
+| DeleteAcls | 31 | 5 | 1-3 | implemented | pass | pass | pass |
+| DescribeConfigs | 32 | 1 | 1-4 | implemented | pass | pass | pass |
+| AlterConfigs | 33 | 4 | 0-2 | implemented | - | pass | pass |
 | AlterReplicaLogDirs | 34 | | not planned | unimplemented | - | - | - |
 | DescribeLogDirs | 35 | | not planned | unimplemented | - | - | - |
 | SaslAuthenticate | 36 | 1 | 0-2 | implemented (PLAIN) | pass | pass | pass |
-| CreatePartitions | 37 | 4 | 0-3 | implemented | - | - | - |
+| CreatePartitions | 37 | 4 | 0-3 | implemented | pass | pass | pass |
 | CreateDelegationToken | 38 | | not planned | unimplemented | - | - | - |
 | RenewDelegationToken | 39 | | not planned | unimplemented | - | - | - |
 | ExpireDelegationToken | 40 | | not planned | unimplemented | - | - | - |
 | DescribeDelegationToken | 41 | | not planned | unimplemented | - | - | - |
 | DeleteGroups | 42 | 3 | 0-3 | implemented | pass | pass | pass |
 | ElectLeaders | 43 | | internal leader changes follow Raft; API not planned | unimplemented | - | - | - |
-| IncrementalAlterConfigs | 44 | 4 | 0-1 | implemented | - | - | - |
+| IncrementalAlterConfigs | 44 | 4 | 0-1 | implemented | pass | pass | pass |
 | AlterPartitionReassignments | 45 | | not planned | unimplemented | - | - | - |
 | ListPartitionReassignments | 46 | | not planned | unimplemented | - | - | - |
-| OffsetDelete | 47 | 4 | 0 | implemented | - | - | - |
+| OffsetDelete | 47 | 4 | 0 | implemented | pass | - | pass |
 | DescribeClientQuotas | 48 | | throttle is internal; API not planned for 0–5 | unimplemented | - | - | - |
 | AlterClientQuotas | 49 | | not planned | unimplemented | - | - | - |
 | DescribeUserScramCredentials | 50 | | SCRAM not planned | unimplemented | - | - | - |
@@ -165,11 +165,11 @@ acceptance test. `-` means not run.
 | DescribeQuorum | 55 | | not planned (KRaft-specific) | unimplemented | - | - | - |
 | UpdateFeatures | 57 | | not planned | unimplemented | - | - | - |
 | Envelope | 58 | | not planned | unimplemented | - | - | - |
-| DescribeCluster | 60 | 4 | 0-2 | implemented | - | - | - |
+| DescribeCluster | 60 | 4 | 0-2 | implemented | pass | pass | - |
 | DescribeProducers | 61 | | not planned before phase 5, then reconsider | unimplemented | - | - | - |
 | UnregisterBroker | 64 | | not planned | unimplemented | - | - | - |
-| DescribeTransactions | 65 | 5 | 0 | implemented | pass | - | - |
-| ListTransactions | 66 | 5 | 0-2 | implemented | pass | - | - |
+| DescribeTransactions | 65 | 5 | 0 | implemented | pass | - | pass |
+| ListTransactions | 66 | 5 | 0-2 | implemented | pass | - | pass |
 | AllocateProducerIds | 67 | | broker-internal | unimplemented | - | - | - |
 | ConsumerGroupHeartbeat | 68 | 3 | 0-1 | implemented | pass | - | - |
 | ConsumerGroupDescribe | 69 | 3 | TBD | unimplemented | - | - | - |
@@ -223,8 +223,15 @@ assigning the partition. None of them join a consumer group.
 hidden from `read_committed`, and an abort stays hidden. The Java and
 librdkafka runs also commit the group offset in the same transaction.
 The same three clients produce a compacted log and see an ACL denial.
-`DescribeTransactions` and `ListTransactions` are exercised by the Java
-admin client. Compaction still runs only on sealed extents when
+The same three clients also run the admin path in `clients_run_the_admin_apis`:
+describe and alter topic config, create partitions, delete records, delete
+the topic, and delete the ACL they created. Java and librdkafka call
+`DescribeCluster`. Java and franz-go call `OffsetDelete`. librdkafka and
+franz-go call non-incremental `AlterConfigs`; the Java 4.4 admin client has
+no such method. Java and franz-go call `DescribeTransactions` and
+`ListTransactions`. librdkafka has no transaction-admin API and no
+`OffsetDelete` method in the installed client. franz-go has no
+`DescribeCluster` method. Compaction still runs only on sealed extents when
 `CAMUS_COMPACT_MS` is set, and an ACL host other than `*` does not match.
 
 Produce requests at version 13 and above name the topic by id. The Python and
