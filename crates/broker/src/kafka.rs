@@ -1374,10 +1374,8 @@ impl Kafka {
                         },
                     })
                     .await;
-                match noted {
-                    Ok(result) if result.error_code == 0 => {}
-                    Ok(result) => return Err(result.error_code),
-                    Err(_) => return Err(NOT_LEADER),
+                if let Some(code) = noted_error(&noted) {
+                    return Err(code);
                 }
             }
         }
@@ -1828,50 +1826,7 @@ impl Kafka {
                     },
                 })
                 .await;
-            let code = match applied {
-                Ok(response) if response.error_code == 0 => None,
-                Ok(response) => Some(response.error_code),
-                Err(_) => Some(NOT_LEADER),
-            };
-            if let Some(code) = code {
-                return fail(items, code);
-            }
-        }
-        let mut noted = pieces.iter();
-        for (item, plan) in items.iter().zip(&plans) {
-            let Some(id) = item.txn_id.clone() else {
-                if matches!(plan, Plan::Append) {
-                    let _ = noted.next();
-                }
-                continue;
-            };
-            let (start, end) = match plan {
-                Plan::Replay(offset) => (*offset, offset + i64::from(item.records)),
-                Plan::Append => {
-                    let piece = noted.next().expect("piece");
-                    (piece.start, piece.end)
-                }
-                Plan::Error(_) => continue,
-            };
-            let applied = self
-                .meta_apply(Command::NoteTxn {
-                    transactional_id: id,
-                    producer_id: item.producer_id,
-                    producer_epoch: item.producer_epoch,
-                    span: TxnSpan {
-                        topic: item.topic.clone(),
-                        partition: item.partition,
-                        start,
-                        end,
-                    },
-                })
-                .await;
-            let code = match applied {
-                Ok(response) if response.error_code == 0 => None,
-                Ok(response) => Some(response.error_code),
-                Err(_) => Some(NOT_LEADER),
-            };
-            if let Some(code) = code {
+            if let Some(code) = noted_error(&applied) {
                 return fail(items, code);
             }
         }
@@ -1961,98 +1916,109 @@ impl Kafka {
             row.error_code = NOT_LEADER;
             return row;
         }
-        let Some(state) = self.partition_state(topic, partition) else {
-            row.error_code = UNKNOWN_TOPIC;
-            return row;
-        };
-        let wal_end = self.wal().end_offset(&topic_id(topic), partition);
-        let high_watermark = state.next_offset.max(wal_end);
-        let mut stable = high_watermark;
-        row.high_watermark = high_watermark;
-        row.last_stable_offset = high_watermark;
-        row.log_start_offset = state.log_start;
-        if offset < state.log_start || offset > high_watermark {
-            row.error_code = 1;
-            return row;
-        }
-        let mut out = BytesMut::new();
         let limit = max_bytes.max(0) as usize;
-        for extent in &state.extents {
-            if extent.end <= offset {
-                continue;
-            }
-            let end = extent.file_offset + u64::from(extent.length);
-            let Ok(bytes) = self
-                .bucket
-                .get_range(&extent.key, extent.file_offset..end)
-                .await
-            else {
-                row.error_code = STORAGE;
+        // Publish seals the WAL after the metadata write. A fetch that reads
+        // metadata first can miss batches sealed before the WAL read. Retry
+        // when that prefix moves.
+        for _ in 0..8 {
+            let Some(state) = self.partition_state(topic, partition) else {
+                row.error_code = UNKNOWN_TOPIC;
                 return row;
             };
-            let Ok(info) = batch::inspect(&bytes, MAX_FRAME) else {
-                row.error_code = CORRUPT;
+            let sealed = state.next_offset;
+            let wal_end = self.wal().end_offset(&topic_id(topic), partition);
+            let high_watermark = sealed.max(wal_end);
+            let mut stable = high_watermark;
+            row.high_watermark = high_watermark;
+            row.last_stable_offset = high_watermark;
+            row.log_start_offset = state.log_start;
+            row.error_code = 0;
+            row.records = None;
+            if offset < state.log_start || offset > high_watermark {
+                row.error_code = 1;
                 return row;
-            };
-            let mut cursor = 0;
-            for batch in info {
-                let next = batch.last_offset + 1;
-                if isolation == 1 {
-                    match txn_batch(batch.base_offset, batch.transactional, &state) {
-                        TxnView::Stop => {
-                            stable = stable.min(batch.base_offset);
-                            break;
-                        }
-                        TxnView::Skip => {
-                            cursor += batch.len;
-                            continue;
-                        }
-                        TxnView::Take => {}
-                    }
-                }
-                if next > offset && batch.base_offset < stable {
-                    if !out.is_empty() && out.len() + batch.len > limit {
-                        break;
-                    }
-                    out.extend_from_slice(&bytes[cursor..cursor + batch.len]);
-                }
-                cursor += batch.len;
             }
-        }
-        if offset < stable {
-            let remaining = limit.saturating_sub(out.len());
-            let extra = match self
-                .wal()
-                .read(
-                    &topic_id(topic),
-                    partition,
-                    state.next_offset,
-                    offset,
-                    remaining,
-                )
-                .await
-            {
-                Ok(extra) => extra,
-                Err(_) => {
+            let mut out = BytesMut::new();
+            let mut stopped = false;
+            'extents: for extent in &state.extents {
+                if extent.end <= offset {
+                    continue;
+                }
+                let end = extent.file_offset + u64::from(extent.length);
+                let Ok(bytes) = self
+                    .bucket
+                    .get_range(&extent.key, extent.file_offset..end)
+                    .await
+                else {
                     row.error_code = STORAGE;
                     return row;
+                };
+                let Ok(info) = batch::inspect(&bytes, MAX_FRAME) else {
+                    row.error_code = CORRUPT;
+                    return row;
+                };
+                let mut cursor = 0;
+                for batch in info {
+                    let next = batch.last_offset + 1;
+                    if isolation == 1 {
+                        match txn_batch(batch.base_offset, batch.transactional, &state) {
+                            TxnView::Stop => {
+                                stable = stable.min(batch.base_offset);
+                                stopped = true;
+                                break 'extents;
+                            }
+                            TxnView::Skip => {
+                                cursor += batch.len;
+                                continue;
+                            }
+                            TxnView::Take => {}
+                        }
+                    }
+                    if next > offset && batch.base_offset < stable {
+                        if !out.is_empty() && out.len() + batch.len > limit {
+                            stopped = true;
+                            break 'extents;
+                        }
+                        out.extend_from_slice(&bytes[cursor..cursor + batch.len]);
+                    }
+                    cursor += batch.len;
                 }
-            };
-            let extra = if isolation == 1 {
-                filter_txn(&extra, &state, &mut stable)
-            } else {
-                extra
-            };
-            if !extra.is_empty() && (out.is_empty() || out.len() + extra.len() <= limit) {
-                out.extend_from_slice(&extra);
             }
-        }
-        if isolation == 1 {
-            row.high_watermark = stable;
-            row.last_stable_offset = stable;
-        }
-        if !out.is_empty() {
-            row.records = Some(out.freeze());
+            if !stopped && offset < stable {
+                let remaining = limit.saturating_sub(out.len());
+                let extra = match self
+                    .wal()
+                    .read(&topic_id(topic), partition, sealed, offset, remaining)
+                    .await
+                {
+                    Ok(extra) => extra,
+                    Err(_) => {
+                        row.error_code = STORAGE;
+                        return row;
+                    }
+                };
+                let extra = if isolation == 1 {
+                    filter_txn(&extra, &state, &mut stable)
+                } else {
+                    extra
+                };
+                if !extra.is_empty() && (out.is_empty() || out.len() + extra.len() <= limit) {
+                    out.extend_from_slice(&extra);
+                }
+            }
+            let moved = self
+                .partition_state(topic, partition)
+                .is_some_and(|later| later.next_offset != sealed);
+            if isolation == 1 {
+                row.high_watermark = stable;
+                row.last_stable_offset = stable;
+            }
+            if !out.is_empty() {
+                row.records = Some(out.freeze());
+            }
+            if !moved {
+                return row;
+            }
         }
         row
     }
@@ -2266,6 +2232,19 @@ fn config_row(name: &str, value: &str) -> DescribeConfigsResourceResult {
     row.config_source = 1;
     row.config_type = 2;
     row
+}
+
+/// `NoteTxn` applies the abort and reports the Kafka code in `value` when the
+/// batch cannot join the transaction. A normal success leaves `value` empty.
+fn noted_error(applied: &anyhow::Result<camus_metadata::Response>) -> Option<i16> {
+    match applied {
+        Ok(response) if response.error_code != 0 => Some(response.error_code),
+        Ok(response) => match response.value.as_deref() {
+            Some(text) if !text.is_empty() => text.parse().ok(),
+            _ => None,
+        },
+        Err(_) => Some(NOT_LEADER),
+    }
 }
 
 enum TxnView {

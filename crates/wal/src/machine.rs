@@ -252,13 +252,15 @@ impl Machine {
         };
         heads.sort_by_key(|head| head.start);
         let mut size = 0u64;
-        heads.retain(|head| {
-            let keep = size == 0 || size + head.len <= limit as u64;
-            if keep {
-                size += head.len;
+        let mut kept = Vec::new();
+        for head in heads {
+            if size != 0 && size + head.len > limit as u64 {
+                break;
             }
-            keep
-        });
+            size += head.len;
+            kept.push(head);
+        }
+        let heads = kept;
         let mut out = Vec::with_capacity(size as usize);
         for batch in self.materialize(heads).await? {
             out.extend_from_slice(&batch.bytes);

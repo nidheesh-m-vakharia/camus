@@ -267,9 +267,13 @@ pub fn note(
         return Ok(Issued::Reject(INVALID_TXN));
     };
     if txn.producer_id != producer_id || txn.epoch != epoch || txn.state != "ongoing" {
+        // The batch is already in the log. Abort it so it cannot stay open and
+        // hold the last stable offset, and tell the producer the write is not
+        // part of a transaction. The value is the Kafka error; the puts still
+        // apply.
         let mut put = Vec::new();
         mark(get, &mut put, &[span], false)?;
-        return Ok(applied(put, String::new()));
+        return Ok(applied(put, INVALID_TXN.to_string()));
     }
     if !txn
         .partitions
@@ -613,5 +617,53 @@ mod tests {
         let get = |key: &str| Ok(store.get(key).cloned());
         let (_, partition) = partition_row(&get, "orders", 0).unwrap().unwrap();
         assert_eq!(partition.txn_aborted, vec![Span { start: 0, end: 1 }]);
+    }
+
+    #[test]
+    fn a_note_after_commit_aborts_the_batch_and_rejects_the_produce() {
+        let mut store = memory();
+        let (issued, id, epoch) = {
+            let get = |key: &str| Ok(store.get(key).cloned());
+            let issued = init(&get, "checkout", -1, -1, 60_000).unwrap();
+            let text = match &issued {
+                Issued::Applied { value, .. } => value.clone(),
+                Issued::Reject(code) => panic!("init {code}"),
+            };
+            let (id, epoch) = text.split_once(',').unwrap();
+            (
+                issued,
+                id.parse::<i64>().unwrap(),
+                epoch.parse::<i16>().unwrap(),
+            )
+        };
+        apply(&mut store, issued);
+        let issued = call(&store, |get| {
+            add_partitions(get, "checkout", id, epoch, &[("orders".into(), 0)], 1_000)
+        });
+        apply(&mut store, issued);
+        let issued = call(&store, |get| end(get, "checkout", id, epoch, true));
+        apply(&mut store, issued);
+        let issued = call(&store, |get| {
+            note(
+                get,
+                "checkout",
+                id,
+                epoch,
+                TxnSpan {
+                    topic: "orders".into(),
+                    partition: 0,
+                    start: 4,
+                    end: 5,
+                },
+            )
+        });
+        match &issued {
+            Issued::Applied { value, .. } => assert_eq!(value, "48"),
+            Issued::Reject(code) => panic!("note dropped the abort: {code}"),
+        }
+        apply(&mut store, issued);
+        let get = |key: &str| Ok(store.get(key).cloned());
+        let (_, partition) = partition_row(&get, "orders", 0).unwrap().unwrap();
+        assert_eq!(partition.txn_aborted, vec![Span { start: 4, end: 5 }]);
     }
 }
