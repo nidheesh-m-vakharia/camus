@@ -11,6 +11,8 @@
 //! Group ids are hex-encoded in keys, so a prefix scan for one group never
 //! matches another whose id shares a prefix.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// One member as of the stored generation.
@@ -32,6 +34,34 @@ pub struct MemberRecord {
     pub subscription: Vec<u8>,
     /// What the leader assigned it. Empty until the leader syncs.
     pub assignment: Vec<u8>,
+    /// KIP-848 member epoch. Classic members leave this at 0.
+    #[serde(default)]
+    pub member_epoch: i32,
+    /// The epoch before the last bump. A commit at this epoch is still
+    /// accepted, for a heartbeat response that the member has not applied.
+    #[serde(default)]
+    pub previous_member_epoch: i32,
+    /// Topic names this member subscribed to. Empty for a classic member.
+    #[serde(default)]
+    pub subscribed_topics: Vec<String>,
+    /// Topic-name regex, KIP-848 version 1. `None` if the member did not set one.
+    #[serde(default)]
+    pub subscribed_regex: Option<String>,
+    /// Server assignor the member asked for (`uniform`, `range`).
+    #[serde(default)]
+    pub server_assignor: Option<String>,
+    /// Rack id, when the member sent one.
+    #[serde(default)]
+    pub rack_id: Option<String>,
+    /// `stable`, `unrevoked`, or `unreleased`. Empty for a classic member.
+    #[serde(default)]
+    pub member_state: String,
+    /// Partitions the member may use, `topic id -> partition -> assignment epoch`.
+    #[serde(default)]
+    pub assigned: BTreeMap<String, BTreeMap<i32, i32>>,
+    /// Partitions the member still has to revoke.
+    #[serde(default)]
+    pub revoking: BTreeMap<String, BTreeMap<i32, i32>>,
 }
 
 /// A classic group as of its latest generation.
@@ -47,6 +77,12 @@ pub struct GroupRecord {
     pub leader: Option<String>,
     /// Members of this generation. Empty for an empty group.
     pub members: Vec<MemberRecord>,
+    /// `consumer` for a KIP-848 group. Empty for a classic group.
+    #[serde(default)]
+    pub kind: String,
+    /// Target assignment at `generation`: member id, topic id, partitions.
+    #[serde(default)]
+    pub target: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
 }
 
 /// One committed offset.
@@ -124,6 +160,8 @@ pub mod codes {
     pub const NON_EMPTY_GROUP: i16 = 68;
     /// No record and no offsets for the group.
     pub const GROUP_ID_NOT_FOUND: i16 = 69;
+    /// The member epoch is not the one the consumer group has stored.
+    pub const STALE_MEMBER_EPOCH: i16 = 113;
 }
 
 /// Read a stored group record.
@@ -146,6 +184,9 @@ pub fn check_commit(
     generation: i32,
     member_id: &str,
 ) -> Result<(), i16> {
+    if stored.is_some_and(|record| record.kind == "consumer") {
+        return check_consumer_commit(stored, generation, member_id);
+    }
     match stored {
         // A simple commit (no generation) is for a group with no members.
         _ if generation < 0 => match stored {
@@ -166,6 +207,36 @@ pub fn check_commit(
                 Ok(())
             }
         }
+    }
+}
+
+/// A KIP-848 commit carries the member epoch, not the group epoch.
+fn check_consumer_commit(
+    stored: Option<&GroupRecord>,
+    epoch: i32,
+    member_id: &str,
+) -> Result<(), i16> {
+    let Some(record) = stored else {
+        return Err(codes::ILLEGAL_GENERATION);
+    };
+    if epoch < 0 {
+        return if record.members.is_empty() {
+            Ok(())
+        } else {
+            Err(codes::UNKNOWN_MEMBER_ID)
+        };
+    }
+    let Some(member) = record
+        .members
+        .iter()
+        .find(|member| member.member_id == member_id)
+    else {
+        return Err(codes::UNKNOWN_MEMBER_ID);
+    };
+    if member.member_epoch == epoch || (epoch > 0 && member.previous_member_epoch == epoch) {
+        Ok(())
+    } else {
+        Err(codes::STALE_MEMBER_EPOCH)
     }
 }
 
@@ -216,5 +287,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(check_commit(Some(&empty), -1, ""), Ok(()));
+    }
+
+    #[test]
+    fn consumer_commits_follow_the_member_epoch() {
+        let record = GroupRecord {
+            kind: "consumer".into(),
+            generation: 4,
+            members: vec![MemberRecord {
+                member_id: "m1".into(),
+                member_epoch: 4,
+                previous_member_epoch: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(check_commit(Some(&record), 4, "m1"), Ok(()));
+        assert_eq!(check_commit(Some(&record), 3, "m1"), Ok(()));
+        assert_eq!(
+            check_commit(Some(&record), 2, "m1"),
+            Err(codes::STALE_MEMBER_EPOCH)
+        );
+        assert_eq!(
+            check_commit(Some(&record), 4, "other"),
+            Err(codes::UNKNOWN_MEMBER_ID)
+        );
     }
 }

@@ -7,15 +7,19 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
 mod catalog;
 pub mod groups;
 mod machine;
+mod producers;
 mod network;
 
 pub use catalog::{
     parse_partition, parse_topic, partition_storage_key, topic_index_key, topic_storage_key,
     Extent, Partition, PublishPart, Topic,
 };
+pub use admin::{ConfigChange, ConfigEdit, Item, OffsetDrop, PartitionIncrease, RecordCut};
+pub use producers::{sequence_key, ProducerNote};
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -68,6 +72,24 @@ pub enum Command {
         /// Slices in commit order.
         parts: Vec<PublishPart>,
     },
+    /// Publish extents and the producer sequences those batches established.
+    /// Same offset rule as [`Command::Publish`]. A note that is not a fresh
+    /// sequence rejects the whole command.
+    PublishWithProducers {
+        /// Slices in commit order.
+        parts: Vec<PublishPart>,
+        /// Producer batches inside those slices.
+        producers: Vec<ProducerNote>,
+    },
+    /// Allocate a producer id, or bump its epoch. A transactional id is rejected.
+    InitProducer {
+        /// True when the client sent a transactional id. Phase 5.
+        transactional: bool,
+        /// `-1` allocates. Otherwise the id whose epoch to bump.
+        producer_id: i64,
+        /// Current epoch. Must match the stored epoch when `producer_id` is set.
+        producer_epoch: i16,
+    },
     /// Store a consumer group's record. Rejected with ILLEGAL_GENERATION when
     /// the stored generation is newer.
     SaveGroup {
@@ -92,6 +114,26 @@ pub enum Command {
     DeleteGroup {
         /// Group id.
         group: String,
+    },
+    /// Raise a topic's partition count. Assignments are rejected.
+    CreatePartitions {
+        /// One entry per topic in the request.
+        topics: Vec<admin::PartitionIncrease>,
+    },
+    /// Set or check topic configs.
+    AlterConfigs {
+        /// One entry per resource.
+        changes: Vec<admin::ConfigChange>,
+    },
+    /// Move partition log starts to an object boundary.
+    DeleteRecords {
+        /// One entry per partition.
+        cuts: Vec<admin::RecordCut>,
+    },
+    /// Remove committed offsets for a group.
+    OffsetDelete {
+        /// Group and the partitions to forget.
+        forget: admin::OffsetDrop,
     },
 }
 
@@ -228,8 +270,39 @@ impl MetadataNode {
     }
 
     /// Commit extent metadata. The object itself is already in the bucket.
-    pub async fn publish(&self, parts: Vec<PublishPart>) -> anyhow::Result<Response> {
-        let response = self.raft.client_write(Command::Publish { parts }).await?;
+    pub async fn publish(
+        &self,
+        parts: Vec<PublishPart>,
+        producers: Vec<ProducerNote>,
+    ) -> anyhow::Result<Response> {
+        let response = self
+            .raft
+            .client_write(Command::PublishWithProducers { parts, producers })
+            .await?;
+        Ok(response.data)
+    }
+
+    /// Commit an admin or group command. `value` is command-specific.
+    pub async fn apply(&self, command: Command) -> anyhow::Result<Response> {
+        let response = self.raft.client_write(command).await?;
+        Ok(response.data)
+    }
+
+    /// Allocate or bump a producer id. `value` is `"{producer_id},{epoch}"` on success.
+    pub async fn init_producer(
+        &self,
+        transactional: bool,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> anyhow::Result<Response> {
+        let response = self
+            .raft
+            .client_write(Command::InitProducer {
+                transactional,
+                producer_id,
+                producer_epoch,
+            })
+            .await?;
         Ok(response.data)
     }
 

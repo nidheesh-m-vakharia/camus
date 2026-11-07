@@ -89,7 +89,7 @@ committed offsets. A coordinator leader failover does not split-brain the
 group. Cases ported from the 4.4.0 group coordinator tests that apply to
 the classic protocol.
 
-Status 2026-11-06: classic groups done; KIP-848 open.
+Status 2026-11-06: classic groups and KIP-848 `ConsumerGroupHeartbeat` are done.
 
 | Item | Status | Test |
 | --- | --- | --- |
@@ -97,7 +97,7 @@ Status 2026-11-06: classic groups done; KIP-848 open.
 | Coordinator failover does not split-brain the group | done | `broker/tests/group_failover.rs` |
 | List, describe, delete | done | `broker/tests/group_failover.rs` |
 | Cases ported from the 4.4.0 group coordinator tests | done | `coordinator/src/tests.rs`; `docs/kafka-coordinator-port.md` maps all 183 classic cases (101 ported, the rest with reasons) |
-| KIP-848 `ConsumerGroupHeartbeat` | open | |
+| KIP-848 `ConsumerGroupHeartbeat` | done | `coordinator/src/consumer.rs`; `broker/tests/groups.rs` (`java_consumer_group_commits_and_resumes`) |
 
 ### Phase 4 — Idempotence and admin
 
@@ -108,6 +108,10 @@ Status 2026-11-06: classic groups done; KIP-848 open.
 Acceptance: a producer with `enable.idempotence=true` retries without
 duplicates across a leader change. `DeleteRecords` honors the whole-object
 rule in ADR 0010 and documents it.
+
+Status 2026-11-06: idempotent produce and the admin APIs in this phase are
+in. `DeleteRecords` follows the whole-object rule in ADR 0010. No real
+client has been run against these APIs yet.
 
 ### Phase 5 — Transactions, log compaction, ACLs
 

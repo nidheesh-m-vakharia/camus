@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "Consumer group coordinator: the classic protocol. Transactions come in Phase 5."
+description = "Consumer group coordinator: classic groups and KIP-848. Transactions come in Phase 5."
 
 [dependencies]
 camus-metadata = { path = "../metadata" }
+regex = "1"
 tokio = { version = "1", features = ["sync", "rt"] }
 uuid = { version = "1", features = ["v4"] }
 

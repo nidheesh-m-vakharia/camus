@@ -22,6 +22,27 @@ pub struct Topic {
     pub durability: String,
     /// Epoch written into record batches. Starts at 0.
     pub leader_epoch: i32,
+    /// `retention.ms`. Kafka's 7 days. `-1` keeps data by time.
+    #[serde(default = "default_retention_ms")]
+    pub retention_ms: i64,
+    /// `retention.bytes`. `-1` is no byte limit, matching Kafka.
+    #[serde(default = "default_retention_bytes")]
+    pub retention_bytes: i64,
+    /// `cleanup.policy`. `compact` is rejected until Phase 5.
+    #[serde(default = "default_cleanup")]
+    pub cleanup_policy: String,
+}
+
+fn default_retention_ms() -> i64 {
+    604_800_000
+}
+
+fn default_retention_bytes() -> i64 {
+    -1
+}
+
+fn default_cleanup() -> String {
+    "delete".into()
 }
 
 /// One sealed object range for a partition.
@@ -88,6 +109,8 @@ pub enum Outcome {
         put: Vec<(String, String)>,
         /// Keys to remove.
         del: Vec<String>,
+        /// Extra result for the proposer, such as per-partition codes.
+        value: Option<String>,
     },
     /// Do not change the map. `0` is not used here.
     Reject(i16),
@@ -140,6 +163,9 @@ pub fn create_topic(
         partitions,
         durability: durability.to_string(),
         leader_epoch: 0,
+        retention_ms: default_retention_ms(),
+        retention_bytes: default_retention_bytes(),
+        cleanup_policy: default_cleanup(),
     };
     let mut put = vec![
         (
@@ -169,6 +195,7 @@ pub fn create_topic(
     Ok(Outcome::Change {
         put,
         del: Vec::new(),
+        value: None,
     })
 }
 
@@ -193,13 +220,19 @@ pub fn delete_topic(
         TOPICS.to_string(),
         serde_json::to_string(&list).map_err(|err| err.to_string())?,
     )];
-    Ok(Outcome::Change { put, del })
+    Ok(Outcome::Change {
+        put,
+        del,
+        value: None,
+    })
 }
 
 /// Publish extents. Each part must begin at that partition's next offset.
+/// `notes` are the producer sequences inside those extents.
 pub fn publish(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     parts: &[PublishPart],
+    notes: &[crate::ProducerNote],
 ) -> Result<Outcome, String> {
     let mut pending: BTreeMap<(String, i32), Partition> = BTreeMap::new();
     let mut ids: BTreeMap<String, String> = BTreeMap::new();
@@ -245,10 +278,18 @@ pub fn publish(
             serde_json::to_string(&state).map_err(|err| err.to_string())?,
         ));
     }
-    Ok(Outcome::Change {
-        put,
-        del: Vec::new(),
-    })
+    let sequences = crate::producers::apply_notes(get, parts, notes)?;
+    match sequences {
+        Outcome::Reject(code) => Ok(Outcome::Reject(code)),
+        Outcome::Change { put: extra, del, .. } => {
+            put.extend(extra);
+            Ok(Outcome::Change {
+                put,
+                del,
+                value: None,
+            })
+        }
+    }
 }
 
 /// Decode a topic row.
@@ -308,7 +349,7 @@ mod tests {
             base_timestamp: 0,
             max_timestamp: 0,
         };
-        match publish(&get, &[part]).unwrap() {
+        match publish(&get, &[part], &[]).unwrap() {
             Outcome::Reject(1) => {}
             other => panic!("expected offset rejection, got {other:?}"),
         }

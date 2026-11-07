@@ -88,8 +88,7 @@ one object (up to the flush size, or 128 MiB after compaction).
 an offset in the middle of an object advances the log start only to the
 next object boundary at or after the requested offset, and the response's
 low watermark is the offset actually deleted. This is coarser than Kafka,
-which can split a segment. The difference goes in `compatibility.md` when
-the API is implemented. Until Phase 4 the API returns `UNSUPPORTED_VERSION`.
+which can split a segment. The difference is recorded in `compatibility.md`.
 
 Empty topics and deleted topics: `DeleteTopics` (Phase 1) removes metadata
 and enqueues object deletes. After the metadata commit, produce returns

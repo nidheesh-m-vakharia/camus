@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::serve::ListenerExt;
 use axum::{Json, Router};
-use camus_metadata::{BasicNode, MetadataNode, NodeId, PublishPart};
+use camus_metadata::{BasicNode, Command, MetadataNode, NodeId, ProducerNote, PublishPart};
 use camus_storage::{Bucket, BucketConfig};
 use camus_wal::Shard;
 use clap::Parser;
@@ -137,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/metrics", get(prometheus))
         .route("/admin/write", post(write))
         .route("/admin/publish", post(publish))
+        .route("/admin/apply", post(apply_command))
         .route("/admin/read", get(read))
         .route("/raft-vote", post(vote))
         .route("/raft-append", post(append))
@@ -371,12 +372,30 @@ async fn write(
     Ok(Json(serde_json::json!({ "previous": response.value })))
 }
 
+#[derive(Deserialize)]
+struct PublishBody {
+    parts: Vec<PublishPart>,
+    #[serde(default)]
+    producers: Vec<ProducerNote>,
+}
+
+/// Commit a metadata command for a broker that does not lead the group.
+async fn apply_command(
+    State(node): State<Arc<MetadataNode>>,
+    Json(command): Json<Command>,
+) -> Result<Json<camus_metadata::Response>, (StatusCode, String)> {
+    node.apply(command)
+        .await
+        .map(Json)
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))
+}
+
 /// Commit extents on behalf of a WAL shard leader that does not lead metadata.
 async fn publish(
     State(node): State<Arc<MetadataNode>>,
-    Json(parts): Json<Vec<PublishPart>>,
+    Json(body): Json<PublishBody>,
 ) -> Result<Json<camus_metadata::Response>, (StatusCode, String)> {
-    node.publish(parts)
+    node.publish(body.parts, body.producers)
         .await
         .map(Json)
         .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))

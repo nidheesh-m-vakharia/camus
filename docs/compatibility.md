@@ -33,7 +33,7 @@ Until then the API returns an error rather than a partial imitation.
 | `acks=1` | Same barrier as `acks=all`: WAL quorum fsync, or R2 put plus metadata commit | Leader-local ack | 0005 |
 | Unclean leader election | Never automatic. Operator truncate only | Default off, can be enabled | 0008 |
 | `DeleteRecords` midpoint | Advances to the next whole-object boundary | Can split a segment | 0010 |
-| Idempotence before Phase 4 | `InitProducerId` is an error, so retries can duplicate if the client does not use idempotence | Supported | 0009 |
+| Idempotence | `InitProducerId` allocates a producer id. A retried sequence returns the original offset and is not appended. Transactions are still rejected | Supported | 0009 |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
 
@@ -80,8 +80,22 @@ before members hear of it, and an offset commit is checked against the
 stored generation when it is applied, so a failover keeps the generation
 and an old generation cannot commit. `FindCoordinator` for transactions
 or share groups answers `INVALID_REQUEST` (42) until those phases.
-`ConsumerGroupHeartbeat` (KIP-848) is not implemented: the Java client
-must use `group.protocol=classic`, which is its default in 4.4.0.
+`ConsumerGroupHeartbeat` (KIP-848) versions 0–1 are implemented. The
+broker's default assignor is `uniform` (round-robin per topic; not Kafka's
+sticky uniform assignor) and `range` is the other supported name. A member
+that names any other assignor gets `UNSUPPORTED_ASSIGNOR` (112). Topic
+regexes are Rust regexes. An offset commit is accepted at the member's
+current epoch or the previous one. The Java client's default remains
+`group.protocol=classic`. `group.protocol=consumer` is exercised by
+`GroupConsumerRoundTrip`.
+`DeleteRecords` moves the log start to the next whole-object boundary at or
+after the requested offset, and the response low watermark is that offset.
+An offset past the sealed end is `OFFSET_OUT_OF_RANGE` (1), including
+records that are still only in the WAL. `cleanup.policy=compact` is
+`INVALID_CONFIG` (40). `CreatePartitions` rejects an explicit replica
+assignment. `retention.ms` defaults to 604800000 and `retention.bytes` to
+-1. A classic group that still has members refuses `OffsetDelete` with
+`GROUP_SUBSCRIBED_TO_TOPIC` (86).
 JoinGroup reports the client host as `/unknown`.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
@@ -111,8 +125,8 @@ acceptance test. `-` means not run.
 | ApiVersions | 18 | 1 | 0-5 | implemented | pass | pass | pass |
 | CreateTopics | 19 | 1 | 2-7 | implemented | pass | pass | pass |
 | DeleteTopics | 20 | 1 | 1-6 | implemented | - | - | - |
-| DeleteRecords | 21 | 4 | TBD | unimplemented | - | - | - |
-| InitProducerId | 22 | 4 | TBD | unimplemented | - | - | - |
+| DeleteRecords | 21 | 4 | 0-2 | implemented | - | - | - |
+| InitProducerId | 22 | 4 | 0-4 | implemented | - | - | - |
 | OffsetForLeaderEpoch | 23 | | not planned for phases 0–5 | unimplemented | - | - | - |
 | AddPartitionsToTxn | 24 | 5 | TBD | unimplemented | - | - | - |
 | AddOffsetsToTxn | 25 | 5 | TBD | unimplemented | - | - | - |
@@ -123,21 +137,21 @@ acceptance test. `-` means not run.
 | CreateAcls | 30 | 5 | TBD | unimplemented | - | - | - |
 | DeleteAcls | 31 | 5 | TBD | unimplemented | - | - | - |
 | DescribeConfigs | 32 | 1 | 1-4 | implemented | - | - | - |
-| AlterConfigs | 33 | 4 | TBD | unimplemented | - | - | - |
+| AlterConfigs | 33 | 4 | 0-2 | implemented | - | - | - |
 | AlterReplicaLogDirs | 34 | | not planned | unimplemented | - | - | - |
 | DescribeLogDirs | 35 | | not planned | unimplemented | - | - | - |
 | SaslAuthenticate | 36 | 1 | 0-2 | implemented (PLAIN) | pass | pass | pass |
-| CreatePartitions | 37 | 4 | TBD | unimplemented | - | - | - |
+| CreatePartitions | 37 | 4 | 0-3 | implemented | - | - | - |
 | CreateDelegationToken | 38 | | not planned | unimplemented | - | - | - |
 | RenewDelegationToken | 39 | | not planned | unimplemented | - | - | - |
 | ExpireDelegationToken | 40 | | not planned | unimplemented | - | - | - |
 | DescribeDelegationToken | 41 | | not planned | unimplemented | - | - | - |
 | DeleteGroups | 42 | 3 | 0-3 | implemented | - | - | - |
 | ElectLeaders | 43 | | internal leader changes follow Raft; API not planned | unimplemented | - | - | - |
-| IncrementalAlterConfigs | 44 | 4 | TBD | unimplemented | - | - | - |
+| IncrementalAlterConfigs | 44 | 4 | 0-1 | implemented | - | - | - |
 | AlterPartitionReassignments | 45 | | not planned | unimplemented | - | - | - |
 | ListPartitionReassignments | 46 | | not planned | unimplemented | - | - | - |
-| OffsetDelete | 47 | 4 | TBD | unimplemented | - | - | - |
+| OffsetDelete | 47 | 4 | 0 | implemented | - | - | - |
 | DescribeClientQuotas | 48 | | throttle is internal; API not planned for 0–5 | unimplemented | - | - | - |
 | AlterClientQuotas | 49 | | not planned | unimplemented | - | - | - |
 | DescribeUserScramCredentials | 50 | | SCRAM not planned | unimplemented | - | - | - |
@@ -145,13 +159,13 @@ acceptance test. `-` means not run.
 | DescribeQuorum | 55 | | not planned (KRaft-specific) | unimplemented | - | - | - |
 | UpdateFeatures | 57 | | not planned | unimplemented | - | - | - |
 | Envelope | 58 | | not planned | unimplemented | - | - | - |
-| DescribeCluster | 60 | 4 | TBD | unimplemented | - | - | - |
+| DescribeCluster | 60 | 4 | 0-2 | implemented | - | - | - |
 | DescribeProducers | 61 | | not planned before phase 5, then reconsider | unimplemented | - | - | - |
 | UnregisterBroker | 64 | | not planned | unimplemented | - | - | - |
 | DescribeTransactions | 65 | 5 | TBD | unimplemented | - | - | - |
 | ListTransactions | 66 | 5 | TBD | unimplemented | - | - | - |
 | AllocateProducerIds | 67 | | broker-internal | unimplemented | - | - | - |
-| ConsumerGroupHeartbeat | 68 | 3 | KIP-848, after classic groups | unimplemented | - | - | - |
+| ConsumerGroupHeartbeat | 68 | 3 | 0-1 | implemented | pass | - | - |
 | ConsumerGroupDescribe | 69 | 3 | TBD | unimplemented | - | - | - |
 | GetTelemetrySubscriptions | 71 | | not planned | unimplemented | - | - | - |
 | PushTelemetry | 72 | | not planned | unimplemented | - | - | - |

@@ -121,6 +121,52 @@ fn java_group_commits_and_resumes() {
 }
 
 #[test]
+fn java_consumer_group_commits_and_resumes() {
+    if !minio() {
+        return;
+    }
+    let jars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-jars");
+    if !jars.join("kafka-clients-4.4.0.jar").is_file() {
+        eprintln!("skipping java; run the SASL tests once to download the jars");
+        return;
+    }
+    // The server tells the client how often to heartbeat. A short interval
+    // lets the two members finish revocation inside the test.
+    std::env::set_var("CAMUS_CONSUMER_HEARTBEAT_MS", "200");
+    std::env::set_var("CAMUS_CONSUMER_SESSION_MS", "10000");
+    let root = tempfile::tempdir().unwrap();
+    let classes = root.path().join("classes");
+    std::fs::create_dir_all(&classes).unwrap();
+    let mut cp = vec![classes.display().to_string()];
+    for entry in std::fs::read_dir(&jars).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+            cp.push(path.display().to_string());
+        }
+    }
+    let cp = cp.join(":");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/java/GroupConsumerRoundTrip.java");
+    let compiled = Command::new("javac")
+        .args(["--release", "17", "-cp", &cp, "-d"])
+        .arg(&classes)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "javac\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let (_nodes, bootstrap) = cluster(root.path());
+    let ran = Command::new("java")
+        .args(["-cp", &cp, "GroupConsumerRoundTrip", &bootstrap])
+        .output()
+        .unwrap();
+    check(root.path(), ran, "java consumer protocol");
+}
+
+#[test]
 fn franz_go_group_commits_and_resumes() {
     if !minio() {
         return;

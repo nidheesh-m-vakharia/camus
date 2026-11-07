@@ -333,6 +333,7 @@ fn bare(names: &[&str], order: u64) -> Member {
         sync: None,
         new_since: None,
         join_order: order,
+        revoke_since: None,
     }
 }
 
@@ -1754,14 +1755,13 @@ async fn test_list_groups() {
     ctx.c.touch("simple-group");
     let listed = ctx.c.list();
     assert_eq!(listed.len(), 2);
-    assert_eq!(
-        listed[0],
-        ("group-id".into(), State::Stable, "consumer".into())
-    );
-    assert_eq!(
-        listed[1],
-        ("simple-group".into(), State::Empty, String::new())
-    );
+    assert_eq!(listed[0].id, "group-id");
+    assert_eq!(listed[0].state, "Stable");
+    assert_eq!(listed[0].protocol_type, "consumer");
+    assert_eq!(listed[0].group_type, "classic");
+    assert_eq!(listed[1].id, "simple-group");
+    assert_eq!(listed[1].state, "Empty");
+    assert_eq!(listed[1].group_type, "classic");
 }
 
 #[tokio::test]

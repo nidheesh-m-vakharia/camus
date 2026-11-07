@@ -18,6 +18,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::admin;
 use crate::catalog::{self, Outcome};
 use crate::{Command, NodeId, Response, TypeConfig};
 
@@ -181,6 +182,13 @@ fn apply_command(
         Command::SaveGroup { .. } | Command::CommitOffsets { .. } | Command::DeleteGroup { .. } => {
             return apply_group(kv, command);
         }
+        Command::InitProducer {
+            transactional,
+            producer_id,
+            producer_epoch,
+        } => {
+            return apply_init(kv, transactional, producer_id, producer_epoch);
+        }
         _ => {}
     }
     if let Command::Put { key, value } = command {
@@ -207,7 +215,23 @@ fn apply_command(
                 durability,
             } => catalog::create_topic(&read, &name, &id, partitions, &durability),
             Command::DeleteTopic { name } => catalog::delete_topic(&read, &name),
-            Command::Publish { parts } => catalog::publish(&read, &parts),
+            Command::Publish { parts } => catalog::publish(&read, &parts, &[]),
+            Command::PublishWithProducers { parts, producers } => {
+                catalog::publish(&read, &parts, &producers)
+            }
+            Command::InitProducer { .. } => unreachable!("handled above"),
+            Command::CreatePartitions { topics } => {
+                admin::create_partitions(&read, &topics).and_then(admin::outcome)
+            }
+            Command::AlterConfigs { changes } => {
+                admin::alter_configs(&read, &changes).and_then(admin::outcome)
+            }
+            Command::DeleteRecords { cuts } => {
+                admin::delete_records(&read, &cuts).and_then(admin::outcome)
+            }
+            Command::OffsetDelete { forget } => {
+                admin::offset_delete(&read, &forget).and_then(admin::outcome)
+            }
             Command::SaveGroup { .. }
             | Command::CommitOffsets { .. }
             | Command::DeleteGroup { .. } => {
@@ -219,16 +243,43 @@ fn apply_command(
         outcome.map_err(|err| io(ErrorSubject::StateMachine, &std::io::Error::other(err)))?;
     match outcome {
         Outcome::Reject(code) => Ok(Response::reject(code)),
-        Outcome::Change { put, del } => {
-            for (key, value) in put {
-                kv.insert(key.as_str(), value.as_str())
+        Outcome::Change { put, del, value } => {
+            for (key, stored) in put {
+                kv.insert(key.as_str(), stored.as_str())
                     .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
             }
             for key in del {
                 kv.remove(key.as_str())
                     .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
             }
-            Ok(Response::ok(None))
+            Ok(Response::ok(value))
+        }
+    }
+}
+
+fn apply_init(
+    kv: &mut redb::Table<&str, &str>,
+    transactional: bool,
+    producer_id: i64,
+    producer_epoch: i16,
+) -> Result<Response, StorageError<NodeId>> {
+    let err = |err: &dyn std::error::Error| io(ErrorSubject::StateMachine, err);
+    let read = |key: &str| -> Result<Option<String>, String> {
+        match kv.get(key) {
+            Ok(Some(guard)) => Ok(Some(guard.value().to_string())),
+            Ok(None) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    };
+    match crate::producers::init_producer(&read, transactional, producer_id, producer_epoch)
+        .map_err(|err| io(ErrorSubject::StateMachine, &std::io::Error::other(err)))?
+    {
+        crate::producers::Issued::Reject(code) => Ok(Response::reject(code)),
+        crate::producers::Issued::Applied { put, value } => {
+            for (key, stored) in put {
+                kv.insert(key.as_str(), stored.as_str()).map_err(|error| err(&error))?;
+            }
+            Ok(Response::ok(Some(value)))
         }
     }
 }

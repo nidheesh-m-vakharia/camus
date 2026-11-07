@@ -12,7 +12,8 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use camus_coordinator::{
-    codes, Coordinator, JoinRequest, JoinResponse, Leaving, Store, SyncResponse,
+    codes, ConsumerHeartbeat, Coordinator, JoinRequest, JoinResponse, Leaving, Store, SyncResponse,
+    TopicMeta,
 };
 use camus_metadata::groups::{self, GroupRecord, OffsetCommit, OffsetRecord};
 use camus_metadata::{Command, MetadataNode};
@@ -30,12 +31,15 @@ use camus_protocol::messages::offset_fetch_response::{
     OffsetFetchResponseTopic, OffsetFetchResponseTopics,
 };
 use camus_protocol::messages::{
-    BrokerId, DeleteGroupsRequest, DeleteGroupsResponse, DescribeGroupsRequest,
-    DescribeGroupsResponse, FindCoordinatorRequest, FindCoordinatorResponse, GroupId,
-    HeartbeatRequest, HeartbeatResponse, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest,
-    LeaveGroupResponse, ListGroupsRequest, ListGroupsResponse, OffsetCommitRequest,
-    OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse, RequestHeader, SyncGroupRequest,
-    SyncGroupResponse,
+    BrokerId, ConsumerGroupHeartbeatRequest, ConsumerGroupHeartbeatResponse, DeleteGroupsRequest,
+    DeleteGroupsResponse, DescribeGroupsRequest, DescribeGroupsResponse, FindCoordinatorRequest,
+    FindCoordinatorResponse, GroupId, HeartbeatRequest, HeartbeatResponse, JoinGroupRequest,
+    JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest,
+    ListGroupsResponse, OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest,
+    OffsetFetchResponse, RequestHeader, SyncGroupRequest, SyncGroupResponse,
+};
+use camus_protocol::messages::consumer_group_heartbeat_response::{
+    Assignment, TopicPartitions as AssignedPartitions,
 };
 use camus_protocol::protocol::{Decodable, StrBytes};
 use uuid::Uuid;
@@ -79,6 +83,12 @@ pub fn coordinator_config() -> camus_coordinator::Config {
     }
     if let Some(min) = ms("CAMUS_GROUP_MIN_SESSION_MS") {
         config.min_session_timeout = min;
+    }
+    if let Some(session) = ms("CAMUS_CONSUMER_SESSION_MS") {
+        config.consumer_session_timeout = session;
+    }
+    if let Some(interval) = ms("CAMUS_CONSUMER_HEARTBEAT_MS") {
+        config.consumer_heartbeat_interval = interval;
     }
     config
 }
@@ -484,7 +494,7 @@ impl Kafka {
         // Each wanted group: id and, per topic, `(name, id, partitions)`.
         // `None` topics means every committed offset.
         type Wanted = Option<Vec<(String, Uuid, Vec<i32>)>>;
-        let wanted: Vec<(String, Wanted)> = if version >= 8 {
+        let wanted: Vec<(String, i16, Wanted)> = if version >= 8 {
             request
                 .groups
                 .iter()
@@ -502,7 +512,22 @@ impl Kafka {
                             })
                             .collect()
                     });
-                    (group.group_id.0.to_string(), topics)
+                    let member_code = if version >= 9 {
+                        group
+                            .member_id
+                            .as_ref()
+                            .map(|id| {
+                                self.coordinator.check_fetch(
+                                    group.group_id.0.as_str(),
+                                    id.as_str(),
+                                    group.member_epoch,
+                                )
+                            })
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    (group.group_id.0.to_string(), member_code, topics)
                 })
                 .collect()
         } else {
@@ -518,14 +543,15 @@ impl Kafka {
                     })
                     .collect()
             });
-            vec![(request.group_id.0.to_string(), topics)]
+            vec![(request.group_id.0.to_string(), 0, topics)]
         };
 
         // One answer per group: rows of (name, id, partition, record).
         let mut answers = Vec::new();
-        for (group, topics) in wanted {
+        for (group, member_code, topics) in wanted {
+            let group_error = if gate != 0 { gate } else { member_code };
             let mut rows: Vec<(String, Uuid, i32, Option<OffsetRecord>)> = Vec::new();
-            if gate == 0 {
+            if group_error == 0 {
                 let stored = self.stored_offsets(&group);
                 match topics {
                     Some(topics) => {
@@ -562,7 +588,7 @@ impl Kafka {
                     }
                 }
             }
-            answers.push((group, rows));
+            answers.push((group, group_error, rows));
         }
 
         let mut response = OffsetFetchResponse::default();
@@ -571,10 +597,10 @@ impl Kafka {
             None => (-1, -1, Some(String::new())),
         };
         if version >= 8 {
-            for (group, rows) in answers {
+            for (group, group_error, rows) in answers {
                 let mut out = OffsetFetchResponseGroup::default();
                 out.group_id = GroupId(text(&group));
-                out.error_code = gate;
+                out.error_code = group_error;
                 let mut topics: Vec<OffsetFetchResponseTopics> = Vec::new();
                 for (name, id, partition, record) in rows {
                     let at = match topics
@@ -601,8 +627,8 @@ impl Kafka {
                 out.topics = topics;
                 response.groups.push(out);
             }
-        } else if let Some((_, rows)) = answers.into_iter().next() {
-            response.error_code = gate;
+        } else if let Some((_, group_error, rows)) = answers.into_iter().next() {
+            response.error_code = group_error;
             let mut topics: Vec<OffsetFetchResponseTopic> = Vec::new();
             for (name, _, partition, record) in rows {
                 let at = match topics
@@ -642,25 +668,24 @@ impl Kafka {
         // A broker that does not coordinate has no groups to list; the admin
         // client asks every broker and merges.
         if self.coordinating().await.is_ok() {
-            for (group, state, protocol_type) in self.coordinator.list() {
+            for group in self.coordinator.list() {
                 let state_ok = request.states_filter.is_empty()
                     || request
                         .states_filter
                         .iter()
-                        .any(|wanted| wanted.as_str().eq_ignore_ascii_case(state.name()));
+                        .any(|wanted| wanted.as_str().eq_ignore_ascii_case(&group.state));
                 let type_ok = request.types_filter.is_empty()
-                    || request
-                        .types_filter
-                        .iter()
-                        .any(|wanted| wanted.as_str().eq_ignore_ascii_case("classic"));
+                    || request.types_filter.iter().any(|wanted| {
+                        wanted.as_str().eq_ignore_ascii_case(&group.group_type)
+                    });
                 if !(state_ok && type_ok) {
                     continue;
                 }
                 let mut listed = ListedGroup::default();
-                listed.group_id = GroupId(text(&group));
-                listed.protocol_type = text(&protocol_type);
-                listed.group_state = text(state.name());
-                listed.group_type = text("classic");
+                listed.group_id = GroupId(text(&group.id));
+                listed.protocol_type = text(&group.protocol_type);
+                listed.group_state = text(&group.state);
+                listed.group_type = text(&group.group_type);
                 response.groups.push(listed);
             }
         }
@@ -685,7 +710,7 @@ impl Kafka {
             match self.coordinator.describe(group.0.as_str()) {
                 None => out.group_state = text("Dead"),
                 Some(described) => {
-                    out.group_state = text(described.state.name());
+                    out.group_state = text(&described.state_label);
                     out.protocol_type = text(&described.protocol_type);
                     out.protocol_data = text(&described.protocol);
                     out.members = described
@@ -740,6 +765,101 @@ impl Kafka {
             response.results.push(out);
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
+    }
+
+    pub(super) async fn consumer_group_heartbeat(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+    ) -> Reply {
+        let Ok(request) = ConsumerGroupHeartbeatRequest::decode(buf, header.request_api_version)
+        else {
+            return Reply::Close;
+        };
+        let version = header.request_api_version;
+        let heartbeat = ConsumerHeartbeat {
+            group: request.group_id.0.to_string(),
+            member_id: request.member_id.to_string(),
+            member_epoch: request.member_epoch,
+            instance_id: request.instance_id.map(|id| id.to_string()),
+            rack_id: request.rack_id.map(|id| id.to_string()),
+            rebalance_timeout_ms: request.rebalance_timeout_ms,
+            subscribed_topics: request.subscribed_topic_names.map(|names| {
+                names.iter().map(|name| name.0.to_string()).collect()
+            }),
+            subscribed_regex: request.subscribed_topic_regex.map(|value| value.to_string()),
+            server_assignor: request.server_assignor.map(|value| value.to_string()),
+            owned: request.topic_partitions.as_ref().map(|topics| {
+                topics
+                    .iter()
+                    .map(|topic| (topic.topic_id, topic.partitions.clone()))
+                    .collect()
+            }),
+            client_id: header
+                .client_id
+                .as_ref()
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            version,
+        };
+        let topics = self.group_topics();
+        let answer = match self.coordinating().await {
+            Err(code) => camus_coordinator::ConsumerHeartbeatResponse {
+                error: code,
+                message: None,
+                member_id: heartbeat.member_id.clone(),
+                member_epoch: -1,
+                heartbeat_interval_ms: 0,
+                assignment: None,
+            },
+            Ok(()) => {
+                self.coordinator
+                    .consumer_heartbeat(heartbeat, &topics, Instant::now())
+                    .await
+            }
+        };
+        let mut response = ConsumerGroupHeartbeatResponse::default();
+        response.error_code = answer.error;
+        response.error_message = answer.message.map(|value| text(&value));
+        response.member_id = Some(text(&answer.member_id));
+        response.member_epoch = answer.member_epoch;
+        response.heartbeat_interval_ms = answer.heartbeat_interval_ms;
+        response.assignment = answer.assignment.map(|topics| {
+            let mut assignment = Assignment::default();
+            assignment.topic_partitions = topics
+                .into_iter()
+                .map(|(id, partitions)| {
+                    let mut row = AssignedPartitions::default();
+                    row.topic_id = id;
+                    row.partitions = partitions;
+                    row
+                })
+                .collect();
+            assignment
+        });
+        frame_of(version, header.correlation_id, &response)
+    }
+
+    /// Topics the consumer-group assignor can place.
+    fn group_topics(&self) -> Vec<TopicMeta> {
+        self.node
+            .scan_local("topic/")
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let name = key.strip_prefix("topic/")?;
+                if name.is_empty() || name.contains('/') {
+                    return None;
+                }
+                let topic = camus_metadata::parse_topic(&value).ok()?;
+                let id = Uuid::parse_str(&topic.id).ok()?;
+                Some(TopicMeta {
+                    name: topic.name,
+                    id,
+                    partitions: topic.partitions,
+                })
+            })
+            .collect()
     }
 }
 

@@ -134,6 +134,46 @@ const IMPLEMENTED: &[ImplementedApi] = &[
         min: 0,
         max: 3,
     },
+    ImplementedApi {
+        key: ApiKey::ConsumerGroupHeartbeat,
+        min: 0,
+        max: 1,
+    },
+    ImplementedApi {
+        key: ApiKey::InitProducerId,
+        min: 0,
+        max: 4,
+    },
+    ImplementedApi {
+        key: ApiKey::CreatePartitions,
+        min: 0,
+        max: 3,
+    },
+    ImplementedApi {
+        key: ApiKey::AlterConfigs,
+        min: 0,
+        max: 2,
+    },
+    ImplementedApi {
+        key: ApiKey::IncrementalAlterConfigs,
+        min: 0,
+        max: 1,
+    },
+    ImplementedApi {
+        key: ApiKey::DeleteRecords,
+        min: 0,
+        max: 2,
+    },
+    ImplementedApi {
+        key: ApiKey::OffsetDelete,
+        min: 0,
+        max: 0,
+    },
+    ImplementedApi {
+        key: ApiKey::DescribeCluster,
+        min: 0,
+        max: 2,
+    },
 ];
 
 /// Keys in [`implemented_apis`], for callers that only need the key.

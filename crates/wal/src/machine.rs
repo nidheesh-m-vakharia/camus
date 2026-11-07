@@ -97,6 +97,10 @@ struct State {
     membership: Option<StoredMembership<NodeId, openraft::BasicNode>>,
     #[serde(default)]
     next: BTreeMap<String, i64>,
+    /// Producer sequences, keyed by `{topic id hex}/{partition}/{producer id}`.
+    /// A leader change reads this with the log, so a retry is not appended twice.
+    #[serde(default)]
+    producers: BTreeMap<String, camus_protocol::idempotence::ProducerSeq>,
     #[serde(skip)]
     heads: Vec<Head>,
 }
@@ -108,6 +112,30 @@ struct SnapshotData {
     heads: Vec<Head>,
     /// Sealed bytes of every head, by storage key.
     bytes: Vec<(u64, serde_bytes::ByteBuf)>,
+    /// Producer sequences. Absent from snapshots written before idempotence.
+    #[serde(default)]
+    producers: BTreeMap<String, camus_protocol::idempotence::ProducerSeq>,
+}
+
+/// Snapshot body from before producer sequences were stored.
+#[derive(Deserialize)]
+struct SnapshotDataV1 {
+    next: BTreeMap<String, i64>,
+    heads: Vec<Head>,
+    bytes: Vec<(u64, serde_bytes::ByteBuf)>,
+}
+
+fn decode_snapshot(data: &[u8]) -> Result<SnapshotData, &'static str> {
+    if let Ok(parsed) = camus_raft::codec::decode(data) {
+        return Ok(parsed);
+    }
+    let old: SnapshotDataV1 = camus_raft::codec::decode(data).map_err(|_| "snapshot")?;
+    Ok(SnapshotData {
+        next: old.next,
+        heads: old.heads,
+        bytes: old.bytes,
+        producers: BTreeMap::new(),
+    })
 }
 
 /// What changed in one apply call.
@@ -460,6 +488,43 @@ fn apply_at(
         Command::Append(batch) => {
             let key = part_key(&batch.topic_id, batch.partition);
             let start = state.next.get(&key).copied().unwrap_or(0).max(batch.floor);
+            let identities = match camus_protocol::batch::producer_batches(&batch.raw, MAX_BATCH) {
+                Ok(identities) => identities,
+                Err(_) => {
+                    return Response {
+                        base_offset: -1,
+                        error_code: 2,
+                        each: Vec::new(),
+                    };
+                }
+            };
+            let mut known = std::collections::BTreeMap::new();
+            for identity in &identities {
+                if identity.producer_id < 0 {
+                    continue;
+                }
+                let seq_key = format!("{key}/{}", identity.producer_id);
+                if let Some(seq) = state.producers.get(&seq_key) {
+                    known.insert(identity.producer_id, seq.clone());
+                }
+            }
+            let class = match camus_protocol::idempotence::classify(&known, &identities) {
+                Ok(class) => class,
+                Err(code) => {
+                    return Response {
+                        base_offset: -1,
+                        error_code: code,
+                        each: Vec::new(),
+                    };
+                }
+            };
+            if let camus_protocol::idempotence::Class::Replay { base_offset } = class {
+                return Response {
+                    base_offset,
+                    error_code: 0,
+                    each: Vec::new(),
+                };
+            }
             // Validate here, where every replica decides the same way. The
             // sealed bytes are rebuilt from the log entry when read.
             if camus_protocol::batch::seal(&batch.raw, start, batch.epoch, MAX_BATCH).is_err() {
@@ -468,6 +533,23 @@ fn apply_at(
                     error_code: 2,
                     each: Vec::new(),
                 };
+            }
+            if let camus_protocol::idempotence::Class::Fresh = class {
+                let mut at = start;
+                for identity in &identities {
+                    if identity.producer_id >= 0 {
+                        let seq_key = format!("{key}/{}", identity.producer_id);
+                        let seq = state.producers.entry(seq_key).or_default();
+                        camus_protocol::idempotence::record(
+                            seq,
+                            identity.producer_epoch,
+                            identity.base_sequence,
+                            identity.records,
+                            at,
+                        );
+                    }
+                    at += i64::from(identity.records);
+                }
             }
             let end = start + i64::from(batch.records);
             state.next.insert(key, end);
@@ -536,6 +618,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<Machine> {
             next: state.next.clone(),
             heads: state.heads.clone(),
             bytes,
+            producers: state.producers.clone(),
         })
         .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
         let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
@@ -642,12 +725,13 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
         let subject = || ErrorSubject::Snapshot(Some(meta.signature()));
-        let parsed: SnapshotData =
-            camus_raft::codec::decode(&data).map_err(|err| io(subject(), &err))?;
+        let parsed = decode_snapshot(&data)
+            .map_err(|err| io(subject(), &std::io::Error::other(err)))?;
         let state = State {
             last_applied: meta.last_log_id,
             membership: Some(meta.last_membership.clone()),
             next: parsed.next,
+            producers: parsed.producers,
             heads: parsed.heads,
         };
         // Replace every stored head; the snapshot's bytes become detached,

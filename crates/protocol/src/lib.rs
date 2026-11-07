@@ -106,6 +106,7 @@
 
 pub mod batch;
 pub mod compression;
+pub mod idempotence;
 pub mod error;
 pub mod frame;
 #[allow(clippy::all)]

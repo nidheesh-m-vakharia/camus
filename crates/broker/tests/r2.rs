@@ -304,16 +304,18 @@ fn produce_fetch_and_restart_keep_acked_bytes() {
     let (_, produced) = recv::<ProduceResponse>(&mut stream, 9);
     assert_eq!(produced.responses[0].partition_responses[0].error_code, 48);
 
-    // InitProducerId is Phase 4: known to the schema, not served yet.
     send(
         &mut stream,
         ApiKey::InitProducerId,
         4,
         8,
-        &camus_protocol::messages::InitProducerIdRequest::default(),
+        &camus_protocol::messages::InitProducerIdRequest::default()
+            .with_transactional_id(None),
     );
     let (_, init) = recv::<camus_protocol::messages::InitProducerIdResponse>(&mut stream, 4);
-    assert_eq!(init.error_code, ResponseError::UnsupportedVersion.code());
+    assert_eq!(init.error_code, 0);
+    assert!(init.producer_id.0 > 0);
+    assert_eq!(init.producer_epoch, 0);
     drop(stream);
 
     node.child.kill().unwrap();

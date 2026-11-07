@@ -13,7 +13,12 @@ PLAINTEXT and SASL_SSL. Losing the shard leader or a follower loses no
 acknowledged offset; R2 outages throttle produce instead of dropping acks.
 Classic consumer groups (join, sync, heartbeat, commit, fetch, list,
 describe, delete) work with the same three clients and survive a
-coordinator failover. KIP-848 groups are not in yet.
+coordinator failover. KIP-848 `ConsumerGroupHeartbeat` is in: the Java
+client can use `group.protocol=consumer`. `InitProducerId` is in, and a
+retried idempotent batch returns its original offset instead of being
+appended again, including after a WAL leader change. Phase 4 admin APIs
+are in: `DescribeCluster`, `CreatePartitions`, `AlterConfigs`,
+`IncrementalAlterConfigs`, `DeleteRecords`, and `OffsetDelete`.
 The plan and ADRs are in `docs/`. License: Apache-2.0.
 
 ## What a client changes

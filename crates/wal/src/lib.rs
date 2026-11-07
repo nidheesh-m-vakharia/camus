@@ -677,6 +677,106 @@ mod tests {
         assert_eq!(info.len(), 4);
     }
 
+    fn idempotent(value: &[u8], producer: i64, epoch: i16, sequence: i32) -> Append {
+        use camus_protocol::records::{
+            Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+            NO_PARTITION_LEADER_EPOCH,
+        };
+        let records = vec![Record {
+            transactional: false,
+            control: false,
+            delete_horizon: false,
+            partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+            producer_id: producer,
+            producer_epoch: epoch,
+            sequence,
+            timestamp_type: TimestampType::Creation,
+            offset: 0,
+            timestamp: 1,
+            key: None,
+            value: Some(bytes::Bytes::copy_from_slice(value)),
+            headers: Default::default(),
+        }];
+        let mut buf = bytes::BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            &records,
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .unwrap();
+        Append {
+            topic: "events".into(),
+            partition: 0,
+            topic_id: [1; 16],
+            epoch: 0,
+            raw: buf.freeze(),
+            records: 1,
+            base_timestamp: 1,
+            max_timestamp: 1,
+            floor: 0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_idempotent_retry_is_not_appended_again_after_a_leader_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = Arc::new(Router::default());
+        let mut shards = Vec::new();
+        for id in 1..=3 {
+            let path = dir.path().join(format!("n{id}"));
+            shards.push(Some(
+                Shard::open_in_process(id, &path, router.clone())
+                    .await
+                    .unwrap(),
+            ));
+        }
+        let nodes: BTreeMap<_, _> = (1..=3)
+            .map(|id| {
+                (
+                    id,
+                    BasicNode {
+                        addr: format!("wal-{id}"),
+                    },
+                )
+            })
+            .collect();
+        shards[0].as_ref().unwrap().initialize(nodes).await.unwrap();
+        let live: Vec<&Shard> = shards.iter().flatten().collect();
+        let leader = wait_leader(&live).await;
+        let first = live.iter().find(|shard| shard.node_id == leader).unwrap();
+        let batch = idempotent(b"once", 7, 0, 0);
+        let first_ack = first.append(batch.clone()).await.unwrap();
+        assert_eq!(first_ack.error_code, 0);
+        assert_eq!(first_ack.base_offset, 0);
+        let again = first.append(batch.clone()).await.unwrap();
+        assert_eq!(again.base_offset, 0);
+        assert_eq!(first.end_offset(&[1; 16], 0), 1, "the retry is not a second record");
+
+        let gone = shards[(leader - 1) as usize].take().unwrap();
+        gone.raft.shutdown().await.unwrap();
+        drop(gone);
+        let live: Vec<&Shard> = shards.iter().flatten().collect();
+        let next = wait_leader(&live).await;
+        assert_ne!(next, leader);
+        let survivor = live.iter().find(|shard| shard.node_id == next).unwrap();
+        let after = survivor.append(batch).await.unwrap();
+        assert_eq!(after.error_code, 0);
+        assert_eq!(after.base_offset, 0, "the new leader still has the sequence");
+        assert_eq!(survivor.end_offset(&[1; 16], 0), 1);
+        let followed = survivor.append(idempotent(b"next", 7, 0, 1)).await.unwrap();
+        assert_eq!(followed.base_offset, 1);
+        let tail = survivor.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
+        assert_eq!(
+            camus_protocol::batch::inspect(&tail, 1024 * 1024)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn a_fresh_shard_starts_at_the_floor() {
         let dir = tempfile::tempdir().unwrap();

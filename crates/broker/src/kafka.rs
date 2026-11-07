@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use camus_metadata::{MetadataNode, NodeId, PublishPart, Topic};
+use camus_metadata::{sequence_key, MetadataNode, NodeId, ProducerNote, PublishPart, Topic};
 use camus_protocol::batch::{self, BatchError};
 use camus_protocol::error::ResponseError;
 use camus_protocol::frame::{self, encode_response};
@@ -33,10 +33,12 @@ use camus_protocol::messages::metadata_response::{
     MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
 use camus_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
+use camus_protocol::idempotence::{self, Class, ProducerSeq};
 use camus_protocol::messages::{
     ApiKey, ApiVersionsRequest, BrokerId, CreateTopicsRequest, DeleteTopicsRequest,
-    DescribeConfigsRequest, FetchRequest, FetchResponse, ListOffsetsRequest, ListOffsetsResponse,
-    MetadataRequest, ProduceRequest, ProduceResponse, RequestHeader, SaslAuthenticateRequest,
+    DescribeConfigsRequest, FetchRequest, FetchResponse, InitProducerIdRequest,
+    InitProducerIdResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
+    ProduceRequest, ProduceResponse, RequestHeader, SaslAuthenticateRequest,
     SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, TopicName,
 };
 use camus_protocol::protocol::{decode_request_header_from_buffer, Decodable, StrBytes};
@@ -46,6 +48,7 @@ use camus_wal::{Append, SealDrop, Shard, WriteError};
 
 use crate::slot::WalSlot;
 
+mod admin;
 mod groups;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -255,9 +258,10 @@ impl Kafka {
     async fn meta_publish(
         &self,
         parts: Vec<PublishPart>,
+        producers: Vec<ProducerNote>,
     ) -> anyhow::Result<camus_metadata::Response> {
         if self.leader() {
-            return self.node.publish(parts).await;
+            return self.node.publish(parts, producers).await;
         }
         let addr = self
             .leader_http()
@@ -265,10 +269,31 @@ impl Kafka {
         let response = self
             .http
             .post(format!("http://{addr}/admin/publish"))
-            .json(&parts)
+            .json(&serde_json::json!({ "parts": parts, "producers": producers }))
             .send()
             .await?;
         anyhow::ensure!(response.status().is_success(), "forwarded publish failed");
+        Ok(response.json().await?)
+    }
+
+    /// Commit a metadata command here, or on the metadata leader.
+    async fn meta_apply(
+        &self,
+        command: camus_metadata::Command,
+    ) -> anyhow::Result<camus_metadata::Response> {
+        if self.leader() {
+            return self.node.apply(command).await;
+        }
+        let addr = self
+            .leader_http()
+            .ok_or_else(|| anyhow::anyhow!("no metadata leader"))?;
+        let response = self
+            .http
+            .post(format!("http://{addr}/admin/apply"))
+            .json(&command)
+            .send()
+            .await?;
+        anyhow::ensure!(response.status().is_success(), "forwarded apply failed");
         Ok(response.json().await?)
     }
 
@@ -481,6 +506,18 @@ impl Kafka {
             ApiKey::ListGroups => self.list_groups(&header, &mut buf).await,
             ApiKey::DescribeGroups => self.describe_groups(&header, &mut buf).await,
             ApiKey::DeleteGroups => self.delete_groups(&header, &mut buf).await,
+            ApiKey::InitProducerId => self.init_producer_id(&header, &mut buf).await,
+            ApiKey::CreatePartitions => self.create_partitions(&header, &mut buf).await,
+            ApiKey::AlterConfigs => self.alter_configs(&header, &mut buf).await,
+            ApiKey::IncrementalAlterConfigs => {
+                self.incremental_alter_configs(&header, &mut buf).await
+            }
+            ApiKey::DeleteRecords => self.delete_records(&header, &mut buf).await,
+            ApiKey::OffsetDelete => self.offset_delete(&header, &mut buf).await,
+            ApiKey::DescribeCluster => self.describe_cluster(&header, &mut buf),
+            ApiKey::ConsumerGroupHeartbeat => {
+                self.consumer_group_heartbeat(&header, &mut buf).await
+            }
             _ => unsupported(key, version, header.correlation_id),
         }
     }
@@ -757,12 +794,51 @@ impl Kafka {
             } else if let Some(topic) = self.topic(resource.resource_name.as_str()) {
                 result.configs = vec![
                     config_row("durability.mode", &topic.durability),
-                    config_row("cleanup.policy", "delete"),
+                    config_row("cleanup.policy", &topic.cleanup_policy),
+                    config_row("retention.ms", &topic.retention_ms.to_string()),
+                    config_row("retention.bytes", &topic.retention_bytes.to_string()),
                 ];
             } else {
                 result.error_code = UNKNOWN_TOPIC;
             }
             response.results.push(result);
+        }
+        frame_of(header.request_api_version, header.correlation_id, &response)
+    }
+
+    async fn init_producer_id(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+        let Ok(request) = InitProducerIdRequest::decode(buf, header.request_api_version) else {
+            return Reply::Close;
+        };
+        let mut response = InitProducerIdResponse::default();
+        response.producer_epoch = -1;
+        if !self.leader() {
+            response.error_code = NOT_LEADER;
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
+        let transactional = request
+            .transactional_id
+            .as_ref()
+            .is_some_and(|id| !id.0.is_empty());
+        let applied = self
+            .node
+            .init_producer(transactional, request.producer_id.0, request.producer_epoch)
+            .await;
+        match applied {
+            Ok(result) if result.error_code == 0 => {
+                let Some(value) = result.value else {
+                    response.error_code = STORAGE;
+                    return frame_of(header.request_api_version, header.correlation_id, &response);
+                };
+                let Some((id, epoch)) = value.split_once(',') else {
+                    response.error_code = STORAGE;
+                    return frame_of(header.request_api_version, header.correlation_id, &response);
+                };
+                response.producer_id = id.parse::<i64>().unwrap_or(-1).into();
+                response.producer_epoch = epoch.parse::<i16>().unwrap_or(-1);
+            }
+            Ok(result) => response.error_code = result.error_code,
+            Err(_) => response.error_code = NOT_LEADER,
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
@@ -1030,7 +1106,7 @@ impl Kafka {
     async fn put_objects(
         &self,
         upload: Vec<camus_wal::Batch>,
-    ) -> (Vec<PublishPart>, Vec<SealDrop>, bool) {
+    ) -> (Vec<PublishPart>, Vec<ProducerNote>, Vec<SealDrop>, bool) {
         let mut chunks: Vec<Vec<camus_wal::Batch>> = Vec::new();
         let mut size = 0usize;
         for batch in upload {
@@ -1046,8 +1122,14 @@ impl Kafka {
             let bucket = self.bucket.clone();
             puts.spawn(async move {
                 let mut heads = Vec::with_capacity(chunk.len());
+                let mut notes = Vec::new();
                 let mut pieces = Vec::with_capacity(chunk.len());
                 for batch in chunk {
+                    if let Ok(extra) =
+                        producer_notes(&batch.topic, batch.partition, &batch.bytes, batch.start)
+                    {
+                        notes.extend(extra);
+                    }
                     heads.push((
                         batch.topic,
                         batch.topic_id,
@@ -1071,7 +1153,7 @@ impl Kafka {
                 drop(pieces);
                 let key = camus_uploader::object_key();
                 let stored = bucket.put_new(&key, body).await.is_ok();
-                (slot, key, heads, index, stored)
+                (slot, key, heads, notes, index, stored)
             });
         }
         let mut done = Vec::new();
@@ -1082,13 +1164,15 @@ impl Kafka {
         }
         done.sort_by_key(|(slot, ..)| *slot);
         let mut parts = Vec::new();
+        let mut producers = Vec::new();
         let mut seals = Vec::new();
         let mut all_put = true;
-        for (expected, (slot, key, heads, index, stored)) in done.into_iter().enumerate() {
+        for (expected, (slot, key, heads, notes, index, stored)) in done.into_iter().enumerate() {
             if !stored || slot != expected || !all_put {
                 all_put = false;
                 continue;
             }
+            producers.extend(notes);
             for ((topic, topic_id, partition, start, end, base, max), (file_offset, length)) in
                 heads.into_iter().zip(index)
             {
@@ -1111,7 +1195,7 @@ impl Kafka {
                 });
             }
         }
-        (parts, seals, all_put)
+        (parts, producers, seals, all_put)
     }
 
     /// One upload pass: at most `upload.flush.bytes` (8 MiB, ADR 0006) of
@@ -1178,12 +1262,12 @@ impl Kafka {
             upload.push(batch);
         }
         if !upload.is_empty() {
-            let (parts, seals, all_put) = self.put_objects(upload).await;
+            let (parts, producers, seals, all_put) = self.put_objects(upload).await;
             if !all_put {
                 ok = false;
             }
             if !parts.is_empty() {
-                let published = self.meta_publish(parts).await;
+                let published = self.meta_publish(parts, producers).await;
                 let accepted = published.is_ok_and(|response| response.error_code == 0);
                 if !accepted {
                     ok = false;
@@ -1281,20 +1365,96 @@ impl Kafka {
             let id = Uuid::parse_str(&topic.id).unwrap_or_else(|_| Uuid::nil());
             ids.insert(item.topic.clone(), *id.as_bytes());
         }
+        let mut sequences: BTreeMap<(String, i32), BTreeMap<i64, ProducerSeq>> = BTreeMap::new();
+        // One result per item. Appends that share the object are filled in after publish.
+        enum Plan {
+            Replay(i64),
+            Error(i16),
+            Append,
+        }
+        let mut plans = Vec::with_capacity(items.len());
         let mut pieces = Vec::new();
-        let mut parts = Vec::new();
-        let mut assigned = Vec::new();
+        let mut notes = Vec::new();
         for item in &items {
+            let identities = match batch::producer_batches(&item.raw, MAX_BATCH) {
+                Ok(identities) => identities,
+                Err(_) => {
+                    plans.push(Plan::Error(CORRUPT));
+                    continue;
+                }
+            };
             let key = (item.topic.clone(), item.partition);
-            let start = *next.get(&key).expect("offset");
-            let epoch = *epochs.get(&key).expect("epoch");
+            let known = sequences.entry(key).or_default();
+            for identity in &identities {
+                if identity.producer_id < 0 || known.contains_key(&identity.producer_id) {
+                    continue;
+                }
+                if let Some(raw) = self
+                    .node
+                    .read_local(&sequence_key(
+                        &item.topic,
+                        item.partition,
+                        identity.producer_id,
+                    ))
+                    .ok()
+                    .flatten()
+                {
+                    if let Ok(seq) = serde_json::from_str::<ProducerSeq>(&raw) {
+                        known.insert(identity.producer_id, seq);
+                    }
+                }
+            }
+            let class = match idempotence::classify(known, &identities) {
+                Ok(class) => class,
+                Err(code) => {
+                    plans.push(Plan::Error(code));
+                    continue;
+                }
+            };
+            if let Class::Replay { base_offset } = class {
+                plans.push(Plan::Replay(base_offset));
+                continue;
+            }
+            let start = *next.get(&(item.topic.clone(), item.partition)).expect("offset");
+            let epoch = *epochs
+                .get(&(item.topic.clone(), item.partition))
+                .expect("epoch");
             let sealed = match batch::seal(&item.raw, start, epoch, MAX_BATCH) {
                 Ok(bytes) => bytes,
-                Err(_) => return fail(items, CORRUPT),
+                Err(_) => {
+                    plans.push(Plan::Error(CORRUPT));
+                    continue;
+                }
             };
             let end = start + i64::from(item.records);
-            *next.get_mut(&key).expect("offset") = end;
-            assigned.push(start);
+            *next
+                .get_mut(&(item.topic.clone(), item.partition))
+                .expect("offset") = end;
+            if let Class::Fresh = class {
+                let mut at = start;
+                for identity in &identities {
+                    if identity.producer_id >= 0 {
+                        notes.push(ProducerNote {
+                            topic: item.topic.clone(),
+                            partition: item.partition,
+                            producer_id: identity.producer_id,
+                            producer_epoch: identity.producer_epoch,
+                            base_sequence: identity.base_sequence,
+                            records: identity.records,
+                            base_offset: at,
+                        });
+                        idempotence::record(
+                            known.entry(identity.producer_id).or_default(),
+                            identity.producer_epoch,
+                            identity.base_sequence,
+                            identity.records,
+                            at,
+                        );
+                    }
+                    at += i64::from(identity.records);
+                }
+            }
+            plans.push(Plan::Append);
             pieces.push(Piece {
                 topic_id: *ids.get(&item.topic).expect("id"),
                 partition: item.partition,
@@ -1305,37 +1465,53 @@ impl Kafka {
                 bytes: sealed,
             });
         }
-        let (index, body) = camus_uploader::encode(&pieces);
-        let object_key = camus_uploader::object_key();
-        if self.bucket.put_new(&object_key, body).await.is_err() {
-            return fail(items, STORAGE);
-        }
-        for (item, (file_offset, length)) in items.iter().zip(index) {
-            let start = assigned[parts.len()];
-            parts.push(PublishPart {
-                topic: item.topic.clone(),
-                partition: item.partition,
-                start,
-                end: start + i64::from(item.records),
-                object_key: object_key.clone(),
-                file_offset,
-                length,
-                base_timestamp: item.base_timestamp,
-                max_timestamp: item.max_timestamp,
+        let mut parts = Vec::new();
+        if !pieces.is_empty() {
+            let (index, body) = camus_uploader::encode(&pieces);
+            let object_key = camus_uploader::object_key();
+            if self.bucket.put_new(&object_key, body).await.is_err() {
+                return fail(items, STORAGE);
+            }
+            let appended = items.iter().zip(&plans).filter_map(|(item, plan)| {
+                if matches!(plan, Plan::Append) {
+                    Some(item)
+                } else {
+                    None
+                }
             });
+            for (item, (file_offset, length)) in appended.zip(index) {
+                let start = pieces[parts.len()].start;
+                parts.push(PublishPart {
+                    topic: item.topic.clone(),
+                    partition: item.partition,
+                    start,
+                    end: start + i64::from(item.records),
+                    object_key: object_key.clone(),
+                    file_offset,
+                    length,
+                    base_timestamp: item.base_timestamp,
+                    max_timestamp: item.max_timestamp,
+                });
+            }
+            let published = self.node.publish(parts, notes).await;
+            let code = match published {
+                Ok(response) if response.error_code == 0 => None,
+                Ok(response) => Some(response.error_code),
+                Err(_) => Some(NOT_LEADER),
+            };
+            if let Some(code) = code {
+                return fail(items, code);
+            }
         }
-        let published = self.node.publish(parts).await;
-        let code = match published {
-            Ok(response) if response.error_code == 0 => None,
-            Ok(response) => Some(response.error_code),
-            Err(_) => Some(NOT_LEADER),
-        };
-        if let Some(code) = code {
-            return fail(items, code);
-        }
-        for (item, start) in items.into_iter().zip(assigned) {
+        let mut appends = pieces.iter();
+        for (item, plan) in items.into_iter().zip(plans) {
+            let settled = match plan {
+                Plan::Replay(offset) => Ok(offset),
+                Plan::Error(code) => Err(code),
+                Plan::Append => Ok(appends.next().expect("piece").start),
+            };
             if let Some(ack) = item.ack {
-                let _ = ack.send(Ok(start));
+                let _ = ack.send(settled);
             }
         }
     }
@@ -1629,6 +1805,32 @@ fn retry_delay(failures: u32) -> Duration {
         .unwrap_or(0)
         % (base / 2 + 1);
     Duration::from_millis(base + noise)
+}
+
+fn producer_notes(
+    topic: &str,
+    partition: i32,
+    bytes: &[u8],
+    start: i64,
+) -> Result<Vec<ProducerNote>, BatchError> {
+    let identities = batch::producer_batches(bytes, MAX_BATCH)?;
+    let mut notes = Vec::new();
+    let mut at = start;
+    for identity in identities {
+        if identity.producer_id >= 0 {
+            notes.push(ProducerNote {
+                topic: topic.to_string(),
+                partition,
+                producer_id: identity.producer_id,
+                producer_epoch: identity.producer_epoch,
+                base_sequence: identity.base_sequence,
+                records: identity.records,
+                base_offset: at,
+            });
+        }
+        at += i64::from(identity.records);
+    }
+    Ok(notes)
 }
 
 fn topic_id(topic: &Topic) -> [u8; 16] {

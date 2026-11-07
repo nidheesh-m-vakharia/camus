@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use camus_protocol::messages::{
-    ApiKey, ApiVersionsRequest, ApiVersionsResponse, InitProducerIdRequest, InitProducerIdResponse,
+    AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, ApiKey, ApiVersionsRequest, ApiVersionsResponse,
     RequestHeader,
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
@@ -102,17 +102,17 @@ fn an_unimplemented_api_returns_unsupported_version_and_the_connection_stays_up(
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
-    // InitProducerId is Phase 4: known to the schema, not served yet.
+    // AddOffsetsToTxn stays out until transactions.
     send(
         &mut stream,
-        ApiKey::InitProducerId,
+        ApiKey::AddOffsetsToTxn,
+        3,
         4,
-        4,
-        &InitProducerIdRequest::default(),
+        &AddOffsetsToTxnRequest::default(),
     );
-    let (correlation, init) = recv::<InitProducerIdResponse>(&mut stream, 4);
+    let (correlation, txn) = recv::<AddOffsetsToTxnResponse>(&mut stream, 3);
     assert_eq!(correlation, 4);
-    assert_eq!(init.error_code, ResponseError::UnsupportedVersion.code());
+    assert_eq!(txn.error_code, ResponseError::UnsupportedVersion.code());
 
     send(
         &mut stream,
@@ -130,5 +130,9 @@ fn an_unimplemented_api_returns_unsupported_version_and_the_connection_stays_up(
     assert!(versions
         .api_keys
         .iter()
-        .all(|api| api.api_key != ApiKey::InitProducerId as i16));
+        .any(|api| api.api_key == ApiKey::InitProducerId as i16));
+    assert!(versions
+        .api_keys
+        .iter()
+        .all(|api| api.api_key != ApiKey::AddOffsetsToTxn as i16));
 }

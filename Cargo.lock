@@ -19,9 +19,9 @@ dependencies = [
 
 [[package]]
 name = "android_system_properties"
-version = "0.1.6"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
+checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
 dependencies = [
  "libc",
 ]
@@ -343,6 +343,7 @@ name = "camus-coordinator"
 version = "0.1.0"
 dependencies = [
  "camus-metadata",
+ "regex",
  "tokio",
  "uuid",
 ]
@@ -362,6 +363,7 @@ name = "camus-metadata"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "camus-protocol",
  "camus-raft",
  "openraft",
  "redb",
@@ -384,6 +386,7 @@ dependencies = [
  "flate2",
  "indexmap",
  "lz4",
+ "serde",
  "snap",
  "uuid",
  "zstd",
@@ -2135,6 +2138,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

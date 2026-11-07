@@ -18,7 +18,23 @@ const ATTR_AT: usize = 21;
 const BASE_TS_AT: usize = 27;
 const MAX_TS_AT: usize = 35;
 const COUNT_AT: usize = 57;
+const PRODUCER_ID_AT: usize = 43;
+const PRODUCER_EPOCH_AT: usize = 51;
+const SEQUENCE_AT: usize = 53;
 const PREFIX: usize = 61;
+
+/// Producer identity of one batch. `producer_id` `-1` is not idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProducerBatch {
+    /// Idempotent producer id, or `-1`.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub producer_epoch: i16,
+    /// Sequence of the first record.
+    pub base_sequence: i32,
+    /// Records in the batch.
+    pub records: i32,
+}
 
 /// Why a record batch cannot be sealed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +107,28 @@ pub fn inspect(bytes: &[u8], max_batch: usize) -> Result<Vec<BatchInfo>, BatchEr
             max_timestamp: i64::from_be_bytes(batch[MAX_TS_AT..MAX_TS_AT + 8].try_into().unwrap()),
         });
         offset += total;
+    }
+    Ok(out)
+}
+
+/// Producer id, epoch, and base sequence of each batch. Same checks as [`inspect`].
+pub fn producer_batches(bytes: &[u8], max_batch: usize) -> Result<Vec<ProducerBatch>, BatchError> {
+    let info = inspect(bytes, max_batch)?;
+    let mut out = Vec::with_capacity(info.len());
+    let mut offset = 0;
+    for batch in &info {
+        let raw = &bytes[offset..offset + batch.len];
+        out.push(ProducerBatch {
+            producer_id: i64::from_be_bytes(
+                raw[PRODUCER_ID_AT..PRODUCER_EPOCH_AT].try_into().unwrap(),
+            ),
+            producer_epoch: i16::from_be_bytes(
+                raw[PRODUCER_EPOCH_AT..SEQUENCE_AT].try_into().unwrap(),
+            ),
+            base_sequence: i32::from_be_bytes(raw[SEQUENCE_AT..COUNT_AT].try_into().unwrap()),
+            records: batch.records,
+        });
+        offset += batch.len;
     }
     Ok(out)
 }

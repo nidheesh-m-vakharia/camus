@@ -8,10 +8,10 @@
 //! stable group keep their generation across a failover and the group does
 //! not split.
 //!
-//! Behavior follows the classic group protocol of Kafka 4.4.0
-//! (`GroupMetadataManager` and `ClassicGroup`); `src/tests` ports the cases
-//! from its test suite that apply here, and `docs/kafka-coordinator-port.md`
-//! lists every case and what happened to it.
+//! Classic groups follow Kafka 4.4.0 `GroupMetadataManager` and `ClassicGroup`.
+//! `src/tests` ports the cases from that test suite that apply here, and
+//! `docs/kafka-coordinator-port.md` lists every case and what happened to it.
+//! KIP-848 groups live in [`consumer`].
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +23,10 @@ use std::time::{Duration, Instant};
 
 use camus_metadata::groups::{GroupRecord, MemberRecord};
 use tokio::sync::oneshot;
+
+mod consumer;
+
+pub use consumer::{ConsumerHeartbeat, ConsumerHeartbeatResponse, TopicMeta};
 
 /// Kafka error codes the coordinator answers with.
 pub mod codes {
@@ -38,6 +42,12 @@ pub mod codes {
     pub const MEMBER_ID_REQUIRED: i16 = 79;
     pub const GROUP_MAX_SIZE_REACHED: i16 = 81;
     pub const FENCED_INSTANCE_ID: i16 = 82;
+    pub const INVALID_REQUEST: i16 = 42;
+    pub const GROUP_ID_NOT_FOUND: i16 = 69;
+    pub const FENCED_MEMBER_EPOCH: i16 = 110;
+    pub const UNRELEASED_INSTANCE_ID: i16 = 111;
+    pub const UNSUPPORTED_ASSIGNOR: i16 = 112;
+    pub const STALE_MEMBER_EPOCH: i16 = 113;
 }
 
 /// A boxed future, for [`Store::save`].
@@ -65,6 +75,10 @@ pub struct Config {
     /// How long a member that joined during a rebalance may wait for it
     /// without heartbeating (Kafka's `classicGroupNewMemberJoinTimeoutMs`).
     pub new_member_join_timeout: Duration,
+    /// `group.consumer.session.timeout.ms`.
+    pub consumer_session_timeout: Duration,
+    /// `group.consumer.heartbeat.interval.ms`.
+    pub consumer_heartbeat_interval: Duration,
 }
 
 impl Default for Config {
@@ -75,6 +89,8 @@ impl Default for Config {
             max_session_timeout: Duration::from_millis(1_800_000),
             max_size: usize::MAX,
             new_member_join_timeout: Duration::from_millis(300_000),
+            consumer_session_timeout: Duration::from_millis(45_000),
+            consumer_heartbeat_interval: Duration::from_millis(5_000),
         }
     }
 }
@@ -211,9 +227,22 @@ pub struct DescribedMember {
 #[derive(Clone, Debug)]
 pub struct Described {
     pub state: State,
+    /// State name to report. Consumer groups use Kafka's KIP-848 names.
+    pub state_label: String,
     pub protocol_type: String,
     pub protocol: String,
+    /// `classic` or `consumer`.
+    pub group_type: String,
     pub members: Vec<DescribedMember>,
+}
+
+/// One row of ListGroups.
+#[derive(Clone, Debug)]
+pub struct GroupListing {
+    pub id: String,
+    pub state: String,
+    pub protocol_type: String,
+    pub group_type: String,
 }
 
 /// One member to remove in a LeaveGroup.
@@ -232,6 +261,8 @@ struct Member {
     /// Joined during the current rebalance; not yet in a completed one.
     new_since: Option<Instant>,
     join_order: u64,
+    /// When a KIP-848 member was told to revoke, for the rebalance timeout.
+    revoke_since: Option<Instant>,
 }
 
 impl Member {
@@ -278,6 +309,12 @@ struct Group {
     /// A save is in flight; the phase ends when it lands.
     saving: bool,
     next_order: u64,
+    /// KIP-848 group. Classic groups leave this false.
+    consumer: bool,
+    /// Target assignment at `generation`: member, topic id, partitions.
+    target: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
+    /// Topic name to `(topic id, partitions)`, refreshed on each heartbeat.
+    topic_cache: BTreeMap<String, (String, i32)>,
 }
 
 impl Group {
@@ -296,6 +333,9 @@ impl Group {
             initial: None,
             saving: false,
             next_order: 0,
+            consumer: false,
+            target: BTreeMap::new(),
+            topic_cache: BTreeMap::new(),
         }
     }
 
@@ -322,11 +362,24 @@ impl Group {
                     sync: None,
                     new_since: None,
                     join_order: order as u64,
+                    revoke_since: (record.kind == "consumer" && member.member_state == "unrevoked")
+                        .then_some(now),
                     record: member,
                 },
             );
         }
         group.next_order = group.members.len() as u64;
+        group.consumer = record.kind == "consumer";
+        group.target = record.target.clone();
+        if group.consumer {
+            group.state = if group.members.is_empty() {
+                State::Empty
+            } else {
+                State::Stable
+            };
+            group.protocol_type = Some("consumer".into());
+            return group;
+        }
         let assigned = group
             .members
             .values()
@@ -355,12 +408,18 @@ impl Group {
                 .into_iter()
                 .map(|member| {
                     let mut record = member.record.clone();
-                    if self.protocol.is_some() {
+                    if self.protocol.is_some() && !self.consumer {
                         record.subscription = member.metadata(self.protocol.as_ref());
                     }
                     record
                 })
                 .collect(),
+            kind: if self.consumer {
+                "consumer".into()
+            } else {
+                String::new()
+            },
+            target: self.target.clone(),
         }
     }
 
@@ -535,6 +594,12 @@ enum After {
         old_protocols: Vec<(String, Vec<u8>)>,
         response: Box<JoinResponse>,
     },
+    /// A KIP-848 membership change to store. `revert` is the previous record.
+    SaveConsumer {
+        group: String,
+        record: GroupRecord,
+        revert: GroupRecord,
+    },
 }
 
 /// The coordinator for every group this broker leads.
@@ -629,6 +694,15 @@ impl Coordinator {
             ));
         }
         let mut groups = self.groups.lock().expect("groups");
+        if groups
+            .get(&request.group)
+            .is_some_and(|group| group.consumer)
+        {
+            return Reply::Now(JoinResponse::error(
+                codes::INCONSISTENT_GROUP_PROTOCOL,
+                &request.member_id,
+            ));
+        }
         let unknown = request.member_id.is_empty();
         if !groups.contains_key(&request.group) {
             if !unknown {
@@ -782,6 +856,7 @@ impl Coordinator {
             sync: None,
             new_since: Some(now),
             join_order: group.next_order,
+            revoke_since: None,
         };
         group.next_order += 1;
         member.record.member_id = member_id.clone();
@@ -1014,7 +1089,43 @@ impl Coordinator {
                     );
                 });
             }
+            After::SaveConsumer {
+                group,
+                record,
+                revert,
+            } => {
+                let generation = record.generation;
+                let save = self.store.save(group.clone(), record);
+                tokio::spawn(async move {
+                    let result = save.await;
+                    this.consumer_saved(&group, generation, revert, result);
+                });
+            }
         }
+    }
+
+    /// A KIP-848 expiry was stored, or put the previous record back.
+    fn consumer_saved(
+        &self,
+        id: &str,
+        generation: i32,
+        revert: GroupRecord,
+        result: Result<(), i16>,
+    ) {
+        if result.is_ok() {
+            return;
+        }
+        let mut groups = self.groups.lock().expect("groups");
+        let Some(group) = groups.get(id) else {
+            return;
+        };
+        if group.generation != generation {
+            return;
+        }
+        let cache = group.topic_cache.clone();
+        let mut restored = Group::from_record(revert, Instant::now());
+        restored.topic_cache = cache;
+        groups.insert(id.to_string(), restored);
     }
 
     /// The new generation is stored: answer every waiting JoinGroup.
@@ -1121,6 +1232,9 @@ impl Coordinator {
         let Some(group) = groups.get_mut(id) else {
             return Reply::Now(SyncResponse::error(codes::UNKNOWN_MEMBER_ID));
         };
+        if group.consumer {
+            return Reply::Now(SyncResponse::error(codes::INCONSISTENT_GROUP_PROTOCOL));
+        }
         if group.state == State::Dead {
             return Reply::Now(SyncResponse::error(codes::COORDINATOR_NOT_AVAILABLE));
         }
@@ -1240,6 +1354,9 @@ impl Coordinator {
         let Some(group) = groups.get_mut(id) else {
             return codes::UNKNOWN_MEMBER_ID;
         };
+        if group.consumer {
+            return codes::INCONSISTENT_GROUP_PROTOCOL;
+        }
         if group.state == State::Dead {
             return codes::COORDINATOR_NOT_AVAILABLE;
         }
@@ -1270,6 +1387,9 @@ impl Coordinator {
         let Some(group) = groups.get_mut(id) else {
             return Err(codes::UNKNOWN_MEMBER_ID);
         };
+        if group.consumer {
+            return Err(codes::INCONSISTENT_GROUP_PROTOCOL);
+        }
         if group.state == State::Dead {
             return Err(codes::COORDINATOR_NOT_AVAILABLE);
         }
@@ -1344,6 +1464,17 @@ impl Coordinator {
             let mut groups = self.groups.lock().expect("groups");
             for (id, group) in groups.iter_mut() {
                 if group.state == State::Dead {
+                    continue;
+                }
+                if group.consumer {
+                    let revert = group.record();
+                    if consumer::expire(group, now) {
+                        afters.push(After::SaveConsumer {
+                            group: id.clone(),
+                            record: group.record(),
+                            revert,
+                        });
+                    }
                     continue;
                 }
                 // Pending members expire on their own session.
@@ -1450,6 +1581,23 @@ impl Coordinator {
         if group.state == State::Dead {
             return codes::COORDINATOR_NOT_AVAILABLE;
         }
+        if group.consumer {
+            if generation < 0 && group.members.is_empty() {
+                return codes::NONE;
+            }
+            if let Err(code) = group.validate_member(member_id, instance) {
+                return code;
+            }
+            let Some(member) = group.members.get(member_id) else {
+                return codes::UNKNOWN_MEMBER_ID;
+            };
+            if member.record.member_epoch == generation
+                || (generation > 0 && member.record.previous_member_epoch == generation)
+            {
+                return codes::NONE;
+            }
+            return codes::STALE_MEMBER_EPOCH;
+        }
         if generation < 0 && group.state == State::Empty {
             return codes::NONE;
         }
@@ -1468,21 +1616,24 @@ impl Coordinator {
         codes::NONE
     }
 
-    /// Groups this coordinator knows: id, state, protocol type.
-    pub fn list(&self) -> Vec<(String, State, String)> {
+    /// Groups this coordinator knows.
+    pub fn list(&self) -> Vec<GroupListing> {
         let groups = self.groups.lock().expect("groups");
         let mut out: Vec<_> = groups
             .iter()
             .filter(|(_, group)| group.state != State::Dead)
-            .map(|(id, group)| {
-                (
-                    id.clone(),
-                    group.state,
-                    group.protocol_type.clone().unwrap_or_default(),
-                )
+            .map(|(id, group)| GroupListing {
+                id: id.clone(),
+                state: consumer::label(group).to_string(),
+                protocol_type: group.protocol_type.clone().unwrap_or_default(),
+                group_type: if group.consumer {
+                    "consumer".into()
+                } else {
+                    "classic".into()
+                },
             })
             .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.sort_by(|left, right| left.id.cmp(&right.id));
         out
     }
 
@@ -1496,11 +1647,17 @@ impl Coordinator {
         members.sort_by_key(|member| member.join_order);
         Some(Described {
             state: group.state,
+            state_label: consumer::label(group).to_string(),
             protocol_type: group.protocol_type.clone().unwrap_or_default(),
-            protocol: if stable {
+            protocol: if group.consumer || stable {
                 group.protocol.clone().unwrap_or_default()
             } else {
                 String::new()
+            },
+            group_type: if group.consumer {
+                "consumer".into()
+            } else {
+                "classic".into()
             },
             members: members
                 .into_iter()
@@ -1529,6 +1686,85 @@ impl Coordinator {
     /// Forget a deleted group.
     pub fn forget(&self, id: &str) {
         self.groups.lock().expect("groups").remove(id);
+    }
+
+    /// Check an offset fetch that names a member. Classic fetches and admin
+    /// fetches (no member id) are allowed. A consumer-group member must
+    /// present its current epoch.
+    pub fn check_fetch(&self, id: &str, member_id: &str, epoch: i32) -> i16 {
+        if member_id.is_empty() {
+            return codes::NONE;
+        }
+        let groups = self.groups.lock().expect("groups");
+        let Some(group) = groups.get(id) else {
+            return codes::NONE;
+        };
+        if !group.consumer {
+            return codes::NONE;
+        }
+        if group.state == State::Dead {
+            return codes::COORDINATOR_NOT_AVAILABLE;
+        }
+        let Some(member) = group.members.get(member_id) else {
+            return codes::UNKNOWN_MEMBER_ID;
+        };
+        if member.record.member_epoch == epoch {
+            codes::NONE
+        } else {
+            codes::STALE_MEMBER_EPOCH
+        }
+    }
+
+    /// `ConsumerGroupHeartbeat`. The group record is stored before a changed
+    /// membership is reported.
+    pub async fn consumer_heartbeat(
+        self: &Arc<Self>,
+        request: ConsumerHeartbeat,
+        topics: &[TopicMeta],
+        now: Instant,
+    ) -> ConsumerHeartbeatResponse {
+        let outcome = {
+            let mut groups = self.groups.lock().expect("groups");
+            consumer::apply(&mut groups, &self.config, &request, topics, now)
+        };
+        if let Some(record) = outcome.save {
+            let generation = record.generation;
+            match self.store.save(request.group.clone(), record).await {
+                Ok(()) => {}
+                Err(code) => {
+                    let mut groups = self.groups.lock().expect("groups");
+                    match outcome.restore {
+                        consumer::Restore::Keep => {}
+                        consumer::Restore::Remove => {
+                            groups.remove(&request.group);
+                        }
+                        consumer::Restore::Record(revert) => {
+                            if groups
+                                .get(&request.group)
+                                .is_some_and(|group| group.generation == generation)
+                            {
+                                let cache = groups
+                                    .get(&request.group)
+                                    .map(|group| group.topic_cache.clone())
+                                    .unwrap_or_default();
+                                let mut restored = Group::from_record(revert, now);
+                                restored.topic_cache = cache;
+                                groups.insert(request.group, restored);
+                            }
+                        }
+                    }
+                    return ConsumerHeartbeatResponse {
+                        error: code,
+                        message: None,
+                        member_id: request.member_id,
+                        member_epoch: -1,
+                        heartbeat_interval_ms: 0,
+                        assignment: None,
+                    };
+                }
+            }
+        }
+        outcome.response
     }
 
     /// Track a group that only has offsets, so it lists and describes.
