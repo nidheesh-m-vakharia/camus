@@ -11,10 +11,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use camus_metadata::{sequence_key, MetadataNode, NodeId, ProducerNote, PublishPart, Topic};
+use camus_metadata::{
+    sequence_key, Command, MetadataNode, NodeId, ProducerNote, PublishPart, Topic, TxnSpan,
+};
 use camus_protocol::batch::{self, BatchError};
 use camus_protocol::error::ResponseError;
 use camus_protocol::frame::{self, encode_response};
+use camus_protocol::idempotence::{self, Class, ProducerSeq};
 use camus_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
 use camus_protocol::messages::create_topics_response::{
     CreatableTopicResult, CreateTopicsResponse,
@@ -33,7 +36,6 @@ use camus_protocol::messages::metadata_response::{
     MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
 use camus_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
-use camus_protocol::idempotence::{self, Class, ProducerSeq};
 use camus_protocol::messages::{
     ApiKey, ApiVersionsRequest, BrokerId, CreateTopicsRequest, DeleteTopicsRequest,
     DescribeConfigsRequest, FetchRequest, FetchResponse, InitProducerIdRequest,
@@ -48,8 +50,10 @@ use camus_wal::{Append, SealDrop, Shard, WriteError};
 
 use crate::slot::WalSlot;
 
+mod acl;
 mod admin;
 mod groups;
+mod txn;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
@@ -88,6 +92,10 @@ struct Item {
     base_timestamp: i64,
     max_timestamp: i64,
     ack: Option<oneshot::Sender<Result<i64, i16>>>,
+    /// Set when every batch in `raw` belongs to this transaction.
+    txn_id: Option<String>,
+    producer_id: i64,
+    producer_epoch: i16,
 }
 
 enum Reply {
@@ -134,6 +142,9 @@ pub struct Kafka {
     host: String,
     port: i32,
     flush_ms: u64,
+    /// How often to compact sealed extents of `cleanup.policy=compact` topics.
+    /// `0` leaves compaction off.
+    compact_ms: u64,
     /// `wal.disk.limit`: unsealed bytes past which produce is held.
     wal_limit: u64,
     /// `durability.mode` for a topic created without one. `wal` per ADR 0005.
@@ -176,6 +187,10 @@ impl Kafka {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(250);
+        let compact_ms = std::env::var("CAMUS_COMPACT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
         let store = Arc::new(groups::MetadataStore {
             node: Arc::clone(&node),
         });
@@ -186,6 +201,7 @@ impl Kafka {
             host,
             port,
             flush_ms,
+            compact_ms,
             wal_limit,
             default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
                 .unwrap_or_else(|_| "wal".into()),
@@ -354,6 +370,167 @@ impl Kafka {
         camus_metadata::parse_partition(&raw).ok()
     }
 
+    /// `Some` when every batch is one ongoing transaction on this partition.
+    fn accept_txn(
+        &self,
+        txn_id: Option<&str>,
+        info: &[camus_protocol::batch::BatchInfo],
+        identities: &[camus_protocol::batch::ProducerBatch],
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<(String, i64, i16)>, i16> {
+        let any = info.iter().any(|batch| batch.transactional);
+        let all = !info.is_empty() && info.iter().all(|batch| batch.transactional);
+        let Some(id) = txn_id else {
+            return if any { Err(TXN) } else { Ok(None) };
+        };
+        if !all {
+            return Err(INVALID_REQUEST);
+        }
+        let Some(first) = identities.first() else {
+            return Err(CORRUPT);
+        };
+        if identities.iter().any(|batch| {
+            batch.producer_id != first.producer_id || batch.producer_epoch != first.producer_epoch
+        }) {
+            return Err(INVALID_REQUEST);
+        }
+        let get = |key: &str| self.node.read_local(key).map_err(|err| err.to_string());
+        camus_metadata::txn_allows(
+            &get,
+            id,
+            first.producer_id,
+            first.producer_epoch,
+            topic,
+            partition,
+        )?;
+        Ok(Some((
+            id.to_string(),
+            first.producer_id,
+            first.producer_epoch,
+        )))
+    }
+
+    /// A compacting topic rejects a record with no key. Kafka reports that as
+    /// a corrupt message.
+    fn reject_null_key(&self, topic: &Topic, raw: &[u8]) -> Result<(), i16> {
+        if !camus_protocol::compact::compacts(&topic.cleanup_policy) {
+            return Ok(());
+        }
+        let mut bytes = bytes::Bytes::copy_from_slice(raw);
+        let sets = camus_protocol::records::RecordBatchDecoder::decode_all(&mut bytes)
+            .map_err(|_| CORRUPT)?;
+        if sets
+            .iter()
+            .flat_map(|set| &set.records)
+            .any(|record| record.key.is_none())
+        {
+            return Err(CORRUPT);
+        }
+        Ok(())
+    }
+
+    /// Rewrite sealed extents so each key keeps its newest record.
+    async fn compact_sealed(&self) {
+        if !self.leader() {
+            return;
+        }
+        for name in self.topic_names() {
+            let Some(topic) = self.topic(&name) else {
+                continue;
+            };
+            if !camus_protocol::compact::compacts(&topic.cleanup_policy) {
+                continue;
+            }
+            for partition in 0..topic.partitions {
+                self.compact_partition(&topic, partition).await;
+            }
+        }
+    }
+
+    async fn compact_partition(&self, topic: &Topic, partition: i32) {
+        let Some(state) = self.partition_state(topic, partition) else {
+            return;
+        };
+        if state.extents.is_empty() {
+            return;
+        }
+        let mut records = Vec::new();
+        let mut base_timestamp = i64::MAX;
+        let mut max_timestamp = i64::MIN;
+        for extent in &state.extents {
+            let end = extent.file_offset + u64::from(extent.length);
+            let Ok(bytes) = self
+                .bucket
+                .get_range(&extent.key, extent.file_offset..end)
+                .await
+            else {
+                return;
+            };
+            let mut cursor = bytes::Bytes::from(bytes);
+            let Ok(sets) = camus_protocol::records::RecordBatchDecoder::decode_all(&mut cursor)
+            else {
+                return;
+            };
+            for set in sets {
+                for record in set.records {
+                    let covers = |spans: &[camus_metadata::Span]| {
+                        spans
+                            .iter()
+                            .any(|span| span.start <= record.offset && record.offset < span.end)
+                    };
+                    if record.transactional
+                        && !covers(&state.txn_committed)
+                        && !covers(&state.txn_aborted)
+                    {
+                        return;
+                    }
+                    if covers(&state.txn_aborted) {
+                        continue;
+                    }
+                    base_timestamp = base_timestamp.min(record.timestamp);
+                    max_timestamp = max_timestamp.max(record.timestamp);
+                    records.push(record);
+                }
+            }
+        }
+        let Some(kept) = camus_protocol::compact::plan(&records) else {
+            return;
+        };
+        let Ok(body) = camus_protocol::compact::rebuild(&kept) else {
+            return;
+        };
+        let Ok(length) = u32::try_from(body.len()) else {
+            return;
+        };
+        let covered_end = state
+            .extents
+            .last()
+            .map(|extent| extent.end)
+            .unwrap_or(state.next_offset);
+        let object_key = camus_uploader::object_key();
+        if self.bucket.put_new(&object_key, body).await.is_err() {
+            return;
+        }
+        if base_timestamp == i64::MAX {
+            base_timestamp = 0;
+            max_timestamp = 0;
+        }
+        let _ = self
+            .node
+            .apply(Command::Compact {
+                topic: topic.name.clone(),
+                partition,
+                covered_end,
+                object_key,
+                file_offset: 0,
+                length,
+                base_timestamp,
+                max_timestamp,
+            })
+            .await;
+    }
+
     /// Accept connections until the listener closes.
     pub async fn run(self: Arc<Self>, listener: TcpListener) {
         let flush = Arc::clone(&self);
@@ -363,6 +540,15 @@ impl Kafka {
                 flush.flush().await;
             }
         });
+        if self.compact_ms > 0 {
+            let compact = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(compact.compact_ms)).await;
+                    compact.compact_sealed().await;
+                }
+            });
+        }
         let upload = Arc::clone(&self);
         tokio::spawn(async move {
             let mut failures = 0u32;
@@ -485,14 +671,15 @@ impl Kafka {
         if !frame::is_implemented(key, version) {
             return unsupported(key, version, header.correlation_id);
         }
+        let principal = self.principal(*authed);
         match key {
             ApiKey::ApiVersions => self.api_versions(&header, &mut buf),
             ApiKey::Metadata => self.metadata(&header, &mut buf).await,
-            ApiKey::CreateTopics => self.create_topics(&header, &mut buf).await,
-            ApiKey::DeleteTopics => self.delete_topics(&header, &mut buf).await,
+            ApiKey::CreateTopics => self.create_topics(&header, &mut buf, &principal).await,
+            ApiKey::DeleteTopics => self.delete_topics(&header, &mut buf, &principal).await,
             ApiKey::DescribeConfigs => self.describe_configs(&header, &mut buf),
-            ApiKey::Produce => self.produce(&header, &mut buf).await,
-            ApiKey::Fetch => self.fetch(&header, &mut buf).await,
+            ApiKey::Produce => self.produce(&header, &mut buf, &principal).await,
+            ApiKey::Fetch => self.fetch(&header, &mut buf, &principal).await,
             ApiKey::ListOffsets => self.list_offsets(&header, &mut buf).await,
             ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf),
             ApiKey::SaslAuthenticate => self.sasl_authenticate(&header, &mut buf, authed),
@@ -515,6 +702,13 @@ impl Kafka {
             ApiKey::DeleteRecords => self.delete_records(&header, &mut buf).await,
             ApiKey::OffsetDelete => self.offset_delete(&header, &mut buf).await,
             ApiKey::DescribeCluster => self.describe_cluster(&header, &mut buf),
+            ApiKey::AddPartitionsToTxn => self.add_partitions_to_txn(&header, &mut buf).await,
+            ApiKey::AddOffsetsToTxn => self.add_offsets_to_txn(&header, &mut buf).await,
+            ApiKey::TxnOffsetCommit => self.txn_offset_commit(&header, &mut buf).await,
+            ApiKey::EndTxn => self.end_txn(&header, &mut buf).await,
+            ApiKey::DescribeAcls => self.describe_acls(&header, &mut buf, &principal).await,
+            ApiKey::CreateAcls => self.create_acls(&header, &mut buf, &principal).await,
+            ApiKey::DeleteAcls => self.delete_acls(&header, &mut buf, &principal).await,
             ApiKey::ConsumerGroupHeartbeat => {
                 self.consumer_group_heartbeat(&header, &mut buf).await
             }
@@ -663,12 +857,33 @@ impl Kafka {
         topic
     }
 
-    async fn create_topics(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    fn principal(&self, authed: bool) -> String {
+        if authed && self.require_sasl && !self.sasl_user.is_empty() {
+            format!("User:{}", self.sasl_user)
+        } else {
+            "User:ANONYMOUS".into()
+        }
+    }
+
+    fn allows(&self, principal: &str, resource_type: i8, name: &str, operation: i8) -> bool {
+        let raw = self.node.read_local("acls").ok().flatten();
+        camus_metadata::acl_allows(raw.as_deref(), principal, resource_type, name, operation)
+    }
+
+    async fn create_topics(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        principal: &str,
+    ) -> Reply {
         let Ok(request) = CreateTopicsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         if !self.leader() {
             return self.create_error(&request, header, NOT_LEADER);
+        }
+        if !self.allows(principal, 4, "kafka-cluster", 5) {
+            return self.create_error(&request, header, 31);
         }
         let mut response = CreateTopicsResponse::default();
         for topic in request.topics {
@@ -735,7 +950,12 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    async fn delete_topics(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    async fn delete_topics(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        principal: &str,
+    ) -> Reply {
         let Ok(request) = DeleteTopicsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -753,7 +973,9 @@ impl Kafka {
         }
         let mut response = DeleteTopicsResponse::default();
         for name in names {
-            let code = if !self.leader() {
+            let code = if !self.allows(principal, 2, &name, 6) {
+                29
+            } else if !self.leader() {
                 NOT_LEADER
             } else {
                 match self.node.delete_topic(&name).await {
@@ -819,11 +1041,24 @@ impl Kafka {
         let transactional = request
             .transactional_id
             .as_ref()
-            .is_some_and(|id| !id.0.is_empty());
-        let applied = self
-            .node
-            .init_producer(transactional, request.producer_id.0, request.producer_epoch)
-            .await;
+            .filter(|id| !id.0.is_empty())
+            .map(|id| id.0.to_string());
+        let applied = match &transactional {
+            Some(id) => {
+                self.node
+                    .apply(Command::InitTransaction {
+                        transactional_id: id.clone(),
+                        producer_id: request.producer_id.0,
+                        producer_epoch: request.producer_epoch,
+                    })
+                    .await
+            }
+            None => {
+                self.node
+                    .init_producer(false, request.producer_id.0, request.producer_epoch)
+                    .await
+            }
+        };
         match applied {
             Ok(result) if result.error_code == 0 => {
                 let Some(value) = result.value else {
@@ -843,16 +1078,18 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    async fn produce(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    async fn produce(&self, header: &RequestHeader, buf: &mut Bytes, principal: &str) -> Reply {
         let Ok(request) = ProduceRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         if request.acks != 0 && request.acks != 1 && request.acks != -1 {
             return self.produce_all_error(&request, header, INVALID_REQUEST);
         }
-        if request.transactional_id.is_some() {
-            return self.produce_all_error(&request, header, TXN);
-        }
+        let txn_id = request
+            .transactional_id
+            .as_ref()
+            .filter(|id| !id.0.is_empty())
+            .map(|id| id.0.to_string());
         let mut response = ProduceResponse::default();
         let mut waiters = Vec::new();
         let mut held = Duration::ZERO;
@@ -867,6 +1104,17 @@ impl Kafka {
             topic_response.name = topic_name(&name);
             topic_response.topic_id = topic.topic_id;
             let stored = self.topic(&name);
+            if !self.allows(principal, 2, &name, 4) {
+                for partition in topic.partition_data {
+                    if request.acks != 0 {
+                        topic_response
+                            .partition_responses
+                            .push(partition_error(partition.index, 29));
+                    }
+                }
+                response.responses.push(topic_response);
+                continue;
+            }
             for partition in topic.partition_data {
                 match self
                     .enqueue_partition(
@@ -876,6 +1124,7 @@ impl Kafka {
                         partition.index,
                         request.acks,
                         request.timeout_ms,
+                        txn_id.as_deref(),
                         &mut held,
                     )
                     .await
@@ -951,6 +1200,7 @@ impl Kafka {
         partition: i32,
         acks: i16,
         timeout_ms: i32,
+        txn_id: Option<&str>,
         held: &mut Duration,
     ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
         let Some(topic) = topic else {
@@ -958,7 +1208,9 @@ impl Kafka {
         };
         if topic.durability == "wal" {
             return self
-                .write_wal(name, topic, records, partition, acks, timeout_ms, held)
+                .write_wal(
+                    name, topic, records, partition, acks, timeout_ms, txn_id, held,
+                )
                 .await;
         }
         if topic.durability != "r2" {
@@ -979,9 +1231,12 @@ impl Kafka {
         let info = match batch::inspect(raw, MAX_BATCH) {
             Ok(info) => info,
             Err(BatchError::TooLarge) => return Err(TOO_LARGE),
-            Err(BatchError::Transactional) => return Err(TXN),
             Err(BatchError::Corrupt) => return Err(CORRUPT),
+            Err(BatchError::Transactional) => return Err(TXN),
         };
+        let identities = batch::producer_batches(raw, MAX_BATCH).map_err(|_| CORRUPT)?;
+        self.reject_null_key(topic, raw)?;
+        let txn = self.accept_txn(txn_id, &info, &identities, name, partition)?;
         let (tx, rx) = oneshot::channel();
         let waited = self
             .enqueue(Item {
@@ -992,6 +1247,9 @@ impl Kafka {
                 base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
                 max_timestamp: info.last().map(|batch| batch.max_timestamp).unwrap_or(-1),
                 ack: if acks == 0 { None } else { Some(tx) },
+                txn_id: txn.as_ref().map(|(id, _, _)| id.clone()),
+                producer_id: txn.as_ref().map(|(_, id, _)| *id).unwrap_or(-1),
+                producer_epoch: txn.as_ref().map(|(_, _, epoch)| *epoch).unwrap_or(-1),
             })
             .await;
         // A full `r2.buffer.limit` holds the produce in `enqueue`; report it.
@@ -1011,6 +1269,7 @@ impl Kafka {
         partition: i32,
         acks: i16,
         timeout_ms: i32,
+        txn_id: Option<&str>,
         held: &mut Duration,
     ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
         let wal = self.wal();
@@ -1035,9 +1294,15 @@ impl Kafka {
         let info = match batch::inspect(raw, MAX_BATCH) {
             Ok(info) => info,
             Err(BatchError::TooLarge) => return Err(TOO_LARGE),
-            Err(BatchError::Transactional) => return Err(TXN),
             Err(BatchError::Corrupt) => return Err(CORRUPT),
+            Err(BatchError::Transactional) => return Err(TXN),
         };
+        let identities = batch::producer_batches(raw, MAX_BATCH).map_err(|_| CORRUPT)?;
+        self.reject_null_key(topic, raw)?;
+        let txn = self.accept_txn(txn_id, &info, &identities, name, partition)?;
+        if txn.is_some() && acks == 0 {
+            return Err(INVALID_REQUEST);
+        }
         let append = Append {
             topic: name.to_string(),
             partition,
@@ -1060,6 +1325,7 @@ impl Kafka {
         // batch is not appended while held, so a timeout loses nothing that
         // was acknowledged.
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
+        let records = append.records;
         let size = append.raw.len() as u64;
         let hold_start = Instant::now();
         loop {
@@ -1087,6 +1353,28 @@ impl Kafka {
             Ok(Err(WriteError::Other(_))) => return Err(STORAGE),
             Ok(Ok(response)) => response,
         };
+        if let Some((id, producer, epoch)) = txn {
+            if response.error_code == 0 {
+                let noted = self
+                    .meta_apply(Command::NoteTxn {
+                        transactional_id: id,
+                        producer_id: producer,
+                        producer_epoch: epoch,
+                        span: TxnSpan {
+                            topic: name.to_string(),
+                            partition,
+                            start: response.base_offset,
+                            end: response.base_offset + i64::from(records),
+                        },
+                    })
+                    .await;
+                match noted {
+                    Ok(result) if result.error_code == 0 => {}
+                    Ok(result) => return Err(result.error_code),
+                    Err(_) => return Err(NOT_LEADER),
+                }
+            }
+        }
         let (tx, rx) = oneshot::channel();
         let settled = if response.error_code == 0 {
             Ok(response.base_offset)
@@ -1415,7 +1703,9 @@ impl Kafka {
                 plans.push(Plan::Replay(base_offset));
                 continue;
             }
-            let start = *next.get(&(item.topic.clone(), item.partition)).expect("offset");
+            let start = *next
+                .get(&(item.topic.clone(), item.partition))
+                .expect("offset");
             let epoch = *epochs
                 .get(&(item.topic.clone(), item.partition))
                 .expect("epoch");
@@ -1503,6 +1793,82 @@ impl Kafka {
                 return fail(items, code);
             }
         }
+        let mut noted = pieces.iter();
+        for (item, plan) in items.iter().zip(&plans) {
+            let Some(id) = item.txn_id.clone() else {
+                if matches!(plan, Plan::Append) {
+                    let _ = noted.next();
+                }
+                continue;
+            };
+            let (start, end) = match plan {
+                Plan::Replay(offset) => (*offset, offset + i64::from(item.records)),
+                Plan::Append => {
+                    let piece = noted.next().expect("piece");
+                    (piece.start, piece.end)
+                }
+                Plan::Error(_) => continue,
+            };
+            let applied = self
+                .meta_apply(Command::NoteTxn {
+                    transactional_id: id,
+                    producer_id: item.producer_id,
+                    producer_epoch: item.producer_epoch,
+                    span: TxnSpan {
+                        topic: item.topic.clone(),
+                        partition: item.partition,
+                        start,
+                        end,
+                    },
+                })
+                .await;
+            let code = match applied {
+                Ok(response) if response.error_code == 0 => None,
+                Ok(response) => Some(response.error_code),
+                Err(_) => Some(NOT_LEADER),
+            };
+            if let Some(code) = code {
+                return fail(items, code);
+            }
+        }
+        let mut noted = pieces.iter();
+        for (item, plan) in items.iter().zip(&plans) {
+            let Some(id) = item.txn_id.clone() else {
+                if matches!(plan, Plan::Append) {
+                    let _ = noted.next();
+                }
+                continue;
+            };
+            let (start, end) = match plan {
+                Plan::Replay(offset) => (*offset, offset + i64::from(item.records)),
+                Plan::Append => {
+                    let piece = noted.next().expect("piece");
+                    (piece.start, piece.end)
+                }
+                Plan::Error(_) => continue,
+            };
+            let applied = self
+                .meta_apply(Command::NoteTxn {
+                    transactional_id: id,
+                    producer_id: item.producer_id,
+                    producer_epoch: item.producer_epoch,
+                    span: TxnSpan {
+                        topic: item.topic.clone(),
+                        partition: item.partition,
+                        start,
+                        end,
+                    },
+                })
+                .await;
+            let code = match applied {
+                Ok(response) if response.error_code == 0 => None,
+                Ok(response) => Some(response.error_code),
+                Err(_) => Some(NOT_LEADER),
+            };
+            if let Some(code) = code {
+                return fail(items, code);
+            }
+        }
         let mut appends = pieces.iter();
         for (item, plan) in items.into_iter().zip(plans) {
             let settled = match plan {
@@ -1516,7 +1882,7 @@ impl Kafka {
         }
     }
 
-    async fn fetch(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    async fn fetch(&self, header: &RequestHeader, buf: &mut Bytes, principal: &str) -> Reply {
         let Ok(request) = FetchRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -1535,6 +1901,17 @@ impl Kafka {
                 topic_response.topic = topic_name(&name);
                 topic_response.topic_id = topic.topic_id;
                 let stored = self.topic(&name);
+                if !self.allows(principal, 2, &name, 3) {
+                    for partition in &topic.partitions {
+                        let mut row =
+                            camus_protocol::messages::fetch_response::PartitionData::default();
+                        row.partition_index = partition.partition;
+                        row.error_code = 29;
+                        topic_response.partitions.push(row);
+                    }
+                    response.responses.push(topic_response);
+                    continue;
+                }
                 for partition in &topic.partitions {
                     let row = self
                         .fetch_partition(
@@ -1542,6 +1919,7 @@ impl Kafka {
                             partition.partition,
                             partition.fetch_offset,
                             partition.partition_max_bytes,
+                            request.isolation_level,
                         )
                         .await;
                     if row.records.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
@@ -1565,6 +1943,7 @@ impl Kafka {
         partition: i32,
         offset: i64,
         max_bytes: i32,
+        isolation: i8,
     ) -> PartitionData {
         let mut row = PartitionData::default();
         row.partition_index = partition;
@@ -1582,6 +1961,7 @@ impl Kafka {
         };
         let wal_end = self.wal().end_offset(&topic_id(topic), partition);
         let high_watermark = state.next_offset.max(wal_end);
+        let mut stable = high_watermark;
         row.high_watermark = high_watermark;
         row.last_stable_offset = high_watermark;
         row.log_start_offset = state.log_start;
@@ -1609,20 +1989,31 @@ impl Kafka {
                 return row;
             };
             let mut cursor = 0;
-            let mut batch_offset = extent.start;
             for batch in info {
-                let next = batch_offset + i64::from(batch.records);
-                if next > offset {
+                let next = batch.last_offset + 1;
+                if isolation == 1 {
+                    match txn_batch(batch.base_offset, batch.transactional, &state) {
+                        TxnView::Stop => {
+                            stable = stable.min(batch.base_offset);
+                            break;
+                        }
+                        TxnView::Skip => {
+                            cursor += batch.len;
+                            continue;
+                        }
+                        TxnView::Take => {}
+                    }
+                }
+                if next > offset && batch.base_offset < stable {
                     if !out.is_empty() && out.len() + batch.len > limit {
                         break;
                     }
                     out.extend_from_slice(&bytes[cursor..cursor + batch.len]);
                 }
                 cursor += batch.len;
-                batch_offset = next;
             }
         }
-        if offset < high_watermark {
+        if offset < stable {
             let remaining = limit.saturating_sub(out.len());
             let extra = match self
                 .wal()
@@ -1641,9 +2032,18 @@ impl Kafka {
                     return row;
                 }
             };
+            let extra = if isolation == 1 {
+                filter_txn(&extra, &state, &mut stable)
+            } else {
+                extra
+            };
             if !extra.is_empty() && (out.is_empty() || out.len() + extra.len() <= limit) {
                 out.extend_from_slice(&extra);
             }
+        }
+        if isolation == 1 {
+            row.high_watermark = stable;
+            row.last_stable_offset = stable;
         }
         if !out.is_empty() {
             row.records = Some(out.freeze());
@@ -1860,6 +2260,57 @@ fn config_row(name: &str, value: &str) -> DescribeConfigsResourceResult {
     row.config_source = 1;
     row.config_type = 2;
     row
+}
+
+enum TxnView {
+    Take,
+    Skip,
+    Stop,
+}
+
+fn txn_batch(offset: i64, transactional: bool, state: &camus_metadata::Partition) -> TxnView {
+    if !transactional {
+        return TxnView::Take;
+    }
+    if state
+        .txn_aborted
+        .iter()
+        .any(|span| span.start <= offset && offset < span.end)
+    {
+        return TxnView::Skip;
+    }
+    if state
+        .txn_committed
+        .iter()
+        .any(|span| span.start <= offset && offset < span.end)
+    {
+        TxnView::Take
+    } else {
+        TxnView::Stop
+    }
+}
+
+fn filter_txn(bytes: &[u8], state: &camus_metadata::Partition, stable: &mut i64) -> Vec<u8> {
+    let Ok(info) = batch::inspect(bytes, MAX_FRAME) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    for batch in info {
+        match txn_batch(batch.base_offset, batch.transactional, state) {
+            TxnView::Stop => {
+                *stable = (*stable).min(batch.base_offset);
+                break;
+            }
+            TxnView::Skip => {}
+            TxnView::Take if batch.base_offset < *stable => {
+                out.extend_from_slice(&bytes[cursor..cursor + batch.len]);
+            }
+            TxnView::Take => {}
+        }
+        cursor += batch.len;
+    }
+    out
 }
 
 fn frame_of<M>(version: i16, correlation: i32, message: &M) -> Reply

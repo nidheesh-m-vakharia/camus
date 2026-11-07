@@ -157,6 +157,8 @@ pub fn create_partitions(
                 log_start: 0,
                 leader_epoch: stored.leader_epoch,
                 extents: Vec::new(),
+                txn_committed: Vec::new(),
+                txn_aborted: Vec::new(),
             };
             put.push((
                 catalog::partition_storage_key(&stored.id, partition),
@@ -259,13 +261,30 @@ fn assign_policy(slot: &mut String, edit: &ConfigEdit) -> Result<(), i16> {
         3 => join_policy(slot, edit.value.as_deref().unwrap_or(""), false),
         _ => return Err(INVALID_CONFIG),
     };
-    if value.split(',').any(|part| part.trim() == "compact") || value.is_empty() {
+    let mut delete = false;
+    let mut compact = false;
+    for part in value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        match part {
+            "delete" => delete = true,
+            "compact" => compact = true,
+            _ => return Err(INVALID_CONFIG),
+        }
+    }
+    if !delete && !compact {
         return Err(INVALID_CONFIG);
     }
-    if value.split(',').any(|part| part.trim() != "delete") {
-        return Err(INVALID_CONFIG);
+    let mut tokens = Vec::new();
+    if delete {
+        tokens.push("delete");
     }
-    *slot = "delete".into();
+    if compact {
+        tokens.push("compact");
+    }
+    *slot = tokens.join(",");
     Ok(())
 }
 
@@ -275,7 +294,11 @@ fn join_policy(current: &str, extra: &str, append: bool) -> String {
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect();
-    for part in extra.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+    for part in extra
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
         if append {
             if !parts.contains(&part) {
                 parts.push(part);
@@ -510,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_is_rejected() {
+    fn compact_is_stored() {
         let map = world();
         let get = |key: &str| Ok(map.get(key).cloned());
         let done = alter_configs(
@@ -527,7 +550,8 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(done.items[0].code, INVALID_CONFIG);
-        assert!(done.put.is_empty());
+        assert_eq!(done.items[0].code, 0);
+        let topic: crate::catalog::Topic = serde_json::from_str(&done.put[0].1).unwrap();
+        assert_eq!(topic.cleanup_policy, "compact");
     }
 }

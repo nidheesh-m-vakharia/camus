@@ -7,19 +7,25 @@
 
 #![forbid(unsafe_code)]
 
+mod acl;
 mod admin;
 mod catalog;
 pub mod groups;
 mod machine;
-mod producers;
 mod network;
+mod producers;
+mod txn;
 
-pub use catalog::{
-    parse_partition, parse_topic, partition_storage_key, topic_index_key, topic_storage_key,
-    Extent, Partition, PublishPart, Topic,
+pub use acl::{
+    allows as acl_allows, describe as acl_describe, Binding as AclBinding, Filter as AclFilter,
 };
 pub use admin::{ConfigChange, ConfigEdit, Item, OffsetDrop, PartitionIncrease, RecordCut};
+pub use catalog::{
+    parse_partition, parse_topic, partition_storage_key, topic_index_key, topic_storage_key,
+    Extent, Partition, PublishPart, Span, Topic,
+};
 pub use producers::{sequence_key, ProducerNote};
+pub use txn::{check as txn_allows, ensure as txn_ongoing, TxnSpan};
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -134,6 +140,90 @@ pub enum Command {
     OffsetDelete {
         /// Group and the partitions to forget.
         forget: admin::OffsetDrop,
+    },
+    /// Allocate or bump a transactional id. An ongoing transaction is aborted.
+    InitTransaction {
+        /// Transactional id.
+        transactional_id: String,
+        /// `-1` allocates. A known id must match the stored epoch.
+        producer_id: i64,
+        /// Current epoch, ignored when `producer_id` is `-1`.
+        producer_epoch: i16,
+    },
+    /// Start or continue a transaction on these partitions.
+    AddTxnPartitions {
+        /// Transactional id.
+        transactional_id: String,
+        /// Producer id.
+        producer_id: i64,
+        /// Producer epoch.
+        producer_epoch: i16,
+        /// Topic name and partition.
+        partitions: Vec<(String, i32)>,
+    },
+    /// Record a produced range before the produce is acknowledged.
+    NoteTxn {
+        /// Transactional id.
+        transactional_id: String,
+        /// Producer id.
+        producer_id: i64,
+        /// Producer epoch.
+        producer_epoch: i16,
+        /// The range just appended.
+        span: txn::TxnSpan,
+    },
+    /// Stage offsets that commit only with the transaction.
+    StageTxnOffsets {
+        /// Transactional id.
+        transactional_id: String,
+        /// Producer id.
+        producer_id: i64,
+        /// Producer epoch.
+        producer_epoch: i16,
+        /// Group id.
+        group: String,
+        /// Offsets to write on commit.
+        offsets: Vec<groups::OffsetCommit>,
+    },
+    /// Commit or abort the ongoing transaction.
+    EndTransaction {
+        /// Transactional id.
+        transactional_id: String,
+        /// Producer id.
+        producer_id: i64,
+        /// Producer epoch.
+        producer_epoch: i16,
+        /// `true` commits.
+        committed: bool,
+    },
+    /// Replace a sealed offset prefix with one object. The high watermark stays.
+    Compact {
+        /// Topic name.
+        topic: String,
+        /// Partition.
+        partition: i32,
+        /// Exclusive end of the prefix being replaced.
+        covered_end: i64,
+        /// New object key.
+        object_key: String,
+        /// Byte offset of the slice in the object.
+        file_offset: u64,
+        /// Byte length.
+        length: u32,
+        /// First timestamp in the rewritten slice.
+        base_timestamp: i64,
+        /// Last timestamp in the rewritten slice.
+        max_timestamp: i64,
+    },
+    /// Add ACL bindings. Each binding is accepted or rejected on its own.
+    CreateAcls {
+        /// Bindings from the request.
+        bindings: Vec<acl::Binding>,
+    },
+    /// Delete ACL bindings selected by each filter.
+    DeleteAcls {
+        /// One filter per request entry.
+        filters: Vec<acl::Filter>,
     },
 }
 

@@ -309,8 +309,7 @@ fn produce_fetch_and_restart_keep_acked_bytes() {
         ApiKey::InitProducerId,
         4,
         8,
-        &camus_protocol::messages::InitProducerIdRequest::default()
-            .with_transactional_id(None),
+        &camus_protocol::messages::InitProducerIdRequest::default().with_transactional_id(None),
     );
     let (_, init) = recv::<camus_protocol::messages::InitProducerIdResponse>(&mut stream, 4);
     assert_eq!(init.error_code, 0);

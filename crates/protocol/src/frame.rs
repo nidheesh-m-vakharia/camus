@@ -174,6 +174,41 @@ const IMPLEMENTED: &[ImplementedApi] = &[
         min: 0,
         max: 2,
     },
+    ImplementedApi {
+        key: ApiKey::AddPartitionsToTxn,
+        min: 0,
+        max: 3,
+    },
+    ImplementedApi {
+        key: ApiKey::AddOffsetsToTxn,
+        min: 0,
+        max: 3,
+    },
+    ImplementedApi {
+        key: ApiKey::EndTxn,
+        min: 0,
+        max: 3,
+    },
+    ImplementedApi {
+        key: ApiKey::DescribeAcls,
+        min: 1,
+        max: 3,
+    },
+    ImplementedApi {
+        key: ApiKey::CreateAcls,
+        min: 1,
+        max: 3,
+    },
+    ImplementedApi {
+        key: ApiKey::DeleteAcls,
+        min: 1,
+        max: 3,
+    },
+    ImplementedApi {
+        key: ApiKey::TxnOffsetCommit,
+        min: 0,
+        max: 3,
+    },
 ];
 
 /// Keys in [`implemented_apis`], for callers that only need the key.

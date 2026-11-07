@@ -123,6 +123,14 @@ respect to `read_committed` consumers. Compaction preserves the latest key
 per the Kafka log rules ported from `UnifiedLog` at the pin. ACL denial
 returns the authorization errors, not a timeout.
 
+Status 2026-11-06: transactions, `read_committed`, log compaction, and
+ACLs are in. A resource with no ACL stays open. A denial on produce or
+fetch is `TOPIC_AUTHORIZATION_FAILED` (29). `kafka-clients` 4.4.0 passes
+the transaction acceptance (`TxnRoundTrip`): an open batch stays hidden,
+the commit publishes the record and the group offset together, and an
+abort stays hidden. librdkafka and franz-go have not run transactions,
+compaction, or ACLs.
+
 ### Cross-phase rules
 
 - No `todo!()` or `unimplemented!()` on a request path. The dispatcher

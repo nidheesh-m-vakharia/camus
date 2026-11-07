@@ -33,7 +33,10 @@ Until then the API returns an error rather than a partial imitation.
 | `acks=1` | Same barrier as `acks=all`: WAL quorum fsync, or R2 put plus metadata commit | Leader-local ack | 0005 |
 | Unclean leader election | Never automatic. Operator truncate only | Default off, can be enabled | 0008 |
 | `DeleteRecords` midpoint | Advances to the next whole-object boundary | Can split a segment | 0010 |
-| Idempotence | `InitProducerId` allocates a producer id. A retried sequence returns the original offset and is not appended. Transactions are still rejected | Supported | 0009 |
+| Idempotence | `InitProducerId` allocates a producer id. A retried sequence returns the original offset and is not appended | Supported | 0009 |
+| Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. There is no control-batch marker | Control batches plus `read_committed` | 0013 |
+| Compaction | Latest key, original offset, sealed extents only. Tombstones stay. No dirty-ratio cleaner | `UnifiedLog` cleaner, `delete.retention.ms` | 0010 |
+| ACLs | A resource with no ACL is allowed. `DENY` beats `ALLOW`. Only host `*` matches. Produce and fetch return 29 | Default deny when no ACL exists. Any client host | 0012 |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
 
@@ -78,8 +81,8 @@ every group; another broker answers group requests with
 generation and each assignment is committed through the metadata group
 before members hear of it, and an offset commit is checked against the
 stored generation when it is applied, so a failover keeps the generation
-and an old generation cannot commit. `FindCoordinator` for transactions
-or share groups answers `INVALID_REQUEST` (42) until those phases.
+and an old generation cannot commit. `FindCoordinator` serves groups and
+transactions. Share groups answer `INVALID_REQUEST` (42).
 `ConsumerGroupHeartbeat` (KIP-848) versions 0–1 are implemented. The
 broker's default assignor is `uniform` (round-robin per topic; not Kafka's
 sticky uniform assignor) and `range` is the other supported name. A member
@@ -91,8 +94,11 @@ current epoch or the previous one. The Java client's default remains
 `DeleteRecords` moves the log start to the next whole-object boundary at or
 after the requested offset, and the response low watermark is that offset.
 An offset past the sealed end is `OFFSET_OUT_OF_RANGE` (1), including
-records that are still only in the WAL. `cleanup.policy=compact` is
-`INVALID_CONFIG` (40). `CreatePartitions` rejects an explicit replica
+records that are still only in the WAL. `cleanup.policy=compact` keeps the
+latest record for each key at its original offset. Compaction runs on
+sealed extents when `CAMUS_COMPACT_MS` is set; the unsealed tail is left
+alone, tombstones are kept (`delete.retention.ms` is not applied), and a
+record with no key is `CORRUPT_MESSAGE` (2). `CreatePartitions` rejects an explicit replica
 assignment. `retention.ms` defaults to 604800000 and `retention.bytes` to
 -1. A classic group that still has members refuses `OffsetDelete` with
 `GROUP_SUBSCRIBED_TO_TOPIC` (86).
@@ -114,7 +120,7 @@ acceptance test. `-` means not run.
 | Metadata | 3 | 1 | 0-13 | implemented | pass | pass | pass |
 | OffsetCommit | 8 | 3 | 2-10 | implemented | pass | pass | pass |
 | OffsetFetch | 9 | 3 | 1-10 | implemented | pass | pass | pass |
-| FindCoordinator | 10 | 3 | 0-6 (groups only) | implemented | pass | pass | pass |
+| FindCoordinator | 10 | 3 | 0-6 | implemented | pass | pass | pass |
 | JoinGroup | 11 | 3 | 0-9 | implemented | pass | pass | pass |
 | Heartbeat | 12 | 3 | 0-4 | implemented | pass | pass | pass |
 | LeaveGroup | 13 | 3 | 0-5 | implemented | pass | pass | pass |
@@ -126,16 +132,16 @@ acceptance test. `-` means not run.
 | CreateTopics | 19 | 1 | 2-7 | implemented | pass | pass | pass |
 | DeleteTopics | 20 | 1 | 1-6 | implemented | - | - | - |
 | DeleteRecords | 21 | 4 | 0-2 | implemented | - | - | - |
-| InitProducerId | 22 | 4 | 0-4 | implemented | - | - | - |
+| InitProducerId | 22 | 4 | 0-4 | implemented | pass | - | - |
 | OffsetForLeaderEpoch | 23 | | not planned for phases 0–5 | unimplemented | - | - | - |
-| AddPartitionsToTxn | 24 | 5 | TBD | unimplemented | - | - | - |
-| AddOffsetsToTxn | 25 | 5 | TBD | unimplemented | - | - | - |
-| EndTxn | 26 | 5 | TBD | unimplemented | - | - | - |
+| AddPartitionsToTxn | 24 | 5 | 0-3 | implemented | pass | - | - |
+| AddOffsetsToTxn | 25 | 5 | 0-3 | implemented | pass | - | - |
+| EndTxn | 26 | 5 | 0-3 | implemented | pass | - | - |
 | WriteTxnMarkers | 27 | | broker-internal, not a client API | unimplemented | - | - | - |
-| TxnOffsetCommit | 28 | 5 | TBD | unimplemented | - | - | - |
-| DescribeAcls | 29 | 5 | TBD | unimplemented | - | - | - |
-| CreateAcls | 30 | 5 | TBD | unimplemented | - | - | - |
-| DeleteAcls | 31 | 5 | TBD | unimplemented | - | - | - |
+| TxnOffsetCommit | 28 | 5 | 0-3 | implemented | pass | - | - |
+| DescribeAcls | 29 | 5 | 1-3 | implemented | - | - | - |
+| CreateAcls | 30 | 5 | 1-3 | implemented | - | - | - |
+| DeleteAcls | 31 | 5 | 1-3 | implemented | - | - | - |
 | DescribeConfigs | 32 | 1 | 1-4 | implemented | - | - | - |
 | AlterConfigs | 33 | 4 | 0-2 | implemented | - | - | - |
 | AlterReplicaLogDirs | 34 | | not planned | unimplemented | - | - | - |
@@ -211,6 +217,12 @@ assigning the partition. None of them join a consumer group.
 | `kafka-clients` 4.4.0 | `crates/broker/tests/java/SaslRoundTrip.java` |
 | `confluent-kafka` 2.16.1 (librdkafka) | `crates/broker/tests/python/sasl_roundtrip.py` |
 | `franz-go` v1.22.0 | `crates/broker/tests/go/sasl_roundtrip.go` |
+
+`kafka-clients` 4.4.0 also runs a transaction in
+`crates/broker/tests/java/TxnRoundTrip.java`: an open batch stays hidden
+from `read_committed`, the commit publishes the record and the group
+offset together, and an abort stays hidden. librdkafka and franz-go have
+not run that path.
 
 Produce requests at version 13 and above name the topic by id. The Python and
 Go tests skip when their toolchain is not installed under `target/`.

@@ -8,30 +8,32 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use camus_protocol::frame;
 use camus_protocol::messages::alter_configs_request::{AlterConfigsResource, AlterableConfig};
 use camus_protocol::messages::alter_configs_response::AlterConfigsResponse;
 use camus_protocol::messages::create_partitions_request::CreatePartitionsTopic;
 use camus_protocol::messages::create_partitions_response::CreatePartitionsResponse;
 use camus_protocol::messages::create_topics_request::{CreatableTopic, CreatableTopicConfig};
 use camus_protocol::messages::create_topics_response::CreateTopicsResponse;
-use camus_protocol::messages::delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic};
+use camus_protocol::messages::delete_records_request::{
+    DeleteRecordsPartition, DeleteRecordsTopic,
+};
 use camus_protocol::messages::delete_records_response::DeleteRecordsResponse;
 use camus_protocol::messages::describe_cluster_response::DescribeClusterResponse;
 use camus_protocol::messages::describe_configs_request::DescribeConfigsResource;
 use camus_protocol::messages::describe_configs_response::DescribeConfigsResponse;
+use camus_protocol::messages::metadata_request::MetadataRequestTopic;
 use camus_protocol::messages::metadata_response::MetadataResponse;
 use camus_protocol::messages::offset_delete_request::{
     OffsetDeleteRequestPartition, OffsetDeleteRequestTopic,
 };
 use camus_protocol::messages::offset_delete_response::OffsetDeleteResponse;
-use camus_protocol::messages::metadata_request::MetadataRequestTopic;
 use camus_protocol::messages::{
     AlterConfigsRequest, ApiKey, CreatePartitionsRequest, CreateTopicsRequest,
     DeleteRecordsRequest, DescribeClusterRequest, DescribeConfigsRequest, GroupId, MetadataRequest,
     OffsetDeleteRequest, RequestHeader, TopicName,
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
-use camus_protocol::frame;
 
 struct Node {
     child: Child,
@@ -67,8 +69,15 @@ fn header(key: ApiKey, version: i16, correlation: i32) -> RequestHeader {
         .with_client_id(Some(StrBytes::from_static_str("camus-admin")))
 }
 
-fn send<M: Encodable>(stream: &mut TcpStream, key: ApiKey, version: i16, correlation: i32, message: &M) {
-    let frame = frame::encode_request(&header(key, version, correlation), message, version).unwrap();
+fn send<M: Encodable>(
+    stream: &mut TcpStream,
+    key: ApiKey,
+    version: i16,
+    correlation: i32,
+    message: &M,
+) {
+    let frame =
+        frame::encode_request(&header(key, version, correlation), message, version).unwrap();
     stream.write_all(&frame).unwrap();
 }
 
@@ -79,7 +88,8 @@ fn recv<M: Decodable + HeaderVersion>(stream: &mut TcpStream, version: i16) -> M
     let mut body = vec![0u8; size];
     stream.read_exact(&mut body).unwrap();
     let mut buf = Bytes::from(body);
-    let _ = camus_protocol::messages::ResponseHeader::decode(&mut buf, M::header_version(version)).unwrap();
+    let _ = camus_protocol::messages::ResponseHeader::decode(&mut buf, M::header_version(version))
+        .unwrap();
     M::decode(&mut buf, version).unwrap()
 }
 
@@ -128,7 +138,9 @@ fn admin_apis_change_the_topic_and_refuse_a_past_the_end_delete() {
     }
 
     let mut stream = TcpStream::connect(&node.kafka).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     send(
         &mut stream,
@@ -206,8 +218,8 @@ fn admin_apis_change_the_topic_and_refuse_a_past_the_end_delete() {
         5,
         &AlterConfigsRequest::default().with_resources(vec![compact]),
     );
-    let rejected = recv::<AlterConfigsResponse>(&mut stream, 1);
-    assert_eq!(rejected.responses[0].error_code, 40);
+    let accepted = recv::<AlterConfigsResponse>(&mut stream, 1);
+    assert_eq!(accepted.responses[0].error_code, 0);
 
     send(
         &mut stream,
@@ -233,7 +245,12 @@ fn admin_apis_change_the_topic_and_refuse_a_past_the_end_delete() {
     let events = metadata
         .topics
         .iter()
-        .find(|topic| topic.name.as_ref().is_some_and(|name| name.0.as_str() == "events"))
+        .find(|topic| {
+            topic
+                .name
+                .as_ref()
+                .is_some_and(|name| name.0.as_str() == "events")
+        })
         .unwrap();
     assert_eq!(events.partitions.len(), 3);
 
@@ -277,8 +294,9 @@ fn admin_apis_change_the_topic_and_refuse_a_past_the_end_delete() {
             .with_group_id(GroupId(StrBytes::from_static_str("missing")))
             .with_topics(vec![OffsetDeleteRequestTopic::default()
                 .with_name(TopicName(StrBytes::from_static_str("events")))
-                .with_partitions(vec![OffsetDeleteRequestPartition::default()
-                    .with_partition_index(0)])]),
+                .with_partitions(vec![
+                    OffsetDeleteRequestPartition::default().with_partition_index(0)
+                ])]),
     );
     let offsets = recv::<OffsetDeleteResponse>(&mut stream, 0);
     assert_eq!(offsets.error_code, 69);

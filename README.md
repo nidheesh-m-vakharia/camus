@@ -19,6 +19,11 @@ retried idempotent batch returns its original offset instead of being
 appended again, including after a WAL leader change. Phase 4 admin APIs
 are in: `DescribeCluster`, `CreatePartitions`, `AlterConfigs`,
 `IncrementalAlterConfigs`, `DeleteRecords`, and `OffsetDelete`.
+A transactional produce stays hidden from `read_committed` until `EndTxn`
+commits it; an abort stays hidden. The Java client checks that the record
+and its group offset appear together. `cleanup.policy=compact` keeps the
+latest record for each key. ACL denial on produce or fetch returns an
+authorization error.
 The plan and ADRs are in `docs/`. License: Apache-2.0.
 
 ## What a client changes

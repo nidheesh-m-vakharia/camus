@@ -57,7 +57,7 @@ pub enum Issued {
 
 /// Allocate a producer id, or bump the epoch of an existing one.
 ///
-/// A transactional id is rejected. Transactions are Phase 5.
+/// A transactional id is rejected here. [`crate::txn::init`] owns that path.
 pub fn init_producer(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     transactional: bool,
@@ -86,7 +86,9 @@ pub fn init_producer(
     let Some(raw) = get(&id_key(producer_id))? else {
         return Ok(Issued::Reject(59));
     };
-    let stored: i16 = raw.parse().map_err(|err: std::num::ParseIntError| err.to_string())?;
+    let stored: i16 = raw
+        .parse()
+        .map_err(|err: std::num::ParseIntError| err.to_string())?;
     if producer_epoch != stored {
         return Ok(Issued::Reject(47));
     }

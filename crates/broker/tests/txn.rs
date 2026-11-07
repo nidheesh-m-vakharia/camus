@@ -1,0 +1,505 @@
+//! A transactional produce stays hidden from `read_committed` until `EndTxn`.
+//! Abort keeps the batch hidden. `read_uncommitted` sees both.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
+use bytes::{Bytes, BytesMut};
+use camus_protocol::frame;
+use camus_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+use camus_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse;
+use camus_protocol::messages::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+use camus_protocol::messages::create_topics_response::CreateTopicsResponse;
+use camus_protocol::messages::end_txn_response::EndTxnResponse;
+use camus_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
+use camus_protocol::messages::fetch_response::{FetchResponse, PartitionData};
+use camus_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
+use camus_protocol::messages::offset_fetch_response::OffsetFetchResponse;
+use camus_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
+use camus_protocol::messages::produce_response::ProduceResponse;
+use camus_protocol::messages::txn_offset_commit_request::{
+    TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+};
+use camus_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse;
+use camus_protocol::messages::{
+    AddPartitionsToTxnRequest, ApiKey, CreateTopicsRequest, EndTxnRequest, FetchRequest, GroupId,
+    InitProducerIdRequest, InitProducerIdResponse, OffsetFetchRequest, ProduceRequest,
+    RequestHeader, TopicName, TransactionalId, TxnOffsetCommitRequest,
+};
+use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+use camus_protocol::records::{
+    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+    NO_PARTITION_LEADER_EPOCH,
+};
+
+struct Node {
+    child: Child,
+    http: String,
+    kafka: String,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn wait_file(path: &Path) -> String {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+fn wait_leader(http: &str) {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(body) = client.get(format!("http://{http}/admin/metrics")).send() {
+            if let Ok(json) = body.json::<serde_json::Value>() {
+                if json.get("current_leader").and_then(|value| value.as_u64()) == Some(1)
+                    && json.get("wal_leader").and_then(|value| value.as_u64()) == Some(1)
+                {
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("node 1 did not become leader");
+}
+
+fn batch(value: &[u8], producer_id: i64, epoch: i16, sequence: i32) -> Bytes {
+    let records = vec![Record {
+        transactional: true,
+        control: false,
+        delete_horizon: false,
+        partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+        producer_id,
+        producer_epoch: epoch,
+        sequence,
+        timestamp_type: TimestampType::Creation,
+        offset: 0,
+        timestamp: 9,
+        key: Some(Bytes::from_static(b"k")),
+        value: Some(Bytes::copy_from_slice(value)),
+        headers: Default::default(),
+    }];
+    let mut buf = BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut buf,
+        &records,
+        &RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        },
+    )
+    .unwrap();
+    buf.freeze()
+}
+
+fn header(key: ApiKey, version: i16, correlation: i32) -> RequestHeader {
+    RequestHeader::default()
+        .with_request_api_key(key as i16)
+        .with_request_api_version(version)
+        .with_correlation_id(correlation)
+        .with_client_id(Some(StrBytes::from_static_str("camus-txn")))
+}
+
+fn send<M: Encodable>(
+    stream: &mut TcpStream,
+    key: ApiKey,
+    version: i16,
+    correlation: i32,
+    message: &M,
+) {
+    let frame =
+        frame::encode_request(&header(key, version, correlation), message, version).unwrap();
+    stream.write_all(&frame).unwrap();
+}
+
+fn recv<M: Decodable + HeaderVersion>(stream: &mut TcpStream, version: i16) -> M {
+    let mut size_buf = [0u8; 4];
+    stream.read_exact(&mut size_buf).unwrap();
+    let size = i32::from_be_bytes(size_buf) as usize;
+    let mut body = vec![0u8; size];
+    stream.read_exact(&mut body).unwrap();
+    let mut buf = Bytes::from(body);
+    let _ = camus_protocol::messages::ResponseHeader::decode(&mut buf, M::header_version(version))
+        .unwrap();
+    M::decode(&mut buf, version).unwrap()
+}
+
+fn fetch_at(stream: &mut TcpStream, isolation: i8) -> PartitionData {
+    let mut fetch_part = FetchPartition::default();
+    fetch_part.partition = 0;
+    fetch_part.fetch_offset = 0;
+    fetch_part.partition_max_bytes = 1024 * 1024;
+    let mut fetch_topic = FetchTopic::default();
+    fetch_topic.topic = TopicName(StrBytes::from_static_str("orders"));
+    fetch_topic.partitions = vec![fetch_part];
+    send(
+        stream,
+        ApiKey::Fetch,
+        11,
+        9,
+        &FetchRequest::default()
+            .with_max_wait_ms(50)
+            .with_isolation_level(isolation)
+            .with_topics(vec![fetch_topic]),
+    );
+    recv::<FetchResponse>(stream, 11)
+        .responses
+        .remove(0)
+        .partitions
+        .remove(0)
+}
+
+#[test]
+fn read_committed_hides_an_open_transaction_and_an_abort() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    std::fs::create_dir_all(dir).unwrap();
+    let log = std::fs::File::create(dir.join("broker.log")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .args([
+            "--node-id",
+            "1",
+            "--http-addr",
+            "127.0.0.1:0",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--kafka-addr",
+            "127.0.0.1:0",
+            "--dev-plaintext",
+        ])
+        .env("CAMUS_FLUSH_MS", "40")
+        .stdout(std::fs::File::create(dir.join("out.log")).unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let http = wait_file(&dir.join("listen-addr"));
+    let kafka = wait_file(&dir.join("kafka-addr"));
+    let node = Node { child, http, kafka };
+    let client = reqwest::blocking::Client::new();
+    let init = client
+        .post(format!("http://{}/admin/init", node.http))
+        .json(&serde_json::json!([{"id": 1, "addr": node.http}]))
+        .send()
+        .unwrap();
+    assert!(init.status().is_success(), "{}", init.text().unwrap());
+    wait_leader(&node.http);
+
+    let mut stream = TcpStream::connect(&node.kafka).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut created = CreatableTopic::default();
+    created.name = TopicName(StrBytes::from_static_str("orders"));
+    created.num_partitions = 1;
+    created.replication_factor = 1;
+    let mut durability = CreatableTopicConfig::default();
+    durability.name = StrBytes::from_static_str("durability.mode");
+    durability.value = Some(StrBytes::from_static_str("wal"));
+    created.configs = vec![durability];
+    send(
+        &mut stream,
+        ApiKey::CreateTopics,
+        7,
+        1,
+        &CreateTopicsRequest::default().with_topics(vec![created]),
+    );
+    let created = recv::<CreateTopicsResponse>(&mut stream, 7);
+    assert_eq!(created.topics[0].error_code, 0, "{created:?}");
+
+    send(
+        &mut stream,
+        ApiKey::InitProducerId,
+        4,
+        2,
+        &InitProducerIdRequest::default()
+            .with_transactional_id(Some(TransactionalId(StrBytes::from_static_str("checkout")))),
+    );
+    let started = recv::<InitProducerIdResponse>(&mut stream, 4);
+    assert_eq!(started.error_code, 0, "{started:?}");
+    let producer = started.producer_id.0;
+    let epoch = started.producer_epoch;
+
+    send(
+        &mut stream,
+        ApiKey::AddPartitionsToTxn,
+        3,
+        3,
+        &AddPartitionsToTxnRequest::default()
+            .with_v3_and_below_transactional_id(TransactionalId(StrBytes::from_static_str(
+                "checkout",
+            )))
+            .with_v3_and_below_producer_id(producer.into())
+            .with_v3_and_below_producer_epoch(epoch)
+            .with_v3_and_below_topics(vec![AddPartitionsToTxnTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("orders")))
+                .with_partitions(vec![0])]),
+    );
+    let added = recv::<AddPartitionsToTxnResponse>(&mut stream, 3);
+    assert_eq!(
+        added.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code, 0,
+        "{added:?}"
+    );
+
+    produce(&mut stream, 4, batch(b"one", producer, epoch, 0), producer);
+    let hidden = fetch_at(&mut stream, 1);
+    assert_eq!(hidden.error_code, 0, "{hidden:?}");
+    assert!(hidden.records.as_ref().is_none_or(|bytes| bytes.is_empty()));
+    assert_eq!(hidden.high_watermark, 0);
+    let open = fetch_at(&mut stream, 0);
+    assert!(
+        open.records.as_ref().is_some_and(|bytes| !bytes.is_empty()),
+        "{open:?}"
+    );
+
+    send(
+        &mut stream,
+        ApiKey::TxnOffsetCommit,
+        3,
+        5,
+        &TxnOffsetCommitRequest::default()
+            .with_transactional_id(TransactionalId(StrBytes::from_static_str("checkout")))
+            .with_group_id(GroupId(StrBytes::from_static_str("readers")))
+            .with_producer_id(producer.into())
+            .with_producer_epoch(epoch)
+            .with_topics(vec![TxnOffsetCommitRequestTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("orders")))
+                .with_partitions(vec![TxnOffsetCommitRequestPartition::default()
+                    .with_partition_index(0)
+                    .with_committed_offset(1)])]),
+    );
+    let staged = recv::<TxnOffsetCommitResponse>(&mut stream, 3);
+    assert_eq!(staged.topics[0].partitions[0].error_code, 0, "{staged:?}");
+    assert_eq!(committed_offset(&mut stream), -1);
+
+    send(
+        &mut stream,
+        ApiKey::EndTxn,
+        3,
+        10,
+        &EndTxnRequest::default()
+            .with_transactional_id(TransactionalId(StrBytes::from_static_str("checkout")))
+            .with_producer_id(producer.into())
+            .with_producer_epoch(epoch)
+            .with_committed(true),
+    );
+    let ended = recv::<EndTxnResponse>(&mut stream, 3);
+    assert_eq!(ended.error_code, 0, "{ended:?}");
+    assert_eq!(committed_offset(&mut stream), 1);
+    let visible = fetch_at(&mut stream, 1);
+    assert_eq!(visible.high_watermark, 1, "{visible:?}");
+    assert!(visible
+        .records
+        .as_ref()
+        .is_some_and(|bytes| !bytes.is_empty()));
+
+    send(
+        &mut stream,
+        ApiKey::AddPartitionsToTxn,
+        3,
+        6,
+        &AddPartitionsToTxnRequest::default()
+            .with_v3_and_below_transactional_id(TransactionalId(StrBytes::from_static_str(
+                "checkout",
+            )))
+            .with_v3_and_below_producer_id(producer.into())
+            .with_v3_and_below_producer_epoch(epoch)
+            .with_v3_and_below_topics(vec![AddPartitionsToTxnTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("orders")))
+                .with_partitions(vec![0])]),
+    );
+    let added = recv::<AddPartitionsToTxnResponse>(&mut stream, 3);
+    assert_eq!(
+        added.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code, 0,
+        "{added:?}"
+    );
+    produce(&mut stream, 7, batch(b"two", producer, epoch, 1), producer);
+    let held = fetch_at(&mut stream, 1);
+    assert_eq!(held.high_watermark, 1, "{held:?}");
+
+    send(
+        &mut stream,
+        ApiKey::EndTxn,
+        3,
+        8,
+        &EndTxnRequest::default()
+            .with_transactional_id(TransactionalId(StrBytes::from_static_str("checkout")))
+            .with_producer_id(producer.into())
+            .with_producer_epoch(epoch)
+            .with_committed(false),
+    );
+    let aborted = recv::<EndTxnResponse>(&mut stream, 3);
+    assert_eq!(aborted.error_code, 0, "{aborted:?}");
+    let after = fetch_at(&mut stream, 1);
+    assert_eq!(after.error_code, 0, "{after:?}");
+    assert_eq!(after.high_watermark, 2, "{after:?}");
+    assert!(after
+        .records
+        .as_ref()
+        .is_some_and(|bytes| !bytes.is_empty()));
+}
+
+fn committed_offset(stream: &mut TcpStream) -> i64 {
+    let topic = OffsetFetchRequestTopic::default()
+        .with_name(TopicName(StrBytes::from_static_str("orders")))
+        .with_partition_indexes(vec![0]);
+    send(
+        stream,
+        ApiKey::OffsetFetch,
+        7,
+        11,
+        &OffsetFetchRequest::default()
+            .with_group_id(GroupId(StrBytes::from_static_str("readers")))
+            .with_topics(Some(vec![topic])),
+    );
+    let response = recv::<OffsetFetchResponse>(stream, 7);
+    assert_eq!(response.error_code, 0, "{response:?}");
+    response.topics[0].partitions[0].committed_offset
+}
+
+#[test]
+fn java_transaction_hides_an_open_batch_and_commits_its_offset() {
+    let jars = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-jars");
+    if !jars.join("kafka-clients-4.4.0.jar").is_file() {
+        eprintln!("skipping java; run the SASL tests once to download the jars");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    let log = std::fs::File::create(dir.join("broker.log")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .args([
+            "--node-id",
+            "1",
+            "--http-addr",
+            "127.0.0.1:0",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--kafka-addr",
+            "127.0.0.1:0",
+            "--dev-plaintext",
+        ])
+        .env("CAMUS_FLUSH_MS", "40")
+        .env("CAMUS_DEFAULT_DURABILITY", "wal")
+        .stdout(std::fs::File::create(dir.join("out.log")).unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let http = wait_file(&dir.join("listen-addr"));
+    let kafka = wait_file(&dir.join("kafka-addr"));
+    let node = Node {
+        child,
+        http: http.clone(),
+        kafka: kafka.clone(),
+    };
+    let client = reqwest::blocking::Client::new();
+    let init = client
+        .post(format!("http://{http}/admin/init"))
+        .json(&serde_json::json!([{"id": 1, "addr": http}]))
+        .send()
+        .unwrap();
+    assert!(init.status().is_success(), "{}", init.text().unwrap());
+    wait_leader(&node.http);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut registered = false;
+    while Instant::now() < deadline {
+        if let Ok(body) = client
+            .get(format!("http://{}/admin/read", node.http))
+            .query(&[("key", "broker/1")])
+            .send()
+        {
+            if body.status().is_success() && !body.text().unwrap_or_default().is_empty() {
+                registered = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(registered, "broker address was not registered");
+
+    let classes = dir.join("classes");
+    std::fs::create_dir_all(&classes).unwrap();
+    let mut cp = vec![classes.display().to_string()];
+    for entry in std::fs::read_dir(&jars).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+            cp.push(path.display().to_string());
+        }
+    }
+    let cp = cp.join(":");
+    let source =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/java/TxnRoundTrip.java");
+    let javac = Command::new(jdk("javac"))
+        .args(["--release", "17", "-cp", &cp, "-d"])
+        .arg(&classes)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        javac.status.success(),
+        "javac\n{}",
+        String::from_utf8_lossy(&javac.stderr)
+    );
+    let ran = Command::new(jdk("java"))
+        .args(["-cp", &cp, "TxnRoundTrip", &kafka])
+        .output()
+        .unwrap();
+    if !ran.status.success() {
+        let broker_log = std::fs::read_to_string(dir.join("broker.log")).unwrap_or_default();
+        panic!(
+            "java\nstdout:\n{}\nstderr:\n{}\nbroker:\n{}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr),
+            broker_log
+        );
+    }
+}
+
+fn jdk(tool: &str) -> String {
+    let homebrew = format!("/opt/homebrew/opt/openjdk@21/bin/{tool}");
+    if Path::new(&homebrew).is_file() {
+        homebrew
+    } else {
+        tool.to_string()
+    }
+}
+
+fn produce(stream: &mut TcpStream, correlation: i32, raw: Bytes, _producer: i64) {
+    let mut topic = TopicProduceData::default();
+    topic.name = TopicName(StrBytes::from_static_str("orders"));
+    topic.partition_data = vec![PartitionProduceData::default()
+        .with_index(0)
+        .with_records(Some(raw))];
+    send(
+        stream,
+        ApiKey::Produce,
+        9,
+        correlation,
+        &ProduceRequest::default()
+            .with_acks(-1)
+            .with_timeout_ms(5_000)
+            .with_transactional_id(Some(TransactionalId(StrBytes::from_static_str("checkout"))))
+            .with_topic_data(vec![topic]),
+    );
+    let produced = recv::<ProduceResponse>(stream, 9);
+    let part = &produced.responses[0].partition_responses[0];
+    assert_eq!(part.error_code, 0, "{produced:?}");
+}

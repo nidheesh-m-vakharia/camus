@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use camus_protocol::messages::{
-    AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, ApiKey, ApiVersionsRequest, ApiVersionsResponse,
-    RequestHeader,
+    ApiKey, ApiVersionsRequest, ApiVersionsResponse, DescribeUserScramCredentialsRequest,
+    DescribeUserScramCredentialsResponse, RequestHeader,
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 use camus_protocol::{frame, ResponseError};
@@ -102,15 +102,15 @@ fn an_unimplemented_api_returns_unsupported_version_and_the_connection_stays_up(
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
-    // AddOffsetsToTxn stays out until transactions.
+    // SCRAM credentials stay out.
     send(
         &mut stream,
-        ApiKey::AddOffsetsToTxn,
-        3,
+        ApiKey::DescribeUserScramCredentials,
+        0,
         4,
-        &AddOffsetsToTxnRequest::default(),
+        &DescribeUserScramCredentialsRequest::default(),
     );
-    let (correlation, txn) = recv::<AddOffsetsToTxnResponse>(&mut stream, 3);
+    let (correlation, txn) = recv::<DescribeUserScramCredentialsResponse>(&mut stream, 0);
     assert_eq!(correlation, 4);
     assert_eq!(txn.error_code, ResponseError::UnsupportedVersion.code());
 
@@ -134,5 +134,13 @@ fn an_unimplemented_api_returns_unsupported_version_and_the_connection_stays_up(
     assert!(versions
         .api_keys
         .iter()
-        .all(|api| api.api_key != ApiKey::AddOffsetsToTxn as i16));
+        .all(|api| api.api_key != ApiKey::DescribeUserScramCredentials as i16));
+    assert!(versions
+        .api_keys
+        .iter()
+        .any(|api| api.api_key == ApiKey::CreateAcls as i16));
+    assert!(versions
+        .api_keys
+        .iter()
+        .any(|api| api.api_key == ApiKey::EndTxn as i16));
 }

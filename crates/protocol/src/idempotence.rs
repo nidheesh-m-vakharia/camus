@@ -63,10 +63,17 @@ pub fn classify(
     existing: &BTreeMap<i64, ProducerSeq>,
     batches: &[ProducerBatch],
 ) -> Result<Class, i16> {
-    if batches.is_empty() || batches.iter().all(|batch| batch.producer_id == NO_PRODUCER_ID) {
+    if batches.is_empty()
+        || batches
+            .iter()
+            .all(|batch| batch.producer_id == NO_PRODUCER_ID)
+    {
         return Ok(Class::Plain);
     }
-    if batches.iter().any(|batch| batch.producer_id == NO_PRODUCER_ID) {
+    if batches
+        .iter()
+        .any(|batch| batch.producer_id == NO_PRODUCER_ID)
+    {
         return Err(INVALID_REQUEST);
     }
     let mut scratch = existing.clone();

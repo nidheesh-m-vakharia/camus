@@ -18,8 +18,10 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::acl;
 use crate::admin;
 use crate::catalog::{self, Outcome};
+use crate::txn;
 use crate::{Command, NodeId, Response, TypeConfig};
 
 const KV: TableDefinition<&str, &str> = TableDefinition::new("kv");
@@ -232,6 +234,88 @@ fn apply_command(
             Command::OffsetDelete { forget } => {
                 admin::offset_delete(&read, &forget).and_then(admin::outcome)
             }
+            Command::InitTransaction {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+            } => txn::outcome(txn::init(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+            )),
+            Command::AddTxnPartitions {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                partitions,
+            } => txn::outcome(txn::add_partitions(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                &partitions,
+            )),
+            Command::NoteTxn {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                span,
+            } => txn::outcome(txn::note(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                span,
+            )),
+            Command::StageTxnOffsets {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                group,
+                offsets,
+            } => txn::outcome(txn::stage_offsets(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                &group,
+                offsets,
+            )),
+            Command::CreateAcls { bindings } => acl::create(&read, &bindings),
+            Command::DeleteAcls { filters } => acl::delete(&read, &filters),
+            Command::Compact {
+                topic,
+                partition,
+                covered_end,
+                object_key,
+                file_offset,
+                length,
+                base_timestamp,
+                max_timestamp,
+            } => catalog::compact_replace(
+                &read,
+                &topic,
+                partition,
+                covered_end,
+                &object_key,
+                file_offset,
+                length,
+                base_timestamp,
+                max_timestamp,
+            ),
+            Command::EndTransaction {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                committed,
+            } => txn::outcome(txn::end(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                committed,
+            )),
             Command::SaveGroup { .. }
             | Command::CommitOffsets { .. }
             | Command::DeleteGroup { .. } => {
@@ -277,7 +361,8 @@ fn apply_init(
         crate::producers::Issued::Reject(code) => Ok(Response::reject(code)),
         crate::producers::Issued::Applied { put, value } => {
             for (key, stored) in put {
-                kv.insert(key.as_str(), stored.as_str()).map_err(|error| err(&error))?;
+                kv.insert(key.as_str(), stored.as_str())
+                    .map_err(|error| err(&error))?;
             }
             Ok(Response::ok(Some(value)))
         }

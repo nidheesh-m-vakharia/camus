@@ -15,6 +15,7 @@ const MAGIC_AT: usize = 16;
 const CRC_AT: usize = 17;
 const CONTENT_AT: usize = 21;
 const ATTR_AT: usize = 21;
+const LAST_DELTA_AT: usize = 23;
 const BASE_TS_AT: usize = 27;
 const MAX_TS_AT: usize = 35;
 const COUNT_AT: usize = 57;
@@ -43,7 +44,8 @@ pub enum BatchError {
     Corrupt,
     /// One batch is larger than the broker limit.
     TooLarge,
-    /// The transactional attribute is set. Transactions are a later phase.
+    /// Kept so older callers can still name the transactional attribute.
+    /// Inspect no longer returns it; the broker decides from [`BatchInfo::transactional`].
     Transactional,
 }
 
@@ -52,12 +54,18 @@ pub enum BatchError {
 pub struct BatchInfo {
     /// Byte length of this batch, including the offset and length fields.
     pub len: usize,
+    /// Offset of the first record. Compaction can leave gaps after this.
+    pub base_offset: i64,
+    /// Offset of the last record.
+    pub last_offset: i64,
     /// Records in the batch, including control records.
     pub records: i32,
     /// First timestamp in the batch header.
     pub base_timestamp: i64,
     /// Last timestamp in the batch header.
     pub max_timestamp: i64,
+    /// The transactional attribute is set.
+    pub transactional: bool,
 }
 
 /// Walk `bytes` and check magic, length, and CRC. Does not decompress.
@@ -91,20 +99,26 @@ pub fn inspect(bytes: &[u8], max_batch: usize) -> Result<Vec<BatchInfo>, BatchEr
             return Err(BatchError::Corrupt);
         }
         let attributes = i16::from_be_bytes(batch[ATTR_AT..ATTR_AT + 2].try_into().unwrap());
-        if attributes & (1 << 4) != 0 {
-            return Err(BatchError::Transactional);
-        }
         let records = i32::from_be_bytes(batch[COUNT_AT..COUNT_AT + 4].try_into().unwrap());
         if records <= 0 {
             return Err(BatchError::Corrupt);
         }
+        let base_offset = i64::from_be_bytes(batch[0..8].try_into().unwrap());
+        let last_delta =
+            i32::from_be_bytes(batch[LAST_DELTA_AT..LAST_DELTA_AT + 4].try_into().unwrap());
+        if last_delta < 0 {
+            return Err(BatchError::Corrupt);
+        }
         out.push(BatchInfo {
             len: total,
+            base_offset,
+            last_offset: base_offset + i64::from(last_delta),
             records,
             base_timestamp: i64::from_be_bytes(
                 batch[BASE_TS_AT..BASE_TS_AT + 8].try_into().unwrap(),
             ),
             max_timestamp: i64::from_be_bytes(batch[MAX_TS_AT..MAX_TS_AT + 8].try_into().unwrap()),
+            transactional: attributes & (1 << 4) != 0,
         });
         offset += total;
     }

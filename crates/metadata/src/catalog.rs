@@ -28,7 +28,7 @@ pub struct Topic {
     /// `retention.bytes`. `-1` is no byte limit, matching Kafka.
     #[serde(default = "default_retention_bytes")]
     pub retention_bytes: i64,
-    /// `cleanup.policy`. `compact` is rejected until Phase 5.
+    /// `cleanup.policy`. `delete`, `compact`, or `delete,compact`.
     #[serde(default = "default_cleanup")]
     pub cleanup_policy: String,
 }
@@ -75,6 +75,22 @@ pub struct Partition {
     pub leader_epoch: i32,
     /// Sealed ranges, in offset order.
     pub extents: Vec<Extent>,
+    /// Transactional ranges that committed. `read_committed` shows these.
+    #[serde(default)]
+    pub txn_committed: Vec<Span>,
+    /// Transactional ranges that aborted or were fenced. Hidden from
+    /// `read_committed`.
+    #[serde(default)]
+    pub txn_aborted: Vec<Span>,
+}
+
+/// An offset range, inclusive start, exclusive end.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Span {
+    /// Inclusive.
+    pub start: i64,
+    /// Exclusive.
+    pub end: i64,
 }
 
 /// One partition slice inside a publish command.
@@ -180,6 +196,8 @@ pub fn create_topic(
             log_start: 0,
             leader_epoch: 0,
             extents: Vec::new(),
+            txn_committed: Vec::new(),
+            txn_aborted: Vec::new(),
         };
         put.push((
             part_key(&id, partition),
@@ -281,7 +299,9 @@ pub fn publish(
     let sequences = crate::producers::apply_notes(get, parts, notes)?;
     match sequences {
         Outcome::Reject(code) => Ok(Outcome::Reject(code)),
-        Outcome::Change { put: extra, del, .. } => {
+        Outcome::Change {
+            put: extra, del, ..
+        } => {
             put.extend(extra);
             Ok(Outcome::Change {
                 put,
@@ -290,6 +310,63 @@ pub fn publish(
             })
         }
     }
+}
+
+/// Replace the sealed prefix ending at `covered_end` with one extent.
+/// `next_offset` stays put, so surviving records keep the offsets they had.
+pub fn compact_replace(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    topic: &str,
+    partition: i32,
+    covered_end: i64,
+    object_key: &str,
+    file_offset: u64,
+    length: u32,
+    base_timestamp: i64,
+    max_timestamp: i64,
+) -> Result<Outcome, String> {
+    let Some(raw) = get(&topic_key(topic))? else {
+        return Ok(Outcome::Reject(3));
+    };
+    let stored: Topic = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+    if partition < 0 || partition >= stored.partitions {
+        return Ok(Outcome::Reject(3));
+    }
+    let raw =
+        get(&part_key(&stored.id, partition))?.ok_or_else(|| "missing partition".to_string())?;
+    let mut state: Partition = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+    let prefix: Vec<_> = state
+        .extents
+        .iter()
+        .take_while(|extent| extent.end <= covered_end)
+        .cloned()
+        .collect();
+    if prefix.is_empty() || prefix.last().is_none_or(|extent| extent.end != covered_end) {
+        return Ok(Outcome::Reject(1));
+    }
+    let start = prefix[0].start;
+    state.extents.drain(0..prefix.len());
+    state.extents.insert(
+        0,
+        Extent {
+            start,
+            end: covered_end,
+            key: object_key.to_string(),
+            file_offset,
+            length,
+            base_timestamp,
+            max_timestamp,
+        },
+    );
+    state.extents.sort_by_key(|extent| extent.start);
+    Ok(Outcome::Change {
+        put: vec![(
+            part_key(&stored.id, partition),
+            serde_json::to_string(&state).map_err(|err| err.to_string())?,
+        )],
+        del: Vec::new(),
+        value: None,
+    })
 }
 
 /// Decode a topic row.
@@ -353,5 +430,59 @@ mod tests {
             Outcome::Reject(1) => {}
             other => panic!("expected offset rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compact_replace_keeps_the_high_watermark() {
+        let mut map = HashMap::new();
+        let put = {
+            let get = |key: &str| Ok(map.get(key).cloned());
+            let Outcome::Change { put, .. } =
+                create_topic(&get, "events", "topic-1", 1, "r2").unwrap()
+            else {
+                panic!("create");
+            };
+            put
+        };
+        for (key, value) in put {
+            map.insert(key, value);
+        }
+        let published = {
+            let get = |key: &str| Ok(map.get(key).cloned());
+            publish(
+                &get,
+                &[PublishPart {
+                    topic: "events".into(),
+                    partition: 0,
+                    start: 0,
+                    end: 3,
+                    object_key: "bundle/old.seg".into(),
+                    file_offset: 0,
+                    length: 30,
+                    base_timestamp: 1,
+                    max_timestamp: 3,
+                }],
+                &[],
+            )
+            .unwrap()
+        };
+        let Outcome::Change { put, .. } = published else {
+            panic!("publish");
+        };
+        for (key, value) in put {
+            map.insert(key, value);
+        }
+        let replaced = {
+            let get = |key: &str| Ok(map.get(key).cloned());
+            compact_replace(&get, "events", 0, 3, "bundle/new.seg", 0, 12, 1, 3).unwrap()
+        };
+        let Outcome::Change { put, .. } = replaced else {
+            panic!("compact");
+        };
+        let state: Partition = serde_json::from_str(&put[0].1).unwrap();
+        assert_eq!(state.next_offset, 3);
+        assert_eq!(state.extents.len(), 1);
+        assert_eq!(state.extents[0].key, "bundle/new.seg");
+        assert_eq!(state.extents[0].end, 3);
     }
 }

@@ -102,8 +102,9 @@ Listings during that window must not resurrect the topic.
   return the same bytes.
 - Retention tests should use objects smaller than the retention window so
   the whole-object rule does not hide a failure to delete.
-- Log compaction (`cleanup.policy=compact`) is a different algorithm and is
-  not this job. Setting that policy before Phase 5 returns `INVALID_CONFIG`.
+- Log compaction (`cleanup.policy=compact`) is a different algorithm from
+  object merge. Phase 5 keeps the latest record for each key. The
+  differences from Kafka's cleaner are in `docs/compatibility.md`.
 
 ## Alternatives
 

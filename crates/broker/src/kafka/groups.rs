@@ -17,6 +17,9 @@ use camus_coordinator::{
 };
 use camus_metadata::groups::{self, GroupRecord, OffsetCommit, OffsetRecord};
 use camus_metadata::{Command, MetadataNode};
+use camus_protocol::messages::consumer_group_heartbeat_response::{
+    Assignment, TopicPartitions as AssignedPartitions,
+};
 use camus_protocol::messages::delete_groups_response::DeletableGroupResult;
 use camus_protocol::messages::describe_groups_response::{DescribedGroup, DescribedGroupMember};
 use camus_protocol::messages::find_coordinator_response::Coordinator as FoundCoordinator;
@@ -37,9 +40,6 @@ use camus_protocol::messages::{
     JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest,
     ListGroupsResponse, OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest,
     OffsetFetchResponse, RequestHeader, SyncGroupRequest, SyncGroupResponse,
-};
-use camus_protocol::messages::consumer_group_heartbeat_response::{
-    Assignment, TopicPartitions as AssignedPartitions,
 };
 use camus_protocol::protocol::{Decodable, StrBytes};
 use uuid::Uuid;
@@ -169,10 +169,10 @@ impl Kafka {
             Some((id as i32, host.to_string(), port.parse::<i32>().ok()?))
         });
         let answer = |key: &str| -> (i16, Option<String>, i32, String, i32) {
-            if request.key_type != 0 {
+            if request.key_type != 0 && request.key_type != 1 {
                 return (
                     INVALID_REQUEST,
-                    Some("only consumer groups have a coordinator yet".into()),
+                    Some("only group and transaction coordinators are served".into()),
                     -1,
                     String::new(),
                     -1,
@@ -675,9 +675,10 @@ impl Kafka {
                         .iter()
                         .any(|wanted| wanted.as_str().eq_ignore_ascii_case(&group.state));
                 let type_ok = request.types_filter.is_empty()
-                    || request.types_filter.iter().any(|wanted| {
-                        wanted.as_str().eq_ignore_ascii_case(&group.group_type)
-                    });
+                    || request
+                        .types_filter
+                        .iter()
+                        .any(|wanted| wanted.as_str().eq_ignore_ascii_case(&group.group_type));
                 if !(state_ok && type_ok) {
                     continue;
                 }
@@ -784,10 +785,12 @@ impl Kafka {
             instance_id: request.instance_id.map(|id| id.to_string()),
             rack_id: request.rack_id.map(|id| id.to_string()),
             rebalance_timeout_ms: request.rebalance_timeout_ms,
-            subscribed_topics: request.subscribed_topic_names.map(|names| {
-                names.iter().map(|name| name.0.to_string()).collect()
-            }),
-            subscribed_regex: request.subscribed_topic_regex.map(|value| value.to_string()),
+            subscribed_topics: request
+                .subscribed_topic_names
+                .map(|names| names.iter().map(|name| name.0.to_string()).collect()),
+            subscribed_regex: request
+                .subscribed_topic_regex
+                .map(|value| value.to_string()),
             server_assignor: request.server_assignor.map(|value| value.to_string()),
             owned: request.topic_partitions.as_ref().map(|topics| {
                 topics

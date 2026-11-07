@@ -67,7 +67,11 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    pub(super) async fn create_partitions(&self, header: &super::RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn create_partitions(
+        &self,
+        header: &super::RequestHeader,
+        buf: &mut Bytes,
+    ) -> Reply {
         let Ok(request) = CreatePartitionsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -86,10 +90,7 @@ impl Kafka {
                     .is_some_and(|rows| !rows.is_empty()),
             })
             .collect();
-        let applied = self
-            .node
-            .apply(Command::CreatePartitions { topics })
-            .await;
+        let applied = self.node.apply(Command::CreatePartitions { topics }).await;
         let items = items_of(applied.ok());
         let mut response = CreatePartitionsResponse::default();
         for (topic, item) in request.topics.iter().zip(items_or(&request.topics, items)) {
@@ -117,7 +118,11 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    pub(super) async fn alter_configs(&self, header: &super::RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn alter_configs(
+        &self,
+        header: &super::RequestHeader,
+        buf: &mut Bytes,
+    ) -> Reply {
         let Ok(request) = AlterConfigsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -151,8 +156,7 @@ impl Kafka {
         header: &super::RequestHeader,
         buf: &mut Bytes,
     ) -> Reply {
-        let Ok(request) =
-            IncrementalAlterConfigsRequest::decode(buf, header.request_api_version)
+        let Ok(request) = IncrementalAlterConfigsRequest::decode(buf, header.request_api_version)
         else {
             return Reply::Close;
         };
@@ -190,7 +194,11 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    pub(super) async fn delete_records(&self, header: &super::RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn delete_records(
+        &self,
+        header: &super::RequestHeader,
+        buf: &mut Bytes,
+    ) -> Reply {
         let Ok(request) = DeleteRecordsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -201,10 +209,7 @@ impl Kafka {
             let led = stored.as_ref().is_some_and(|topic| self.leads_topic(topic));
             for partition in &topic.partitions {
                 if stored.is_none() {
-                    local.push(Some(Item {
-                        code: 3,
-                        low: -1,
-                    }));
+                    local.push(Some(Item { code: 3, low: -1 }));
                     continue;
                 }
                 if !led {
@@ -262,7 +267,11 @@ impl Kafka {
         }
     }
 
-    pub(super) async fn offset_delete(&self, header: &super::RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn offset_delete(
+        &self,
+        header: &super::RequestHeader,
+        buf: &mut Bytes,
+    ) -> Reply {
         let Ok(request) = OffsetDeleteRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -296,10 +305,7 @@ impl Kafka {
             let mut row = OffsetDeleteResponseTopic::default();
             row.name = topic.name.clone();
             for partition in &topic.partitions {
-                let item = items.next().unwrap_or(Item {
-                    code: 69,
-                    low: 0,
-                });
+                let item = items.next().unwrap_or(Item { code: 69, low: 0 });
                 if item.code == 69 {
                     missing = true;
                 }
@@ -335,9 +341,7 @@ fn items_or<T>(rows: &[T], items: Vec<Item>) -> Vec<Item> {
     if items.len() == rows.len() {
         items
     } else {
-        rows.iter()
-            .map(|_| Item { code: 6, low: 0 })
-            .collect()
+        rows.iter().map(|_| Item { code: 6, low: 0 }).collect()
     }
 }
 
@@ -349,7 +353,9 @@ fn configs_error(
 ) -> Reply {
     let mut response = AlterResponse::default();
     for resource in &request.resources {
-        let mut row = camus_protocol::messages::alter_configs_response::AlterConfigsResourceResponse::default();
+        let mut row =
+            camus_protocol::messages::alter_configs_response::AlterConfigsResourceResponse::default(
+            );
         row.resource_type = resource.resource_type;
         row.resource_name = resource.resource_name.clone();
         row.error_code = code;
@@ -367,7 +373,9 @@ fn configs_from(
     let items = items_or(&request.resources, items);
     let mut response = AlterResponse::default();
     for (resource, item) in request.resources.iter().zip(items) {
-        let mut row = camus_protocol::messages::alter_configs_response::AlterConfigsResourceResponse::default();
+        let mut row =
+            camus_protocol::messages::alter_configs_response::AlterConfigsResourceResponse::default(
+            );
         row.resource_type = resource.resource_type;
         row.resource_name = resource.resource_name.clone();
         row.error_code = item.code;

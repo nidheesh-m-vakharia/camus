@@ -105,10 +105,11 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod batch;
+pub mod compact;
 pub mod compression;
-pub mod idempotence;
 pub mod error;
 pub mod frame;
+pub mod idempotence;
 #[allow(clippy::all)]
 pub mod messages;
 pub mod protocol;
