@@ -205,6 +205,16 @@ const IMPLEMENTED: &[ImplementedApi] = &[
         max: 3,
     },
     ImplementedApi {
+        key: ApiKey::DescribeTransactions,
+        min: 0,
+        max: 0,
+    },
+    ImplementedApi {
+        key: ApiKey::ListTransactions,
+        min: 0,
+        max: 2,
+    },
+    ImplementedApi {
         key: ApiKey::TxnOffsetCommit,
         min: 0,
         max: 3,

@@ -243,6 +243,7 @@ fn apply_command(
                 &transactional_id,
                 producer_id,
                 producer_epoch,
+                60_000,
             )),
             Command::AddTxnPartitions {
                 transactional_id,
@@ -255,6 +256,7 @@ fn apply_command(
                 producer_id,
                 producer_epoch,
                 &partitions,
+                -1,
             )),
             Command::NoteTxn {
                 transactional_id,
@@ -284,6 +286,32 @@ fn apply_command(
             )),
             Command::CreateAcls { bindings } => acl::create(&read, &bindings),
             Command::DeleteAcls { filters } => acl::delete(&read, &filters),
+            Command::InitTransactionTimed {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                timeout_ms,
+            } => txn::outcome(txn::init(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                if timeout_ms > 0 { timeout_ms } else { 60_000 },
+            )),
+            Command::AddTxnPartitionsAt {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                partitions,
+                started_ms,
+            } => txn::outcome(txn::add_partitions(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                &partitions,
+                started_ms,
+            )),
             Command::Compact {
                 topic,
                 partition,

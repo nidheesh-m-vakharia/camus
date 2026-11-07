@@ -38,6 +38,39 @@ struct Txn {
     spans: Vec<TxnSpan>,
     group: Option<String>,
     offsets: Vec<OffsetCommit>,
+    /// From `InitProducerId`. `0` means the default of 60 seconds.
+    #[serde(default = "default_timeout")]
+    timeout_ms: i32,
+    /// Wall time the transaction became `ongoing`, or `-1` when it is not.
+    #[serde(default = "default_start")]
+    started_ms: i64,
+}
+
+fn default_timeout() -> i32 {
+    60_000
+}
+
+fn default_start() -> i64 {
+    -1
+}
+
+/// A stored transaction, in the names `DescribeTransactions` returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxnInfo {
+    /// Transactional id.
+    pub transactional_id: String,
+    /// `Empty`, `Ongoing`, `CompleteCommit`, or `CompleteAbort`.
+    pub state: String,
+    /// Producer id.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub epoch: i16,
+    /// Timeout from `InitProducerId`.
+    pub timeout_ms: i32,
+    /// Start time while ongoing, otherwise `-1`.
+    pub started_ms: i64,
+    /// Partitions in the current transaction. Empty unless it is ongoing.
+    pub partitions: Vec<(String, i32)>,
 }
 
 type Get<'a> = &'a dyn Fn(&str) -> Result<Option<String>, String>;
@@ -131,6 +164,7 @@ pub fn init(
     transactional_id: &str,
     producer_id: i64,
     producer_epoch: i16,
+    timeout_ms: i32,
 ) -> Result<Issued, String> {
     if let Some(mut txn) = load(get, transactional_id)? {
         if producer_id >= 0 && (producer_id != txn.producer_id || producer_epoch != txn.epoch) {
@@ -155,6 +189,8 @@ pub fn init(
         txn.spans.clear();
         txn.offsets.clear();
         txn.group = None;
+        txn.started_ms = -1;
+        txn.timeout_ms = timeout_ms;
         store_txn(&mut put, transactional_id, &txn)?;
         return Ok(applied(put, value));
     }
@@ -176,6 +212,8 @@ pub fn init(
         spans: Vec::new(),
         group: None,
         offsets: Vec::new(),
+        timeout_ms,
+        started_ms: -1,
     };
     store_txn(&mut put, transactional_id, &txn)?;
     Ok(applied(put, value))
@@ -188,6 +226,7 @@ pub fn add_partitions(
     producer_id: i64,
     epoch: i16,
     partitions: &[(String, i32)],
+    started_ms: i64,
 ) -> Result<Issued, String> {
     let Some(mut txn) = load(get, transactional_id)? else {
         return Ok(Issued::Reject(INVALID_TXN));
@@ -201,6 +240,7 @@ pub fn add_partitions(
         txn.spans.clear();
         txn.offsets.clear();
         txn.group = None;
+        txn.started_ms = started_ms;
     }
     for partition in partitions {
         if partition_row(get, &partition.0, partition.1)?.is_none() {
@@ -355,8 +395,54 @@ pub fn end(
     txn.spans.clear();
     txn.offsets.clear();
     txn.group = None;
+    txn.started_ms = -1;
     store_txn(&mut put, transactional_id, &txn)?;
     Ok(applied(put, String::new()))
+}
+
+/// Read one stored transaction. `raw` is the JSON at `txn/{id}`.
+pub fn inspect(transactional_id: &str, raw: &str) -> Result<TxnInfo, String> {
+    let txn: Txn = serde_json::from_str(raw).map_err(|err| err.to_string())?;
+    let ongoing = txn.state == "ongoing";
+    Ok(TxnInfo {
+        transactional_id: transactional_id.to_string(),
+        state: kafka_state(&txn.state).to_string(),
+        producer_id: txn.producer_id,
+        epoch: txn.epoch,
+        timeout_ms: if txn.timeout_ms > 0 {
+            txn.timeout_ms
+        } else {
+            default_timeout()
+        },
+        started_ms: if ongoing { txn.started_ms } else { -1 },
+        partitions: if ongoing { txn.partitions } else { Vec::new() },
+    })
+}
+
+/// Kafka's name for a stored state. Unknown stored values stay empty.
+pub fn kafka_state(state: &str) -> &'static str {
+    match state {
+        "empty" => "Empty",
+        "ongoing" => "Ongoing",
+        "committed" => "CompleteCommit",
+        "aborted" => "CompleteAbort",
+        _ => "",
+    }
+}
+
+/// Names `ListTransactions` accepts as a state filter.
+pub fn known_state(state: &str) -> bool {
+    matches!(
+        state,
+        "Empty"
+            | "Ongoing"
+            | "PrepareCommit"
+            | "PrepareAbort"
+            | "CompleteCommit"
+            | "CompleteAbort"
+            | "Dead"
+            | "PrepareEpochFence"
+    )
 }
 
 /// Map an [`Issued`] result onto a catalog outcome.
@@ -416,7 +502,7 @@ mod tests {
         let mut store = memory();
         let (issued, id, epoch) = {
             let get = |key: &str| Ok(store.get(key).cloned());
-            let issued = init(&get, "checkout", -1, -1).unwrap();
+            let issued = init(&get, "checkout", -1, -1, 60_000).unwrap();
             let text = match &issued {
                 Issued::Applied { value, .. } => value.clone(),
                 Issued::Reject(code) => panic!("init {code}"),
@@ -430,7 +516,7 @@ mod tests {
         };
         apply(&mut store, issued);
         let issued = call(&store, |get| {
-            add_partitions(get, "checkout", id, epoch, &[("orders".into(), 0)])
+            add_partitions(get, "checkout", id, epoch, &[("orders".into(), 0)], 1_000)
         });
         apply(&mut store, issued);
         let issued = call(&store, |get| {
@@ -481,7 +567,7 @@ mod tests {
         let mut store = memory();
         let (issued, id, epoch) = {
             let get = |key: &str| Ok(store.get(key).cloned());
-            let issued = init(&get, "checkout", -1, -1).unwrap();
+            let issued = init(&get, "checkout", -1, -1, 60_000).unwrap();
             let text = match &issued {
                 Issued::Applied { value, .. } => value.clone(),
                 Issued::Reject(code) => panic!("init {code}"),
@@ -495,7 +581,7 @@ mod tests {
         };
         apply(&mut store, issued);
         let issued = call(&store, |get| {
-            add_partitions(get, "checkout", id, epoch, &[("orders".into(), 0)])
+            add_partitions(get, "checkout", id, epoch, &[("orders".into(), 0)], 1_000)
         });
         apply(&mut store, issued);
         let issued = call(&store, |get| {
@@ -515,7 +601,7 @@ mod tests {
         apply(&mut store, issued);
         let (issued, bumped) = {
             let get = |key: &str| Ok(store.get(key).cloned());
-            let issued = init(&get, "checkout", id, epoch).unwrap();
+            let issued = init(&get, "checkout", id, epoch, 60_000).unwrap();
             let bumped = match &issued {
                 Issued::Applied { value, .. } => value.clone(),
                 Issued::Reject(code) => panic!("fence {code}"),

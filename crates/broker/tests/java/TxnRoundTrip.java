@@ -48,6 +48,14 @@ public class TxnRoundTrip {
             producer.commitTransaction();
             check(drain(first, Duration.ofSeconds(15)).equals(Set.of("open")), "committed record missing");
         }
+        try (Admin client = Admin.create(admin)) {
+            TransactionDescription described =
+                    client.describeTransactions(List.of(transactionalId)).all().get().get(transactionalId);
+            check(described.state().toString().equals("CompleteCommit"), "describe " + described.state());
+            boolean listed = client.listTransactions().all().get().stream()
+                    .anyMatch(row -> row.transactionalId().equals(transactionalId));
+            check(listed, "transaction missing from the list");
+        }
 
         try (KafkaConsumer<String, String> resumed = consumer(bootstrap, group)) {
             resumed.subscribe(List.of(topic));

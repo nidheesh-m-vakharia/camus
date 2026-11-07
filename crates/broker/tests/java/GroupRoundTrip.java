@@ -38,6 +38,17 @@ public class GroupRoundTrip {
         check(extra.isEmpty(), "re-read " + extra.count() + " records");
         third.commitSync();
         third.close();
+        Properties adminProps = new Properties();
+        adminProps.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
+        try (Admin client = Admin.create(adminProps)) {
+            boolean listed = client.listGroups().all().get().stream()
+                    .anyMatch(row -> row.groupId().equals(group));
+            check(listed, "group missing from list");
+            String described = client.describeConsumerGroups(List.of(group))
+                    .describedGroups().get(group).get().groupId();
+            check(described.equals(group), "describe " + described);
+            client.deleteConsumerGroups(List.of(group)).all().get();
+        }
         System.out.println("java group ok: 40 shared by two members, 20 resumed by a third");
     }
 

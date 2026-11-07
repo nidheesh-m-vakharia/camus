@@ -25,7 +25,10 @@ pub use catalog::{
     Extent, Partition, PublishPart, Span, Topic,
 };
 pub use producers::{sequence_key, ProducerNote};
-pub use txn::{check as txn_allows, ensure as txn_ongoing, TxnSpan};
+pub use txn::{
+    check as txn_allows, ensure as txn_ongoing, inspect as txn_inspect, known_state as txn_state,
+    TxnInfo, TxnSpan,
+};
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -224,6 +227,30 @@ pub enum Command {
     DeleteAcls {
         /// One filter per request entry.
         filters: Vec<acl::Filter>,
+    },
+    /// Allocate a transactional id and store the timeout from `InitProducerId`.
+    InitTransactionTimed {
+        /// Transactional id.
+        transactional_id: String,
+        /// `-1` allocates. A known id must match the stored epoch.
+        producer_id: i64,
+        /// Current epoch, ignored when `producer_id` is `-1`.
+        producer_epoch: i16,
+        /// Client timeout in milliseconds. `0` means 60 seconds.
+        timeout_ms: i32,
+    },
+    /// Start or continue a transaction and record when it became ongoing.
+    AddTxnPartitionsAt {
+        /// Transactional id.
+        transactional_id: String,
+        /// Producer id.
+        producer_id: i64,
+        /// Producer epoch.
+        producer_epoch: i16,
+        /// Topic name and partition.
+        partitions: Vec<(String, i32)>,
+        /// Milliseconds since the epoch. Replicas share this value.
+        started_ms: i64,
     },
 }
 

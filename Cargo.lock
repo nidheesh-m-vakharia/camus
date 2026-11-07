@@ -311,6 +311,7 @@ dependencies = [
  "clap",
  "openraft",
  "rcgen",
+ "regex",
  "reqwest",
  "rustls",
  "rustls-pemfile",

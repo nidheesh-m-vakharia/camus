@@ -706,6 +706,11 @@ impl Kafka {
             ApiKey::AddOffsetsToTxn => self.add_offsets_to_txn(&header, &mut buf).await,
             ApiKey::TxnOffsetCommit => self.txn_offset_commit(&header, &mut buf).await,
             ApiKey::EndTxn => self.end_txn(&header, &mut buf).await,
+            ApiKey::DescribeTransactions => {
+                self.describe_transactions(&header, &mut buf, &principal)
+                    .await
+            }
+            ApiKey::ListTransactions => self.list_transactions(&header, &mut buf, &principal).await,
             ApiKey::DescribeAcls => self.describe_acls(&header, &mut buf, &principal).await,
             ApiKey::CreateAcls => self.create_acls(&header, &mut buf, &principal).await,
             ApiKey::DeleteAcls => self.delete_acls(&header, &mut buf, &principal).await,
@@ -1046,10 +1051,11 @@ impl Kafka {
         let applied = match &transactional {
             Some(id) => {
                 self.node
-                    .apply(Command::InitTransaction {
+                    .apply(Command::InitTransactionTimed {
                         transactional_id: id.clone(),
                         producer_id: request.producer_id.0,
                         producer_epoch: request.producer_epoch,
+                        timeout_ms: request.transaction_timeout_ms,
                     })
                     .await
             }

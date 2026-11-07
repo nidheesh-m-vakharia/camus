@@ -76,4 +76,9 @@ extra = third.poll(1.0)
 assert extra is None or extra.error(), f"re-read {extra.value()}"
 third.commit(asynchronous=False)
 third.close()
+listed = admin.list_consumer_groups().result()
+assert any(row.group_id == group for row in listed.valid), listed
+described = admin.describe_consumer_groups([group])[group].result()
+assert described.group_id == group, described
+admin.delete_consumer_groups([group])[group].result()
 print(f"librdkafka group ok: 40 shared by two members, 20 resumed by a third")

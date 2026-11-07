@@ -125,8 +125,8 @@ acceptance test. `-` means not run.
 | Heartbeat | 12 | 3 | 0-4 | implemented | pass | pass | pass |
 | LeaveGroup | 13 | 3 | 0-5 | implemented | pass | pass | pass |
 | SyncGroup | 14 | 3 | 0-5 | implemented | pass | pass | pass |
-| DescribeGroups | 15 | 3 | 0-6 | implemented | - | - | - |
-| ListGroups | 16 | 3 | 0-5 | implemented | - | - | - |
+| DescribeGroups | 15 | 3 | 0-6 | implemented | pass | pass | pass |
+| ListGroups | 16 | 3 | 0-5 | implemented | pass | pass | pass |
 | SaslHandshake | 17 | 1 | 0-1 | implemented (PLAIN) | pass | pass | pass |
 | ApiVersions | 18 | 1 | 0-5 | implemented | pass | pass | pass |
 | CreateTopics | 19 | 1 | 2-7 | implemented | pass | pass | pass |
@@ -134,13 +134,13 @@ acceptance test. `-` means not run.
 | DeleteRecords | 21 | 4 | 0-2 | implemented | - | - | - |
 | InitProducerId | 22 | 4 | 0-4 | implemented | pass | - | - |
 | OffsetForLeaderEpoch | 23 | | not planned for phases 0–5 | unimplemented | - | - | - |
-| AddPartitionsToTxn | 24 | 5 | 0-3 | implemented | pass | - | - |
-| AddOffsetsToTxn | 25 | 5 | 0-3 | implemented | pass | - | - |
-| EndTxn | 26 | 5 | 0-3 | implemented | pass | - | - |
+| AddPartitionsToTxn | 24 | 5 | 0-3 | implemented | pass | pass | pass |
+| AddOffsetsToTxn | 25 | 5 | 0-3 | implemented | pass | pass | - |
+| EndTxn | 26 | 5 | 0-3 | implemented | pass | pass | pass |
 | WriteTxnMarkers | 27 | | broker-internal, not a client API | unimplemented | - | - | - |
-| TxnOffsetCommit | 28 | 5 | 0-3 | implemented | pass | - | - |
-| DescribeAcls | 29 | 5 | 1-3 | implemented | - | - | - |
-| CreateAcls | 30 | 5 | 1-3 | implemented | - | - | - |
+| TxnOffsetCommit | 28 | 5 | 0-3 | implemented | pass | pass | - |
+| DescribeAcls | 29 | 5 | 1-3 | implemented | pass | pass | - |
+| CreateAcls | 30 | 5 | 1-3 | implemented | pass | pass | pass |
 | DeleteAcls | 31 | 5 | 1-3 | implemented | - | - | - |
 | DescribeConfigs | 32 | 1 | 1-4 | implemented | - | - | - |
 | AlterConfigs | 33 | 4 | 0-2 | implemented | - | - | - |
@@ -152,7 +152,7 @@ acceptance test. `-` means not run.
 | RenewDelegationToken | 39 | | not planned | unimplemented | - | - | - |
 | ExpireDelegationToken | 40 | | not planned | unimplemented | - | - | - |
 | DescribeDelegationToken | 41 | | not planned | unimplemented | - | - | - |
-| DeleteGroups | 42 | 3 | 0-3 | implemented | - | - | - |
+| DeleteGroups | 42 | 3 | 0-3 | implemented | pass | pass | pass |
 | ElectLeaders | 43 | | internal leader changes follow Raft; API not planned | unimplemented | - | - | - |
 | IncrementalAlterConfigs | 44 | 4 | 0-1 | implemented | - | - | - |
 | AlterPartitionReassignments | 45 | | not planned | unimplemented | - | - | - |
@@ -168,8 +168,8 @@ acceptance test. `-` means not run.
 | DescribeCluster | 60 | 4 | 0-2 | implemented | - | - | - |
 | DescribeProducers | 61 | | not planned before phase 5, then reconsider | unimplemented | - | - | - |
 | UnregisterBroker | 64 | | not planned | unimplemented | - | - | - |
-| DescribeTransactions | 65 | 5 | TBD | unimplemented | - | - | - |
-| ListTransactions | 66 | 5 | TBD | unimplemented | - | - | - |
+| DescribeTransactions | 65 | 5 | 0 | implemented | pass | - | - |
+| ListTransactions | 66 | 5 | 0-2 | implemented | pass | - | - |
 | AllocateProducerIds | 67 | | broker-internal | unimplemented | - | - | - |
 | ConsumerGroupHeartbeat | 68 | 3 | 0-1 | implemented | pass | - | - |
 | ConsumerGroupDescribe | 69 | 3 | TBD | unimplemented | - | - | - |
@@ -218,11 +218,14 @@ assigning the partition. None of them join a consumer group.
 | `confluent-kafka` 2.16.1 (librdkafka) | `crates/broker/tests/python/sasl_roundtrip.py` |
 | `franz-go` v1.22.0 | `crates/broker/tests/go/sasl_roundtrip.go` |
 
-`kafka-clients` 4.4.0 also runs a transaction in
-`crates/broker/tests/java/TxnRoundTrip.java`: an open batch stays hidden
-from `read_committed`, the commit publishes the record and the group
-offset together, and an abort stays hidden. librdkafka and franz-go have
-not run that path.
+`kafka-clients` 4.4.0, librdkafka, and franz-go each run a transaction
+(`TxnRoundTrip`, `phase5_roundtrip.py`, `gophase5`): an open batch stays
+hidden from `read_committed`, and an abort stays hidden. The Java and
+librdkafka runs also commit the group offset in the same transaction.
+The same three clients produce a compacted log and see an ACL denial.
+`DescribeTransactions` and `ListTransactions` are exercised by the Java
+admin client. Compaction still runs only on sealed extents when
+`CAMUS_COMPACT_MS` is set, and an ACL host other than `*` does not match.
 
 Produce requests at version 13 and above name the topic by id. The Python and
 Go tests skip when their toolchain is not installed under `target/`.

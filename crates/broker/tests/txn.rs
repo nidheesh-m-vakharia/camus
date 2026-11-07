@@ -25,9 +25,10 @@ use camus_protocol::messages::txn_offset_commit_request::{
 };
 use camus_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse;
 use camus_protocol::messages::{
-    AddPartitionsToTxnRequest, ApiKey, CreateTopicsRequest, EndTxnRequest, FetchRequest, GroupId,
-    InitProducerIdRequest, InitProducerIdResponse, OffsetFetchRequest, ProduceRequest,
-    RequestHeader, TopicName, TransactionalId, TxnOffsetCommitRequest,
+    AddPartitionsToTxnRequest, ApiKey, CreateTopicsRequest, DescribeTransactionsRequest,
+    DescribeTransactionsResponse, EndTxnRequest, FetchRequest, GroupId, InitProducerIdRequest,
+    InitProducerIdResponse, ListTransactionsRequest, ListTransactionsResponse, OffsetFetchRequest,
+    ProduceRequest, RequestHeader, TopicName, TransactionalId, TxnOffsetCommitRequest,
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 use camus_protocol::records::{
@@ -269,6 +270,13 @@ fn read_committed_hides_an_open_transaction_and_an_abort() {
         open.records.as_ref().is_some_and(|bytes| !bytes.is_empty()),
         "{open:?}"
     );
+    let described = describe_txn(&mut stream, 20);
+    assert_eq!(described.error_code, 0, "{described:?}");
+    assert_eq!(described.transaction_state.as_str(), "Ongoing");
+    assert_eq!(described.topics[0].partitions, vec![0]);
+    assert!(listed(&mut stream, 21, &["Ongoing"])
+        .iter()
+        .any(|state| state.as_str() == "Ongoing"));
 
     send(
         &mut stream,
@@ -310,6 +318,21 @@ fn read_committed_hides_an_open_transaction_and_an_abort() {
         .records
         .as_ref()
         .is_some_and(|bytes| !bytes.is_empty()));
+    let described = describe_txn(&mut stream, 22);
+    assert_eq!(described.transaction_state.as_str(), "CompleteCommit");
+    assert!(described.topics.is_empty(), "{described:?}");
+    assert!(listed(&mut stream, 23, &["Ongoing"]).is_empty());
+    send(
+        &mut stream,
+        ApiKey::ListTransactions,
+        0,
+        24,
+        &ListTransactionsRequest::default()
+            .with_state_filters(vec![StrBytes::from_static_str("Nope")]),
+    );
+    let unknown = recv::<ListTransactionsResponse>(&mut stream, 0);
+    assert_eq!(unknown.error_code, 42, "{unknown:?}");
+    assert_eq!(unknown.unknown_state_filters[0].as_str(), "Nope");
 
     send(
         &mut stream,
@@ -471,6 +494,43 @@ fn java_transaction_hides_an_open_batch_and_commits_its_offset() {
             broker_log
         );
     }
+}
+
+fn describe_txn(
+    stream: &mut TcpStream,
+    correlation: i32,
+) -> camus_protocol::messages::describe_transactions_response::TransactionState {
+    send(
+        stream,
+        ApiKey::DescribeTransactions,
+        0,
+        correlation,
+        &DescribeTransactionsRequest::default()
+            .with_transactional_ids(vec![TransactionalId(StrBytes::from_static_str("checkout"))]),
+    );
+    recv::<DescribeTransactionsResponse>(stream, 0)
+        .transaction_states
+        .remove(0)
+}
+
+fn listed(stream: &mut TcpStream, correlation: i32, states: &[&str]) -> Vec<StrBytes> {
+    send(
+        stream,
+        ApiKey::ListTransactions,
+        0,
+        correlation,
+        &ListTransactionsRequest::default().with_state_filters(
+            states
+                .iter()
+                .map(|state| StrBytes::from_string((*state).to_string()))
+                .collect(),
+        ),
+    );
+    recv::<ListTransactionsResponse>(stream, 0)
+        .transaction_states
+        .into_iter()
+        .map(|state| state.transaction_state)
+        .collect()
 }
 
 fn jdk(tool: &str) -> String {

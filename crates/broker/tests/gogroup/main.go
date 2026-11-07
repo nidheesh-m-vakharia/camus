@@ -48,6 +48,19 @@ func main() {
 	check(len(extra.Records()) == 0, fmt.Sprintf("re-read %d records", len(extra.Records())))
 	must(third.CommitUncommittedOffsets(ctx))
 	third.Close()
+	adminClient, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	must(err)
+	adm := kadm.NewClient(adminClient)
+	listed, err := adm.ListGroups(ctx)
+	must(err)
+	_, ok := listed[group]
+	check(ok, "group missing from list")
+	described, err := adm.DescribeGroups(ctx, group)
+	must(err)
+	check(described[group].Group == group, "describe")
+	_, err = adm.DeleteGroup(ctx, group)
+	must(err)
+	adminClient.Close()
 	fmt.Println("franz-go group ok: 40 shared by two members, 20 resumed by a third")
 }
 
