@@ -208,7 +208,11 @@ fn clients_see_a_compacted_log() {
 #[test]
 fn clients_run_the_admin_apis() {
     let node = spawn(false);
-    java(&node, "tests/java/Phase5RoundTrip.java", &["admin", &node.kafka]);
+    java(
+        &node,
+        "tests/java/Phase5RoundTrip.java",
+        &["admin", &node.kafka],
+    );
     python(&node, "admin");
     go(&node, "admin");
 }

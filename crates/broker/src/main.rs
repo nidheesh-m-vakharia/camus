@@ -531,19 +531,16 @@ async fn start_kafka(
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let bound = listener.local_addr()?;
     std::fs::write(args.data_dir.join("kafka-addr"), bound.to_string())?;
-    let host = if bind.ip().is_unspecified() {
-        "127.0.0.1".to_string()
-    } else {
-        bound.ip().to_string()
-    };
+    let (host, port) = advertised_kafka(bind, bound.port());
     let bucket = Bucket::connect(&BucketConfig {
         endpoint: std::env::var("CAMUS_S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),
         bucket: std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into()),
-        region: "us-east-1".into(),
+        region: std::env::var("CAMUS_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
         access_key: std::env::var("CAMUS_S3_ACCESS_KEY").unwrap_or_else(|_| "camus".into()),
         secret_key: std::env::var("CAMUS_S3_SECRET_KEY")
             .unwrap_or_else(|_| "camus-dev-secret".into()),
+        virtual_hosted: env_flag("CAMUS_S3_VIRTUAL_HOST"),
     })?;
     let user = std::env::var("CAMUS_SASL_USER").unwrap_or_default();
     let password = std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default();
@@ -556,7 +553,7 @@ async fn start_kafka(
         bucket,
         i32::try_from(node_id)?,
         host,
-        bound.port() as i32,
+        port,
         require_sasl,
         user,
         password,
@@ -566,6 +563,53 @@ async fn start_kafka(
     info!(%bound, sasl = require_sasl, "kafka listener");
     tokio::spawn(async move { kafka.run(listener).await });
     Ok(())
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref().map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+/// Host and port clients should dial. `CAMUS_ADVERTISED_HOST` wins. On
+/// Railway, the public TCP proxy is used when that pair is unset.
+fn advertised_kafka(bind: SocketAddr, bound_port: u16) -> (String, i32) {
+    let host = std::env::var("CAMUS_ADVERTISED_HOST")
+        .ok()
+        .or_else(|| std::env::var("RAILWAY_TCP_PROXY_DOMAIN").ok());
+    let port = std::env::var("CAMUS_ADVERTISED_PORT")
+        .ok()
+        .or_else(|| std::env::var("RAILWAY_TCP_PROXY_PORT").ok());
+    advertised_endpoint(bind, bound_port, host.as_deref(), port.as_deref())
+}
+
+fn advertised_endpoint(
+    bind: SocketAddr,
+    bound_port: u16,
+    host: Option<&str>,
+    port: Option<&str>,
+) -> (String, i32) {
+    let host = host.and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    });
+    let port = port
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|port: &i32| *port > 0);
+    if let Some(host) = host {
+        return (host.to_string(), port.unwrap_or(i32::from(bound_port)));
+    }
+    let host = if bind.ip().is_unspecified() {
+        "127.0.0.1".to_string()
+    } else {
+        bind.ip().to_string()
+    };
+    (host, i32::from(bound_port))
 }
 
 fn load_tls(
@@ -584,4 +628,29 @@ fn load_tls(
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::advertised_endpoint;
+
+    #[test]
+    fn unspecified_bind_advertises_loopback() {
+        let bind: SocketAddr = "0.0.0.0:9092".parse().unwrap();
+        assert_eq!(
+            advertised_endpoint(bind, 9092, None, None),
+            ("127.0.0.1".into(), 9092)
+        );
+    }
+
+    #[test]
+    fn railway_proxy_replaces_the_bind_address() {
+        let bind: SocketAddr = "0.0.0.0:9092".parse().unwrap();
+        assert_eq!(
+            advertised_endpoint(bind, 9092, Some("roundhouse.proxy.rlwy.net"), Some("15140")),
+            ("roundhouse.proxy.rlwy.net".into(), 15140)
+        );
+    }
 }
