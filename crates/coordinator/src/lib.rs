@@ -236,6 +236,22 @@ pub struct Described {
     pub members: Vec<DescribedMember>,
 }
 
+/// A KIP-848 group as ConsumerGroupDescribe reports it.
+#[derive(Clone, Debug)]
+pub struct ConsumerDescribed {
+    /// KIP-848 state name.
+    pub state_label: String,
+    /// Group epoch.
+    pub group_epoch: i32,
+    /// Epoch the target assignment was computed at.
+    pub assignment_epoch: i32,
+    /// Server assignor in use.
+    pub assignor: String,
+    /// Members with their stored record and target assignment
+    /// (`topic id -> partitions`).
+    pub members: Vec<(MemberRecord, BTreeMap<String, Vec<i32>>)>,
+}
+
 /// One row of ListGroups.
 #[derive(Clone, Debug)]
 pub struct GroupListing {
@@ -1640,6 +1656,35 @@ impl Coordinator {
 
     /// DescribeGroups for one group, or `None` if unknown. Outside Stable,
     /// Kafka reports no protocol and no member metadata.
+    /// A KIP-848 group's state for ConsumerGroupDescribe. `None` when the
+    /// group does not exist or is a classic group.
+    pub fn describe_consumer(&self, id: &str) -> Option<ConsumerDescribed> {
+        let groups = self.groups.lock().expect("groups");
+        let group = groups.get(id)?;
+        if !group.consumer {
+            return None;
+        }
+        let mut members: Vec<&Member> = group.members.values().collect();
+        members.sort_by_key(|member| member.join_order);
+        Some(ConsumerDescribed {
+            state_label: consumer::label(group).to_string(),
+            group_epoch: group.generation,
+            assignment_epoch: group.generation,
+            assignor: group.protocol.clone().unwrap_or_default(),
+            members: members
+                .into_iter()
+                .map(|member| {
+                    let target = group
+                        .target
+                        .get(&member.record.member_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    (member.record.clone(), target)
+                })
+                .collect(),
+        })
+    }
+
     pub fn describe(&self, id: &str) -> Option<Described> {
         let groups = self.groups.lock().expect("groups");
         let group = groups.get(id)?;

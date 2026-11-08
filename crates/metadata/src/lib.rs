@@ -28,7 +28,7 @@ pub use catalog::{
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{
     check as txn_allows, clock as txn_clock, ensure as txn_ongoing, inspect as txn_inspect,
-    known_state as txn_state, TxnClock, TxnInfo, TxnSpan,
+    known_state as txn_state, spans as txn_spans, TxnClock, TxnInfo, TxnSpan,
 };
 
 use std::collections::BTreeMap;

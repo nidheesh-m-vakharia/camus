@@ -52,6 +52,7 @@ use crate::slot::WalSlot;
 
 mod acl;
 mod admin;
+mod describe;
 mod epochs;
 mod groups;
 mod txn;
@@ -602,6 +603,13 @@ impl Kafka {
             first.producer_id,
             first.producer_epoch,
         )))
+    }
+
+    /// The log directory DescribeLogDirs names: the bucket and key prefix.
+    fn log_dir(&self) -> String {
+        let bucket = std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into());
+        let prefix = std::env::var("CAMUS_S3_PREFIX").unwrap_or_default();
+        format!("s3://{bucket}/{prefix}")
     }
 
     /// The partition's high watermark: the sealed end, or the WAL end for a
@@ -1275,6 +1283,16 @@ impl Kafka {
             ApiKey::DescribeAcls => self.describe_acls(&header, &mut buf, &caller).await,
             ApiKey::CreateAcls => self.create_acls(&header, &mut buf, &caller).await,
             ApiKey::DeleteAcls => self.delete_acls(&header, &mut buf, &caller).await,
+            ApiKey::ConsumerGroupDescribe => {
+                self.consumer_group_describe(&header, &mut buf, &caller)
+                    .await
+            }
+            ApiKey::DescribeTopicPartitions => {
+                self.describe_topic_partitions(&header, &mut buf, &caller)
+                    .await
+            }
+            ApiKey::DescribeProducers => self.describe_producers(&header, &mut buf, &caller).await,
+            ApiKey::DescribeLogDirs => self.describe_log_dirs(&header, &mut buf, &caller).await,
             ApiKey::OffsetForLeaderEpoch => {
                 self.offset_for_leader_epoch(&header, &mut buf, &caller)
                     .await

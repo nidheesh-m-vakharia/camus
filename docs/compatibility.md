@@ -195,6 +195,12 @@ is older than `CAMUS_PRODUCER_ID_EXPIRATION_MS` (default 86400000), checked
 every `CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS` (default 600000). Kafka uses the
 batch's own newest timestamp; Camus uses the extent's, which is never older.
 The `producer/{id}` epoch row of an idempotent producer is kept.
+DescribeLogDirs reports one log directory per broker, `s3://<bucket>/<prefix>`,
+holding the partitions that broker leads, sized by their sealed bytes; total
+and usable bytes are unknown (-1). DescribeProducers lists producers whose
+sequence state is sealed in metadata, with `last_timestamp` and
+`coordinator_epoch` of -1. ConsumerGroupDescribe answers for KIP-848 groups;
+a classic or unknown group is `GROUP_ID_NOT_FOUND` (69).
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the
@@ -237,7 +243,7 @@ acceptance test. `-` means not run.
 | DescribeConfigs | 32 | 1 | 1-4 | implemented | pass | pass | pass |
 | AlterConfigs | 33 | 4 | 0-2 | implemented | - | pass | pass |
 | AlterReplicaLogDirs | 34 | | not planned | unimplemented | - | - | - |
-| DescribeLogDirs | 35 | | not planned | unimplemented | - | - | - |
+| DescribeLogDirs | 35 | | 1-4 | implemented | - | - | - |
 | SaslAuthenticate | 36 | 1 | 0-2 | implemented (PLAIN) | pass | pass | pass |
 | CreatePartitions | 37 | 4 | 0-3 | implemented | pass | pass | pass |
 | CreateDelegationToken | 38 | | not planned | unimplemented | - | - | - |
@@ -258,17 +264,17 @@ acceptance test. `-` means not run.
 | UpdateFeatures | 57 | | not planned | unimplemented | - | - | - |
 | Envelope | 58 | | not planned | unimplemented | - | - | - |
 | DescribeCluster | 60 | 4 | 0-2 | implemented | pass | pass | - |
-| DescribeProducers | 61 | | not planned before phase 5, then reconsider | unimplemented | - | - | - |
+| DescribeProducers | 61 | | 0 | implemented | - | - | - |
 | UnregisterBroker | 64 | | not planned | unimplemented | - | - | - |
 | DescribeTransactions | 65 | 5 | 0 | implemented | pass | - | pass |
 | ListTransactions | 66 | 5 | 0-2 | implemented | pass | - | pass |
 | AllocateProducerIds | 67 | | broker-internal | unimplemented | - | - | - |
 | ConsumerGroupHeartbeat | 68 | 3 | 0-1 | implemented | pass | - | - |
-| ConsumerGroupDescribe | 69 | 3 | TBD | unimplemented | - | - | - |
+| ConsumerGroupDescribe | 69 | 3 | 0-1 | implemented | - | - | - |
 | GetTelemetrySubscriptions | 71 | | not planned | unimplemented | - | - | - |
 | PushTelemetry | 72 | | not planned | unimplemented | - | - | - |
 | ListClientMetricsResources | 74 | | not planned | unimplemented | - | - | - |
-| DescribeTopicPartitions | 75 | | not planned for 0–5 | unimplemented | - | - | - |
+| DescribeTopicPartitions | 75 | | 0 | implemented | - | - | - |
 
 Version numbers are filled in when the handler lands, from the generated
 4.4.0 schema, capped at what the handler implements. "TBD" means the range
