@@ -6,13 +6,13 @@
   var easeOut = "cubic-bezier(0.23, 1, 0.32, 1)";
   var easeIn = "cubic-bezier(0.55, 0, 1, 0.45)";
 
-  function enter(el, delay) {
+  function enter(el) {
     el.animate(
       [
-        { opacity: 0, transform: "translateY(8px)" },
+        { opacity: 0, transform: "translateY(4px)" },
         { opacity: 1, transform: "translateY(0)" },
       ],
-      { duration: 280, delay: delay, easing: easeOut, fill: "backwards" }
+      { duration: 220, easing: easeOut, fill: "backwards" }
     );
   }
 
@@ -23,17 +23,13 @@
     return el.animate(
       [
         { opacity: 1, transform: "translateY(0)" },
-        { opacity: 0, transform: "translateY(-8px)" },
+        { opacity: 0, transform: "translateY(-4px)" },
       ],
       { duration: 180, easing: easeIn, fill: "forwards" }
     ).finished;
   }
 
-  if (!reduce) {
-    Array.prototype.forEach.call(main.children, function (el, index) {
-      enter(el, Math.min(index, 2) * 70);
-    });
-  }
+  if (!reduce) enter(main);
 
   window.addEventListener("pageshow", function (event) {
     if (!event.persisted) return;
