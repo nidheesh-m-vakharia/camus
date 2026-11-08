@@ -8,7 +8,7 @@ if [ "$#" -eq 0 ]; then
     auto=1
     set -- \
         --node-id "${CAMUS_NODE_ID:-1}" \
-        --http-addr "${CAMUS_HTTP_ADDR:-0.0.0.0:18001}" \
+        --http-addr "${CAMUS_HTTP_ADDR:-0.0.0.0:${PORT:-18001}}" \
         --kafka-addr "${CAMUS_KAFKA_ADDR:-0.0.0.0:9092}" \
         --data-dir "${CAMUS_DATA_DIR:-/data}" \
         --dev-plaintext \
