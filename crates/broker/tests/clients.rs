@@ -54,7 +54,9 @@ fn spawn(compact: bool) -> Node {
     while Instant::now() < deadline {
         if let Ok(body) = client.get(format!("http://{http}/admin/metrics")).send() {
             if let Ok(json) = body.json::<serde_json::Value>() {
-                if json.get("current_leader").and_then(|value| value.as_u64()) == Some(1) {
+                if json.get("current_leader").and_then(|value| value.as_u64()) == Some(1)
+                    && json.get("wal_leader").and_then(|value| value.as_u64()) == Some(1)
+                {
                     if let Ok(body) = client
                         .get(format!("http://{http}/admin/read"))
                         .query(&[("key", "broker/1")])

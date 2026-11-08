@@ -33,7 +33,7 @@ pub struct Piece {
 
 /// A new write-once object key.
 pub fn object_key() -> String {
-    format!("bundle/{}.seg", ulid::Ulid::new())
+    format!("bundle/{}.seg", ulid::Ulid::generate())
 }
 
 /// Concatenate `pieces` and append the footer.

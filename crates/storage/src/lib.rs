@@ -14,7 +14,8 @@ use bytes::Bytes;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
 use object_store::{
-    BackoffConfig, ClientOptions, ObjectStore, PutMode, PutOptions, PutPayload, RetryConfig,
+    BackoffConfig, ClientOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    RetryConfig,
 };
 
 /// An S3-compatible bucket.

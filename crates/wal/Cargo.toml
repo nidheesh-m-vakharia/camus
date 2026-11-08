@@ -12,7 +12,7 @@ bytes = { version = "1", features = ["serde"] }
 camus-protocol = { path = "../protocol" }
 camus-raft = { path = "../raft" }
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
-redb = "2"
+redb = "4"
 reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

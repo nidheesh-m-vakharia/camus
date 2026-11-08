@@ -130,7 +130,9 @@ fn admin_apis_change_the_topic_and_refuse_a_past_the_end_delete() {
             .send()
             .unwrap();
         let json = body.json::<serde_json::Value>().unwrap_or_default();
-        if json.get("current_leader").and_then(|value| value.as_u64()) == Some(1) {
+        if json.get("current_leader").and_then(|value| value.as_u64()) == Some(1)
+            && json.get("wal_leader").and_then(|value| value.as_u64()) == Some(1)
+        {
             break;
         }
         assert!(start.elapsed() < Duration::from_secs(10), "no leader");

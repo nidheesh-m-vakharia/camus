@@ -9,4 +9,4 @@ description = "Bundle sealed record batches into one R2 object."
 [dependencies]
 bytes = "1"
 crc = "3"
-ulid = "1"
+ulid = "3"
