@@ -14,7 +14,7 @@ use openraft::{
     AnyError, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, RaftSnapshotBuilder,
     SnapshotMeta, StorageError, StorageIOError, StoredMembership,
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 

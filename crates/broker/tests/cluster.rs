@@ -1,7 +1,7 @@
 //! Three broker processes form a metadata group. Killing the leader leaves
 //! the committed write readable and a new write can commit.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,6 @@ use serde_json::Value;
 struct Node {
     id: u64,
     child: Child,
-    dir: PathBuf,
     addr: String,
 }
 
@@ -43,12 +42,7 @@ impl Node {
             .spawn()
             .unwrap();
         let addr = wait_file(&dir.join("listen-addr"));
-        Self {
-            id,
-            child,
-            dir,
-            addr,
-        }
+        Self { id, child, addr }
     }
 }
 

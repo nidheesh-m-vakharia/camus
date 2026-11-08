@@ -28,7 +28,7 @@ use openraft::{
     AnyError, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, RaftSnapshotBuilder,
     SnapshotMeta, StorageError, StorageIOError, StoredMembership,
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -439,7 +439,8 @@ fn persist(
         redb::Durability::Immediate
     } else {
         redb::Durability::None
-    });
+    })
+    .map_err(|e| err(&e))?;
     {
         let mut table = txn.open_table(META).map_err(|e| err(&e))?;
         table.insert(STATE, meta.as_str()).map_err(|e| err(&e))?;

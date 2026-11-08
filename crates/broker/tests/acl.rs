@@ -41,7 +41,6 @@ impl Drop for Node {
 
 fn spawn() -> Node {
     let dir = tempfile::tempdir().unwrap().keep();
-    let log = std::fs::File::create(dir.join("broker.log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
         .args([
             "--node-id",
@@ -55,7 +54,7 @@ fn spawn() -> Node {
             "--dev-plaintext",
         ])
         .stdout(std::fs::File::create(dir.join("out.log")).unwrap())
-        .stderr(log)
+        .stderr(std::fs::File::create(dir.join("broker.log")).unwrap())
         .spawn()
         .unwrap();
     let http = wait_file(&dir.join("listen-addr"));
@@ -71,7 +70,9 @@ fn spawn() -> Node {
     while Instant::now() < deadline {
         if let Ok(body) = client.get(format!("http://{http}/admin/metrics")).send() {
             if let Ok(json) = body.json::<serde_json::Value>() {
-                if json.get("current_leader").and_then(|value| value.as_u64()) == Some(1) {
+                if json.get("current_leader").and_then(|value| value.as_u64()) == Some(1)
+                    && json.get("wal_leader").and_then(|value| value.as_u64()) == Some(1)
+                {
                     return Node { child, kafka };
                 }
             }
