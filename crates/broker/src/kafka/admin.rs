@@ -145,10 +145,26 @@ impl Kafka {
                         value: config.value.as_ref().map(|value| value.to_string()),
                     })
                     .collect(),
+                replace: true,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let messages = self.config_messages(&changes);
         let applied = self.node.apply(Command::AlterConfigs { changes }).await;
-        configs_from(&request, header, items_of(applied.ok()), false)
+        configs_from(&request, header, items_of(applied.ok()), messages)
+    }
+
+    /// Why each change would be rejected, checked against this broker's copy
+    /// of the topic. The metadata group returns only the code.
+    fn config_messages(&self, changes: &[ConfigChange]) -> Vec<Option<String>> {
+        changes
+            .iter()
+            .map(|change| {
+                let topic = self.topic(&change.name)?;
+                camus_metadata::config::apply_change(&topic, &change.edits, change.replace)
+                    .err()
+                    .map(|rejected| rejected.message)
+            })
+            .collect()
     }
 
     pub(super) async fn incremental_alter_configs(
@@ -179,16 +195,21 @@ impl Kafka {
                         value: config.value.as_ref().map(|value| value.to_string()),
                     })
                     .collect(),
+                replace: false,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let messages = self.config_messages(&changes);
         let applied = self.node.apply(Command::AlterConfigs { changes }).await;
         let items = items_or(&request.resources, items_of(applied.ok()));
         let mut response = IncrementalAlterConfigsResponse::default();
-        for (resource, item) in request.resources.iter().zip(items) {
+        for ((resource, item), message) in request.resources.iter().zip(items).zip(messages) {
             let mut row = camus_protocol::messages::incremental_alter_configs_response::AlterConfigsResourceResponse::default();
             row.resource_type = resource.resource_type;
             row.resource_name = resource.resource_name.clone();
             row.error_code = item.code;
+            if item.code == camus_metadata::config::INVALID_CONFIG {
+                row.error_message = message.map(StrBytes::from_string);
+            }
             response.responses.push(row);
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
@@ -368,17 +389,20 @@ fn configs_from(
     request: &AlterConfigsRequest,
     header: &super::RequestHeader,
     items: Vec<Item>,
-    _: bool,
+    messages: Vec<Option<String>>,
 ) -> Reply {
     let items = items_or(&request.resources, items);
     let mut response = AlterResponse::default();
-    for (resource, item) in request.resources.iter().zip(items) {
+    for ((resource, item), message) in request.resources.iter().zip(items).zip(messages) {
         let mut row =
             camus_protocol::messages::alter_configs_response::AlterConfigsResourceResponse::default(
             );
         row.resource_type = resource.resource_type;
         row.resource_name = resource.resource_name.clone();
         row.error_code = item.code;
+        if item.code == camus_metadata::config::INVALID_CONFIG {
+            row.error_message = message.map(StrBytes::from_string);
+        }
         response.responses.push(row);
     }
     frame_of(header.request_api_version, header.correlation_id, &response)

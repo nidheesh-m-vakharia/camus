@@ -62,7 +62,7 @@ use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 const MAX_FRAME: usize = 100 * 1024 * 1024;
-const MAX_BATCH: usize = 1024 * 1024;
+const MAX_BATCH: usize = batch::MAX_BATCH_CEILING;
 const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 /// Most unsealed bytes one upload pass takes: up to four objects of
 /// `FLUSH_BYTES`, put in parallel, then one publish and one seal for all.
@@ -76,6 +76,16 @@ const LEADER_NOT_AVAILABLE: i16 = 5;
 const NOT_LEADER: i16 = 6;
 const REQUEST_TIMED_OUT: i16 = 7;
 const TOO_LARGE: i16 = 10;
+const INVALID_RECORD: i16 = 87;
+const INVALID_PARTITIONS: i16 = 37;
+const INVALID_REPLICATION_FACTOR: i16 = 38;
+const INVALID_REPLICA_ASSIGNMENT: i16 = 39;
+/// Kafka `num.partitions`, used when CreateTopics sends -1.
+const DEFAULT_PARTITIONS: i32 = 1;
+/// `DescribeConfigs` sources: set on the topic, set on the broker, default.
+const CONFIG_SOURCE_TOPIC: i8 = 1;
+const CONFIG_SOURCE_BROKER: i8 = 4;
+const CONFIG_SOURCE_DEFAULT: i8 = 5;
 const SASL_MECHANISM: i16 = 33;
 const ILLEGAL_SASL: i16 = 34;
 const INVALID_CONFIG: i16 = 40;
@@ -149,6 +159,9 @@ pub struct Kafka {
     wal_limit: u64,
     /// `durability.mode` for a topic created without one. `wal` per ADR 0005.
     default_durability: String,
+    /// `message.max.bytes`: the batch limit for a topic without
+    /// `max.message.bytes`. Kafka's default, 1048588.
+    message_max_bytes: usize,
     require_sasl: bool,
     sasl_user: String,
     sasl_pass: String,
@@ -187,6 +200,11 @@ impl Kafka {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(250);
+        let message_max_bytes = std::env::var("CAMUS_MESSAGE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(camus_metadata::config::DEFAULT_MESSAGE_MAX_BYTES as usize)
+            .min(batch::MAX_BATCH_CEILING);
         let compact_ms = std::env::var("CAMUS_COMPACT_MS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -202,6 +220,7 @@ impl Kafka {
             port,
             flush_ms,
             compact_ms,
+            message_max_bytes,
             wal_limit,
             default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
                 .unwrap_or_else(|_| "wal".into()),
@@ -411,8 +430,18 @@ impl Kafka {
         )))
     }
 
-    /// A compacting topic rejects a record with no key. Kafka reports that as
-    /// a corrupt message.
+    /// The largest batch `topic` accepts: its `max.message.bytes`, or the
+    /// broker's `message.max.bytes`.
+    fn batch_limit(&self, topic: &Topic) -> usize {
+        if topic.is_set("max.message.bytes") {
+            usize::try_from(topic.config_i64("max.message.bytes")).unwrap_or(0)
+        } else {
+            self.message_max_bytes
+        }
+    }
+
+    /// A compacting topic rejects a record with no key, with `INVALID_RECORD`
+    /// as in Kafka.
     fn reject_null_key(&self, topic: &Topic, raw: &[u8]) -> Result<(), i16> {
         if !camus_protocol::compact::compacts(&topic.cleanup_policy) {
             return Ok(());
@@ -425,7 +454,7 @@ impl Kafka {
             .flat_map(|set| &set.records)
             .any(|record| record.key.is_none())
         {
-            return Err(CORRUPT);
+            return Err(INVALID_RECORD);
         }
         Ok(())
     }
@@ -891,47 +920,91 @@ impl Kafka {
             return self.create_error(&request, header, 31);
         }
         let mut response = CreateTopicsResponse::default();
+        let version = header.request_api_version;
         for topic in request.topics {
             let name = topic.name.0.to_string();
-            let partitions = if topic.num_partitions < 1 {
-                1
+            let configs: Vec<(String, Option<String>)> = topic
+                .configs
+                .iter()
+                .map(|config| {
+                    (
+                        config.name.to_string(),
+                        config.value.as_ref().map(|value| value.to_string()),
+                    )
+                })
+                .collect();
+            let durability = configs
+                .iter()
+                .find(|(config, _)| config == "durability.mode")
+                .map(|(_, value)| value.clone().unwrap_or_default())
+                .unwrap_or_else(|| self.default_durability.clone());
+            let partitions = if topic.num_partitions == -1 {
+                DEFAULT_PARTITIONS
             } else {
                 topic.num_partitions
             };
-            let durability = topic
-                .configs
-                .iter()
-                .find(|config| config.name.as_str() == "durability.mode")
-                .map(|config| {
-                    config
-                        .value
-                        .as_ref()
-                        .map(|value| value.to_string())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_else(|| self.default_durability.clone());
-            let code = if request.validate_only {
-                if self.topic(&name).is_some() {
-                    36
-                } else if durability != "r2" && durability != "wal" {
-                    INVALID_CONFIG
-                } else {
-                    0
-                }
-            } else {
-                match self.node.create_topic(&name, partitions, durability).await {
-                    Ok(result) => result.error_code,
-                    Err(_) => NOT_LEADER,
-                }
-            };
             let mut result = CreatableTopicResult::default();
             result.name = topic_name(&name);
-            result.error_code = code;
-            result.num_partitions = partitions;
-            result.replication_factor = 1;
-            if code == 0 {
-                if let Some(stored) = self.topic(&name) {
-                    result.topic_id = Uuid::parse_str(&stored.id).unwrap_or_else(|_| Uuid::nil());
+            let mut checked = self.check_new_topic(&name, &topic, partitions, &configs);
+            if checked.is_ok() && !request.validate_only {
+                checked = match self
+                    .node
+                    .create_topic(&name, partitions, durability.clone(), configs.clone())
+                    .await
+                {
+                    Ok(created) if created.error_code == 0 => Ok(()),
+                    Ok(created) => Err((created.error_code, None)),
+                    Err(_) => Err((NOT_LEADER, None)),
+                };
+            }
+            match checked {
+                Ok(()) => {
+                    let stored = if request.validate_only {
+                        let mut draft = Topic::new(&name, "", partitions, &durability);
+                        for (config, value) in &configs {
+                            let _ = camus_metadata::config::edit(
+                                &mut draft,
+                                config,
+                                camus_metadata::config::Op::Set,
+                                value.as_deref(),
+                                true,
+                            );
+                        }
+                        Some(draft)
+                    } else {
+                        self.topic(&name)
+                    };
+                    result.num_partitions = partitions;
+                    result.replication_factor = self.replication_factor(&durability);
+                    if let Some(stored) = stored {
+                        result.topic_id =
+                            Uuid::parse_str(&stored.id).unwrap_or_else(|_| Uuid::nil());
+                        if version >= 5 {
+                            result.configs = Some(
+                                self.topic_configs(&stored)
+                                    .into_iter()
+                                    .map(|row| {
+                                        let mut out = camus_protocol::messages::create_topics_response::CreatableTopicConfigs::default();
+                                        out.name = StrBytes::from_static_str(row.spec.name);
+                                        out.value = Some(StrBytes::from_string(row.value));
+                                        out.read_only = row.spec.create_only;
+                                        out.config_source = row.source;
+                                        out
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+                Err((code, message)) => {
+                    result.error_code = code;
+                    result.error_message = message.map(StrBytes::from_string).or_else(|| {
+                        (code == 36).then(|| {
+                            StrBytes::from_string(format!("Topic '{name}' already exists."))
+                        })
+                    });
+                    result.num_partitions = -1;
+                    result.replication_factor = -1;
                 }
             }
             response.topics.push(result);
@@ -953,6 +1026,85 @@ impl Kafka {
             response.topics.push(result);
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
+    }
+
+    /// Check a CreateTopics entry the way Kafka does, with its message.
+    fn check_new_topic(
+        &self,
+        name: &str,
+        topic: &camus_protocol::messages::create_topics_request::CreatableTopic,
+        partitions: i32,
+        configs: &[(String, Option<String>)],
+    ) -> Result<(), (i16, Option<String>)> {
+        if self.topic(name).is_some() {
+            return Err((36, None));
+        }
+        if !topic.assignments.is_empty() {
+            return Err((
+                INVALID_REPLICA_ASSIGNMENT,
+                Some("Camus places replicas itself; replica assignments are not accepted.".into()),
+            ));
+        }
+        if partitions < 1 {
+            return Err((
+                INVALID_PARTITIONS,
+                Some(format!(
+                    "Number of partitions must be larger than 0, or -1 for the default; got {}.",
+                    topic.num_partitions
+                )),
+            ));
+        }
+        let brokers = self.broker_list().len().max(1) as i16;
+        if topic.replication_factor != -1
+            && (topic.replication_factor < 1 || topic.replication_factor > brokers)
+        {
+            return Err((
+                INVALID_REPLICATION_FACTOR,
+                Some(format!(
+                    "Replication factor must be -1 or between 1 and the {brokers} available brokers; got {}.",
+                    topic.replication_factor
+                )),
+            ));
+        }
+        camus_metadata::config::check_create(configs)
+            .map_err(|rejected| (rejected.code, Some(rejected.message)))
+    }
+
+    /// The replica count Metadata reports for a topic of this durability.
+    fn replication_factor(&self, durability: &str) -> i16 {
+        if durability == "wal" {
+            i16::try_from(self.shard_view().voters.len().max(1)).unwrap_or(i16::MAX)
+        } else {
+            1
+        }
+    }
+
+    /// Every config of `topic` with its effective value and Kafka source.
+    fn topic_configs(&self, topic: &Topic) -> Vec<ConfigView> {
+        camus_metadata::config::SPECS
+            .iter()
+            .map(|spec| {
+                let broker_value = match spec.name {
+                    "max.message.bytes" => Some(self.message_max_bytes.to_string()),
+                    "durability.mode" => Some(self.default_durability.clone()),
+                    _ => None,
+                };
+                let (value, source) = if topic.is_set(spec.name) {
+                    (topic.config(spec.name), CONFIG_SOURCE_TOPIC)
+                } else if let Some(value) = broker_value.filter(|value| value != spec.default) {
+                    (value, CONFIG_SOURCE_BROKER)
+                } else if spec.name == "durability.mode" {
+                    (topic.durability.clone(), CONFIG_SOURCE_DEFAULT)
+                } else {
+                    (spec.default.to_string(), CONFIG_SOURCE_DEFAULT)
+                };
+                ConfigView {
+                    spec,
+                    value,
+                    source,
+                }
+            })
+            .collect()
     }
 
     async fn delete_topics(
@@ -1019,12 +1171,35 @@ impl Kafka {
             if resource.resource_type != 2 {
                 result.error_code = INVALID_REQUEST;
             } else if let Some(topic) = self.topic(resource.resource_name.as_str()) {
-                result.configs = vec![
-                    config_row("durability.mode", &topic.durability),
-                    config_row("cleanup.policy", &topic.cleanup_policy),
-                    config_row("retention.ms", &topic.retention_ms.to_string()),
-                    config_row("retention.bytes", &topic.retention_bytes.to_string()),
-                ];
+                // Null asks for every config. An empty list is treated the
+                // same way, since asking for no configs has no use.
+                let wanted = resource
+                    .configuration_keys
+                    .as_ref()
+                    .filter(|keys| !keys.is_empty());
+                result.configs = self
+                    .topic_configs(&topic)
+                    .into_iter()
+                    .filter(|row| {
+                        wanted.is_none_or(|keys| keys.iter().any(|key| key.as_str() == row.spec.name))
+                    })
+                    .map(|row| {
+                        let mut out = DescribeConfigsResourceResult::default();
+                        out.name = StrBytes::from_static_str(row.spec.name);
+                        out.value = Some(StrBytes::from_string(row.value.clone()));
+                        out.read_only = row.spec.create_only;
+                        out.config_source = row.source;
+                        out.config_type = row.spec.config_type();
+                        if request.include_synonyms {
+                            let mut synonym = camus_protocol::messages::describe_configs_response::DescribeConfigsSynonym::default();
+                            synonym.name = StrBytes::from_static_str(row.spec.name);
+                            synonym.value = Some(StrBytes::from_string(row.value));
+                            synonym.source = row.source;
+                            out.synonyms.push(synonym);
+                        }
+                        out
+                    })
+                    .collect();
             } else {
                 result.error_code = UNKNOWN_TOPIC;
             }
@@ -1170,7 +1345,10 @@ impl Kafka {
             let row = &mut response.responses[topic_index].partition_responses[partition_index];
             match settled {
                 Ok(offset) => row.base_offset = offset,
-                Err(code) => row.error_code = code,
+                Err(code) => {
+                    row.error_code = code;
+                    row.error_message = produce_message(code);
+                }
             }
         }
         response.throttle_time_ms = i32::try_from(held.as_millis()).unwrap_or(i32::MAX);
@@ -1234,7 +1412,7 @@ impl Kafka {
         if raw.is_empty() {
             return Ok(None);
         }
-        let info = match batch::inspect(raw, MAX_BATCH) {
+        let info = match batch::inspect(raw, self.batch_limit(topic)) {
             Ok(info) => info,
             Err(BatchError::TooLarge) => return Err(TOO_LARGE),
             Err(BatchError::Corrupt) => return Err(CORRUPT),
@@ -1297,7 +1475,7 @@ impl Kafka {
         if raw.is_empty() {
             return Ok(None);
         }
-        let info = match batch::inspect(raw, MAX_BATCH) {
+        let info = match batch::inspect(raw, self.batch_limit(topic)) {
             Ok(info) => info,
             Err(BatchError::TooLarge) => return Err(TOO_LARGE),
             Err(BatchError::Corrupt) => return Err(CORRUPT),
@@ -2219,19 +2397,28 @@ fn partition_error(index: i32, code: i16) -> PartitionProduceResponse {
     let mut row = PartitionProduceResponse::default();
     row.index = index;
     row.error_code = code;
+    row.error_message = produce_message(code);
     row.base_offset = -1;
     row.log_append_time_ms = -1;
     row.log_start_offset = 0;
     row
 }
 
-fn config_row(name: &str, value: &str) -> DescribeConfigsResourceResult {
-    let mut row = DescribeConfigsResourceResult::default();
-    row.name = StrBytes::from_string(name.to_string());
-    row.value = Some(StrBytes::from_string(value.to_string()));
-    row.config_source = 1;
-    row.config_type = 2;
-    row
+/// The message Kafka sends with a produce error, where it sends one.
+fn produce_message(code: i16) -> Option<StrBytes> {
+    let text = match code {
+        INVALID_RECORD => "Compacted topic cannot accept message without key.",
+        TOO_LARGE => "The record batch is larger than the topic's max.message.bytes.",
+        _ => return None,
+    };
+    Some(StrBytes::from_static_str(text))
+}
+
+/// One topic config as CreateTopics and DescribeConfigs report it.
+struct ConfigView {
+    spec: &'static camus_metadata::config::Spec,
+    value: String,
+    source: i8,
 }
 
 /// `NoteTxn` applies the abort and reports the Kafka code in `value` when the

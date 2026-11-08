@@ -108,7 +108,11 @@ async fn every_replica_stores_the_same_topic_id() {
     nodes[0].initialize(voters(&[1, 2, 3])).await.unwrap();
     let created = wait_until(|| async {
         for node in &nodes {
-            if node.create_topic("events", 1, "wal").await.is_ok() {
+            if node
+                .create_topic("events", 1, "wal", Vec::new())
+                .await
+                .is_ok()
+            {
                 return true;
             }
         }

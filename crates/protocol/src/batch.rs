@@ -10,6 +10,11 @@ use bytes::{Bytes, BytesMut};
 use crate::records::crc32c;
 
 const HEADER: usize = 12;
+
+/// Largest record batch any topic may accept, counted as Kafka counts
+/// `max.message.bytes`: the whole batch including the 12-byte log overhead.
+/// The broker, WAL, and uploader all check against this.
+pub const MAX_BATCH_CEILING: usize = 8 * 1024 * 1024;
 const EPOCH_AT: usize = 12;
 const MAGIC_AT: usize = 16;
 const CRC_AT: usize = 17;

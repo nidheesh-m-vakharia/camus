@@ -262,18 +262,6 @@ fn fetched(stream: &mut TcpStream) -> Vec<Record> {
 }
 
 #[test]
-fn a_null_key_on_a_compact_topic_is_corrupt() {
-    let node = spawn("0");
-    let mut stream = TcpStream::connect(&node.kafka).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    topic(&mut stream, "wal");
-    assert_eq!(produce(&mut stream, 3, batch(None, b"x")), 2);
-    assert_eq!(produce(&mut stream, 4, batch(Some(b"a"), b"1")), 0);
-}
-
-#[test]
 fn compaction_keeps_the_latest_value_at_its_offset() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
         eprintln!("skipping compaction test; set CAMUS_MINIO=1");

@@ -98,11 +98,30 @@ records that are still only in the WAL. `cleanup.policy=compact` keeps the
 latest record for each key at its original offset. Compaction runs on
 sealed extents when `CAMUS_COMPACT_MS` is set; the unsealed tail is left
 alone, tombstones are kept (`delete.retention.ms` is not applied), and a
-record with no key is `CORRUPT_MESSAGE` (2). `CreatePartitions` rejects an explicit replica
-assignment. `retention.ms` defaults to 604800000 and `retention.bytes` to
--1. A classic group that still has members refuses `OffsetDelete` with
+record with no key is `INVALID_RECORD` (87), as in Kafka. `CreatePartitions`
+and `CreateTopics` reject an explicit replica assignment. A classic group that still has members refuses `OffsetDelete` with
 `GROUP_SUBSCRIBED_TO_TOPIC` (86).
 JoinGroup reports the client host as `/unknown`.
+
+Topic configs are the same for `CreateTopics`, `AlterConfigs`, and
+`IncrementalAlterConfigs`, and are listed in `crates/metadata/src/config.rs`
+with their Kafka 4.4.0 defaults. `DescribeConfigs` returns every one with its
+source.
+
+| Configs | Camus |
+| --- | --- |
+| `cleanup.policy`, `retention.ms`, `retention.bytes`, `max.message.bytes`, `delete.retention.ms`, `min.compaction.lag.ms` | Stored and applied |
+| `durability.mode` | Camus only. Set at creation, then read-only |
+| `segment.*`, `flush.*`, `min.insync.replicas`, `index.interval.bytes`, `file.delete.delay.ms`, `preallocate`, `local.retention.*`, `max.compaction.lag.ms`, `min.cleanable.dirty.ratio`, `message.timestamp.before.max.ms`, `message.timestamp.after.max.ms`, `*.replication.throttled.replicas` | Accepted and stored, with no effect |
+| `message.timestamp.type=LogAppendTime`, `compression.type` other than `producer`, `unclean.leader.election.enable=true`, `remote.storage.enable=true`, any other name | `INVALID_CONFIG` (40) with a message |
+
+Legacy `AlterConfigs` replaces the topic's whole config set, so a config it
+does not name returns to its default, as in Kafka. `max.message.bytes`
+defaults to `CAMUS_MESSAGE_MAX_BYTES`, which defaults to Kafka's 1048588, and
+cannot exceed 8388608. CreateTopics accepts `num_partitions=-1` (one
+partition) and a `replication_factor` of -1 or up to the broker count;
+partitions are replicated to every WAL shard voter either way.
+`retention.ms` and `retention.bytes` are stored but not yet enforced.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the

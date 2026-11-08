@@ -472,7 +472,7 @@ mod tests {
         let put = {
             let get = |key: &str| Ok(store.get(key).cloned());
             let Outcome::Change { put, .. } =
-                catalog::create_topic(&get, "orders", "topic-1", 1, "wal").unwrap()
+                catalog::create_topic(&get, "orders", "topic-1", 1, "wal", &[]).unwrap()
             else {
                 panic!("topic");
             };

@@ -31,6 +31,79 @@ pub struct Topic {
     /// `cleanup.policy`. `delete`, `compact`, or `delete,compact`.
     #[serde(default = "default_cleanup")]
     pub cleanup_policy: String,
+    /// Configs set on this topic, by name, in stored form. A name that is
+    /// absent uses its default. The typed fields above mirror their entries.
+    #[serde(default)]
+    pub overrides: BTreeMap<String, String>,
+}
+
+impl Topic {
+    /// A topic with every config at its default.
+    pub fn new(name: &str, id: &str, partitions: i32, durability: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            id: id.to_string(),
+            partitions,
+            durability: durability.to_string(),
+            leader_epoch: 0,
+            retention_ms: default_retention_ms(),
+            retention_bytes: default_retention_bytes(),
+            cleanup_policy: default_cleanup(),
+            overrides: BTreeMap::new(),
+        }
+    }
+
+    /// The value of a config, set or default. Unknown names are empty.
+    pub fn config(&self, name: &str) -> String {
+        match name {
+            "cleanup.policy" => return self.cleanup_policy.clone(),
+            "retention.ms" => return self.retention_ms.to_string(),
+            "retention.bytes" => return self.retention_bytes.to_string(),
+            "durability.mode" => return self.durability.clone(),
+            _ => {}
+        }
+        if let Some(value) = self.overrides.get(name) {
+            return value.clone();
+        }
+        crate::config::spec(name)
+            .map(|spec| spec.default.to_string())
+            .unwrap_or_default()
+    }
+
+    /// A numeric config, set or default.
+    pub fn config_i64(&self, name: &str) -> i64 {
+        self.config(name).parse().unwrap_or_default()
+    }
+
+    /// The config was set on this topic rather than left at its default.
+    pub fn is_set(&self, name: &str) -> bool {
+        self.overrides.contains_key(name)
+    }
+
+    /// Set a checked value, or return to the default with `None`.
+    pub(crate) fn set_config(&mut self, name: &str, value: Option<String>) {
+        let default = || {
+            crate::config::spec(name)
+                .map(|spec| spec.default.to_string())
+                .unwrap_or_default()
+        };
+        let effective = value.clone().unwrap_or_else(default);
+        match name {
+            "cleanup.policy" => self.cleanup_policy = effective,
+            "retention.ms" => self.retention_ms = effective.parse().unwrap_or_default(),
+            "retention.bytes" => self.retention_bytes = effective.parse().unwrap_or_default(),
+            "durability.mode" => self.durability = effective,
+            _ => {}
+        }
+        match value {
+            Some(value) => {
+                self.overrides.insert(name.to_string(), value);
+            }
+            None => {
+                self.overrides.remove(name);
+            }
+        }
+    }
 }
 
 fn default_retention_ms() -> i64 {
@@ -155,13 +228,15 @@ fn names(raw: Option<String>) -> Result<Vec<String>, String> {
 
 /// Create a topic. `partitions` must be at least 1. `durability` is `r2` or `wal`.
 /// `id` is chosen by the proposer and carried in the command, so every
-/// replica stores the same one.
+/// replica stores the same one. `configs` are checked here as well as by the
+/// proposer, so every replica decides the same way.
 pub fn create_topic(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     name: &str,
     id: &str,
     partitions: i32,
     durability: &str,
+    configs: &[(String, Option<String>)],
 ) -> Result<Outcome, String> {
     if id.is_empty() {
         return Ok(Outcome::Reject(42));
@@ -173,16 +248,30 @@ pub fn create_topic(
         return Ok(Outcome::Reject(36));
     }
     let id = id.to_string();
-    let topic = Topic {
-        name: name.to_string(),
-        id: id.clone(),
-        partitions,
-        durability: durability.to_string(),
-        leader_epoch: 0,
-        retention_ms: default_retention_ms(),
-        retention_bytes: default_retention_bytes(),
-        cleanup_policy: default_cleanup(),
-    };
+    let mut topic = Topic::new(name, &id, partitions, durability);
+    for (config, value) in configs {
+        if config == "durability.mode" {
+            continue;
+        }
+        let edited = crate::config::edit(
+            &mut topic,
+            config,
+            crate::config::Op::Set,
+            value.as_deref(),
+            true,
+        );
+        if let Err(rejected) = edited {
+            return Ok(Outcome::Reject(rejected.code));
+        }
+    }
+    if configs
+        .iter()
+        .any(|(config, _)| config == "durability.mode")
+    {
+        topic
+            .overrides
+            .insert("durability.mode".into(), durability.to_string());
+    }
     let mut put = vec![
         (
             topic_key(name),
@@ -404,9 +493,15 @@ mod tests {
         let mut map = HashMap::new();
         let put = {
             let get = |key: &str| Ok(map.get(key).cloned());
-            let Outcome::Change { put, .. } =
-                create_topic(&get, "events", &uuid::Uuid::new_v4().to_string(), 1, "r2").unwrap()
-            else {
+            let Outcome::Change { put, .. } = create_topic(
+                &get,
+                "events",
+                &uuid::Uuid::new_v4().to_string(),
+                1,
+                "r2",
+                &[],
+            )
+            .unwrap() else {
                 panic!("create");
             };
             put
@@ -438,7 +533,7 @@ mod tests {
         let put = {
             let get = |key: &str| Ok(map.get(key).cloned());
             let Outcome::Change { put, .. } =
-                create_topic(&get, "events", "topic-1", 1, "r2").unwrap()
+                create_topic(&get, "events", "topic-1", 1, "r2", &[]).unwrap()
             else {
                 panic!("create");
             };

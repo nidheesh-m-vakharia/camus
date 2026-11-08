@@ -10,6 +10,7 @@
 mod acl;
 mod admin;
 mod catalog;
+pub mod config;
 pub mod groups;
 mod machine;
 mod network;
@@ -70,6 +71,9 @@ pub enum Command {
         partitions: i32,
         /// `r2` or `wal`.
         durability: String,
+        /// Topic configs from the request, checked again at apply time.
+        #[serde(default)]
+        configs: Vec<(String, Option<String>)>,
     },
     /// Delete a topic by name.
     DeleteTopic {
@@ -364,6 +368,7 @@ impl MetadataNode {
         name: impl Into<String>,
         partitions: i32,
         durability: impl Into<String>,
+        configs: Vec<(String, Option<String>)>,
     ) -> anyhow::Result<Response> {
         let response = self
             .raft
@@ -372,6 +377,7 @@ impl MetadataNode {
                 id: uuid::Uuid::new_v4().to_string(),
                 partitions,
                 durability: durability.into(),
+                configs,
             })
             .await?;
         Ok(response.data)

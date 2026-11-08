@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{self, Outcome, Partition, Topic};
+use crate::config;
 use crate::groups::{self, GroupRecord};
 
-const INVALID_CONFIG: i16 = 40;
 const UNKNOWN_TOPIC: i16 = 3;
 const OFFSET_OUT_OF_RANGE: i16 = 1;
 const INVALID_PARTITIONS: i16 = 37;
@@ -73,6 +73,10 @@ pub struct ConfigChange {
     pub validate_only: bool,
     /// Edits, applied only if every one is valid.
     pub edits: Vec<ConfigEdit>,
+    /// Legacy `AlterConfigs`: configs not named in `edits` return to their
+    /// defaults, as in Kafka.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 /// One partition to trim.
@@ -201,8 +205,9 @@ pub fn alter_configs(
             });
             continue;
         };
-        match apply_edits(&mut topic, &change.edits) {
-            Ok(()) => {
+        match config::apply_change(&topic, &change.edits, change.replace) {
+            Ok(next) => {
+                topic = next;
                 if !change.validate_only {
                     put.push((
                         catalog::topic_storage_key(&change.name),
@@ -211,7 +216,10 @@ pub fn alter_configs(
                 }
                 items.push(Item { code: 0, low: 0 });
             }
-            Err(code) => items.push(Item { code, low: 0 }),
+            Err(rejected) => items.push(Item {
+                code: rejected.code,
+                low: 0,
+            }),
         }
     }
     Ok(Done {
@@ -219,95 +227,6 @@ pub fn alter_configs(
         del: Vec::new(),
         items,
     })
-}
-
-fn apply_edits(topic: &mut Topic, edits: &[ConfigEdit]) -> Result<(), i16> {
-    let mut next = topic.clone();
-    for edit in edits {
-        match edit.name.as_str() {
-            "retention.ms" => assign_long(&mut next.retention_ms, edit, 604_800_000)?,
-            "retention.bytes" => assign_long(&mut next.retention_bytes, edit, -1)?,
-            "cleanup.policy" => assign_policy(&mut next.cleanup_policy, edit)?,
-            _ => return Err(INVALID_CONFIG),
-        }
-    }
-    *topic = next;
-    Ok(())
-}
-
-fn assign_long(slot: &mut i64, edit: &ConfigEdit, default: i64) -> Result<(), i16> {
-    match edit.op {
-        0 => *slot = parse_long(edit.value.as_deref().unwrap_or(""))?,
-        1 => *slot = default,
-        _ => return Err(INVALID_CONFIG),
-    }
-    Ok(())
-}
-
-fn parse_long(value: &str) -> Result<i64, i16> {
-    let parsed: i64 = value.parse().map_err(|_| INVALID_CONFIG)?;
-    if parsed == -1 || parsed > 0 {
-        Ok(parsed)
-    } else {
-        Err(INVALID_CONFIG)
-    }
-}
-
-fn assign_policy(slot: &mut String, edit: &ConfigEdit) -> Result<(), i16> {
-    let value = match edit.op {
-        0 => edit.value.clone().unwrap_or_default(),
-        1 => "delete".into(),
-        2 => join_policy(slot, edit.value.as_deref().unwrap_or(""), true),
-        3 => join_policy(slot, edit.value.as_deref().unwrap_or(""), false),
-        _ => return Err(INVALID_CONFIG),
-    };
-    let mut delete = false;
-    let mut compact = false;
-    for part in value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        match part {
-            "delete" => delete = true,
-            "compact" => compact = true,
-            _ => return Err(INVALID_CONFIG),
-        }
-    }
-    if !delete && !compact {
-        return Err(INVALID_CONFIG);
-    }
-    let mut tokens = Vec::new();
-    if delete {
-        tokens.push("delete");
-    }
-    if compact {
-        tokens.push("compact");
-    }
-    *slot = tokens.join(",");
-    Ok(())
-}
-
-fn join_policy(current: &str, extra: &str, append: bool) -> String {
-    let mut parts: Vec<&str> = current
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
-    for part in extra
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        if append {
-            if !parts.contains(&part) {
-                parts.push(part);
-            }
-        } else {
-            parts.retain(|have| *have != part);
-        }
-    }
-    parts.join(",")
 }
 
 /// Move log starts to an object boundary at or after the requested offset.
@@ -485,7 +404,7 @@ mod tests {
         let mut map = HashMap::new();
         let get = |key: &str| Ok(map.get(key).cloned());
         let Outcome::Change { put, .. } =
-            catalog::create_topic(&get, "events", "topic-1", 1, "r2").unwrap()
+            catalog::create_topic(&get, "events", "topic-1", 1, "r2", &[]).unwrap()
         else {
             panic!("create");
         };
@@ -547,11 +466,38 @@ mod tests {
                     op: 0,
                     value: Some("compact".into()),
                 }],
+                replace: false,
             }],
         )
         .unwrap();
         assert_eq!(done.items[0].code, 0);
         let topic: crate::catalog::Topic = serde_json::from_str(&done.put[0].1).unwrap();
         assert_eq!(topic.cleanup_policy, "compact");
+    }
+
+    #[test]
+    fn legacy_alter_resets_configs_it_does_not_name() {
+        let mut map = world();
+        let change = |name: &str, value: &str, replace: bool| ConfigChange {
+            resource_type: 2,
+            name: "events".into(),
+            validate_only: false,
+            edits: vec![ConfigEdit {
+                name: name.into(),
+                op: 0,
+                value: Some(value.into()),
+            }],
+            replace,
+        };
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let done = alter_configs(&get, &[change("retention.ms", "60000", false)]).unwrap();
+        let (key, value) = done.put[0].clone();
+        map.insert(key, value);
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let done = alter_configs(&get, &[change("segment.bytes", "1048576", true)]).unwrap();
+        let topic: crate::catalog::Topic = serde_json::from_str(&done.put[0].1).unwrap();
+        assert_eq!(topic.retention_ms, 604_800_000);
+        assert!(!topic.is_set("retention.ms"));
+        assert_eq!(topic.config("segment.bytes"), "1048576");
     }
 }

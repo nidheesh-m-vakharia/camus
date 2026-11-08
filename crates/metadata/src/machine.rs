@@ -215,7 +215,8 @@ fn apply_command(
                 id,
                 partitions,
                 durability,
-            } => catalog::create_topic(&read, &name, &id, partitions, &durability),
+                configs,
+            } => catalog::create_topic(&read, &name, &id, partitions, &durability, &configs),
             Command::DeleteTopic { name } => catalog::delete_topic(&read, &name),
             Command::Publish { parts } => catalog::publish(&read, &parts, &[]),
             Command::PublishWithProducers { parts, producers } => {
