@@ -64,7 +64,7 @@ on 9092. The Kafka listener is PLAINTEXT. Admin HTTP listens on Railway's
 `PORT` and stays off the public internet. `GET /health` is the healthcheck.
 
 ```
-npm install
+npm install --prefix .railway
 railway login
 railway link
 railway config plan
