@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Three brokers — Camus</title>
+  <meta name="description" content="Start MinIO and three Camus brokers, and form a Raft group.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html" aria-current="page">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">Three brokers, one group.</h1>
+      </header>
+
+      <p class="lede">The brokers profile is the smallest setup that can lose a process and still commit metadata. It is not a Kafka listener. The single-broker image is the one that opens port <span class="ports">9092</span>.</p>
+      <pre><code>docker compose --profile brokers up</code></pre>
+      <h2>What comes up</h2>
+      <p>Compose builds MinIO and three brokers from this repo. The broker command is flags only: a node id, an HTTP address, and a data directory. An init container waits, then posts <code>/admin/init</code> to the first broker with all three members.</p>
+      <pre><code>[{"id":1,"addr":"broker-1:18001"},
+ {"id":2,"addr":"broker-2:18002"},
+ {"id":3,"addr":"broker-3:18003"}]</code></pre>
+      <p>Those addresses are the HTTP admin ports, which is what the Raft group dials. Published host ports are <span class="ports">18001</span>, <span class="ports">18002</span>, and <span class="ports">18003</span>. After init, <code>GET /admin/metrics</code> on any of them should show a <code>current_leader</code>.</p>
+      <h2>There is no Kafka port yet</h2>
+      <p>The compose services do not pass <code>--kafka-addr</code>. Nothing is published on <span class="ports">9092</span>. To attach a client, run the <a href="run.html">one-broker</a> image, or add <code>--kafka-addr</code> to the command yourself and publish that port. <code>--dev-plaintext</code> on a non-loopback address also needs <code>--allow-non-loopback</code>.</p>
+      <h2>What this group is for</h2>
+      <p>Metadata writes commit through a majority. The cluster test does the same thing without Docker: three processes, one committed write, kill the leader, and a new write still commits. That test is described on the <a href="tests.html">tests</a> page. Losing a majority of a write-ahead log shard is a different failure, and it needs <a href="recovery.html">recovery</a>.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

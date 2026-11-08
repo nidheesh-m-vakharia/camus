@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>What Kafka clients can do with Camus</title>
+  <meta name="description" content="Change the bootstrap server. Produce, fetch, groups, transactions, admin, and compaction, and the differences from Kafka.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html" aria-current="page">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">Change the bootstrap server. Then use the client you already have.</h1>
+      </header>
+
+      <p class="lede">These clients have been run against Camus: kafka-clients 4.4.0, librdkafka (confluent-kafka 2.16.1), and franz-go v1.22.0. A feature is listed here when at least one of them has exercised it. The compatibility doc records which one.</p>
+      <h2>Produce and fetch</h2>
+      <p>A producer appends record batches. A consumer fetches them by offset. An idempotent producer retries a sequence with the same producer id and epoch. The broker returns the original offset instead of appending the batch again, so a timeout followed by a retry does not duplicate that sequence.</p>
+      <p>A fetch is a page of the log from the offset you ask for. In the default isolation, you see batches that have been acknowledged. <code>read_committed</code> is stricter, and is described with transactions below.</p>
+      <h2>Groups</h2>
+      <p>Classic consumer groups join, sync, heartbeat, commit offsets, and leave. You can also list groups, describe one, and delete one. The Java client can set <code>group.protocol=consumer</code>, which uses the KIP-848 heartbeat instead of the classic join and sync.</p>
+      <p>Group authorization is not checked. Topic authorization is. A produce or fetch that fails an ACL returns <code>TOPIC_AUTHORIZATION_FAILED</code> (29) on that response, rather than hanging until the client times out.</p>
+      <h2>Transactions</h2>
+      <p><code>read_committed</code> hides a batch until <code>EndTxn</code> commits it. An abort stays hidden. Camus does not write Kafka control-batch markers. Visibility is the committed and aborted offset ranges stored in metadata. A consumer in isolation level 1 simply does not receive offsets inside an open or aborted range.</p>
+      <p>A produce that arrives after the transaction is no longer ongoing is rejected with <code>INVALID_TXN_STATE</code> (48). The batch is not left visible.</p>
+      <h2>Admin</h2>
+      <p>The admin calls those three libraries actually make: describe cluster, describe and alter configs, create partitions, delete records, delete topics, and ACLs. Java has no non-incremental alter-configs in the client that was run. librdkafka has no offset-delete method and no transaction-admin API. franz-go has no describe-cluster. The compatibility table leaves a cell blank when that library cannot make the call, or when it has not been run.</p>
+      <h2>Compaction</h2>
+      <p><code>cleanup.policy=compact</code> keeps the latest record for each key, at its original offset. Older values for that key are dropped from sealed extents. Compaction runs only when <code>CAMUS_COMPACT_MS</code> is greater than 0. It does not touch the unsealed tail. Tombstones are kept. There is no <code>delete.retention.ms</code> cleaner and no dirty-ratio trigger.</p>
+      <h2>Differences that will surprise you</h2>
+      <table>
+        <thead>
+          <tr><th>Behavior</th><th>Camus</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>acks=1</code></td><td>Same barrier as <code>acks=all</code>. The broker does not acknowledge a batch that only one replica has seen, even if you asked for one.</td></tr>
+          <tr><td><code>acks=0</code></td><td>The broker does not wait. The batch may be lost.</td></tr>
+          <tr><td>A resource with no ACL</td><td>Allowed. Kafka's default is the opposite. Once an ACL matches, <code>DENY</code> beats <code>ALLOW</code>. Only host <code>*</code> matches. A more specific host is not consulted.</td></tr>
+          <tr><td>Produce or fetch denied</td><td><code>TOPIC_AUTHORIZATION_FAILED</code> (29), not a timeout.</td></tr>
+          <tr><td><code>DeleteRecords</code></td><td>Advances to the next whole object. It does not split a segment at an arbitrary offset.</td></tr>
+          <tr><td>Control batches</td><td>Not written. Transaction visibility is metadata ranges, not markers inside the log.</td></tr>
+        </tbody>
+      </table>
+      <p>The full list, including APIs that stay unimplemented, is in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a>.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

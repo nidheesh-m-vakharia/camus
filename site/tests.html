@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tests — Camus</title>
+  <meta name="description" content="Run the workspace tests, the MinIO tests, and the three-process cluster test.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html" aria-current="page">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">Most tests do not need a bucket. The ones that seal objects do.</h1>
+      </header>
+
+      <p class="lede"><code>cargo test --workspace</code> is the check GitHub Actions runs. It does not start MinIO. Tests that would rewrite sealed objects skip unless you opt in.</p>
+      <h2>On a laptop</h2>
+      <pre><code>cargo test --workspace
+docker compose up -d minio create-bucket
+CAMUS_MINIO=1 cargo test -p camus-storage --test minio</code></pre>
+      <p>The bucket has to exist first. The compose command and the default keys are on the <a href="minio.html">bucket</a> page. <code>CAMUS_MINIO=1</code> is the opt-in. Without it, those tests skip instead of failing on a missing endpoint.</p>
+      <h2>Three processes</h2>
+      <p><code>cargo test -p camus-broker --test cluster</code> starts three broker processes, commits a metadata write, kills the leader, and checks that a new write commits. It is the same property as the <a href="brokers.html">brokers profile</a>, without Docker.</p>
+      <h2>What CI publishes</h2>
+      <p>GitHub Actions runs <code>cargo test --workspace --locked</code> on pull requests and on <code>main</code>. A green <code>main</code> publishes <code>ghcr.io/nidheesh-m-vakharia/camus</code>, tagged <code>latest</code> and the commit. The package stays private until that is changed in the GitHub package settings. The workflow does not start MinIO, and it does not run the formatter.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>
