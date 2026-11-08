@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://camus.nidheesh.dev/sitemap.xml
