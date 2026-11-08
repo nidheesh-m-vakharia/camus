@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SASL — Camus</title>
+  <meta name="description" content="Turn on SASL_SSL with a certificate and a PLAIN username and password.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html" aria-current="page">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">A certificate makes the listener require SASL.</h1>
+      </header>
+
+      <p class="lede">Plaintext is the local path. Pass a certificate and a key, and set a username and password, and clients must authenticate before any other call.</p>
+      <h2>Flags and variables</h2>
+      <ul>
+        <li><code>--tls-cert</code> and <code>--tls-key</code> for the listener certificate.</li>
+        <li><code>CAMUS_SASL_USER</code> and <code>CAMUS_SASL_PASSWORD</code> for the one PLAIN identity.</li>
+      </ul>
+      <p>The mechanism is PLAIN. There is no SCRAM and no delegation token. With a certificate configured, the listener allows ApiVersions and the SASL handshake, and requires SASL before any other API.</p>
+      <h2>Plaintext, on purpose</h2>
+      <p><code>--dev-plaintext</code> skips TLS. It is refused when the bind address is not loopback, unless you also pass <code>--allow-non-loopback</code>. The Docker image binds <span class="ports">0.0.0.0</span> and sets that flag, because a container's listener is never the host's loopback. Do not use that combination as a stand-in for SASL on a shared network.</p>
+      <p>ACLs are a separate switch from the handshake. A client that has authenticated can still be denied a topic. That denial is <code>TOPIC_AUTHORIZATION_FAILED</code> (29), described on the <a href="clients.html">clients</a> page. A resource with no matching ACL is allowed.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

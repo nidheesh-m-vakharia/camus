@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Durability — Camus</title>
+  <meta name="description" content="wal acknowledges after a disk quorum. r2 acknowledges after the object is stored.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html" aria-current="page">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">Two ways to acknowledge a produce.</h1>
+      </header>
+
+      <p class="lede"><code>wal</code> answers as soon as a disk majority has the batch. <code>r2</code> answers only after the object is stored and the offset is committed. The cluster default is <code>wal</code>.</p>
+      <table>
+        <thead>
+          <tr><th>Mode</th><th>When a produce is acknowledged</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>wal</code>, the default</td>
+            <td>A majority of the WAL shard has fsynced the batch. The upload to the bucket follows, and the write-ahead log is truncated once that range is sealed.</td>
+          </tr>
+          <tr>
+            <td><code>r2</code></td>
+            <td>The batch is in the bucket and the metadata group has committed its offsets. The broker keeps no log bytes.</td>
+          </tr>
+        </tbody>
+      </table>
+      <h2>Why wal is the default</h2>
+      <p>Object storage is the right place for the log you keep. It is a poor place to wait on every acknowledgement. <code>wal</code> keeps a few seconds of log on local disk so the producer is not limited by bucket latency. The bytes are still uploaded. After the seal, the local copy of that range can go.</p>
+      <p>A broker can accept that first acknowledgement without a bucket. The upload that should follow will fail. If you need the sealed log, create the bucket first. The <a href="minio.html">bucket page</a> is the local way to do that.</p>
+      <h2>When to choose r2</h2>
+      <p>Choose <code>r2</code> when a broker disk is not an acceptable copy of the log, even for a few seconds. The producer waits for the round trip to the bucket and for the metadata commit. A restarted broker has nothing to replay from local disk. The log it serves is the objects already sealed.</p>
+      <h2>How you set it</h2>
+      <p>Set <code>durability.mode</code> on the topic when you create it. The value is <code>wal</code> or <code>r2</code>. Topics that do not set it inherit <code>CAMUS_DEFAULT_DURABILITY</code>, which is <code>wal</code> unless you change the environment.</p>
+      <p>The decision is written down in <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr/0005-durability-and-acks.md">ADR 0005</a>. <code>acks=1</code> does not weaken either mode. It uses the same barrier as <code>acks=all</code>. <code>acks=0</code> does not wait, and the batch may be lost.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

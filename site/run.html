@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Run one Camus broker</title>
+  <meta name="description" content="Start one Camus broker with Docker or cargo, then check that it has a leader.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html" aria-current="page">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">Run one broker.</h1>
+      </header>
+
+      <p class="lede">Docker listens on <span class="ports">18001</span> for HTTP admin and <span class="ports">9092</span> for Kafka PLAINTEXT, then forms a one-node group. Clients use <span class="ports">127.0.0.1:9092</span>.</p>
+      <h2>From a built image</h2>
+      <p>Build the image from this repo, then publish the two ports. With no arguments, the entrypoint starts node <span class="ports">1</span>, stores data in <code>/data</code>, and allows plaintext off loopback because the process is inside a container. It then posts <code>/admin/init</code> to itself so the single node becomes a group.</p>
+      <pre><code>docker build -t camus .
+docker run --rm -p 18001:18001 -p 9092:9092 camus</code></pre>
+      <p>If you pass arguments, the entrypoint runs the broker with those flags and does not initialize the group, unless <code>CAMUS_AUTO_INIT=1</code>. The compose file uses that shape: the command is flags only, not the binary name.</p>
+      <h2>From a checkout</h2>
+      <p>The same shape, on loopback, with different ports so it does not collide with anything already bound to <span class="ports">9092</span>. <code>--dev-plaintext</code> turns off TLS for a local listener. It is refused on a non-loopback address unless you also pass <code>--allow-non-loopback</code>. A checkout bound to <span class="ports">127.0.0.1</span> does not need that second flag. The Docker image sets it for you.</p>
+      <pre><code>cargo run -p camus-broker -- \
+  --node-id 1 \
+  --http-addr 127.0.0.1:18080 \
+  --kafka-addr 127.0.0.1:19092 \
+  --data-dir /tmp/camus \
+  --dev-plaintext
+
+curl -sf -X POST http://127.0.0.1:18080/admin/init \
+  -H 'content-type: application/json' \
+  -d '[{"id":1,"addr":"127.0.0.1:18080"}]'</code></pre>
+      <p>The init body is the group: each member's id and the address the others use to reach its HTTP admin port. For one node, that address is the host and port you just bound. Do not point it at the Kafka port.</p>
+      <h2>Know that it is up</h2>
+      <p><code>GET /admin/metrics</code> returns JSON. Before you produce, <code>current_leader</code> and <code>wal_leader</code> should both be <span class="ports">1</span> on this one-node group. <code>GET /metrics</code> is the same process in Prometheus text. The address in the init body is the HTTP admin port the other brokers dial, not the Kafka port.</p>
+      <h2>The bucket is separate</h2>
+      <p>The process will start without MinIO. A <code>wal</code> produce can be acknowledged after the disk quorum, and the later upload will fail if there is no bucket. Create the bucket before you care about the sealed log. The defaults and the container caveat are on the <a href="minio.html">bucket</a> page.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>
