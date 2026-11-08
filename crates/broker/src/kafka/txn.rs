@@ -349,7 +349,7 @@ impl Kafka {
     }
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|time| time.as_millis() as i64)

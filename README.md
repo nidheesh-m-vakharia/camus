@@ -40,7 +40,9 @@ curl -sf -X POST http://127.0.0.1:18080/admin/init \
 
 The bucket defaults to MinIO at `http://127.0.0.1:9100`, bucket `camus`,
 keys `camus` / `camus-dev-secret`. Override with `CAMUS_S3_ENDPOINT`,
-`CAMUS_S3_BUCKET`, `CAMUS_S3_ACCESS_KEY`, and `CAMUS_S3_SECRET_KEY`. A
+`CAMUS_S3_BUCKET`, `CAMUS_S3_ACCESS_KEY`, and `CAMUS_S3_SECRET_KEY`.
+`CAMUS_S3_PREFIX` puts every key under a prefix. The broker deletes objects
+it no longer references, so each cluster needs its own bucket or prefix. A
 container does not see MinIO on the host at `127.0.0.1`; point
 `CAMUS_S3_ENDPOINT` at the host.
 

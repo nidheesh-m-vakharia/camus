@@ -572,6 +572,15 @@ pub fn partition_leader(via: &str, exclude: Option<i32>) -> (i32, String) {
 }
 
 pub fn batch(value: &str) -> Bytes {
+    encode_batch(None, value)
+}
+
+/// One record with `key`, for compacted topics.
+pub fn keyed_batch(key: &str, value: &str) -> Bytes {
+    encode_batch(Some(key), value)
+}
+
+fn encode_batch(key: Option<&str>, value: &str) -> Bytes {
     let records = vec![Record {
         transactional: false,
         control: false,
@@ -583,7 +592,7 @@ pub fn batch(value: &str) -> Bytes {
         timestamp_type: TimestampType::Creation,
         offset: 0,
         timestamp: 9,
-        key: None,
+        key: key.map(|key| Bytes::copy_from_slice(key.as_bytes())),
         value: Some(Bytes::copy_from_slice(value.as_bytes())),
         headers: Default::default(),
     }];
@@ -609,6 +618,17 @@ pub fn produce(addr: &str, value: &str) -> (i16, i64) {
 /// Produce one batch with `acks=all` and `timeout_ms`. Returns the partition
 /// error, the base offset, and the response's `throttle_time_ms`.
 pub fn produce_full(addr: &str, value: &str, timeout_ms: i32) -> (i16, i64, i32) {
+    produce_raw(addr, batch(value), timeout_ms)
+}
+
+/// Produce `records` as one batch with `acks=all`. Returns the partition
+/// error and offset.
+pub fn produce_batch(addr: &str, records: Bytes) -> (i16, i64) {
+    let (code, offset, _) = produce_raw(addr, records, 5_000);
+    (code, offset)
+}
+
+fn produce_raw(addr: &str, records: Bytes, timeout_ms: i32) -> (i16, i64, i32) {
     let mut stream = connect(addr);
     stream
         .set_read_timeout(Some(Duration::from_millis(timeout_ms as u64 + 15_000)))
@@ -617,7 +637,7 @@ pub fn produce_full(addr: &str, value: &str, timeout_ms: i32) -> (i16, i64, i32)
     topic.name = TopicName(StrBytes::from_static_str(TOPIC));
     topic.partition_data = vec![PartitionProduceData::default()
         .with_index(0)
-        .with_records(Some(batch(value)))];
+        .with_records(Some(records))];
     send(
         &mut stream,
         ApiKey::Produce,

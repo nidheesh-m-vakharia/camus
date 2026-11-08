@@ -185,6 +185,8 @@ async fn health() -> &'static str {
 }
 
 async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let stats = &camus_compactor::STATS;
     let metrics = node.raft.metrics().borrow().clone();
     let leader = metrics
         .current_leader
@@ -202,13 +204,29 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
          camus_raft_leader {}\n\
          # HELP camus_raft_current_leader Node id of the current leader, or NaN.\n\
          # TYPE camus_raft_current_leader gauge\n\
-         camus_raft_current_leader {leader}\n",
+         camus_raft_current_leader {leader}\n\
+         # HELP camus_retention_cuts_total Partitions whose log start retention moved.\n\
+         # TYPE camus_retention_cuts_total counter\n\
+         camus_retention_cuts_total {}\n\
+         # HELP camus_sweeps_total Completed orphan object sweeps.\n\
+         # TYPE camus_sweeps_total counter\n\
+         camus_sweeps_total {}\n\
+         # HELP camus_sweep_objects_deleted_total Objects the orphan sweep deleted.\n\
+         # TYPE camus_sweep_objects_deleted_total counter\n\
+         camus_sweep_objects_deleted_total {}\n\
+         # HELP camus_sweep_bytes_deleted_total Bytes in the objects the orphan sweep deleted.\n\
+         # TYPE camus_sweep_bytes_deleted_total counter\n\
+         camus_sweep_bytes_deleted_total {}\n",
         metrics.current_term,
         if metrics.current_leader == Some(metrics.id) {
             1
         } else {
             0
         },
+        stats.retention_cuts.load(Relaxed),
+        stats.sweeps.load(Relaxed),
+        stats.objects_deleted.load(Relaxed),
+        stats.bytes_deleted.load(Relaxed),
     )
 }
 
@@ -231,6 +249,10 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "wal_rpc_handled_count": camus_wal::RPC_TIMES.handled_count.load(std::sync::atomic::Ordering::Relaxed),
         "wal_rpc_handled_us": camus_wal::RPC_TIMES.handled_us.load(std::sync::atomic::Ordering::Relaxed),
         "wal_storage_failed": wal.storage_failed(),
+        "retention_cuts": camus_compactor::STATS.retention_cuts.load(std::sync::atomic::Ordering::Relaxed),
+        "sweeps": camus_compactor::STATS.sweeps.load(std::sync::atomic::Ordering::Relaxed),
+        "sweep_objects_deleted": camus_compactor::STATS.objects_deleted.load(std::sync::atomic::Ordering::Relaxed),
+        "sweep_bytes_deleted": camus_compactor::STATS.bytes_deleted.load(std::sync::atomic::Ordering::Relaxed),
     }))
 }
 
@@ -544,6 +566,7 @@ async fn start_kafka(
         access_key: std::env::var("CAMUS_S3_ACCESS_KEY").unwrap_or_else(|_| "camus".into()),
         secret_key: std::env::var("CAMUS_S3_SECRET_KEY")
             .unwrap_or_else(|_| "camus-dev-secret".into()),
+        prefix: std::env::var("CAMUS_S3_PREFIX").unwrap_or_default(),
     })?;
     let user = std::env::var("CAMUS_SASL_USER").unwrap_or_default();
     let password = std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default();

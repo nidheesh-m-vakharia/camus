@@ -20,6 +20,7 @@ camus-storage = { path = "../storage" }
 camus-uploader = { path = "../uploader" }
 camus-wal = { path = "../wal" }
 camus-coordinator = { path = "../coordinator" }
+camus-compactor = { path = "../compactor" }
 clap = { version = "4", features = ["derive"] }
 openraft = { version = "=0.9.25", features = ["serde"] }
 regex = "1"

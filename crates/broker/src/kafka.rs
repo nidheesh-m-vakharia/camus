@@ -157,6 +157,18 @@ pub struct Kafka {
     compact_ms: u64,
     /// `wal.disk.limit`: unsealed bytes past which produce is held.
     wal_limit: u64,
+    /// Kafka's `log.retention.check.interval.ms`: how often the metadata
+    /// leader applies `retention.ms` and `retention.bytes`.
+    retention_check_ms: u64,
+    /// How often the metadata leader looks for orphaned objects.
+    sweep_ms: u64,
+    /// An object younger than this is never swept, so an upload waiting
+    /// for its metadata commit survives (ADR 0007).
+    sweep_min_age_ms: i64,
+    /// Kafka's `file.delete.delay.ms`: how long an object stays after it is
+    /// first seen unreferenced.
+    sweep_delay_ms: i64,
+    sweeper: Mutex<camus_compactor::sweep::Sweeper>,
     /// `durability.mode` for a topic created without one. `wal` per ADR 0005.
     default_durability: String,
     /// `message.max.bytes`: the batch limit for a topic without
@@ -200,6 +212,16 @@ impl Kafka {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(250);
+        let env_ms = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(default)
+        };
+        let retention_check_ms = env_ms("CAMUS_RETENTION_CHECK_MS", 300_000);
+        let sweep_ms = env_ms("CAMUS_SWEEP_MS", 300_000);
+        let sweep_min_age_ms = env_ms("CAMUS_SWEEP_MIN_AGE_MS", 3_600_000) as i64;
+        let sweep_delay_ms = env_ms("CAMUS_FILE_DELETE_DELAY_MS", 60_000) as i64;
         let message_max_bytes = std::env::var("CAMUS_MESSAGE_MAX_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -221,6 +243,11 @@ impl Kafka {
             flush_ms,
             compact_ms,
             message_max_bytes,
+            retention_check_ms,
+            sweep_ms,
+            sweep_min_age_ms,
+            sweep_delay_ms,
+            sweeper: Mutex::new(camus_compactor::sweep::Sweeper::default()),
             wal_limit,
             default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
                 .unwrap_or_else(|_| "wal".into()),
@@ -459,6 +486,137 @@ impl Kafka {
         Ok(())
     }
 
+    /// Move each partition's log start past the sealed extents that
+    /// `retention.ms` or `retention.bytes` no longer keeps.
+    async fn enforce_retention(&self) {
+        if !self.leader() {
+            return;
+        }
+        let now = txn::now_ms();
+        let mut cuts = Vec::new();
+        for name in self.topic_names() {
+            let Some(topic) = self.topic(&name) else {
+                continue;
+            };
+            if !topic
+                .cleanup_policy
+                .split(',')
+                .any(|policy| policy == "delete")
+            {
+                continue;
+            }
+            for partition in 0..topic.partitions {
+                let Some(state) = self.partition_state(&topic, partition) else {
+                    continue;
+                };
+                if let Some(offset) = camus_compactor::retention::cut(
+                    &state.extents,
+                    state.log_start,
+                    topic.retention_ms,
+                    topic.retention_bytes,
+                    now,
+                ) {
+                    cuts.push(camus_metadata::RecordCut {
+                        topic: name.clone(),
+                        partition,
+                        offset,
+                    });
+                }
+            }
+        }
+        if cuts.is_empty() {
+            return;
+        }
+        let count = cuts.len() as u64;
+        match self.meta_apply(Command::DeleteRecords { cuts }).await {
+            Ok(_) => {
+                camus_compactor::STATS
+                    .retention_cuts
+                    .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(partitions = count, "retention moved log starts");
+            }
+            Err(err) => tracing::warn!(%err, "retention commit failed"),
+        }
+    }
+
+    /// Every object key an extent points into. Any read or parse failure is
+    /// an error, because a missing reference would delete live data.
+    fn referenced_objects(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let mut keys = std::collections::BTreeSet::new();
+        let names: Vec<String> = match self.node.read_local(camus_metadata::topic_index_key())? {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        };
+        for name in names {
+            let Some(raw) = self
+                .node
+                .read_local(&camus_metadata::topic_storage_key(&name))?
+            else {
+                continue;
+            };
+            let topic = camus_metadata::parse_topic(&raw).map_err(anyhow::Error::msg)?;
+            for partition in 0..topic.partitions {
+                let raw = self
+                    .node
+                    .read_local(&camus_metadata::partition_storage_key(&topic.id, partition))?
+                    .ok_or_else(|| anyhow::anyhow!("{name}-{partition} has no partition row"))?;
+                let state = camus_metadata::parse_partition(&raw).map_err(anyhow::Error::msg)?;
+                keys.extend(state.extents.into_iter().map(|extent| extent.key));
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Delete bundle objects that no extent has referenced for the delete
+    /// delay. Runs on the metadata leader only.
+    async fn sweep_objects(&self) -> anyhow::Result<()> {
+        if !self.leader() {
+            return Ok(());
+        }
+        // List before reading references: an object published in between is
+        // then either referenced or too young to delete.
+        let listed: Vec<camus_compactor::sweep::Listed> = self
+            .bucket
+            .list("bundle/")
+            .await?
+            .into_iter()
+            .map(|(key, size, modified_ms)| camus_compactor::sweep::Listed {
+                key,
+                size,
+                modified_ms,
+            })
+            .collect();
+        let referenced = self.referenced_objects()?;
+        let plan = self.sweeper.lock().await.plan(
+            &listed,
+            &referenced,
+            txn::now_ms(),
+            self.sweep_min_age_ms,
+            self.sweep_delay_ms,
+        );
+        let stats = &camus_compactor::STATS;
+        for object in plan {
+            if !self.leader() {
+                break;
+            }
+            match self.bucket.delete(&object.key).await {
+                Ok(()) => {
+                    stats
+                        .objects_deleted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stats
+                        .bytes_deleted
+                        .fetch_add(object.size, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(err) => tracing::warn!(key = %object.key, %err, "orphan delete failed"),
+            }
+        }
+        stats
+            .sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Rewrite sealed extents so each key keeps its newest record.
     async fn compact_sealed(&self) {
         if !self.leader() {
@@ -575,6 +733,26 @@ impl Kafka {
                 loop {
                     tokio::time::sleep(Duration::from_millis(compact.compact_ms)).await;
                     compact.compact_sealed().await;
+                }
+            });
+        }
+        if self.retention_check_ms > 0 {
+            let retention = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(retention.retention_check_ms)).await;
+                    retention.enforce_retention().await;
+                }
+            });
+        }
+        if self.sweep_ms > 0 {
+            let sweep = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(sweep.sweep_ms)).await;
+                    if let Err(err) = sweep.sweep_objects().await {
+                        tracing::warn!(%err, "object sweep skipped");
+                    }
                 }
             });
         }

@@ -2,7 +2,7 @@
 //!
 //! The client speaks the S3 API through `object_store`, with conditional puts
 //! enabled (`If-Match` / `If-None-Match`). Cloudflare R2 and MinIO both
-//! implement that. Phase 0 covers put, ranged get, and delete. The uploader
+//! implement that. It covers put, ranged get, list, and delete. The uploader
 //! is a later crate and is not wired in here.
 
 #![forbid(unsafe_code)]
@@ -22,6 +22,7 @@ use object_store::{
 #[derive(Clone)]
 pub struct Bucket {
     store: Arc<dyn ObjectStore>,
+    prefix: String,
 }
 
 /// How to reach the bucket.
@@ -37,6 +38,9 @@ pub struct BucketConfig {
     pub access_key: String,
     /// Secret key.
     pub secret_key: String,
+    /// Prepended to every key, so several clusters can share one bucket.
+    /// Empty, or ending in `/`. Callers never see it.
+    pub prefix: String,
 }
 
 impl Bucket {
@@ -68,9 +72,19 @@ impl Bucket {
                     .with_timeout(std::time::Duration::from_secs(30)),
             )
             .build()?;
+        let prefix = if config.prefix.is_empty() || config.prefix.ends_with('/') {
+            config.prefix.clone()
+        } else {
+            format!("{}/", config.prefix)
+        };
         Ok(Self {
             store: Arc::new(store),
+            prefix,
         })
+    }
+
+    fn path(&self, key: &str) -> Path {
+        Path::from(format!("{}{key}", self.prefix))
     }
 
     /// Write `bytes` to `key`. A second create of the same key fails.
@@ -80,26 +94,45 @@ impl Bucket {
             ..Default::default()
         };
         self.store
-            .put_opts(&Path::from(key), PutPayload::from_bytes(bytes), opts)
+            .put_opts(&self.path(key), PutPayload::from_bytes(bytes), opts)
             .await?;
         Ok(())
     }
 
     /// Read `range` of an object. `range` is half-open.
     pub async fn get_range(&self, key: &str, range: Range<u64>) -> anyhow::Result<Bytes> {
-        let bytes = self.store.get_range(&Path::from(key), range).await?;
+        let bytes = self.store.get_range(&self.path(key), range).await?;
         Ok(bytes)
     }
 
     /// Delete `key`. Missing keys are an error from the store, not a success.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.store.delete(&Path::from(key)).await?;
+        self.store.delete(&self.path(key)).await?;
         Ok(())
+    }
+
+    /// Every object under `prefix`, as `(key, size, last-modified Unix ms)`.
+    /// Keys are returned without the bucket's own prefix.
+    pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64, i64)>> {
+        use futures::TryStreamExt;
+        let objects: Vec<_> = self
+            .store
+            .list(Some(&self.path(prefix)))
+            .try_collect()
+            .await?;
+        Ok(objects
+            .into_iter()
+            .filter_map(|meta| {
+                let key = meta.location.to_string();
+                let key = key.strip_prefix(&self.prefix)?.to_string();
+                Some((key, meta.size, meta.last_modified.timestamp_millis()))
+            })
+            .collect())
     }
 
     /// Whether `key` is absent. `true` means a get would not return bytes.
     pub async fn is_missing(&self, key: &str) -> anyhow::Result<bool> {
-        match self.store.head(&Path::from(key)).await {
+        match self.store.head(&self.path(key)).await {
             Ok(_) => Ok(false),
             Err(object_store::Error::NotFound { .. }) => Ok(true),
             Err(err) => Err(err.into()),

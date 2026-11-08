@@ -121,7 +121,21 @@ defaults to `CAMUS_MESSAGE_MAX_BYTES`, which defaults to Kafka's 1048588, and
 cannot exceed 8388608. CreateTopics accepts `num_partitions=-1` (one
 partition) and a `replication_factor` of -1 or up to the broker count;
 partitions are replicated to every WAL shard voter either way.
-`retention.ms` and `retention.bytes` are stored but not yet enforced.
+`retention.ms` and `retention.bytes` are enforced on topics whose
+`cleanup.policy` includes `delete`, every `CAMUS_RETENTION_CHECK_MS`
+(default 300000, Kafka's `log.retention.check.interval.ms`). As Kafka works
+in whole segments and never deletes the active one, Camus moves the log start
+past whole sealed extents and never touches the unsealed WAL tail. Time uses
+each extent's newest record timestamp. Size counts sealed bytes only.
+
+Objects that no extent references any more, after retention, `DeleteRecords`,
+compaction, or a topic delete, are deleted by an orphan sweep on the metadata
+leader every `CAMUS_SWEEP_MS` (default 300000). An object is swept only when it
+is older than `CAMUS_SWEEP_MIN_AGE_MS` (default 3600000, ADR 0007), so an upload
+still waiting for its metadata commit is safe, and has been unreferenced for
+`CAMUS_FILE_DELETE_DELAY_MS` (default 60000, Kafka's `file.delete.delay.ms`).
+The sweep owns every `bundle/` object under the cluster's key prefix: give each
+cluster its own bucket or its own `CAMUS_S3_PREFIX`.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the
