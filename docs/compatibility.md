@@ -55,8 +55,15 @@ fetch, and list-offsets with `NOT_LEADER_OR_FOLLOWER` (6). A produce that
 cannot commit within `timeout_ms`, for example with no quorum, gets
 `REQUEST_TIMED_OUT` (7); the entry may still commit later, so a client
 without idempotence can duplicate on retry. The upload to object storage
-follows the ack. The partition `leader_epoch` does not yet change with the
-shard term. The shard leader records itself in metadata so every broker
+follows the ack. A `wal` partition's leader epoch is the WAL shard's Raft term plus a base
+kept in metadata; `truncate-to-sealed` raises the base, so the epoch only
+grows. An `r2` partition's epoch is the metadata group's term. Batches are
+sealed with that epoch, publish records where each epoch starts, and
+`OffsetForLeaderEpoch` (v3–4) answers from that history and, on the shard
+leader, from the epochs of batches still in the WAL, so a consumer detects a
+truncation and a failover is not mistaken for one. Fetch, ListOffsets, and
+`OffsetForLeaderEpoch` check `current_leader_epoch`: older is
+`FENCED_LEADER_EPOCH` (74), newer is `UNKNOWN_LEADER_EPOCH` (76). The shard leader records itself in metadata so every broker
 names the same leader; a broker that has just restarted can name a stale
 leader for about a second, and clients recover through the usual
 `NOT_LEADER_OR_FOLLOWER` retry. After a shard loses a majority, its
@@ -218,7 +225,7 @@ acceptance test. `-` means not run.
 | DeleteTopics | 20 | 1 | 1-6 | implemented | pass | pass | pass |
 | DeleteRecords | 21 | 4 | 0-2 | implemented | pass | pass | pass |
 | InitProducerId | 22 | 4 | 0-4 | implemented | pass | - | - |
-| OffsetForLeaderEpoch | 23 | | not planned for phases 0–5 | unimplemented | - | - | - |
+| OffsetForLeaderEpoch | 23 | | 3-4 | implemented | - | - | - |
 | AddPartitionsToTxn | 24 | 5 | 0-3 | implemented | pass | pass | pass |
 | AddOffsetsToTxn | 25 | 5 | 0-3 | implemented | pass | pass | - |
 | EndTxn | 26 | 5 | 0-3 | implemented | pass | pass | pass |

@@ -172,6 +172,7 @@ pub fn create_partitions(
                 extents: Vec::new(),
                 txn_committed: Vec::new(),
                 txn_aborted: Vec::new(),
+                epochs: Vec::new(),
             };
             put.push((
                 catalog::partition_storage_key(&stored.id, partition),
@@ -410,6 +411,7 @@ mod tests {
         let mut map = world();
         let get = |key: &str| Ok(map.get(key).cloned());
         let part = PublishPart {
+            epoch: -1,
             topic: "events".into(),
             partition: 0,
             start: 0,
@@ -475,6 +477,7 @@ mod tests {
         }
         let get = |key: &str| Ok(map.get(key).cloned());
         let part = |start: i64, end: i64| PublishPart {
+            epoch: -1,
             topic: "events".into(),
             partition: 0,
             start,

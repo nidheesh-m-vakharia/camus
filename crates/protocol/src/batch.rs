@@ -73,6 +73,14 @@ pub struct BatchInfo {
     pub transactional: bool,
 }
 
+/// The `partitionLeaderEpoch` of the first batch in `bytes`, or `-1`.
+pub fn leader_epoch(bytes: &[u8]) -> i32 {
+    bytes
+        .get(EPOCH_AT..EPOCH_AT + 4)
+        .map(|raw| i32::from_be_bytes(raw.try_into().expect("four bytes")))
+        .unwrap_or(-1)
+}
+
 /// Walk `bytes` and check magic, length, and CRC. Does not decompress.
 pub fn inspect(bytes: &[u8], max_batch: usize) -> Result<Vec<BatchInfo>, BatchError> {
     let mut out = Vec::new();

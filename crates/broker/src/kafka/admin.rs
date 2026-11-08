@@ -374,7 +374,7 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    fn leads_topic(&self, topic: &Topic) -> bool {
+    pub(super) fn leads_topic(&self, topic: &Topic) -> bool {
         if topic.durability == "wal" {
             self.wal().is_leader()
         } else {
