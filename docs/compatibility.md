@@ -136,6 +136,23 @@ still waiting for its metadata commit is safe, and has been unreferenced for
 `CAMUS_FILE_DELETE_DELAY_MS` (default 60000, Kafka's `file.delete.delay.ms`).
 The sweep owns every `bundle/` object under the cluster's key prefix: give each
 cluster its own bucket or its own `CAMUS_S3_PREFIX`.
+
+Transactions follow Kafka's coordinator timers. `InitProducerId` with a
+`transaction_timeout_ms` of 0 or less, or above `CAMUS_TXN_MAX_TIMEOUT_MS`
+(default 900000, Kafka's `transaction.max.timeout.ms`), is
+`INVALID_TRANSACTION_TIMEOUT` (50). The metadata leader aborts a transaction
+that has been ongoing longer than its timeout, checking every
+`CAMUS_TXN_ABORT_INTERVAL_MS` (default 10000), and bumps the producer epoch,
+so the old producer gets `PRODUCER_FENCED` (90) and may recover with
+`InitProducerId` from the epoch it had (KIP-360). A transactional id that has
+not changed for `CAMUS_TRANSACTIONAL_ID_EXPIRATION_MS` (default 604800000) is
+removed, checked every `CAMUS_TXN_CLEANUP_INTERVAL_MS` (default 3600000).
+Idempotent producer state for a partition is removed once the log start has
+passed the producer's last batch, or once the sealed extent holding that batch
+is older than `CAMUS_PRODUCER_ID_EXPIRATION_MS` (default 86400000), checked
+every `CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS` (default 600000). Kafka uses the
+batch's own newest timestamp; Camus uses the extent's, which is never older.
+The `producer/{id}` epoch row of an idempotent producer is kept.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the

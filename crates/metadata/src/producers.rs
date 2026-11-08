@@ -169,3 +169,154 @@ pub fn apply_notes(
         value: None,
     })
 }
+
+/// Remove producer sequence state Kafka would expire. For each candidate,
+/// the state goes when the log start has passed the producer's last batch
+/// (Kafka's `ProducerStateManager.truncateHead`), or when the sealed extent
+/// holding that batch is older than `expiration_ms` (Kafka's
+/// `producer.id.expiration.ms`, which uses the batch's newest timestamp). A
+/// batch still only in the WAL, or a producer with an ongoing transaction,
+/// keeps its state. `value` is the number of entries removed.
+pub fn expire(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    keys: &[(String, i32, i64)],
+    now_ms: i64,
+    expiration_ms: i64,
+) -> Result<Outcome, String> {
+    let mut del = Vec::new();
+    for (topic, partition, producer_id) in keys {
+        let key = sequence_key(topic, *partition, *producer_id);
+        let Some(raw) = get(&key)? else {
+            continue;
+        };
+        if in_transaction(get, *producer_id)? {
+            continue;
+        }
+        let state: ProducerSeq = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+        let Some(last) = state.batches.last() else {
+            del.push(key);
+            continue;
+        };
+        let last_end = last.base_offset + i64::from(last.records);
+        let Some(raw_topic) = get(&crate::catalog::topic_storage_key(topic))? else {
+            del.push(key);
+            continue;
+        };
+        let stored = crate::catalog::parse_topic(&raw_topic)?;
+        let Some(raw_part) = get(&crate::catalog::partition_storage_key(
+            &stored.id, *partition,
+        ))?
+        else {
+            del.push(key);
+            continue;
+        };
+        let part = crate::catalog::parse_partition(&raw_part)?;
+        if last_end <= part.log_start {
+            del.push(key);
+            continue;
+        }
+        let holder = part
+            .extents
+            .iter()
+            .find(|extent| extent.start <= last.base_offset && last.base_offset < extent.end);
+        if let Some(extent) = holder {
+            if now_ms.saturating_sub(extent.max_timestamp) >= expiration_ms {
+                del.push(key);
+            }
+        }
+    }
+    let removed = del.len().to_string();
+    Ok(Outcome::Change {
+        put: Vec::new(),
+        del,
+        value: Some(removed),
+    })
+}
+
+fn in_transaction(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    producer_id: i64,
+) -> Result<bool, String> {
+    let Some(id) = get(&format!("txn-by-producer/{producer_id}"))? else {
+        return Ok(false);
+    };
+    let Some(raw) = get(&format!("txn/{id}"))? else {
+        return Ok(false);
+    };
+    let clock = crate::txn::clock(&raw)?;
+    Ok(clock.producer_id == producer_id && clock.ongoing)
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use std::collections::HashMap;
+
+    use camus_protocol::idempotence::StoredBatch;
+
+    use super::*;
+    use crate::catalog::{self, Extent};
+
+    fn store(extent_ts: i64, log_start: i64, extent_end: i64) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let Outcome::Change { put, .. } =
+            catalog::create_topic(&get, "orders", "topic-1", 1, "wal", &[]).unwrap()
+        else {
+            panic!("create");
+        };
+        for (key, value) in put {
+            map.insert(key, value);
+        }
+        let part_key = catalog::partition_storage_key("topic-1", 0);
+        let mut part = catalog::parse_partition(&map[&part_key]).unwrap();
+        part.log_start = log_start;
+        part.next_offset = 20;
+        if extent_end > 0 {
+            part.extents.push(Extent {
+                start: 0,
+                end: extent_end,
+                key: "bundle/a.seg".into(),
+                file_offset: 0,
+                length: 10,
+                base_timestamp: extent_ts,
+                max_timestamp: extent_ts,
+            });
+        }
+        map.insert(part_key, serde_json::to_string(&part).unwrap());
+        let state = ProducerSeq {
+            epoch: 0,
+            batches: vec![StoredBatch {
+                base_sequence: 0,
+                last_sequence: 4,
+                base_offset: 5,
+                records: 5,
+            }],
+        };
+        map.insert(
+            sequence_key("orders", 0, 7),
+            serde_json::to_string(&state).unwrap(),
+        );
+        map
+    }
+
+    fn removed(map: &HashMap<String, String>, now: i64) -> bool {
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let Outcome::Change { del, .. } =
+            expire(&get, &[("orders".into(), 0, 7)], now, 1_000).unwrap()
+        else {
+            panic!("expire");
+        };
+        !del.is_empty()
+    }
+
+    #[test]
+    fn state_expires_with_its_extent_or_the_log_start() {
+        assert!(!removed(&store(10_000, 0, 20), 10_500), "fresh extent");
+        assert!(removed(&store(10_000, 0, 20), 11_000), "old extent");
+        assert!(
+            removed(&store(10_000_000, 10, 20), 0),
+            "log start passed it"
+        );
+        assert!(!removed(&store(0, 0, 0), i64::MAX), "still only in the WAL");
+    }
+}
