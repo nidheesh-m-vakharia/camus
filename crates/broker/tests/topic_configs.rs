@@ -15,11 +15,13 @@ use camus_protocol::messages::incremental_alter_configs_request::{
     AlterConfigsResource as IncrementalResource, AlterableConfig as IncrementalConfig,
 };
 use camus_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse;
+use camus_protocol::messages::metadata_request::MetadataRequestTopic;
+use camus_protocol::messages::metadata_response::MetadataResponse;
 use camus_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use camus_protocol::messages::produce_response::ProduceResponse;
 use camus_protocol::messages::{
     AlterConfigsRequest, ApiKey, CreateTopicsRequest, DescribeConfigsRequest,
-    IncrementalAlterConfigsRequest, ProduceRequest, TopicName,
+    IncrementalAlterConfigsRequest, MetadataRequest, ProduceRequest, TopicName,
 };
 use camus_protocol::protocol::StrBytes;
 use camus_protocol::records::{
@@ -369,4 +371,86 @@ fn a_null_key_on_a_compacted_topic_is_an_invalid_record() {
     assert_eq!(code, 87);
     assert!(message.unwrap().contains("without key"));
     assert_eq!(produce(&addr, "keyed", batch_of(100, Some(b"k"))).0, 0);
+}
+
+#[test]
+fn topic_names_follow_kafka_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = single(dir.path(), Opts::default());
+    let addr = kafka_addr(&node);
+    assert_eq!(
+        create(&addr, vec![topic("a.b", &[])], false).topics[0].error_code,
+        0
+    );
+    let long: &'static str = Box::leak("x".repeat(250).into_boxed_str());
+    let response = create(
+        &addr,
+        vec![
+            topic("bad name", &[]),
+            topic("..", &[]),
+            topic(long, &[]),
+            topic("a_b", &[]),
+        ],
+        false,
+    );
+    let codes: Vec<i16> = response.topics.iter().map(|t| t.error_code).collect();
+    assert_eq!(codes, vec![17, 17, 17, 17], "{response:?}");
+    let collision = response.topics[3].error_message.as_ref().unwrap();
+    assert!(collision.contains("a.b"), "{collision}");
+}
+
+fn metadata_for(addr: &str, name: &'static str, auto: bool) -> (i16, usize) {
+    let mut stream = connect(addr);
+    send(
+        &mut stream,
+        ApiKey::Metadata,
+        12,
+        &MetadataRequest::default()
+            .with_topics(Some(vec![MetadataRequestTopic::default()
+                .with_name(Some(TopicName(StrBytes::from_static_str(name))))]))
+            .with_allow_auto_topic_creation(auto),
+    );
+    let response = recv::<MetadataResponse>(&mut stream, 12);
+    (
+        response.topics[0].error_code,
+        response.topics[0].partitions.len(),
+    )
+}
+
+#[test]
+fn metadata_creates_a_missing_topic_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = single(dir.path(), Opts::default().env("CAMUS_NUM_PARTITIONS", "3"));
+    let addr = kafka_addr(&node);
+    assert_eq!(metadata_for(&addr, "untouched", false), (3, 0));
+    assert_eq!(
+        metadata_for(&addr, "fresh", true).0,
+        5,
+        "LEADER_NOT_AVAILABLE first"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (code, partitions) = metadata_for(&addr, "fresh", true);
+        if code == 0 {
+            assert_eq!(partitions, 3);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never created: {code}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(metadata_for(&addr, "bad name", true).0, 17);
+}
+
+#[test]
+fn auto_create_can_be_turned_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = single(
+        dir.path(),
+        Opts::default().env("CAMUS_AUTO_CREATE_TOPICS", "false"),
+    );
+    let addr = kafka_addr(&node);
+    assert_eq!(metadata_for(&addr, "fresh", true), (3, 0));
 }
