@@ -1,0 +1,33 @@
+name: Bug
+description: The broker did something it should not.
+title: ""
+labels: ["bug"]
+body:
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: The request, the error code, and what the broker did.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit or image
+      description: The commit sha, or the image tag you ran.
+      placeholder: ghcr.io/nidheesh-m-vakharia/camus@sha256 or a commit
+    validations:
+      required: true
+  - type: textarea
+    id: client
+    attributes:
+      label: Client
+      description: Library and version, if a client was involved.
+    validations:
+      required: false
