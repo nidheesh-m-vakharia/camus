@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camus — a Kafka broker that stores the log in object storage</title>
+  <meta name="description" content="Camus is a Kafka-compatible broker in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html" aria-current="page">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">A Kafka broker that keeps the log in object storage.</h1>
+      </header>
+
+      <p class="lede" style="--n: 1">Producers, consumers, and admin clients speak the Kafka wire protocol. The durable log lives in Cloudflare R2, or any S3-compatible bucket. A small set of Rust binaries replicates metadata, and a short write-ahead log, with Raft.</p>
+      <h2>One process</h2>
+      <p>Camus is a single binary. It accepts Kafka TCP, writes record batches as objects, and keeps topics, groups, offsets, and transactions in a Raft group. A deployment does not add a JVM inside the broker, ZooKeeper, KRaft, or a separate database.</p>
+      <p>The brokers are the same program with different node ids. They agree on metadata through Raft. In the default durability mode they also replicate a short write-ahead log, so a produce can be acknowledged after a disk quorum. The object upload still happens. The write-ahead log is a buffer of seconds, then it is truncated.</p>
+      <h2>What you point a client at</h2>
+      <p>The bootstrap server. Compatibility is pinned to Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. Where a KIP and that tree disagree, the tree wins. The matrix of implemented APIs, and which client has actually passed each one, is in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a>.</p>
+      <p>Three clients have been run against the broker: kafka-clients 4.4.0, librdkafka through confluent-kafka 2.16.1, and franz-go v1.22.0. They produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the compatibility doc stays unmarked until that client has really passed the call.</p>
+      <h2>Where to go next</h2>
+      <ul>
+        <li><a href="run.html">Run</a> one broker with Docker, or from a checkout.</li>
+        <li><a href="minio.html">Give it a bucket</a> before you care about the sealed log.</li>
+        <li><a href="clients.html">Clients</a> lists what those libraries can do, and the differences that will surprise you.</li>
+        <li><a href="durability.html">Durability</a> is the choice between acknowledging on a disk quorum and acknowledging only after the object is stored.</li>
+      </ul>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bucket — Camus</title>
+  <meta name="description" content="Run MinIO from this repo and point Camus at the bucket.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html" aria-current="page">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">The broker's default bucket is a local MinIO.</h1>
+      </header>
+
+      <p class="lede">Defaults are <span class="ports">http://127.0.0.1:9100</span>, bucket <code>camus</code>, access key <code>camus</code>, secret <code>camus-dev-secret</code>. Override any of them when the bucket is not that.</p>
+      <h2>Why this image is built here</h2>
+      <p>Current community MinIO images are no longer published upstream. <code>deploy/minio</code> builds one from the archived release this repo pins. Compose names it <code>camus-minio</code> and uses it both for the server and for the one-shot that creates the bucket.</p>
+      <pre><code>docker compose up -d minio create-bucket</code></pre>
+      <p>The API is on <span class="ports">9100</span>, mapped to <span class="ports">9000</span> in the container. The console is on <span class="ports">9101</span>. <code>create-bucket</code> waits until MinIO answers, then creates <code>camus</code> if it is missing.</p>
+      <h2>What the broker reads</h2>
+      <p>Leave the variables unset and a broker on the host uses the defaults above. Set them when the endpoint, bucket, or keys differ.</p>
+      <ul>
+        <li><code>CAMUS_S3_ENDPOINT</code></li>
+        <li><code>CAMUS_S3_BUCKET</code></li>
+        <li><code>CAMUS_S3_ACCESS_KEY</code></li>
+        <li><code>CAMUS_S3_SECRET_KEY</code></li>
+      </ul>
+      <h2>From inside the Camus container</h2>
+      <p><span class="ports">127.0.0.1</span> inside the container is the container, not the host where MinIO is published. Point <code>CAMUS_S3_ENDPOINT</code> at the host, for example <code>http://host.docker.internal:9100</code>. On a shared Docker network the hostname is the compose service, <code>http://minio:9000</code>, because that name uses the container port rather than the published one.</p>
+      <p>Connecting does not dial the bucket at process start. The failure shows up when an upload or a read of a sealed object needs it. That is why a <a href="run.html">one-broker run</a> can look healthy and still lose the seal.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

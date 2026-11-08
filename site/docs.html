@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Docs — Camus</title>
+  <meta name="description" content="The plan, the ADRs, and the Kafka 4.4.0 compatibility matrix.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html" aria-current="page">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">The longer documents live in the repo.</h1>
+      </header>
+
+      <p class="lede">This site is the operating guide. The repo holds the decisions and the API matrix. Those stay next to the code because they change when an API is implemented.</p>
+      <h2>Plan</h2>
+      <p>The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/PLAN.md">plan</a> is what has been accepted, phase by phase. A later phase's API is not given a success path early. The plan is the list of what "done" required, including the client tests.</p>
+      <h2>ADRs</h2>
+      <p>The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr">ADRs</a> are the decisions: the wire protocol and the 4.4.0 pin, Raft, durability and acknowledgements, offsets, ACLs, and how a phase is allowed to ship. When this site and an ADR disagree, the ADR is the one that was accepted with the code.</p>
+      <h2>Compatibility</h2>
+      <p>The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> is the 4.4.0 pin and every API. A tested-client column stays empty until kafka-clients, librdkafka, or franz-go has actually passed that call. The summary of what those clients can do is on the <a href="clients.html">clients</a> page.</p>
+      <h2>Crates</h2>
+      <p>The workspace is <code>protocol</code>, <code>broker</code>, <code>raft</code>, <code>metadata</code>, <code>wal</code>, <code>storage</code>, <code>uploader</code>, <code>coordinator</code>, <code>compactor</code>, <code>cli</code>, and <code>engine-bench</code>. <code>camus-broker</code> is the binary you run. The uploader, coordinator, and compactor crates are part of that process. They are not empty placeholders.</p>
+      <p>Losing a majority of a write-ahead log shard is not a test failure you retry. It is <a href="recovery.html">recovery</a>, and it drops acknowledged data that was not sealed yet.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

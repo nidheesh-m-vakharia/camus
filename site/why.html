@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Why Camus exists</title>
+  <meta name="description" content="Camus keeps the Kafka protocol and moves the long-term log to object storage.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html" aria-current="page">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">Kafka clients are already everywhere. The log does not have to live on broker disks.</h1>
+      </header>
+
+      <p class="lede">The protocol is the part worth keeping. The disk layout, the JVM, and a separate coordination service are the part that is expensive to operate. Camus speaks the wire protocol and stores the long-term log in object storage.</p>
+      <h2>What stays</h2>
+      <p>Producers, consumers, and admin tools keep working by changing the bootstrap address. The broker accepts the Kafka request framing those clients already send. It does not ask you to adopt a new client SDK.</p>
+      <p>That compatibility is pinned, not aspirational. The reference is the Apache Kafka 4.4.0 tree. A later KIP does not override that tree. Unimplemented APIs return a Kafka error. They do not pretend to succeed.</p>
+      <h2>What moves</h2>
+      <p>Record batches that have been sealed live as objects in Cloudflare R2, or in any S3-compatible bucket. MinIO is the local stand-in. The broker does not keep a full replica of the log on its own disk in the long run.</p>
+      <p>Metadata is different from the log. Topics, group membership, committed offsets, and transaction ranges have to be agreed quickly and exactly. Those live in a Raft group, encoded so that every broker applies the same commands in the same order.</p>
+      <h2>Why there is still a write-ahead log</h2>
+      <p>Waiting for an object upload on every produce makes acknowledgements as slow as the bucket. The default <code>wal</code> mode replicates a short log to a majority of a shard, fsyncs it, and acknowledges then. The upload follows. Once the range is sealed, that slice of the write-ahead log is truncated. It is a buffer, not the system of record.</p>
+      <p>The other mode, <code>r2</code>, skips that buffer. The produce is acknowledged only after the object is stored and the metadata group has committed the offsets. Brokers in that mode hold no log bytes. You take that trade when you would rather wait on the bucket than keep a local log. Both modes are described on the <a href="durability.html">durability</a> page.</p>
+      <h2>What a deployment looks like</h2>
+      <p>A handful of copies of the same binary. One of them can run alone, which is the Docker image: it listens, then forms a one-node group by itself. Three of them, started with <a href="brokers.html">the brokers profile</a>, elect a leader and keep accepting metadata writes after that leader is gone.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

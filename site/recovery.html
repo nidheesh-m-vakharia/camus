@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recovery — Camus</title>
+  <meta name="description" content="truncate-to-sealed resumes a write-ahead log shard that has lost a majority, and drops unsealed acknowledgements.">
+  <link rel="preload" href="fonts/Kecal-variable-web.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html" aria-current="page">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">A shard that has lost a majority does not catch up on its own.</h1>
+      </header>
+
+      <p class="lede"><code>camus admin truncate-to-sealed</code> resumes a write-ahead log shard at its sealed end. Acknowledged batches that were not sealed yet are dropped. The flag is <code>--i-accept-data-loss</code>.</p>
+      <h2>When you need it</h2>
+      <p>A <code>wal</code> produce is acknowledged after a majority of the shard has fsynced the batch. If that majority is gone, the shard cannot confirm the tail. The sealed objects in the bucket are the prefix that is still known. The command moves the shard forward to that prefix and discards the rest.</p>
+      <p>This is not the three-broker failover on the <a href="brokers.html">brokers</a> page. There, one process dies and a remaining majority still commits. Here, the majority of a log shard is gone. Waiting does not rebuild it.</p>
+      <h2>How you run it</h2>
+      <pre><code>camus admin truncate-to-sealed \
+  --broker 127.0.0.1:18080 \
+  --i-accept-data-loss</code></pre>
+      <p>The broker flag is the HTTP admin address of a surviving voter, not the Kafka port. The command posts <code>/admin/truncate-to-sealed</code>. Without <code>--i-accept-data-loss</code> it will not do the work. There is no quieter flag that keeps the unsealed acknowledgements, because those bytes are what the lost majority was holding.</p>
+      <p>After it returns, producers can append again from the sealed end. Consumers should not expect the offsets that were acknowledged and then dropped. Those records are not in the bucket and not on the shard.</p>
+
+      <footer>
+        <p>License Apache-2.0. Kecal is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2024 Jiří Krblich, and the Instrument Sans project authors.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>
