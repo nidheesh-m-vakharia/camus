@@ -18,6 +18,7 @@ async fn put_range_and_delete() {
         region: "us-east-1".into(),
         access_key: "camus".into(),
         secret_key: "camus-dev-secret".into(),
+        virtual_hosted: false,
     })
     .unwrap();
 

@@ -49,7 +49,11 @@ The bucket defaults to MinIO at `http://127.0.0.1:9100`, bucket `camus`,
 keys `camus` / `camus-dev-secret`. Override with `CAMUS_S3_ENDPOINT`,
 `CAMUS_S3_BUCKET`, `CAMUS_S3_ACCESS_KEY`, and `CAMUS_S3_SECRET_KEY`. A
 container does not see MinIO on the host at `127.0.0.1`; point
-`CAMUS_S3_ENDPOINT` at the host.
+`CAMUS_S3_ENDPOINT` at the host. `CAMUS_S3_REGION` defaults to `us-east-1`.
+Set `CAMUS_S3_VIRTUAL_HOST=1` for a virtual-hosted endpoint such as a
+Railway Bucket. `CAMUS_ADVERTISED_HOST` and `CAMUS_ADVERTISED_PORT` are
+the address clients should dial. On Railway those fall back to
+`RAILWAY_TCP_PROXY_DOMAIN` and `RAILWAY_TCP_PROXY_PORT`.
 
 `GET /admin/metrics` returns JSON, including `current_leader` and
 `wal_leader`. `GET /metrics` is Prometheus.
@@ -58,6 +62,25 @@ Three brokers plus MinIO: `docker compose --profile brokers up`. The image
 is published from `main` to `ghcr.io/<owner>/camus`, tagged `latest` and
 the commit sha, after the test workflow passes. The GitHub package stays
 private until you change that in the package settings.
+
+## Railway
+
+`.railway/railway.ts` is one broker from this repo, a volume at `/data`,
+a Railway Bucket named `logs` for sealed extents, and a public TCP proxy
+on 9092. The Kafka listener is PLAINTEXT. Admin HTTP listens on Railway's
+`PORT` and stays off the public internet. `GET /health` is the healthcheck.
+
+```
+npm install --prefix .railway
+railway login
+railway link
+railway config plan
+railway config apply
+```
+
+Bootstrap servers are `RAILWAY_TCP_PROXY_DOMAIN:RAILWAY_TCP_PROXY_PORT`.
+The bucket variables are references to `logs`, so credentials stay in
+Railway.
 
 ## What clients can do
 
