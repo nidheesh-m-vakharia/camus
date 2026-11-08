@@ -1,0 +1,18 @@
+name: Feature
+description: A Kafka behavior or operational change you want.
+title: ""
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+    validations:
+      required: true
+  - type: textarea
+    id: kafka
+    attributes:
+      label: How Kafka does this
+      description: The API, config, or client behavior you are comparing with. Leave blank if this is not a Kafka difference.
+    validations:
+      required: false
