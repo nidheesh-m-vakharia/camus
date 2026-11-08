@@ -1,6 +1,7 @@
 //! Log compaction. The latest record for each key is kept at its original
 //! offset. A null value is a tombstone and replaces every earlier value of
-//! that key. Tombstones are kept; `delete.retention.ms` is not applied.
+//! that key. A tombstone older than the caller's cutoff
+//! (`delete.retention.ms`) is dropped as well, and its key with it.
 //!
 //! Records are rebuilt with [`crate::records::RecordBatchEncoder`], so a
 //! batch's base offset and last-offset delta still name the surviving
@@ -17,7 +18,13 @@ use crate::records::{Compression, Record, RecordBatchEncoder, RecordEncodeOption
 /// `None` means every keyed record is already the latest one, so a rewrite
 /// would not drop anything. Control records are not part of the key index.
 pub fn plan(records: &[Record]) -> Option<Vec<Record>> {
-    let kept = retain(records);
+    plan_expiring(records, i64::MIN)
+}
+
+/// Like [`plan`], also dropping tombstones whose timestamp is before
+/// `tombstones_before`. `Some(empty)` means nothing survives.
+pub fn plan_expiring(records: &[Record], tombstones_before: i64) -> Option<Vec<Record>> {
+    let kept = retain_expiring(records, tombstones_before);
     let comparable = records.iter().filter(|record| !record.control).count();
     if kept.len() == comparable {
         None
@@ -28,6 +35,10 @@ pub fn plan(records: &[Record]) -> Option<Vec<Record>> {
 
 /// Latest record per key, plus any record that has no key, in offset order.
 pub fn retain(records: &[Record]) -> Vec<Record> {
+    retain_expiring(records, i64::MIN)
+}
+
+fn retain_expiring(records: &[Record], tombstones_before: i64) -> Vec<Record> {
     let mut latest: BTreeMap<Vec<u8>, Record> = BTreeMap::new();
     let mut unkeyed = Vec::new();
     for record in records {
@@ -41,7 +52,10 @@ pub fn retain(records: &[Record]) -> Vec<Record> {
             None => unkeyed.push(record.clone()),
         }
     }
-    let mut out: Vec<Record> = latest.into_values().collect();
+    let mut out: Vec<Record> = latest
+        .into_values()
+        .filter(|record| record.value.is_some() || record.timestamp >= tombstones_before)
+        .collect();
     out.append(&mut unkeyed);
     out.sort_by_key(|record| record.offset);
     out
@@ -121,6 +135,22 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].offset, 1);
         assert!(kept[0].value.is_none());
+    }
+
+    #[test]
+    fn an_old_tombstone_is_dropped_with_its_key() {
+        let records = vec![
+            record(0, b"a", Some(b"1")),
+            record(1, b"a", None),
+            record(5, b"b", None),
+        ];
+        // Timestamps equal offsets here: the tombstone at 1 is older than 3,
+        // the one at 5 is not.
+        let kept = plan_expiring(&records, 3).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].offset, 5);
+        let none = plan_expiring(&records[..2], 3).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]

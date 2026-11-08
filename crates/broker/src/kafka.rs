@@ -154,7 +154,8 @@ pub struct Kafka {
     port: i32,
     flush_ms: u64,
     /// How often to compact sealed extents of `cleanup.policy=compact` topics.
-    /// `0` leaves compaction off.
+    /// `0` turns compaction off. Kafka's cleaner is on by default, and so is
+    /// this.
     compact_ms: u64,
     /// `wal.disk.limit`: unsealed bytes past which produce is held.
     wal_limit: u64,
@@ -275,7 +276,7 @@ impl Kafka {
         let compact_ms = std::env::var("CAMUS_COMPACT_MS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(300_000);
         let store = Arc::new(groups::MetadataStore {
             node: Arc::clone(&node),
         });
@@ -792,13 +793,27 @@ impl Kafka {
         let Some(state) = self.partition_state(topic, partition) else {
             return;
         };
-        if state.extents.is_empty() {
+        // `min.compaction.lag.ms`: only the leading extents whose newest
+        // record is at least that old are compacted.
+        let now = txn::now_ms();
+        let lag = topic.config_i64("min.compaction.lag.ms");
+        let eligible: Vec<&camus_metadata::Extent> = state
+            .extents
+            .iter()
+            .take_while(|extent| now.saturating_sub(extent.max_timestamp) >= lag)
+            .collect();
+        let Some(last) = eligible.last() else {
             return;
-        }
+        };
+        let covered_end = last.end;
+        let tombstones_before = now.saturating_sub(topic.config_i64("delete.retention.ms"));
         let mut records = Vec::new();
         let mut base_timestamp = i64::MAX;
         let mut max_timestamp = i64::MIN;
-        for extent in &state.extents {
+        for extent in eligible {
+            if extent.length == 0 {
+                continue;
+            }
             let end = extent.file_offset + u64::from(extent.length);
             let Ok(bytes) = self
                 .bucket
@@ -834,24 +849,27 @@ impl Kafka {
                 }
             }
         }
-        let Some(kept) = camus_protocol::compact::plan(&records) else {
+        let Some(kept) = camus_protocol::compact::plan_expiring(&records, tombstones_before) else {
             return;
         };
-        let Ok(body) = camus_protocol::compact::rebuild(&kept) else {
-            return;
+        // When nothing survives, the prefix becomes an extent with no
+        // object and no bytes. The log start stays where it is, as Kafka's
+        // cleaner leaves it, and a fetch there moves on to the next record.
+        let (object_key, length) = if kept.is_empty() {
+            (String::new(), 0)
+        } else {
+            let Ok(body) = camus_protocol::compact::rebuild(&kept) else {
+                return;
+            };
+            let Ok(length) = u32::try_from(body.len()) else {
+                return;
+            };
+            let object_key = camus_uploader::object_key();
+            if self.bucket.put_new(&object_key, body).await.is_err() {
+                return;
+            }
+            (object_key, length)
         };
-        let Ok(length) = u32::try_from(body.len()) else {
-            return;
-        };
-        let covered_end = state
-            .extents
-            .last()
-            .map(|extent| extent.end)
-            .unwrap_or(state.next_offset);
-        let object_key = camus_uploader::object_key();
-        if self.bucket.put_new(&object_key, body).await.is_err() {
-            return;
-        }
         if base_timestamp == i64::MAX {
             base_timestamp = 0;
             max_timestamp = 0;
@@ -2564,7 +2582,8 @@ impl Kafka {
             let mut out = BytesMut::new();
             let mut stopped = false;
             'extents: for extent in &state.extents {
-                if extent.end <= offset {
+                // A compacted range whose records all expired has no bytes.
+                if extent.end <= offset || extent.length == 0 {
                     continue;
                 }
                 let end = extent.file_offset + u64::from(extent.length);
@@ -2722,7 +2741,7 @@ impl Kafka {
             return row;
         }
         for extent in &state.extents {
-            if extent.max_timestamp < timestamp {
+            if extent.max_timestamp < timestamp || extent.length == 0 {
                 continue;
             }
             let end = extent.file_offset + u64::from(extent.length);

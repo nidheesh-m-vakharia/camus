@@ -35,7 +35,7 @@ Until then the API returns an error rather than a partial imitation.
 | `DeleteRecords` midpoint | Advances to the next whole-object boundary | Can split a segment | 0010 |
 | Idempotence | `InitProducerId` allocates a producer id. A retried sequence returns the original offset and is not appended | Supported | 0009 |
 | Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. There is no control-batch marker | Control batches plus `read_committed` | 0013 |
-| Compaction | Latest key, original offset, sealed extents only. Tombstones stay. No dirty-ratio cleaner | `UnifiedLog` cleaner, `delete.retention.ms` | 0010 |
+| Compaction | Latest key, original offset, sealed extents only, on a timer rather than a dirty ratio. A tombstone's `delete.retention.ms` counts from its own timestamp | `LogCleaner` by dirty ratio; tombstone horizon counts from the first cleaning (KIP-534) | 0010 |
 | ACLs | A resource with no ACL is denied when SASL is on and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
@@ -95,9 +95,14 @@ current epoch or the previous one. The Java client's default remains
 after the requested offset, and the response low watermark is that offset.
 An offset past the sealed end is `OFFSET_OUT_OF_RANGE` (1), including
 records that are still only in the WAL. `cleanup.policy=compact` keeps the
-latest record for each key at its original offset. Compaction runs on
-sealed extents when `CAMUS_COMPACT_MS` is set; the unsealed tail is left
-alone, tombstones are kept (`delete.retention.ms` is not applied), and a
+latest record for each key at its original offset. Compaction runs every
+`CAMUS_COMPACT_MS` (default 300000; `0` turns it off) over the leading sealed
+extents whose newest record is at least `min.compaction.lag.ms` old; the
+unsealed tail is left alone. A tombstone whose timestamp is older than
+`delete.retention.ms` (default 86400000) is removed with its key. Kafka starts
+that clock at the tombstone's first cleaning, so Camus can remove one sooner
+than Kafka would. A compacted range with nothing left keeps its offsets and the
+log start does not move, as in Kafka. A
 record with no key is `INVALID_RECORD` (87), as in Kafka. `CreatePartitions`
 and `CreateTopics` reject an explicit replica assignment. A classic group that still has members refuses `OffsetDelete` with
 `GROUP_SUBSCRIBED_TO_TOPIC` (86).
@@ -297,8 +302,7 @@ franz-go call non-incremental `AlterConfigs`; the Java 4.4 admin client has
 no such method. Java and franz-go call `DescribeTransactions` and
 `ListTransactions`. librdkafka has no transaction-admin API and no
 `OffsetDelete` method in the installed client. franz-go has no
-`DescribeCluster` method. Compaction still runs only on sealed extents when
-`CAMUS_COMPACT_MS` is set.
+`DescribeCluster` method.
 
 Produce requests at version 13 and above name the topic by id. The Python and
 Go tests skip when their toolchain is not installed under `target/`.
