@@ -36,7 +36,7 @@ Until then the API returns an error rather than a partial imitation.
 | Idempotence | `InitProducerId` allocates a producer id. A retried sequence returns the original offset and is not appended | Supported | 0009 |
 | Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. There is no control-batch marker | Control batches plus `read_committed` | 0013 |
 | Compaction | Latest key, original offset, sealed extents only. Tombstones stay. No dirty-ratio cleaner | `UnifiedLog` cleaner, `delete.retention.ms` | 0010 |
-| ACLs | A resource with no ACL is allowed. `DENY` beats `ALLOW`. Only host `*` matches. Produce and fetch return 29 | Default deny when no ACL exists. Any client host | 0012 |
+| ACLs | A resource with no ACL is denied when SASL is on and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
 
@@ -101,7 +101,23 @@ alone, tombstones are kept (`delete.retention.ms` is not applied), and a
 record with no key is `INVALID_RECORD` (87), as in Kafka. `CreatePartitions`
 and `CreateTopics` reject an explicit replica assignment. A classic group that still has members refuses `OffsetDelete` with
 `GROUP_SUBSCRIBED_TO_TOPIC` (86).
-JoinGroup reports the client host as `/unknown`.
+JoinGroup records the client host as `/<ip>`, as Kafka does.
+
+Every implemented API is authorized as Kafka's `KafkaApis` does it, with the
+same resource, operation, and error: `TOPIC_AUTHORIZATION_FAILED` (29),
+`GROUP_AUTHORIZATION_FAILED` (30), `CLUSTER_AUTHORIZATION_FAILED` (31), or
+`TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53). A matching `DENY` wins; an
+`ALLOW` must match the principal and the client's IP, or `*`; `READ`, `WRITE`,
+`DELETE`, and `ALTER` imply `DESCRIBE`, and `ALTER_CONFIGS` implies
+`DESCRIBE_CONFIGS`. A resource no ACL names follows
+`CAMUS_ACL_ALLOW_IF_NO_ACL` (Kafka's `allow.everyone.if.no.acl.found`), which
+defaults to `false` when SASL is required and `true` on the dev PLAINTEXT
+listener, where every client is `User:ANONYMOUS`. `CAMUS_SUPER_USERS` is
+Kafka's `super.users`, a `;`-separated principal list; the SASL user from
+`CAMUS_SASL_USER` is always a super user, so a new cluster can create its
+first ACLs. A broker serving TLS refuses to start unless `CAMUS_S3_ENDPOINT`,
+`CAMUS_S3_BUCKET`, `CAMUS_S3_ACCESS_KEY`, and `CAMUS_S3_SECRET_KEY` are set;
+the MinIO defaults apply only with `--dev-plaintext`.
 
 Topic configs are the same for `CreateTopics`, `AlterConfigs`, and
 `IncrementalAlterConfigs`, and are listed in `crates/metadata/src/config.rs`
@@ -282,7 +298,7 @@ no such method. Java and franz-go call `DescribeTransactions` and
 `ListTransactions`. librdkafka has no transaction-admin API and no
 `OffsetDelete` method in the installed client. franz-go has no
 `DescribeCluster` method. Compaction still runs only on sealed extents when
-`CAMUS_COMPACT_MS` is set, and an ACL host other than `*` does not match.
+`CAMUS_COMPACT_MS` is set.
 
 Produce requests at version 13 and above name the topic by id. The Python and
 Go tests skip when their toolchain is not installed under `target/`.

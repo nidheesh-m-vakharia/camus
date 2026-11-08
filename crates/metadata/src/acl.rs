@@ -1,10 +1,12 @@
-//! Topic, group, and cluster ACLs.
+//! Topic, group, and cluster ACLs, evaluated as Kafka's authorizer does.
 //!
-//! A resource with no matching ACL is allowed. That is Kafka's
-//! `allow.everyone.if.no.acl.found`. Once any ACL names the resource, a
-//! matching `DENY` wins, then a matching `ALLOW`, and anything else is
-//! denied. Hosts other than `*` are stored but do not match; the broker
-//! does not know the client address.
+//! A `DENY` that matches the principal, the client host, and the operation
+//! (or `ALL`) wins. A resource that no ACL names at all is allowed only when
+//! `allow_if_none` is set, which is Kafka's `allow.everyone.if.no.acl.found`.
+//! Otherwise an `ALLOW` must match the principal, the host, and the
+//! operation or one that implies it: `READ`, `WRITE`, `DELETE`, and `ALTER`
+//! imply `DESCRIBE`, and `ALTER_CONFIGS` implies `DESCRIBE_CONFIGS`. Super
+//! users are the broker's decision and never reach this module.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +19,6 @@ const WRITE: i8 = 4;
 const DELETE: i8 = 6;
 const ALTER: i8 = 7;
 const DESCRIBE: i8 = 8;
-const CLUSTER_ACTION: i8 = 9;
 const DESCRIBE_CONFIGS: i8 = 10;
 const ALTER_CONFIGS: i8 = 11;
 const DENY: i8 = 2;
@@ -100,13 +101,10 @@ fn grants(acl_operation: i8, needed: i8) -> bool {
         return true;
     }
     if needed == DESCRIBE {
-        return matches!(
-            acl_operation,
-            READ | WRITE | DELETE | ALTER | CLUSTER_ACTION
-        );
+        return matches!(acl_operation, READ | WRITE | DELETE | ALTER);
     }
     if needed == DESCRIBE_CONFIGS {
-        return matches!(acl_operation, DESCRIBE | ALTER_CONFIGS);
+        return acl_operation == ALTER_CONFIGS;
     }
     false
 }
@@ -115,34 +113,40 @@ fn principal_matches(binding: &Binding, principal: &str) -> bool {
     binding.principal == principal || binding.principal == "User:*"
 }
 
+fn host_matches(binding: &Binding, host: &str) -> bool {
+    binding.host == "*" || binding.host == host
+}
+
 /// `true` when `principal` may perform `operation` on the resource.
 ///
 /// `raw` is the stored JSON array, or `None` when nothing has been written.
+/// `host` is the client's IP address as text.
 pub fn allows(
     raw: Option<&str>,
     principal: &str,
+    host: &str,
     resource_type: i8,
     name: &str,
     operation: i8,
+    allow_if_none: bool,
 ) -> bool {
     let Ok(acls) = load(raw.map(str::to_string)) else {
         return false;
     };
-    let matched: Vec<_> = acls
+    let named: Vec<_> = acls
         .iter()
-        .filter(|binding| resource_matches(binding, resource_type, name) && binding.host == "*")
+        .filter(|binding| resource_matches(binding, resource_type, name))
         .collect();
-    if matched.is_empty() {
-        return true;
+    if named.is_empty() {
+        return allow_if_none;
     }
-    let mine: Vec<_> = matched
+    let mine: Vec<_> = named
         .into_iter()
-        .filter(|binding| principal_matches(binding, principal))
+        .filter(|binding| principal_matches(binding, principal) && host_matches(binding, host))
         .collect();
-    if mine
-        .iter()
-        .any(|binding| binding.permission == DENY && grants(binding.operation, operation))
-    {
+    if mine.iter().any(|binding| {
+        binding.permission == DENY && (binding.operation == ALL || binding.operation == operation)
+    }) {
         return false;
     }
     mine.iter()
@@ -275,21 +279,116 @@ mod tests {
         }
     }
 
+    const HOST: &str = "10.0.0.1";
+    const CLUSTER_ACTION: i8 = 9;
+
+    fn check(raw: Option<&str>, principal: &str, name: &str, operation: i8) -> bool {
+        allows(raw, principal, HOST, 2, name, operation, false)
+    }
+
     #[test]
-    fn no_acl_allows_and_a_deny_beats_an_allow() {
-        assert!(allows(None, "User:ANONYMOUS", 2, "orders", WRITE));
+    fn no_acl_follows_allow_if_none() {
+        assert!(allows(
+            None,
+            "User:ANONYMOUS",
+            HOST,
+            2,
+            "orders",
+            WRITE,
+            true
+        ));
+        assert!(!allows(
+            None,
+            "User:ANONYMOUS",
+            HOST,
+            2,
+            "orders",
+            WRITE,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_deny_beats_an_allow() {
         let mut stored = vec![allow_write()];
         let raw = serde_json::to_string(&stored).unwrap();
-        assert!(allows(Some(&raw), "User:ANONYMOUS", 2, "orders", WRITE));
-        assert!(allows(Some(&raw), "User:ANONYMOUS", 2, "orders", DESCRIBE));
-        assert!(!allows(Some(&raw), "User:ANONYMOUS", 2, "orders", READ));
-        assert!(allows(Some(&raw), "User:ANONYMOUS", 2, "other", READ));
+        assert!(check(Some(&raw), "User:ANONYMOUS", "orders", WRITE));
+        assert!(check(Some(&raw), "User:ANONYMOUS", "orders", DESCRIBE));
+        assert!(!check(Some(&raw), "User:ANONYMOUS", "orders", READ));
+        assert!(!check(Some(&raw), "User:ANONYMOUS", "other", READ));
         stored.push(Binding {
             permission: DENY,
             ..allow_write()
         });
         let raw = serde_json::to_string(&stored).unwrap();
-        assert!(!allows(Some(&raw), "User:ANONYMOUS", 2, "orders", WRITE));
+        assert!(!check(Some(&raw), "User:ANONYMOUS", "orders", WRITE));
+    }
+
+    #[test]
+    fn a_deny_does_not_spread_to_implied_operations() {
+        let stored = vec![
+            Binding {
+                operation: ALL,
+                ..allow_write()
+            },
+            Binding {
+                operation: READ,
+                permission: DENY,
+                ..allow_write()
+            },
+        ];
+        let raw = serde_json::to_string(&stored).unwrap();
+        assert!(!check(Some(&raw), "User:ANONYMOUS", "orders", READ));
+        assert!(check(Some(&raw), "User:ANONYMOUS", "orders", DESCRIBE));
+    }
+
+    #[test]
+    fn a_host_acl_matches_only_that_client() {
+        let stored = vec![Binding {
+            host: HOST.into(),
+            ..allow_write()
+        }];
+        let raw = serde_json::to_string(&stored).unwrap();
+        assert!(allows(
+            Some(&raw),
+            "User:ANONYMOUS",
+            HOST,
+            2,
+            "orders",
+            WRITE,
+            true
+        ));
+        assert!(!allows(
+            Some(&raw),
+            "User:ANONYMOUS",
+            "10.0.0.2",
+            2,
+            "orders",
+            WRITE,
+            true
+        ));
+    }
+
+    #[test]
+    fn implied_describe_operations_follow_kafka() {
+        for (granted, needed, allowed) in [
+            (READ, DESCRIBE, true),
+            (ALTER, DESCRIBE, true),
+            (CLUSTER_ACTION, DESCRIBE, false),
+            (ALTER_CONFIGS, DESCRIBE_CONFIGS, true),
+            (DESCRIBE, DESCRIBE_CONFIGS, false),
+        ] {
+            let stored = vec![Binding {
+                operation: granted,
+                ..allow_write()
+            }];
+            let raw = serde_json::to_string(&stored).unwrap();
+            assert_eq!(
+                check(Some(&raw), "User:ANONYMOUS", "orders", needed),
+                allowed,
+                "{granted} for {needed}"
+            );
+        }
     }
 
     #[test]
@@ -300,7 +399,7 @@ mod tests {
             ..allow_write()
         }];
         let raw = serde_json::to_string(&stored).unwrap();
-        assert!(allows(Some(&raw), "User:ANONYMOUS", 2, "orders", WRITE));
-        assert!(!allows(Some(&raw), "User:bob", 2, "orders", WRITE));
+        assert!(check(Some(&raw), "User:ANONYMOUS", "orders", WRITE));
+        assert!(!check(Some(&raw), "User:bob", "orders", WRITE));
     }
 }

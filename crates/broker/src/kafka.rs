@@ -188,6 +188,11 @@ pub struct Kafka {
     /// `max.message.bytes`. Kafka's default, 1048588.
     message_max_bytes: usize,
     require_sasl: bool,
+    /// Kafka's `super.users`. The SASL user from the environment is always one,
+    /// so a new cluster has someone who may create the first ACLs.
+    super_users: std::collections::BTreeSet<String>,
+    /// Kafka's `allow.everyone.if.no.acl.found`.
+    allow_if_no_acl: bool,
     sasl_user: String,
     sasl_pass: String,
     tls: Option<TlsAcceptor>,
@@ -235,6 +240,25 @@ impl Kafka {
         let sweep_ms = env_ms("CAMUS_SWEEP_MS", 300_000);
         let sweep_min_age_ms = env_ms("CAMUS_SWEEP_MIN_AGE_MS", 3_600_000) as i64;
         let sweep_delay_ms = env_ms("CAMUS_FILE_DELETE_DELAY_MS", 60_000) as i64;
+        // Kafka's `super.users` is a semicolon-separated principal list.
+        let mut super_users: std::collections::BTreeSet<String> =
+            std::env::var("CAMUS_SUPER_USERS")
+                .unwrap_or_default()
+                .split(';')
+                .map(str::trim)
+                .filter(|principal| !principal.is_empty())
+                .map(str::to_string)
+                .collect();
+        if require_sasl && !sasl_user.is_empty() {
+            super_users.insert(format!("User:{sasl_user}"));
+        }
+        // Without SASL every client is `User:ANONYMOUS`, as on a Kafka
+        // listener with no authorizer, so a resource no ACL names stays open.
+        let allow_if_no_acl = match std::env::var("CAMUS_ACL_ALLOW_IF_NO_ACL").ok().as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => !require_sasl,
+        };
         let txn_max_timeout_ms = env_ms("CAMUS_TXN_MAX_TIMEOUT_MS", 900_000) as i64;
         let txn_abort_interval_ms = env_ms("CAMUS_TXN_ABORT_INTERVAL_MS", 10_000);
         let txn_id_expiration_ms =
@@ -279,6 +303,8 @@ impl Kafka {
             default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
                 .unwrap_or_else(|_| "wal".into()),
             require_sasl,
+            super_users,
+            allow_if_no_acl,
             sasl_user,
             sasl_pass,
             tls,
@@ -956,7 +982,7 @@ impl Kafka {
             }
         });
         loop {
-            let Ok((tcp, _)) = listener.accept().await else {
+            let Ok((tcp, peer)) = listener.accept().await else {
                 break;
             };
             let _ = tcp.set_nodelay(true);
@@ -973,13 +999,16 @@ impl Kafka {
                 } else {
                     Socket::Plain(tcp)
                 };
-                let _ = kafka.connection(socket).await;
+                let _ = kafka.connection(socket, peer.ip().to_string()).await;
             });
         }
     }
 
-    async fn connection(&self, mut socket: Socket) -> anyhow::Result<()> {
-        let mut authed = !self.require_sasl;
+    async fn connection(&self, mut socket: Socket, host: String) -> anyhow::Result<()> {
+        let mut session = Session {
+            authed: !self.require_sasl,
+            host,
+        };
         loop {
             let mut size_buf = [0u8; 4];
             if socket.read_exact(&mut size_buf).await.is_err() {
@@ -993,7 +1022,7 @@ impl Kafka {
             if socket.read_exact(&mut body).await.is_err() {
                 break;
             }
-            match self.handle(&body, &mut authed).await {
+            match self.handle(&body, &mut session).await {
                 Reply::Frame(frame) => {
                     if socket.write_all(&frame).await.is_err() {
                         break;
@@ -1006,7 +1035,7 @@ impl Kafka {
         Ok(())
     }
 
-    async fn handle(&self, body: &[u8], authed: &mut bool) -> Reply {
+    async fn handle(&self, body: &[u8], session: &mut Session) -> Reply {
         let mut buf = Bytes::copy_from_slice(body);
         let header = match decode_request_header_from_buffer(&mut buf) {
             Ok(header) => header,
@@ -1026,57 +1055,65 @@ impl Kafka {
             key,
             ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate
         );
-        if self.require_sasl && !(*authed) && !allowed_before_auth {
+        if self.require_sasl && !session.authed && !allowed_before_auth {
             return self.illegal_sasl(key, version, header.correlation_id);
         }
         if !frame::is_implemented(key, version) {
             return unsupported(key, version, header.correlation_id);
         }
-        let principal = self.principal(*authed);
+        let caller = Caller {
+            principal: self.principal(session.authed),
+            host: session.host.clone(),
+        };
         match key {
             ApiKey::ApiVersions => self.api_versions(&header, &mut buf),
-            ApiKey::Metadata => self.metadata(&header, &mut buf).await,
-            ApiKey::CreateTopics => self.create_topics(&header, &mut buf, &principal).await,
-            ApiKey::DeleteTopics => self.delete_topics(&header, &mut buf, &principal).await,
-            ApiKey::DescribeConfigs => self.describe_configs(&header, &mut buf),
-            ApiKey::Produce => self.produce(&header, &mut buf, &principal).await,
-            ApiKey::Fetch => self.fetch(&header, &mut buf, &principal).await,
-            ApiKey::ListOffsets => self.list_offsets(&header, &mut buf).await,
+            ApiKey::Metadata => self.metadata(&header, &mut buf, &caller).await,
+            ApiKey::CreateTopics => self.create_topics(&header, &mut buf, &caller).await,
+            ApiKey::DeleteTopics => self.delete_topics(&header, &mut buf, &caller).await,
+            ApiKey::DescribeConfigs => self.describe_configs(&header, &mut buf, &caller),
+            ApiKey::Produce => self.produce(&header, &mut buf, &caller).await,
+            ApiKey::Fetch => self.fetch(&header, &mut buf, &caller).await,
+            ApiKey::ListOffsets => self.list_offsets(&header, &mut buf, &caller).await,
             ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf),
-            ApiKey::SaslAuthenticate => self.sasl_authenticate(&header, &mut buf, authed),
-            ApiKey::FindCoordinator => self.find_coordinator(&header, &mut buf).await,
-            ApiKey::JoinGroup => self.join_group(&header, &mut buf).await,
-            ApiKey::SyncGroup => self.sync_group(&header, &mut buf).await,
-            ApiKey::Heartbeat => self.heartbeat(&header, &mut buf).await,
-            ApiKey::LeaveGroup => self.leave_group(&header, &mut buf).await,
-            ApiKey::OffsetCommit => self.offset_commit(&header, &mut buf).await,
-            ApiKey::OffsetFetch => self.offset_fetch(&header, &mut buf).await,
-            ApiKey::ListGroups => self.list_groups(&header, &mut buf).await,
-            ApiKey::DescribeGroups => self.describe_groups(&header, &mut buf).await,
-            ApiKey::DeleteGroups => self.delete_groups(&header, &mut buf).await,
-            ApiKey::InitProducerId => self.init_producer_id(&header, &mut buf).await,
-            ApiKey::CreatePartitions => self.create_partitions(&header, &mut buf).await,
-            ApiKey::AlterConfigs => self.alter_configs(&header, &mut buf).await,
-            ApiKey::IncrementalAlterConfigs => {
-                self.incremental_alter_configs(&header, &mut buf).await
+            ApiKey::SaslAuthenticate => {
+                self.sasl_authenticate(&header, &mut buf, &mut session.authed)
             }
-            ApiKey::DeleteRecords => self.delete_records(&header, &mut buf).await,
-            ApiKey::OffsetDelete => self.offset_delete(&header, &mut buf).await,
-            ApiKey::DescribeCluster => self.describe_cluster(&header, &mut buf),
-            ApiKey::AddPartitionsToTxn => self.add_partitions_to_txn(&header, &mut buf).await,
-            ApiKey::AddOffsetsToTxn => self.add_offsets_to_txn(&header, &mut buf).await,
-            ApiKey::TxnOffsetCommit => self.txn_offset_commit(&header, &mut buf).await,
-            ApiKey::EndTxn => self.end_txn(&header, &mut buf).await,
-            ApiKey::DescribeTransactions => {
-                self.describe_transactions(&header, &mut buf, &principal)
+            ApiKey::FindCoordinator => self.find_coordinator(&header, &mut buf, &caller).await,
+            ApiKey::JoinGroup => self.join_group(&header, &mut buf, &caller).await,
+            ApiKey::SyncGroup => self.sync_group(&header, &mut buf, &caller).await,
+            ApiKey::Heartbeat => self.heartbeat(&header, &mut buf, &caller).await,
+            ApiKey::LeaveGroup => self.leave_group(&header, &mut buf, &caller).await,
+            ApiKey::OffsetCommit => self.offset_commit(&header, &mut buf, &caller).await,
+            ApiKey::OffsetFetch => self.offset_fetch(&header, &mut buf, &caller).await,
+            ApiKey::ListGroups => self.list_groups(&header, &mut buf, &caller).await,
+            ApiKey::DescribeGroups => self.describe_groups(&header, &mut buf, &caller).await,
+            ApiKey::DeleteGroups => self.delete_groups(&header, &mut buf, &caller).await,
+            ApiKey::InitProducerId => self.init_producer_id(&header, &mut buf, &caller).await,
+            ApiKey::CreatePartitions => self.create_partitions(&header, &mut buf, &caller).await,
+            ApiKey::AlterConfigs => self.alter_configs(&header, &mut buf, &caller).await,
+            ApiKey::IncrementalAlterConfigs => {
+                self.incremental_alter_configs(&header, &mut buf, &caller)
                     .await
             }
-            ApiKey::ListTransactions => self.list_transactions(&header, &mut buf, &principal).await,
-            ApiKey::DescribeAcls => self.describe_acls(&header, &mut buf, &principal).await,
-            ApiKey::CreateAcls => self.create_acls(&header, &mut buf, &principal).await,
-            ApiKey::DeleteAcls => self.delete_acls(&header, &mut buf, &principal).await,
+            ApiKey::DeleteRecords => self.delete_records(&header, &mut buf, &caller).await,
+            ApiKey::OffsetDelete => self.offset_delete(&header, &mut buf, &caller).await,
+            ApiKey::DescribeCluster => self.describe_cluster(&header, &mut buf, &caller),
+            ApiKey::AddPartitionsToTxn => {
+                self.add_partitions_to_txn(&header, &mut buf, &caller).await
+            }
+            ApiKey::AddOffsetsToTxn => self.add_offsets_to_txn(&header, &mut buf, &caller).await,
+            ApiKey::TxnOffsetCommit => self.txn_offset_commit(&header, &mut buf, &caller).await,
+            ApiKey::EndTxn => self.end_txn(&header, &mut buf, &caller).await,
+            ApiKey::DescribeTransactions => {
+                self.describe_transactions(&header, &mut buf, &caller).await
+            }
+            ApiKey::ListTransactions => self.list_transactions(&header, &mut buf, &caller).await,
+            ApiKey::DescribeAcls => self.describe_acls(&header, &mut buf, &caller).await,
+            ApiKey::CreateAcls => self.create_acls(&header, &mut buf, &caller).await,
+            ApiKey::DeleteAcls => self.delete_acls(&header, &mut buf, &caller).await,
             ApiKey::ConsumerGroupHeartbeat => {
-                self.consumer_group_heartbeat(&header, &mut buf).await
+                self.consumer_group_heartbeat(&header, &mut buf, &caller)
+                    .await
             }
             _ => unsupported(key, version, header.correlation_id),
         }
@@ -1113,10 +1150,13 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    async fn metadata(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    async fn metadata(&self, header: &RequestHeader, buf: &mut Bytes, caller: &Caller) -> Reply {
         let Ok(request) = MetadataRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
+        // Kafka leaves out topics the caller may not describe when it lists
+        // every topic, and reports them as unauthorized when they are named.
+        let listing = request.topics.is_none();
         let names = match request.topics {
             None => self.topic_names(),
             Some(topics) => topics
@@ -1143,7 +1183,14 @@ impl Kafka {
         response.controller_id = BrokerId(leader.unwrap_or(-1));
         response.brokers = self.broker_list();
         for name in names {
-            response.topics.push(self.metadata_topic(&name, leader));
+            if self.allows(caller, auth::TOPIC, &name, auth::DESCRIBE) {
+                response.topics.push(self.metadata_topic(&name, leader));
+            } else if !listing {
+                let mut denied = MetadataResponseTopic::default();
+                denied.name = Some(topic_name(&name));
+                denied.error_code = auth::TOPIC_FAILED;
+                response.topics.push(denied);
+            }
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
@@ -1231,16 +1278,30 @@ impl Kafka {
         }
     }
 
-    fn allows(&self, principal: &str, resource_type: i8, name: &str, operation: i8) -> bool {
+    /// Kafka's authorizer: super users may do anything; otherwise the ACLs
+    /// decide, and a resource no ACL names follows
+    /// `allow.everyone.if.no.acl.found`.
+    fn allows(&self, caller: &Caller, resource_type: i8, name: &str, operation: i8) -> bool {
+        if self.super_users.contains(&caller.principal) {
+            return true;
+        }
         let raw = self.node.read_local("acls").ok().flatten();
-        camus_metadata::acl_allows(raw.as_deref(), principal, resource_type, name, operation)
+        camus_metadata::acl_allows(
+            raw.as_deref(),
+            &caller.principal,
+            &caller.host,
+            resource_type,
+            name,
+            operation,
+            self.allow_if_no_acl,
+        )
     }
 
     async fn create_topics(
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        principal: &str,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = CreateTopicsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
@@ -1248,9 +1309,7 @@ impl Kafka {
         if !self.leader() {
             return self.create_error(&request, header, NOT_LEADER);
         }
-        if !self.allows(principal, 4, "kafka-cluster", 5) {
-            return self.create_error(&request, header, 31);
-        }
+        let cluster_create = self.allows(caller, auth::CLUSTER, auth::CLUSTER_NAME, auth::CREATE);
         let mut response = CreateTopicsResponse::default();
         let version = header.request_api_version;
         for topic in request.topics {
@@ -1277,7 +1336,12 @@ impl Kafka {
             };
             let mut result = CreatableTopicResult::default();
             result.name = topic_name(&name);
-            let mut checked = self.check_new_topic(&name, &topic, partitions, &configs);
+            let mut checked =
+                if cluster_create || self.allows(caller, auth::TOPIC, &name, auth::CREATE) {
+                    self.check_new_topic(&name, &topic, partitions, &configs)
+                } else {
+                    Err((auth::TOPIC_FAILED, None))
+                };
             if checked.is_ok() && !request.validate_only {
                 checked = match self
                     .node
@@ -1443,7 +1507,7 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        principal: &str,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = DeleteTopicsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
@@ -1462,7 +1526,7 @@ impl Kafka {
         }
         let mut response = DeleteTopicsResponse::default();
         for name in names {
-            let code = if !self.allows(principal, 2, &name, 6) {
+            let code = if !self.allows(caller, auth::TOPIC, &name, auth::DELETE) {
                 29
             } else if !self.leader() {
                 NOT_LEADER
@@ -1491,7 +1555,7 @@ impl Kafka {
         self.node.read_local(&format!("id/{id}")).ok().flatten()
     }
 
-    fn describe_configs(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    fn describe_configs(&self, header: &RequestHeader, buf: &mut Bytes, caller: &Caller) -> Reply {
         let Ok(request) = DescribeConfigsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -1502,6 +1566,13 @@ impl Kafka {
             result.resource_name = resource.resource_name.clone();
             if resource.resource_type != 2 {
                 result.error_code = INVALID_REQUEST;
+            } else if !self.allows(
+                caller,
+                auth::TOPIC,
+                resource.resource_name.as_str(),
+                auth::DESCRIBE_CONFIGS,
+            ) {
+                result.error_code = auth::TOPIC_FAILED;
             } else if let Some(topic) = self.topic(resource.resource_name.as_str()) {
                 // Null asks for every config. An empty list is treated the
                 // same way, since asking for no configs has no use.
@@ -1540,7 +1611,12 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    async fn init_producer_id(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    async fn init_producer_id(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = InitProducerIdRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -1555,6 +1631,30 @@ impl Kafka {
             .as_ref()
             .filter(|id| !id.0.is_empty())
             .map(|id| id.0.to_string());
+        // A transactional id needs WRITE on it. An idempotent producer needs
+        // IDEMPOTENT_WRITE on the cluster or WRITE on some topic (KIP-679).
+        let authorized = match &transactional {
+            Some(id) => self.allows(caller, auth::TXN_ID, id, auth::WRITE),
+            None => {
+                self.allows(
+                    caller,
+                    auth::CLUSTER,
+                    auth::CLUSTER_NAME,
+                    auth::IDEMPOTENT_WRITE,
+                ) || self
+                    .topic_names()
+                    .iter()
+                    .any(|name| self.allows(caller, auth::TOPIC, name, auth::WRITE))
+            }
+        };
+        if !authorized {
+            response.error_code = if transactional.is_some() {
+                auth::TXN_ID_FAILED
+            } else {
+                auth::CLUSTER_FAILED
+            };
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
         if transactional.is_some()
             && (request.transaction_timeout_ms <= 0
                 || i64::from(request.transaction_timeout_ms) > self.txn_max_timeout_ms)
@@ -1599,7 +1699,7 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    async fn produce(&self, header: &RequestHeader, buf: &mut Bytes, principal: &str) -> Reply {
+    async fn produce(&self, header: &RequestHeader, buf: &mut Bytes, caller: &Caller) -> Reply {
         let Ok(request) = ProduceRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -1611,6 +1711,11 @@ impl Kafka {
             .as_ref()
             .filter(|id| !id.0.is_empty())
             .map(|id| id.0.to_string());
+        if let Some(id) = &txn_id {
+            if !self.allows(caller, auth::TXN_ID, id, auth::WRITE) {
+                return self.produce_all_error(&request, header, auth::TXN_ID_FAILED);
+            }
+        }
         let mut response = ProduceResponse::default();
         let mut waiters = Vec::new();
         let mut held = Duration::ZERO;
@@ -1625,7 +1730,7 @@ impl Kafka {
             topic_response.name = topic_name(&name);
             topic_response.topic_id = topic.topic_id;
             let stored = self.topic(&name);
-            if !self.allows(principal, 2, &name, 4) {
+            if !self.allows(caller, auth::TOPIC, &name, auth::WRITE) {
                 for partition in topic.partition_data {
                     if request.acks != 0 {
                         topic_response
@@ -2361,7 +2466,7 @@ impl Kafka {
         }
     }
 
-    async fn fetch(&self, header: &RequestHeader, buf: &mut Bytes, principal: &str) -> Reply {
+    async fn fetch(&self, header: &RequestHeader, buf: &mut Bytes, caller: &Caller) -> Reply {
         let Ok(request) = FetchRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -2380,7 +2485,7 @@ impl Kafka {
                 topic_response.topic = topic_name(&name);
                 topic_response.topic_id = topic.topic_id;
                 let stored = self.topic(&name);
-                if !self.allows(principal, 2, &name, 3) {
+                if !self.allows(caller, auth::TOPIC, &name, auth::READ) {
                     for partition in &topic.partitions {
                         let mut row =
                             camus_protocol::messages::fetch_response::PartitionData::default();
@@ -2541,7 +2646,12 @@ impl Kafka {
         row
     }
 
-    async fn list_offsets(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    async fn list_offsets(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = ListOffsetsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -2551,7 +2661,17 @@ impl Kafka {
             let mut topic_response = ListOffsetsTopicResponse::default();
             topic_response.name = topic_name(&name);
             let stored = self.topic(&name);
+            let allowed = self.allows(caller, auth::TOPIC, &name, auth::DESCRIBE);
             for partition in topic.partitions {
+                if !allowed {
+                    let mut row = ListOffsetsPartitionResponse::default();
+                    row.partition_index = partition.partition_index;
+                    row.error_code = auth::TOPIC_FAILED;
+                    row.timestamp = -1;
+                    row.offset = -1;
+                    topic_response.partitions.push(row);
+                    continue;
+                }
                 topic_response.partitions.push(
                     self.list_one(
                         stored.as_ref(),
@@ -2672,6 +2792,40 @@ impl Kafka {
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
+}
+
+/// Kafka ACL resource types, operations, and authorization errors.
+pub(crate) mod auth {
+    pub(crate) const TOPIC: i8 = 2;
+    pub(crate) const GROUP: i8 = 3;
+    pub(crate) const CLUSTER: i8 = 4;
+    pub(crate) const TXN_ID: i8 = 5;
+    pub(crate) const READ: i8 = 3;
+    pub(crate) const WRITE: i8 = 4;
+    pub(crate) const CREATE: i8 = 5;
+    pub(crate) const DELETE: i8 = 6;
+    pub(crate) const ALTER: i8 = 7;
+    pub(crate) const DESCRIBE: i8 = 8;
+    pub(crate) const DESCRIBE_CONFIGS: i8 = 10;
+    pub(crate) const ALTER_CONFIGS: i8 = 11;
+    pub(crate) const IDEMPOTENT_WRITE: i8 = 12;
+    pub(crate) const CLUSTER_NAME: &str = "kafka-cluster";
+    pub(crate) const TOPIC_FAILED: i16 = 29;
+    pub(crate) const GROUP_FAILED: i16 = 30;
+    pub(crate) const CLUSTER_FAILED: i16 = 31;
+    pub(crate) const TXN_ID_FAILED: i16 = 53;
+}
+
+/// Who sent a request: the principal and the client's IP address.
+pub(crate) struct Caller {
+    pub(crate) principal: String,
+    pub(crate) host: String,
+}
+
+/// What a connection knows about its client.
+struct Session {
+    authed: bool,
+    host: String,
 }
 
 /// How an upload pass ended.

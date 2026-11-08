@@ -21,13 +21,14 @@ use camus_protocol::messages::{
 };
 use camus_protocol::protocol::{Decodable, StrBytes};
 
-use super::{frame_of, Kafka, Reply};
+use super::{auth, frame_of, Caller, Kafka, Reply};
 
 const NOT_COORDINATOR: i16 = 16;
 const INVALID_REQUEST: i16 = 42;
 const UNKNOWN_TOPIC: i16 = 3;
 const NOT_FOUND: i16 = 72;
 const TXN_AUTH: i16 = 53;
+const OPERATION_NOT_ATTEMPTED: i16 = 55;
 const CLUSTER_AUTH: i16 = 31;
 const CLUSTER: i8 = 4;
 const TXN_ID: i8 = 5;
@@ -38,6 +39,7 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = AddPartitionsToTxnRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
@@ -60,6 +62,40 @@ impl Kafka {
             .collect();
         if id.is_empty() || partitions.is_empty() {
             response.error_code = INVALID_REQUEST;
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
+        // Kafka needs WRITE on the transactional id and on every topic. When
+        // a topic is denied, nothing is added: denied partitions get 29 and
+        // the others OPERATION_NOT_ATTEMPTED.
+        let id_allowed = self.allows(caller, auth::TXN_ID, &id, auth::WRITE);
+        let denied: Vec<bool> = request
+            .v3_and_below_topics
+            .iter()
+            .map(|topic| !self.allows(caller, auth::TOPIC, topic.name.0.as_str(), auth::WRITE))
+            .collect();
+        if !id_allowed || denied.iter().any(|denied| *denied) {
+            for (topic, topic_denied) in request.v3_and_below_topics.into_iter().zip(denied) {
+                let code = if !id_allowed {
+                    auth::TXN_ID_FAILED
+                } else if topic_denied {
+                    auth::TOPIC_FAILED
+                } else {
+                    OPERATION_NOT_ATTEMPTED
+                };
+                let mut row = AddPartitionsToTxnTopicResult::default();
+                row.name = topic.name;
+                row.results_by_partition = topic
+                    .partitions
+                    .into_iter()
+                    .map(|partition_index| {
+                        let mut part = AddPartitionsToTxnPartitionResult::default();
+                        part.partition_index = partition_index;
+                        part.partition_error_code = code;
+                        part
+                    })
+                    .collect();
+                response.results_by_topic_v3_and_below.push(row);
+            }
             return frame_of(header.request_api_version, header.correlation_id, &response);
         }
         let applied = self
@@ -98,12 +134,24 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = AddOffsetsToTxnRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let mut response = AddOffsetsToTxnResponse::default();
-        response.error_code = self.offsets_ready(&request).await;
+        response.error_code = if !self.allows(
+            caller,
+            auth::TXN_ID,
+            request.transactional_id.0.as_str(),
+            auth::WRITE,
+        ) {
+            auth::TXN_ID_FAILED
+        } else if !self.allows(caller, auth::GROUP, request.group_id.0.as_str(), auth::READ) {
+            auth::GROUP_FAILED
+        } else {
+            self.offsets_ready(&request).await
+        };
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
@@ -125,7 +173,12 @@ impl Kafka {
         .unwrap_or(0)
     }
 
-    pub(super) async fn txn_offset_commit(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn txn_offset_commit(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = TxnOffsetCommitRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -138,10 +191,39 @@ impl Kafka {
             }
             return frame_of(header.request_api_version, header.correlation_id, &response);
         }
+        let gate = if !self.allows(
+            caller,
+            auth::TXN_ID,
+            request.transactional_id.0.as_str(),
+            auth::WRITE,
+        ) {
+            auth::TXN_ID_FAILED
+        } else if !self.allows(caller, auth::GROUP, request.group_id.0.as_str(), auth::READ) {
+            auth::GROUP_FAILED
+        } else {
+            0
+        };
+        if gate != 0 {
+            for topic in request.topics {
+                let partitions = topic.partitions.clone();
+                response
+                    .topics
+                    .push(offset_topic(topic.name, gate, &partitions));
+            }
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
         let mut offsets = Vec::new();
         let mut planned = Vec::new();
         for topic in &request.topics {
             let name = topic.name.0.to_string();
+            if !self.allows(caller, auth::TOPIC, &name, auth::READ) {
+                planned.push((
+                    topic.name.clone(),
+                    auth::TOPIC_FAILED,
+                    topic.partitions.clone(),
+                ));
+                continue;
+            }
             let Some(stored) = self.topic(&name) else {
                 planned.push((topic.name.clone(), UNKNOWN_TOPIC, topic.partitions.clone()));
                 continue;
@@ -193,7 +275,12 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    pub(super) async fn end_txn(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn end_txn(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = EndTxnRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -204,6 +291,15 @@ impl Kafka {
         }
         if request.transactional_id.0.is_empty() {
             response.error_code = INVALID_REQUEST;
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
+        if !self.allows(
+            caller,
+            auth::TXN_ID,
+            request.transactional_id.0.as_str(),
+            auth::WRITE,
+        ) {
+            response.error_code = auth::TXN_ID_FAILED;
             return frame_of(header.request_api_version, header.correlation_id, &response);
         }
         let applied = self
@@ -227,7 +323,7 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        principal: &str,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = DescribeTransactionsRequest::decode(buf, header.request_api_version)
         else {
@@ -241,7 +337,7 @@ impl Kafka {
             state.transactional_id = TransactionalId(StrBytes::from_string(name.clone()));
             if !leader {
                 state.error_code = NOT_COORDINATOR;
-            } else if !self.allows(principal, TXN_ID, &name, DESCRIBE) {
+            } else if !self.allows(caller, TXN_ID, &name, DESCRIBE) {
                 state.error_code = TXN_AUTH;
             } else {
                 match self.node.read_local(&format!("txn/{name}")) {
@@ -262,7 +358,7 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        principal: &str,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = ListTransactionsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
@@ -272,7 +368,7 @@ impl Kafka {
             response.error_code = NOT_COORDINATOR;
             return frame_of(header.request_api_version, header.correlation_id, &response);
         }
-        if !self.allows(principal, CLUSTER, "kafka-cluster", DESCRIBE) {
+        if !self.allows(caller, CLUSTER, "kafka-cluster", DESCRIBE) {
             response.error_code = CLUSTER_AUTH;
             return frame_of(header.request_api_version, header.correlation_id, &response);
         }
