@@ -420,6 +420,7 @@ impl Group {
                 String::new()
             },
             target: self.target.clone(),
+            empty_since_ms: -1,
         }
     }
 

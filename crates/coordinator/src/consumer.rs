@@ -2,11 +2,12 @@
 //!
 //! Checked against Kafka 4.4.0 `GroupMetadataManager.consumerGroupHeartbeat`,
 //! `modern/consumer/CurrentAssignmentBuilder`, `ConsumerGroup.validateOffsetCommit`,
-//! and `assignor/RangeAssignor`. `uniform` assigns each topic round-robin across
-//! the members subscribed to it, in `RangeAssignor`'s member order. Kafka's
-//! uniform assignor is sticky; this one is not. Rack-aware placement is not
-//! implemented. A topic regex is a Rust `regex` pattern. An offset commit is
-//! accepted at the member's current epoch or the one just before it.
+//! and `assignor/RangeAssignor`. `uniform` is sticky, like Kafka's
+//! `UniformAssignor`: a member keeps the partitions it has while it stays
+//! subscribed and under its fair share, and only the rest move. Rack-aware
+//! placement is not implemented. A topic regex is a Rust `regex` pattern. An
+//! offset commit is accepted at the member's current epoch or the one just
+//! before it.
 //!
 //! The group epoch and each member's epoch, subscription, and assignment are
 //! stored in the group record before the response is sent.
@@ -566,7 +567,7 @@ fn assign(group: &Group, assignor: &str) -> BTreeMap<String, BTreeMap<String, Ve
     if assignor == "range" {
         assign_range(&seats, &counts)
     } else {
-        assign_uniform(&seats, &counts)
+        assign_uniform(&seats, &counts, &group.target)
     }
 }
 
@@ -590,35 +591,99 @@ fn topic_ids(group: &Group, member: &MemberRecord) -> BTreeSet<String> {
         .collect()
 }
 
+/// Kafka's sticky `UniformAssignor`, simplified. Every member gets a fair
+/// share of the partitions it can take: the total split evenly, with the
+/// remainder going to the members that already hold the most, so the fewest
+/// partitions move. A member keeps what it has, up to its share, while it is
+/// still subscribed. Partitions left over go one at a time to the subscribed
+/// member holding the fewest. When subscriptions differ, a partition only
+/// some members can take may push one of them past its share.
 fn assign_uniform(
     seats: &[Seat<'_>],
     counts: &BTreeMap<String, i32>,
+    previous: &BTreeMap<String, BTreeMap<String, Vec<i32>>>,
 ) -> BTreeMap<String, BTreeMap<String, Vec<i32>>> {
-    let mut target: BTreeMap<String, BTreeMap<String, Vec<i32>>> = BTreeMap::new();
+    let mut wanted: Vec<(String, i32)> = Vec::new();
     let mut topics: BTreeSet<&str> = BTreeSet::new();
     for seat in seats {
         topics.extend(seat.topics.iter().map(String::as_str));
     }
-    for topic in topics {
-        let Some(partitions) = counts.get(topic).copied().filter(|count| *count > 0) else {
+    for topic in &topics {
+        let partitions = counts.get(*topic).copied().unwrap_or(0);
+        wanted.extend((0..partitions).map(|partition| (topic.to_string(), partition)));
+    }
+    let wanted_set: BTreeSet<(String, i32)> = wanted.iter().cloned().collect();
+
+    // What each member still holds and may keep.
+    let mut held: Vec<Vec<(String, i32)>> = seats
+        .iter()
+        .map(|seat| {
+            let mut kept: Vec<(String, i32)> = previous
+                .get(seat.member)
+                .into_iter()
+                .flatten()
+                .filter(|(topic, _)| seat.topics.contains(*topic))
+                .flat_map(|(topic, partitions)| {
+                    partitions
+                        .iter()
+                        .map(move |partition| (topic.clone(), *partition))
+                })
+                .filter(|owned| wanted_set.contains(owned))
+                .collect();
+            kept.sort();
+            kept
+        })
+        .collect();
+
+    // Fair shares: the remainder goes to the members already holding most.
+    let base = wanted.len() / seats.len();
+    let extra = wanted.len() % seats.len();
+    let mut by_load: Vec<usize> = (0..seats.len()).collect();
+    by_load.sort_by(|left, right| {
+        held[*right]
+            .len()
+            .cmp(&held[*left].len())
+            .then(left.cmp(right))
+    });
+    let mut share = vec![base; seats.len()];
+    for seat in by_load.into_iter().take(extra) {
+        share[seat] += 1;
+    }
+
+    // Release what is over a share, highest partitions first.
+    let mut taken: BTreeSet<(String, i32)> = BTreeSet::new();
+    for (seat, owned) in held.iter_mut().enumerate() {
+        owned.truncate(share[seat]);
+        taken.extend(owned.iter().cloned());
+    }
+
+    for item in wanted.into_iter().filter(|item| !taken.contains(item)) {
+        let eligible = || (0..seats.len()).filter(|seat| seats[*seat].topics.contains(&item.0));
+        let under = eligible()
+            .filter(|seat| held[*seat].len() < share[*seat])
+            .min_by_key(|seat| (held[*seat].len(), *seat));
+        let Some(owner) =
+            under.or_else(|| eligible().min_by_key(|seat| (held[*seat].len(), *seat)))
+        else {
             continue;
         };
-        let holders: Vec<&str> = seats
-            .iter()
-            .filter(|seat| seat.topics.contains(topic))
-            .map(|seat| seat.member)
-            .collect();
-        if holders.is_empty() {
-            continue;
-        }
-        for partition in 0..partitions {
-            let owner = holders[partition as usize % holders.len()];
+        held[owner].push(item);
+    }
+
+    let mut target: BTreeMap<String, BTreeMap<String, Vec<i32>>> = BTreeMap::new();
+    for (seat, owned) in seats.iter().zip(held) {
+        for (topic, partition) in owned {
             target
-                .entry(owner.to_string())
+                .entry(seat.member.to_string())
                 .or_default()
-                .entry(topic.to_string())
+                .entry(topic)
                 .or_default()
                 .push(partition);
+        }
+    }
+    for topics in target.values_mut() {
+        for partitions in topics.values_mut() {
+            partitions.sort_unstable();
         }
     }
     target
@@ -1154,5 +1219,92 @@ mod tests {
         let groups = coordinator.groups.lock().unwrap();
         assert!(groups["g"].members.contains_key("a"));
         assert!(!groups["g"].members.contains_key("b"));
+    }
+}
+
+#[cfg(test)]
+mod uniform_tests {
+    use super::*;
+
+    type Plan = BTreeMap<String, BTreeMap<String, Vec<i32>>>;
+
+    fn seats<'a>(members: &'a [&'a str]) -> Vec<Seat<'a>> {
+        members
+            .iter()
+            .map(|member| Seat {
+                member,
+                instance: None,
+                topics: BTreeSet::from(["t".to_string()]),
+            })
+            .collect()
+    }
+
+    fn plan(entries: &[(&str, &[i32])]) -> Plan {
+        entries
+            .iter()
+            .map(|(member, partitions)| {
+                (
+                    member.to_string(),
+                    BTreeMap::from([("t".to_string(), partitions.to_vec())]),
+                )
+            })
+            .collect()
+    }
+
+    fn owned(plan: &Plan, member: &str) -> Vec<i32> {
+        plan.get(member)
+            .and_then(|topics| topics.get("t"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn moved(before: &Plan, after: &Plan) -> usize {
+        after
+            .iter()
+            .map(|(member, _)| {
+                owned(after, member)
+                    .into_iter()
+                    .filter(|partition| !owned(before, member).contains(partition))
+                    .count()
+            })
+            .sum()
+    }
+
+    fn counts(partitions: i32) -> BTreeMap<String, i32> {
+        BTreeMap::from([("t".to_string(), partitions)])
+    }
+
+    #[test]
+    fn partitions_are_split_evenly() {
+        let target = assign_uniform(&seats(&["a", "b"]), &counts(6), &Plan::new());
+        assert_eq!(owned(&target, "a").len(), 3);
+        assert_eq!(owned(&target, "b").len(), 3);
+    }
+
+    #[test]
+    fn a_new_member_takes_only_its_share() {
+        let before = plan(&[("a", &[0, 1, 2, 3, 4, 5])]);
+        let after = assign_uniform(&seats(&["a", "b"]), &counts(6), &before);
+        assert_eq!(owned(&after, "a"), vec![0, 1, 2]);
+        assert_eq!(owned(&after, "b"), vec![3, 4, 5]);
+        assert_eq!(moved(&before, &after), 3);
+    }
+
+    #[test]
+    fn a_third_member_moves_one_partition_from_each() {
+        let before = plan(&[("a", &[0, 1, 2]), ("b", &[3, 4, 5])]);
+        let after = assign_uniform(&seats(&["a", "b", "c"]), &counts(6), &before);
+        assert_eq!(owned(&after, "a"), vec![0, 1]);
+        assert_eq!(owned(&after, "b"), vec![3, 4]);
+        assert_eq!(owned(&after, "c"), vec![2, 5]);
+        assert_eq!(moved(&before, &after), 2);
+    }
+
+    #[test]
+    fn a_departed_member_only_frees_its_own_partitions() {
+        let before = plan(&[("a", &[0, 1]), ("b", &[2, 3]), ("c", &[4, 5])]);
+        let after = assign_uniform(&seats(&["a", "b"]), &counts(6), &before);
+        assert_eq!(owned(&after, "a"), vec![0, 1, 4]);
+        assert_eq!(owned(&after, "b"), vec![2, 3, 5]);
     }
 }

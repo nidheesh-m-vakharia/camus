@@ -56,7 +56,12 @@ pub struct MetadataStore {
 }
 
 impl Store for MetadataStore {
-    fn save(&self, group: String, record: GroupRecord) -> camus_coordinator::SaveFuture {
+    fn save(&self, group: String, mut record: GroupRecord) -> camus_coordinator::SaveFuture {
+        // Stamp every empty record; metadata keeps the first stamp while the
+        // group stays empty, and offset retention counts from it.
+        if record.members.is_empty() {
+            record.empty_since_ms = now_ms();
+        }
         let node = Arc::clone(&self.node);
         Box::pin(async move {
             match node.group_write(Command::SaveGroup { group, record }).await {

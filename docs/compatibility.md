@@ -82,13 +82,20 @@ stored generation when it is applied, so a failover keeps the generation
 and an old generation cannot commit. `FindCoordinator` serves groups and
 transactions. Share groups answer `INVALID_REQUEST` (42).
 `ConsumerGroupHeartbeat` (KIP-848) versions 0–1 are implemented. The
-broker's default assignor is `uniform` (round-robin per topic; not Kafka's
-sticky uniform assignor) and `range` is the other supported name. A member
+broker's default assignor is `uniform`, sticky like Kafka's `UniformAssignor`
+(members keep their partitions up to a fair share and only the rest move),
+and `range` is the other supported name. A member
 that names any other assignor gets `UNSUPPORTED_ASSIGNOR` (112). Topic
 regexes are Rust regexes. An offset commit is accepted at the member's
 current epoch or the previous one. The Java client's default remains
 `group.protocol=classic`. `group.protocol=consumer` is exercised by
 `GroupConsumerRoundTrip`.
+Committed offsets of a group with no members expire
+`CAMUS_OFFSETS_RETENTION_MINUTES` (default 10080, Kafka's
+`offsets.retention.minutes`) after it became empty, checked every
+`CAMUS_OFFSETS_RETENTION_CHECK_INTERVAL_MS` (default 600000); a group that only
+commits counts from each commit, as in Kafka. The group goes with its last
+offset. A group with members keeps its offsets.
 `DeleteRecords` moves the log start to the requested offset, as in Kafka, up
 to the high watermark, which includes records still only in the WAL; `-1`
 means the high watermark, and an offset past it is `OFFSET_OUT_OF_RANGE` (1).
