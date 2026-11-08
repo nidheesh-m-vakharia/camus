@@ -1,0 +1,7 @@
+name = "camus"
+compatibility_date = "2026-11-07"
+
+[assets]
+directory = "./site"
+html_handling = "none"
+not_found_handling = "none"

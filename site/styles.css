@@ -1,7 +1,7 @@
 @font-face {
-  font-family: Kecal;
-  src: url("fonts/Kecal-variable-web.woff2") format("woff2");
-  font-weight: 200 800;
+  font-family: Pollen;
+  src: url("fonts/Pollen-variable.woff2") format("woff2");
+  font-weight: 400 700;
   font-style: normal;
   font-display: swap;
 }
@@ -43,7 +43,7 @@
   --ease-in: cubic-bezier(0.55, 0, 1, 0.45);
   --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
 
-  --sans: Kecal, "Avenir Next", "Segoe UI", sans-serif;
+  --sans: Pollen, system-ui, sans-serif;
   --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   --measure: 65ch;
   --page: 68rem;
@@ -92,6 +92,7 @@ html {
   color: var(--text);
   font-family: var(--sans);
   font-weight: var(--weight-body);
+  font-variation-settings: "ROND" 100;
   font-synthesis: none;
   font-optical-sizing: auto;
   line-height: var(--space);
