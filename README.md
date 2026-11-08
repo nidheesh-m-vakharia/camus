@@ -1,5 +1,12 @@
 # Camus
 
+![Camus](site/banner.png)
+
+[![License: Apache-2.0](https://img.shields.io/github/license/nidheesh-m-vakharia/camus?color=3e63dd)](LICENSE)
+[![CI](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml/badge.svg)](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml)
+[![Kafka 4.4.0](https://img.shields.io/badge/Kafka-4.4.0-171717)](docs/compatibility.md)
+[![Rust](https://img.shields.io/badge/rust-stable-934c1a)](rust-toolchain.toml)
+
 Camus is a Kafka broker in one Rust binary. Producers, consumers, and admin
 clients use the Kafka wire protocol. The log is stored in Cloudflare R2, or
 any S3-compatible bucket. Brokers replicate metadata, and a short

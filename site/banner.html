@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Camus</title>
+  <style>
+    @font-face {
+      font-family: Pollen;
+      src: url("fonts/Pollen-variable.woff2") format("woff2");
+      font-weight: 400 700;
+      font-display: block;
+    }
+
+    * { box-sizing: border-box; margin: 0; }
+
+    html, body {
+      width: 1280px;
+      height: 640px;
+      overflow: hidden;
+      background: #0a0a0a;
+      color: #ededed;
+      font-family: Pollen, system-ui, sans-serif;
+      font-weight: 500;
+      font-variation-settings: "ROND" 100;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .frame {
+      width: 1280px;
+      height: 640px;
+      padding: 64px 72px 56px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .mark {
+      display: flex;
+      align-items: center;
+      gap: 22px;
+    }
+
+    svg { width: 72px; height: 64px; display: block; }
+
+    .name {
+      font-size: 92px;
+      line-height: 0.9;
+      letter-spacing: -0.035em;
+      font-weight: 500;
+    }
+
+    .line {
+      max-width: 16em;
+      font-size: 40px;
+      line-height: 1.15;
+      letter-spacing: -0.03em;
+      font-weight: 500;
+    }
+
+    .facts {
+      display: flex;
+      gap: 28px;
+      color: #a0a0a0;
+      font-size: 18px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-weight: 500;
+    }
+
+    .facts span { color: #5472e4; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <div class="mark">
+      <svg viewBox="0 0 32 28" aria-hidden="true">
+        <circle cx="4.6" cy="4.6" r="2.7" fill="#ededed"/>
+        <circle cx="4.6" cy="14" r="2.7" fill="#ededed"/>
+        <circle cx="4.6" cy="23.4" r="2.7" fill="#ededed"/>
+        <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="#5472e4" stroke-width="4.6" stroke-linecap="round"/>
+      </svg>
+      <div class="name">Camus</div>
+    </div>
+    <p class="line">A Kafka broker that keeps the log in object storage.</p>
+    <p class="facts">Rust <span>·</span> Kafka 4.4.0 <span>·</span> Raft <span>·</span> R2 / S3</p>
+  </div>
+</body>
+</html>
