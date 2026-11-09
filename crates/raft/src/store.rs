@@ -3,8 +3,10 @@
 //! [`RaftLogStorage`] backed by [`SegmentLog`].
 //!
 //! Append serializes entries, writes them, and `fsync`s once for the whole
-//! batch before they are inserted into the readable index. `save_vote`
-//! `fsync`s the meta file before it returns.
+//! batch before they are inserted into the readable index. Reads do not wait
+//! for an append's `fsync` (see [`SegmentLog`]). `save_vote` `fsync`s the meta
+//! file before it returns. A purge records the purged id in that same file,
+//! one durable write, before any segment is removed.
 
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -17,13 +19,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::segment::SegmentLog;
 
-struct Inner<C>
+/// The vote, commit hint and purge point, with the directory they live in.
+struct Meta<C>
 where
     C: RaftTypeConfig,
 {
-    log: SegmentLog,
     dir: PathBuf,
-    meta: RaftDiskMeta<C>,
+    disk: RaftDiskMeta<C>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,7 +57,8 @@ pub struct SegmentLogStore<C>
 where
     C: RaftTypeConfig,
 {
-    inner: Arc<Mutex<Inner<C>>>,
+    log: Arc<SegmentLog>,
+    meta: Arc<Mutex<Meta<C>>>,
     stats: Arc<AppendStats>,
 }
 
@@ -80,10 +83,18 @@ where
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StorageError<C::NodeId>> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|err| io_err::<C>(None, &err))?;
-        let meta = read_meta::<C>(&dir)?;
-        let log = SegmentLog::open(&dir).map_err(|err| io_err::<C>(None, &err))?;
+        let disk = read_meta::<C>(&dir)?;
+        let purged = disk.last_purged.as_ref().map(|id| id.index);
+        let log = SegmentLog::open_with(
+            &dir,
+            crate::DEFAULT_SEGMENT_BYTES,
+            purged,
+            crate::segment::DEFAULT_TAIL_BYTES,
+        )
+        .map_err(|err| io_err::<C>(None, &err))?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(Inner { log, dir, meta })),
+            log: Arc::new(log),
+            meta: Arc::new(Mutex::new(Meta { dir, disk })),
             stats: Arc::new(AppendStats::default()),
         })
     }
@@ -106,11 +117,9 @@ where
     ) -> Result<Vec<C::Entry>, StorageError<C::NodeId>> {
         let start = bound_owned(range.start_bound());
         let end = bound_owned(range.end_bound());
-        let inner = self.inner.clone();
+        let log = self.log.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = lock(&inner)?;
-            let records = guard
-                .log
+            let records = log
                 .range(start, end)
                 .map_err(|err| io_err::<C>(None, &err))?;
             records
@@ -134,13 +143,13 @@ where
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<C::NodeId>> {
-        let inner = self.inner.clone();
+        let log = self.log.clone();
+        let meta = self.meta.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = lock(&inner)?;
-            let last = match guard.log.last_index() {
+            let last_purged = lock(&meta)?.disk.last_purged.clone();
+            let last = match log.last_index() {
                 Some(index) => {
-                    let bytes = guard
-                        .log
+                    let bytes = log
                         .get(index)
                         .map_err(|err| io_err::<C>(None, &err))?
                         .ok_or_else(|| {
@@ -150,10 +159,10 @@ where
                         crate::codec::decode(&bytes).map_err(|err| io_err::<C>(None, &err))?;
                     Some(entry.get_log_id().clone())
                 }
-                None => guard.meta.last_purged.clone(),
+                None => last_purged.clone(),
             };
             Ok(LogState {
-                last_purged_log_id: guard.meta.last_purged.clone(),
+                last_purged_log_id: last_purged,
                 last_log_id: last,
             })
         })
@@ -167,19 +176,19 @@ where
 
     async fn save_vote(&mut self, vote: &Vote<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
         let vote = vote.clone();
-        let inner = self.inner.clone();
+        let meta = self.meta.clone();
         tokio::task::spawn_blocking(move || {
-            let mut guard = lock(&inner)?;
-            guard.meta.vote = Some(vote);
-            write_meta(&guard.dir, &guard.meta)
+            let mut guard = lock(&meta)?;
+            guard.disk.vote = Some(vote);
+            write_meta(&guard.dir, &guard.disk)
         })
         .await
         .map_err(|err| io_err::<C>(None, &err))?
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<C::NodeId>>, StorageError<C::NodeId>> {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || Ok(lock(&inner)?.meta.vote.clone()))
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || Ok(lock(&meta)?.disk.vote.clone()))
             .await
             .map_err(|err| io_err::<C>(None, &err))?
     }
@@ -192,15 +201,15 @@ where
         // hint: on restart the state machine's last applied id is the floor,
         // and the leader re-sends the commit index. It reaches disk with the
         // next vote or purge. Syncing it here cost two fsyncs per commit.
-        lock(&self.inner)?.meta.committed = committed;
+        lock(&self.meta)?.disk.committed = committed;
         Ok(())
     }
 
     async fn read_committed(
         &mut self,
     ) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || Ok(lock(&inner)?.meta.committed.clone()))
+        let meta = self.meta.clone();
+        tokio::task::spawn_blocking(move || Ok(lock(&meta)?.disk.committed.clone()))
             .await
             .map_err(|err| io_err::<C>(None, &err))?
     }
@@ -219,20 +228,13 @@ where
             let index = entry.get_log_id().index;
             let bytes = crate::codec::encode(&entry)
                 .map_err(|err| io_err::<C>(Some(entry.get_log_id().clone()), &err))?;
-            payloads.push((index, bytes));
+            payloads.push((index, Arc::new(bytes)));
         }
         let entries = payloads.len() as u64;
         let bytes: u64 = payloads.iter().map(|(_, bytes)| bytes.len() as u64).sum();
-        let inner = self.inner.clone();
+        let log = self.log.clone();
         tokio::task::spawn_blocking(move || {
-            let mut guard = lock(&inner)?;
-            let borrowed: Vec<(u64, &[u8])> = payloads
-                .iter()
-                .map(|(index, bytes)| (*index, bytes.as_slice()))
-                .collect();
-            guard
-                .log
-                .append_batch(&borrowed)
+            log.append_shared(payloads)
                 .map_err(|err| io_err::<C>(None, &err))
         })
         .await
@@ -246,12 +248,9 @@ where
     }
 
     async fn truncate(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
-        let inner = self.inner.clone();
+        let log = self.log.clone();
         tokio::task::spawn_blocking(move || {
-            let mut guard = lock(&inner)?;
-            guard
-                .log
-                .truncate_from(log_id.index)
+            log.truncate_from(log_id.index)
                 .map_err(|err| io_err::<C>(Some(log_id), &err))
         })
         .await
@@ -259,14 +258,17 @@ where
     }
 
     async fn purge(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
-        let inner = self.inner.clone();
+        let log = self.log.clone();
+        let meta = self.meta.clone();
         tokio::task::spawn_blocking(move || {
-            let mut guard = lock(&inner)?;
-            guard.meta.last_purged = Some(log_id.clone());
-            write_meta(&guard.dir, &guard.meta)?;
-            guard
-                .log
-                .purge_through(log_id.index)
+            // One durable write records the purge; the log does not keep a
+            // second copy of it. Segments go only after it is on disk.
+            {
+                let mut guard = lock(&meta)?;
+                guard.disk.last_purged = Some(log_id.clone());
+                write_meta(&guard.dir, &guard.disk)?;
+            }
+            log.drop_through(log_id.index)
                 .map_err(|err| io_err::<C>(Some(log_id), &err))
         })
         .await
@@ -275,13 +277,12 @@ where
 }
 
 fn lock<C>(
-    inner: &Mutex<Inner<C>>,
-) -> Result<std::sync::MutexGuard<'_, Inner<C>>, StorageError<C::NodeId>>
+    meta: &Mutex<Meta<C>>,
+) -> Result<std::sync::MutexGuard<'_, Meta<C>>, StorageError<C::NodeId>>
 where
     C: RaftTypeConfig,
 {
-    inner
-        .lock()
+    meta.lock()
         .map_err(|err| io_err::<C>(None, &std::io::Error::other(err.to_string())))
 }
 

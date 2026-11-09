@@ -86,6 +86,26 @@ impl RedbMachine {
         })
     }
 
+    /// Up to `limit` applied keys in `[from, to)`, in key order.
+    pub fn scan_range(
+        &self,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, StorageError<NodeId>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+        let table = match txn.open_table(KV) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(io(ErrorSubject::StateMachine, &err)),
+        };
+        scan_range(&table, from, to, limit)
+            .map_err(|err| io(ErrorSubject::StateMachine, &std::io::Error::other(err)))
+    }
+
     /// Applied keys starting with `prefix`, in key order.
     pub fn scan(&self, prefix: &str) -> Result<Vec<(String, String)>, StorageError<NodeId>> {
         let txn = self
@@ -233,6 +253,9 @@ fn apply_command(
                 Err(err) => Err(err.to_string()),
             }
         };
+        let scan = |from: &str, to: &str, limit: usize| -> Result<Vec<(String, String)>, String> {
+            scan_range(kv, from, to, limit)
+        };
         match command {
             Command::Put { .. } | Command::Delete { .. } => unreachable!("handled above"),
             Command::CreateTopic {
@@ -242,7 +265,7 @@ fn apply_command(
                 durability,
                 configs,
             } => catalog::create_topic(&read, &name, &id, partitions, &durability, &configs),
-            Command::DeleteTopic { name } => catalog::delete_topic(&read, &name),
+            Command::DeleteTopic { name } => catalog::delete_topic(&read, &scan, &name),
             Command::Publish { parts } => catalog::publish(&read, &parts, &[]),
             Command::PublishWithProducers { parts, producers } => {
                 catalog::publish(&read, &parts, &producers)
@@ -255,7 +278,7 @@ fn apply_command(
                 admin::alter_configs(&read, &changes).and_then(admin::outcome)
             }
             Command::DeleteRecords { cuts } => {
-                admin::delete_records(&read, &cuts).and_then(admin::outcome)
+                admin::delete_records(&read, &scan, &cuts).and_then(admin::outcome)
             }
             Command::OffsetDelete { forget } => {
                 admin::offset_delete(&read, &forget).and_then(admin::outcome)
@@ -357,7 +380,7 @@ fn apply_command(
                 keys,
                 now_ms,
                 expiration_ms,
-            } => crate::producers::expire(&read, &keys, now_ms, expiration_ms),
+            } => crate::producers::expire(&read, &scan, &keys, now_ms, expiration_ms),
             Command::AddTxnPartitionsAt {
                 transactional_id,
                 producer_id,
@@ -383,6 +406,7 @@ fn apply_command(
                 max_timestamp,
             } => catalog::compact_replace(
                 &read,
+                &scan,
                 &topic,
                 partition,
                 covered_end,
@@ -430,6 +454,27 @@ fn apply_command(
             Ok(Response::ok(value))
         }
     }
+}
+
+/// Up to `limit` rows with keys in `[from, to)`, in key order.
+fn scan_range(
+    kv: &impl ReadableTable<&'static str, &'static str>,
+    from: &str,
+    to: &str,
+    limit: usize,
+) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    if from >= to {
+        return Ok(out);
+    }
+    for row in kv.range(from..to).map_err(|err| err.to_string())? {
+        if out.len() >= limit {
+            break;
+        }
+        let (key, value) = row.map_err(|err| err.to_string())?;
+        out.push((key.value().to_string(), value.value().to_string()));
+    }
+    Ok(out)
 }
 
 fn apply_init(

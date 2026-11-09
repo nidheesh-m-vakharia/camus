@@ -179,6 +179,7 @@ pub fn apply_notes(
 /// keeps its state. `value` is the number of entries removed.
 pub fn expire(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    scan: crate::catalog::Scan,
     keys: &[(String, i32, i64)],
     now_ms: i64,
     expiration_ms: i64,
@@ -215,10 +216,16 @@ pub fn expire(
             del.push(key);
             continue;
         }
-        let holder = part
-            .extents
-            .iter()
-            .find(|extent| extent.start <= last.base_offset && last.base_offset < extent.end);
+        let holder = crate::catalog::extents_after(
+            scan,
+            &stored.id,
+            *partition,
+            &part,
+            last.base_offset,
+            1,
+        )?
+        .into_iter()
+        .find(|extent| extent.start <= last.base_offset);
         if let Some(extent) = holder {
             if now_ms.saturating_sub(extent.max_timestamp) >= expiration_ms {
                 del.push(key);
@@ -301,8 +308,9 @@ mod expiry_tests {
 
     fn removed(map: &HashMap<String, String>, now: i64) -> bool {
         let get = |key: &str| Ok(map.get(key).cloned());
+        let scan = |from: &str, to: &str, limit: usize| catalog::scan_map(map, from, to, limit);
         let Outcome::Change { del, .. } =
-            expire(&get, &[("orders".into(), 0, 7)], now, 1_000).unwrap()
+            expire(&get, &scan, &[("orders".into(), 0, 7)], now, 1_000).unwrap()
         else {
             panic!("expire");
         };

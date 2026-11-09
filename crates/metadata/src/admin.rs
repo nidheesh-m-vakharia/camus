@@ -245,6 +245,7 @@ pub fn alter_configs(
 /// Move log starts to the requested offsets.
 pub fn delete_records(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    scan: catalog::Scan,
     cuts: &[RecordCut],
 ) -> Result<Done, String> {
     let mut pending: BTreeMap<(String, i32), Partition> = BTreeMap::new();
@@ -281,25 +282,29 @@ pub fn delete_records(
             continue;
         }
         state.log_start = state.log_start.max(offset);
-        state.extents.retain(|extent| extent.end > state.log_start);
         items.push(Item {
             code: 0,
             low: state.log_start,
         });
     }
     let mut put = Vec::new();
-    for ((topic, partition), state) in pending {
+    let mut del = Vec::new();
+    for ((topic, partition), mut state) in pending {
         let id = ids.get(&topic).expect("id");
+        // Extents wholly below the new log start go.
+        del.extend(catalog::extent_keys_through(
+            scan,
+            id,
+            partition,
+            state.log_start,
+        )?);
+        catalog::migrate_extents(id, partition, &mut state, &mut put)?;
         put.push((
             catalog::partition_storage_key(id, partition),
             serde_json::to_string(&state).map_err(|err| err.to_string())?,
         ));
     }
-    Ok(Done {
-        put,
-        del: Vec::new(),
-        items,
-    })
+    Ok(Done { put, del, items })
 }
 
 /// Delete committed offsets. A group with members cannot drop a topic it
@@ -432,8 +437,10 @@ mod tests {
             map.insert(key, value);
         }
         let get = |key: &str| Ok(map.get(key).cloned());
+        let scan = |from: &str, to: &str, limit: usize| catalog::scan_map(&map, from, to, limit);
         let done = delete_records(
             &get,
+            &scan,
             &[RecordCut {
                 topic: "events".into(),
                 partition: 0,
@@ -443,8 +450,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(done.items[0].low, 4);
+        assert!(done.del.is_empty(), "the extent holding offset 4 stays");
         let state: Partition = serde_json::from_str(&done.put[0].1).unwrap();
-        assert_eq!(state.extents.len(), 1, "the extent holding offset 4 stays");
         assert_eq!(state.log_start, 4);
 
         let cut = |offset: i64, high_watermark: i64| RecordCut {
@@ -453,20 +460,21 @@ mod tests {
             offset,
             high_watermark,
         };
-        let past = delete_records(&get, &[cut(15, -1)]).unwrap();
+        let past = delete_records(&get, &scan, &[cut(15, -1)]).unwrap();
         assert_eq!(past.items[0].code, OFFSET_OUT_OF_RANGE);
-        let unsealed = delete_records(&get, &[cut(15, 20)]).unwrap();
+        let unsealed = delete_records(&get, &scan, &[cut(15, 20)]).unwrap();
         assert_eq!(unsealed.items[0].low, 15);
-        let state: Partition = serde_json::from_str(&unsealed.put[0].1).unwrap();
-        assert!(state.extents.is_empty());
+        assert_eq!(unsealed.del, vec![catalog::extent_key("topic-1", 0, 10)]);
     }
 
     #[test]
     fn an_extent_published_below_the_log_start_is_dropped() {
         let mut map = world();
         let get = |key: &str| Ok(map.get(key).cloned());
+        let scan = |from: &str, to: &str, limit: usize| catalog::scan_map(&map, from, to, limit);
         let done = delete_records(
             &get,
+            &scan,
             &[RecordCut {
                 topic: "events".into(),
                 partition: 0,
@@ -495,9 +503,13 @@ mod tests {
         else {
             panic!("publish");
         };
-        let state: Partition = serde_json::from_str(&put[0].1).unwrap();
-        assert_eq!(state.extents.len(), 1);
-        assert_eq!(state.extents[0].start, 3);
+        let extents: Vec<catalog::Extent> = put
+            .iter()
+            .filter(|(key, _)| key.starts_with("ext/"))
+            .map(|(_, value)| serde_json::from_str(value).unwrap())
+            .collect();
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].start, 3);
     }
 
     #[test]
