@@ -437,7 +437,7 @@ async fn init(
         };
         for member in members {
             let addr = &nodes[member].addr;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 let sent = admin
                     .http
@@ -483,7 +483,7 @@ async fn init(
     for (shard, members) in layout.iter().enumerate() {
         for member in members {
             let addr = &nodes[member].addr;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 let formed = admin
                     .http

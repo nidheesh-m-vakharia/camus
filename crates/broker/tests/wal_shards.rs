@@ -24,6 +24,13 @@ use support::*;
 
 const PARTITIONS: i32 = 3;
 
+/// One three-broker cluster at a time. Two of them starting together on a
+/// busy machine lose the race to open every shard before `init` gives up.
+fn one_cluster() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 /// `(leader id, leader address)` of each partition, from `via`'s Metadata,
 /// once every partition has a reachable leader that is not `excluded`.
 fn leaders(via: &str, excluded: Option<i32>) -> Vec<(i32, String)> {
@@ -162,6 +169,7 @@ fn write_and_read_everywhere(via: &str, excluded: Option<i32>, value: &str) {
 
 #[test]
 fn three_brokers_lead_three_shards_and_survive_losing_one() {
+    let _one = one_cluster();
     let root = tempfile::tempdir().unwrap();
     // A short balancer interval: if a preferred voter loses the first
     // election, the balancer hands it its shard within a second.
@@ -301,6 +309,7 @@ fn bounce(nodes: &mut [Node], meta_leader: i32, controller: &str) -> i32 {
 
 #[test]
 fn a_returning_broker_takes_its_shard_back() {
+    let _one = one_cluster();
     let root = tempfile::tempdir().unwrap();
     let (mut nodes, meta_leader, controller) = cluster(
         root.path(),
@@ -342,6 +351,7 @@ fn elect(addr: &str, election_type: i8) -> Vec<i16> {
 
 #[test]
 fn elect_leaders_moves_a_shard_back_to_its_preferred_broker() {
+    let _one = one_cluster();
     let root = tempfile::tempdir().unwrap();
     let (nodes, _, controller) = cluster(
         root.path(),
