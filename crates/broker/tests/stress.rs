@@ -27,8 +27,8 @@ use camus_protocol::messages::{
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 use camus_protocol::records::{
-    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions,
+    TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
 };
 
 struct Node {
@@ -80,7 +80,8 @@ fn spawn(dir: &Path) -> Node {
     while Instant::now() < deadline {
         if let Ok(body) = client.get(format!("http://{http}/admin/metrics")).send() {
             if let Ok(json) = body.json::<serde_json::Value>() {
-                if json["current_leader"].as_u64() == Some(1) && json["wal_leader"].as_u64() == Some(1)
+                if json["current_leader"].as_u64() == Some(1)
+                    && json["wal_leader"].as_u64() == Some(1)
                 {
                     return Node {
                         child,
@@ -128,8 +129,15 @@ fn header(key: ApiKey, version: i16, correlation: i32) -> RequestHeader {
         .with_client_id(Some(StrBytes::from_static_str("camus-stress")))
 }
 
-fn send<M: Encodable>(stream: &mut TcpStream, key: ApiKey, version: i16, correlation: i32, message: &M) {
-    let frame = frame::encode_request(&header(key, version, correlation), message, version).unwrap();
+fn send<M: Encodable>(
+    stream: &mut TcpStream,
+    key: ApiKey,
+    version: i16,
+    correlation: i32,
+    message: &M,
+) {
+    let frame =
+        frame::encode_request(&header(key, version, correlation), message, version).unwrap();
     stream.write_all(&frame).unwrap();
 }
 
@@ -152,7 +160,11 @@ fn batch(value: &[u8], transactional: bool, producer_id: i64, epoch: i16, sequen
         delete_horizon: false,
         partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
         producer_id,
-        producer_epoch: if producer_id < 0 { NO_PRODUCER_EPOCH } else { epoch },
+        producer_epoch: if producer_id < 0 {
+            NO_PRODUCER_EPOCH
+        } else {
+            epoch
+        },
         sequence,
         timestamp_type: TimestampType::Creation,
         offset: 0,
@@ -351,7 +363,11 @@ fn concurrent_produces_keep_every_record_once() {
     );
     let mut seen = BTreeSet::new();
     for record in &fetched {
-        assert!(seen.insert(record.offset), "duplicate fetched offset {}", record.offset);
+        assert!(
+            seen.insert(record.offset),
+            "duplicate fetched offset {}",
+            record.offset
+        );
     }
     assert_eq!(*seen.iter().next().unwrap(), 0);
     assert_eq!(*seen.iter().next_back().unwrap(), expected.len() as i64 - 1);
@@ -389,7 +405,9 @@ fn a_committed_produce_stays_visible_when_end_txn_races_it() {
             3,
             11,
             &AddPartitionsToTxnRequest::default()
-                .with_v3_and_below_transactional_id(TransactionalId(StrBytes::from_string(id.clone())))
+                .with_v3_and_below_transactional_id(TransactionalId(StrBytes::from_string(
+                    id.clone(),
+                )))
                 .with_v3_and_below_producer_id(producer.into())
                 .with_v3_and_below_producer_epoch(epoch)
                 .with_v3_and_below_topics(vec![AddPartitionsToTxnTopic::default()
@@ -398,8 +416,7 @@ fn a_committed_produce_stays_visible_when_end_txn_races_it() {
         );
         let added = recv::<AddPartitionsToTxnResponse>(&mut setup, 3);
         assert_eq!(
-            added.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code,
-            0,
+            added.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code, 0,
             "{added:?}"
         );
 

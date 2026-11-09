@@ -19,6 +19,7 @@ async fn put_range_and_delete() {
         access_key: "camus".into(),
         secret_key: "camus-dev-secret".into(),
         prefix: String::new(),
+        virtual_hosted: false,
     })
     .unwrap();
 
@@ -56,6 +57,7 @@ async fn a_prefix_namespaces_keys_and_list_strips_it() {
             access_key: "camus".into(),
             secret_key: "camus-dev-secret".into(),
             prefix,
+            virtual_hosted: false,
         })
         .unwrap()
     };

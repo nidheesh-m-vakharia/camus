@@ -18,6 +18,29 @@ use object_store::{
     RetryConfig,
 };
 
+/// Endpoint `object_store` can use for virtual-hosted requests. The bucket
+/// name has to be the first label of the host. A path-style endpoint such as
+/// `https://t3.storageapi.dev` becomes `https://camus.t3.storageapi.dev`.
+fn virtual_host_endpoint(endpoint: &str, bucket: &str) -> anyhow::Result<String> {
+    let mut url = url::Url::parse(endpoint)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("S3 endpoint has no host"))?
+        .to_string();
+    let prefixed = format!("{bucket}.");
+    if !host.eq_ignore_ascii_case(bucket)
+        && !host
+            .to_ascii_lowercase()
+            .starts_with(&prefixed.to_ascii_lowercase())
+    {
+        url.set_host(Some(&format!("{bucket}.{host}")))?;
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
 /// An S3-compatible bucket.
 #[derive(Clone)]
 pub struct Bucket {
@@ -41,17 +64,26 @@ pub struct BucketConfig {
     /// Prepended to every key, so several clusters can share one bucket.
     /// Empty, or ending in `/`. Callers never see it.
     pub prefix: String,
+    /// Virtual-hosted requests (`https://bucket.endpoint/...`). Railway
+    /// Buckets need this. MinIO and R2 stay path-style.
+    pub virtual_hosted: bool,
 }
 
 impl Bucket {
     /// Build a client. Conditional put is on, because R2 and MinIO support it.
     pub fn connect(config: &BucketConfig) -> anyhow::Result<Self> {
+        let endpoint = if config.virtual_hosted {
+            virtual_host_endpoint(&config.endpoint, &config.bucket)?
+        } else {
+            config.endpoint.clone()
+        };
         let store = AmazonS3Builder::new()
-            .with_endpoint(&config.endpoint)
+            .with_endpoint(endpoint)
             .with_bucket_name(&config.bucket)
             .with_region(&config.region)
             .with_access_key_id(&config.access_key)
             .with_secret_access_key(&config.secret_key)
+            .with_virtual_hosted_style_request(config.virtual_hosted)
             .with_conditional_put(S3ConditionalPut::ETagMatch)
             // A few quick retries per call. The uploader keeps its own
             // jittered backoff across calls, so an outage ends in seconds,
@@ -137,5 +169,24 @@ impl Bucket {
             Err(object_store::Error::NotFound { .. }) => Ok(true),
             Err(err) => Err(err.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::virtual_host_endpoint;
+
+    #[test]
+    fn virtual_host_inserts_the_bucket_label() {
+        let endpoint = virtual_host_endpoint("https://t3.storageapi.dev", "camus-abc").unwrap();
+        assert_eq!(endpoint, "https://camus-abc.t3.storageapi.dev");
+    }
+
+    #[test]
+    fn virtual_host_leaves_an_already_prefixed_endpoint() {
+        let endpoint =
+            virtual_host_endpoint("https://camus-abc.t3.storageapi.dev/extra", "camus-abc")
+                .unwrap();
+        assert_eq!(endpoint, "https://camus-abc.t3.storageapi.dev");
     }
 }

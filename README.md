@@ -1,5 +1,12 @@
 # Camus
 
+![Camus](site/banner.png)
+
+[![License: Apache-2.0](https://img.shields.io/github/license/nidheesh-m-vakharia/camus?color=3e63dd)](LICENSE)
+[![CI](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml/badge.svg)](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml)
+[![Kafka 4.4.0](https://img.shields.io/badge/Kafka-4.4.0-171717)](docs/compatibility.md)
+[![Rust](https://img.shields.io/badge/rust-stable-934c1a)](rust-toolchain.toml)
+
 Camus is a Kafka broker in one Rust binary. Producers, consumers, and admin
 clients use the Kafka wire protocol. The log is stored in Cloudflare R2, or
 any S3-compatible bucket. Brokers replicate metadata, and a short
@@ -48,7 +55,11 @@ keys `camus` / `camus-dev-secret`. Override with `CAMUS_S3_ENDPOINT`,
 `CAMUS_S3_PREFIX` puts every key under a prefix. The broker deletes objects
 it no longer references, so each cluster needs its own bucket or prefix. A
 container does not see MinIO on the host at `127.0.0.1`; point
-`CAMUS_S3_ENDPOINT` at the host.
+`CAMUS_S3_ENDPOINT` at the host. `CAMUS_S3_REGION` defaults to `us-east-1`.
+Set `CAMUS_S3_VIRTUAL_HOST=1` for a virtual-hosted endpoint such as a
+Railway Bucket. `CAMUS_ADVERTISED_HOST` and `CAMUS_ADVERTISED_PORT` are
+the address clients should dial. On Railway those fall back to
+`RAILWAY_TCP_PROXY_DOMAIN` and `RAILWAY_TCP_PROXY_PORT`.
 
 `GET /admin/metrics` returns JSON, including `current_leader` and
 `wal_leader`. `GET /metrics` is Prometheus.
@@ -57,6 +68,25 @@ Three brokers plus MinIO: `docker compose --profile brokers up`. The image
 is published from `main` to `ghcr.io/<owner>/camus`, tagged `latest` and
 the commit sha, after the test workflow passes. The GitHub package stays
 private until you change that in the package settings.
+
+## Railway
+
+`.railway/railway.ts` is one broker from this repo, a volume at `/data`,
+a Railway Bucket named `logs` for sealed extents, and a public TCP proxy
+on 9092. The Kafka listener is PLAINTEXT. Admin HTTP listens on Railway's
+`PORT` and stays off the public internet. `GET /health` is the healthcheck.
+
+```
+npm install --prefix .railway
+railway login
+railway link
+railway config plan
+railway config apply
+```
+
+Bootstrap servers are `RAILWAY_TCP_PROXY_DOMAIN:RAILWAY_TCP_PROXY_PORT`.
+The bucket variables are references to `logs`, so credentials stay in
+Railway.
 
 ## What clients can do
 
