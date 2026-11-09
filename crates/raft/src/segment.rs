@@ -6,12 +6,24 @@
 //! little-endian. The CRC covers the index, the length, and the payload.
 //! A short or bad-CRC tail is a crash remnant: open truncates it and keeps
 //! every record that was synced before it.
+//!
+//! One writer and any number of readers share a log. The writer holds
+//! `writer` across its write and `fsync`; it takes `index` only to publish
+//! the records once they are durable. Readers take `index` just long enough
+//! to copy record locations, then `pread` from read handles opened once per
+//! segment, with no lock held. A truncate bumps the index generation, and a
+//! reader that saw it change reads again, so it never returns bytes from
+//! past a truncation. The most recent appends also stay in memory, up to a
+//! fixed byte budget, so reading back what was just written does not reach
+//! the disk.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crc::{Crc, CRC_32_ISCSI};
 use serde::{Deserialize, Serialize};
@@ -28,6 +40,15 @@ const MAX_PAYLOAD: u32 = 32 * 1024 * 1024;
 
 /// Default segment size from ADR 0011.
 pub const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default memory for recent appends. An entry is a packed group of up to
+/// about 1 MiB, and two can be committing at once, so this covers what
+/// replication and apply read back right after the write. A read past it
+/// goes to disk; `0` turns it off.
+pub const DEFAULT_TAIL_BYTES: usize = 4 * 1024 * 1024;
+
+/// A record's payload, shared between the tail and readers.
+pub type Payload = Arc<Vec<u8>>;
 
 #[derive(Clone, Copy, Debug)]
 struct Loc {
@@ -47,43 +68,138 @@ struct SegmentMeta {
 #[derive(Debug)]
 pub struct SegmentLog {
     dir: PathBuf,
+    /// Lock order: `writer`, then `index`.
+    writer: Mutex<Writer>,
+    index: Mutex<Index>,
+}
+
+/// What only the writer touches.
+#[derive(Debug)]
+struct Writer {
     segment_bytes: u64,
-    locs: BTreeMap<u64, Loc>,
     active_segment: u64,
+    /// Written with direct I/O on Linux. Readers use their own handles.
     active: File,
     active_len: u64,
     /// Bumped each time `active` is a different file. Registered `io_uring`
     /// descriptors follow this, not the raw number, which the kernel reuses.
+    /// One writer means one submission per ring at a time.
     active_gen: u64,
     skip_through: Option<u64>,
     submit: crate::submit::Submitter,
 }
 
+/// What readers need, published by the writer after each durable change.
+#[derive(Debug)]
+struct Index {
+    locs: BTreeMap<u64, Loc>,
+    /// Read-only handles, opened on first read of a segment.
+    files: BTreeMap<u64, Arc<File>>,
+    /// Bumped by every truncate.
+    generation: u64,
+    /// The most recent appended payloads, at most `tail_cap` bytes.
+    tail: BTreeMap<u64, Payload>,
+    tail_bytes: usize,
+    tail_cap: usize,
+}
+
+impl Index {
+    fn new(locs: BTreeMap<u64, Loc>, tail_cap: usize) -> Self {
+        Self {
+            locs,
+            files: BTreeMap::new(),
+            generation: 0,
+            tail: BTreeMap::new(),
+            tail_bytes: 0,
+            tail_cap,
+        }
+    }
+
+    fn remember(&mut self, index: u64, payload: Payload) {
+        if payload.len() > self.tail_cap {
+            return;
+        }
+        self.tail_bytes += payload.len();
+        self.tail.insert(index, payload);
+        while self.tail_bytes > self.tail_cap {
+            let (_, oldest) = self.tail.pop_first().expect("tail holds bytes");
+            self.tail_bytes -= oldest.len();
+        }
+    }
+
+    fn forget(&mut self, indexes: impl IntoIterator<Item = u64>) {
+        for index in indexes {
+            if let Some(payload) = self.tail.remove(&index) {
+                self.tail_bytes -= payload.len();
+            }
+        }
+    }
+
+    /// Drop read handles for segments no record points into.
+    fn close_unused(&mut self) {
+        let locs = &self.locs;
+        self.files
+            .retain(|segment, _| locs.values().any(|loc| loc.segment == *segment));
+    }
+
+    fn file(&mut self, dir: &Path, segment: u64) -> io::Result<Arc<File>> {
+        if let Some(file) = self.files.get(&segment) {
+            return Ok(file.clone());
+        }
+        let file = Arc::new(File::open(segment_path(dir, segment))?);
+        self.files.insert(segment, file.clone());
+        Ok(file)
+    }
+}
+
+/// Where one read gets a record from.
+enum Source {
+    Tail(Payload),
+    Disk(Loc, Arc<File>),
+}
+
 impl SegmentLog {
     /// Open `dir`, rebuild the index, and drop a torn tail.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
-        Self::open_with_segment_size(dir, DEFAULT_SEGMENT_BYTES)
+        Self::open_with(dir, DEFAULT_SEGMENT_BYTES, None, DEFAULT_TAIL_BYTES)
     }
 
     /// Open with a small segment size. Tests use this to force rotation.
     pub fn open_with_segment_size(dir: impl AsRef<Path>, segment_bytes: u64) -> io::Result<Self> {
+        Self::open_with(dir, segment_bytes, None, DEFAULT_TAIL_BYTES)
+    }
+
+    /// Open, skipping indexes at or below `purged` as well as any this log
+    /// recorded itself, and keeping up to `tail_bytes` of recent appends in
+    /// memory. A caller that persists its own purge point passes it here
+    /// and purges with [`SegmentLog::drop_through`].
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        segment_bytes: u64,
+        purged: Option<u64>,
+        tail_bytes: usize,
+    ) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
-        let skip_through = load_meta(&dir)?.skip_through;
+        let skip_through = load_meta(&dir)?.skip_through.max(purged);
         let mut segments = segment_files(&dir)?;
+        let assemble = |dir: PathBuf, locs, writer| Self {
+            dir,
+            writer: Mutex::new(writer),
+            index: Mutex::new(Index::new(locs, tail_bytes)),
+        };
         if segments.is_empty() {
             let active = create_segment(&dir, 0)?;
-            return Ok(Self {
-                dir,
+            let writer = Writer {
                 segment_bytes,
-                locs: BTreeMap::new(),
                 active_segment: 0,
                 active,
                 active_len: 0,
                 active_gen: 1,
                 skip_through,
                 submit: crate::submit::Submitter::new(),
-            });
+            };
+            return Ok(assemble(dir, BTreeMap::new(), writer));
         }
 
         let mut locs = BTreeMap::new();
@@ -109,17 +225,16 @@ impl SegmentLog {
                 let _ = fs::remove_file(path);
             }
             let active = create_segment(&dir, 0)?;
-            return Ok(Self {
-                dir,
+            let writer = Writer {
                 segment_bytes,
-                locs,
                 active_segment: 0,
                 active,
                 active_len: 0,
                 active_gen: 1,
                 skip_through,
                 submit: crate::submit::Submitter::new(),
-            });
+            };
+            return Ok(assemble(dir, locs, writer));
         }
 
         let active_segment = locs
@@ -135,29 +250,74 @@ impl SegmentLog {
         let active_len = active.metadata()?.len();
         // Open leaves the cursor at byte 0. The next append must extend the tail.
         active.seek(SeekFrom::Start(active_len))?;
-        Ok(Self {
-            dir,
+        let writer = Writer {
             segment_bytes,
-            locs,
             active_segment,
             active,
             active_len,
             active_gen: 1,
             skip_through,
             submit: crate::submit::Submitter::new(),
-        })
+        };
+        Ok(assemble(dir, locs, writer))
+    }
+
+    fn writer(&self) -> io::Result<MutexGuard<'_, Writer>> {
+        self.writer
+            .lock()
+            .map_err(|_| io::Error::other("segment writer lock poisoned"))
+    }
+
+    fn index(&self) -> io::Result<MutexGuard<'_, Index>> {
+        self.index
+            .lock()
+            .map_err(|_| io::Error::other("segment index lock poisoned"))
     }
 
     /// Highest stored index.
     pub fn last_index(&self) -> Option<u64> {
-        self.locs.keys().next_back().copied()
+        self.index().ok()?.locs.keys().next_back().copied()
     }
 
     /// Write records and fsync once per segment. Readers see them only after
     /// that sync. On Linux the write and the fsync are one `io_uring` submission.
-    pub fn append_batch(&mut self, records: &[(u64, &[u8])]) -> io::Result<()> {
+    pub fn append_batch(&self, records: &[(u64, &[u8])]) -> io::Result<()> {
+        let mut writer = self.writer()?;
+        let added = writer.write(&self.dir, self.last_index(), records)?;
+        let mut index = self.index()?;
+        index.locs.extend(added);
+        Ok(())
+    }
+
+    /// [`SegmentLog::append_batch`], keeping the payloads in the in-memory
+    /// tail so reading them back right away does not reach the disk.
+    pub fn append_shared(&self, records: Vec<(u64, Payload)>) -> io::Result<()> {
+        let mut writer = self.writer()?;
+        let borrowed: Vec<(u64, &[u8])> = records
+            .iter()
+            .map(|(index, payload)| (*index, payload.as_slice()))
+            .collect();
+        let added = writer.write(&self.dir, self.last_index(), &borrowed)?;
+        let mut index = self.index()?;
+        index.locs.extend(added);
+        for (at, payload) in records {
+            index.remember(at, payload);
+        }
+        Ok(())
+    }
+}
+
+impl Writer {
+    /// Write and sync `records` after `last_stored`, and return where each
+    /// landed. Nothing is published to readers here.
+    fn write(
+        &mut self,
+        dir: &Path,
+        last_stored: Option<u64>,
+        records: &[(u64, &[u8])],
+    ) -> io::Result<Vec<(u64, Loc)>> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mark = self.active_len;
         let mark_segment = self.active_segment;
@@ -173,7 +333,6 @@ impl SegmentLog {
                     io::Error::new(io::ErrorKind::InvalidInput, "payload exceeds 32MiB"),
                 );
             }
-            let last_stored = self.locs.keys().next_back().copied();
             let last_batch = added.last().map(|(index, _)| *index);
             if let Some(last) = last_stored.max(last_batch) {
                 if index <= last {
@@ -195,7 +354,7 @@ impl SegmentLog {
                 }
                 chunk.clear();
                 let next = index;
-                self.active = create_segment(&self.dir, next)?;
+                self.active = create_segment(dir, next)?;
                 self.active_segment = next;
                 self.active_len = 0;
                 self.active_gen = self.active_gen.wrapping_add(1);
@@ -216,10 +375,7 @@ impl SegmentLog {
         if let Err(err) = self.flush_chunk(chunk_at, &mut chunk) {
             return self.fail_append(mark_segment, mark, chunk_at, err);
         }
-        for (index, loc) in added {
-            self.locs.insert(index, loc);
-        }
-        Ok(())
+        Ok(added)
     }
 
     fn flush_chunk(&mut self, offset: u64, bytes: &mut Vec<u8>) -> io::Result<()> {
@@ -242,13 +398,13 @@ impl SegmentLog {
 
     /// The bytes did not hit disk. Roll the active file back when this batch
     /// did not rotate it.
-    fn fail_append(
+    fn fail_append<T>(
         &mut self,
         mark_segment: u64,
         mark: u64,
         chunk_at: u64,
         err: io::Error,
-    ) -> io::Result<()> {
+    ) -> io::Result<T> {
         let rewind = if self.active_segment == mark_segment {
             mark
         } else {
@@ -259,41 +415,77 @@ impl SegmentLog {
         self.active_len = rewind;
         Err(err)
     }
+}
 
+impl SegmentLog {
     /// Payload at `index`, if it is still in the log.
-    pub fn get(&self, index: u64) -> io::Result<Option<Vec<u8>>> {
-        let Some(loc) = self.locs.get(&index).copied() else {
-            return Ok(None);
-        };
-        Ok(Some(read_payload(&self.dir, loc)?))
+    pub fn get(&self, index: u64) -> io::Result<Option<Payload>> {
+        Ok(self
+            .range(Bound::Included(index), Bound::Included(index))?
+            .into_iter()
+            .next()
+            .map(|(_, payload)| payload))
     }
 
-    /// Records whose indexes fall in `range`, in order.
-    pub fn range(&self, start: Bound<u64>, end: Bound<u64>) -> io::Result<Vec<(u64, Vec<u8>)>> {
-        let mut out = Vec::new();
-        for (&index, &loc) in self.locs.range((start, end)) {
-            out.push((index, read_payload(&self.dir, loc)?));
+    /// Records whose indexes fall in `range`, in order. No lock is held
+    /// while reading from disk.
+    pub fn range(&self, start: Bound<u64>, end: Bound<u64>) -> io::Result<Vec<(u64, Payload)>> {
+        loop {
+            let (generation, plan) = {
+                let mut index = self.index()?;
+                let mut plan = Vec::new();
+                let wanted: Vec<(u64, Loc)> = index
+                    .locs
+                    .range((start, end))
+                    .map(|(at, loc)| (*at, *loc))
+                    .collect();
+                for (at, loc) in wanted {
+                    let source = match index.tail.get(&at) {
+                        Some(payload) => Source::Tail(payload.clone()),
+                        None => Source::Disk(loc, index.file(&self.dir, loc.segment)?),
+                    };
+                    plan.push((at, source));
+                }
+                (index.generation, plan)
+            };
+            let from_disk = plan
+                .iter()
+                .any(|(_, source)| matches!(source, Source::Disk(..)));
+            let read: io::Result<Vec<(u64, Payload)>> = plan
+                .into_iter()
+                .map(|(at, source)| match source {
+                    Source::Tail(payload) => Ok((at, payload)),
+                    Source::Disk(loc, file) => Ok((at, Arc::new(read_payload(&file, loc)?))),
+                })
+                .collect();
+            // A truncate while reading may have cut or rewritten those bytes.
+            if !from_disk || self.index()?.generation == generation {
+                return read;
+            }
         }
-        Ok(out)
     }
 
     /// Drop every record with `index >= from`, inclusive.
-    pub fn truncate_from(&mut self, from: u64) -> io::Result<()> {
-        let doomed: Vec<u64> = self.locs.range(from..).map(|(k, _)| *k).collect();
+    pub fn truncate_from(&self, from: u64) -> io::Result<()> {
+        let mut writer = self.writer()?;
+        let mut index = self.index()?;
+        let doomed: Vec<u64> = index.locs.range(from..).map(|(k, _)| *k).collect();
         if doomed.is_empty() {
             return Ok(());
         }
-        let segments: Vec<u64> = self.locs.values().map(|loc| loc.segment).collect();
-        let mut unique_segments: Vec<u64> = segments;
+        index.generation += 1;
+        let mut unique_segments: Vec<u64> = index.locs.values().map(|loc| loc.segment).collect();
         unique_segments.sort_unstable();
         unique_segments.dedup();
 
-        for index in &doomed {
-            self.locs.remove(index);
+        for at in &doomed {
+            index.locs.remove(at);
         }
+        index.forget(doomed);
+        index.close_unused();
         // Delete segment files that no longer have records, then truncate the
         // one that still does if the cut lands inside it.
-        let mut survivors: Vec<u64> = self.locs.values().map(|loc| loc.segment).collect();
+        let mut survivors: Vec<u64> = index.locs.values().map(|loc| loc.segment).collect();
         survivors.sort_unstable();
         survivors.dedup();
         for segment in unique_segments {
@@ -301,24 +493,24 @@ impl SegmentLog {
                 let _ = fs::remove_file(segment_path(&self.dir, segment));
             }
         }
-        if self.locs.is_empty() {
-            let _ = fs::remove_file(segment_path(&self.dir, self.active_segment));
-            self.active = create_segment(&self.dir, 0)?;
-            self.active_segment = 0;
-            self.active_len = 0;
-            self.active_gen = self.active_gen.wrapping_add(1);
+        if index.locs.is_empty() {
+            let _ = fs::remove_file(segment_path(&self.dir, writer.active_segment));
+            writer.active = create_segment(&self.dir, 0)?;
+            writer.active_segment = 0;
+            writer.active_len = 0;
+            writer.active_gen = writer.active_gen.wrapping_add(1);
             return Ok(());
         }
         let active_segment = survivors.last().copied().unwrap_or(0);
-        if active_segment != self.active_segment {
-            self.active = OpenOptions::new()
+        if active_segment != writer.active_segment {
+            writer.active = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(segment_path(&self.dir, active_segment))?;
-            self.active_segment = active_segment;
-            self.active_gen = self.active_gen.wrapping_add(1);
+            writer.active_segment = active_segment;
+            writer.active_gen = writer.active_gen.wrapping_add(1);
         }
-        let last = self
+        let last = index
             .locs
             .values()
             .filter(|loc| loc.segment == active_segment)
@@ -326,18 +518,20 @@ impl SegmentLog {
         let end = last
             .map(|loc| loc.header + record_len(loc.len as usize))
             .unwrap_or(0);
-        self.active.set_len(end)?;
-        self.active.seek(SeekFrom::Start(end))?;
-        self.active.sync_all()?;
-        self.active_len = end;
+        writer.active.set_len(end)?;
+        writer.active.seek(SeekFrom::Start(end))?;
+        writer.active.sync_all()?;
+        writer.active_len = end;
         Ok(())
     }
 
-    /// Drop records with `index <= through`. Whole segments below the cut are deleted.
-    pub fn purge_through(&mut self, through: u64) -> io::Result<()> {
+    /// Drop records with `index <= through`. Whole segments below the cut are
+    /// deleted. The cut is persisted in this log's own meta file first.
+    pub fn purge_through(&self, through: u64) -> io::Result<()> {
+        let mut writer = self.writer()?;
         // Persist the skip first. A crash before the bytes are removed must
         // not resurrect those indexes on the next open.
-        let skip = self
+        let skip = writer
             .skip_through
             .map_or(through, |current| current.max(through));
         store_meta(
@@ -346,21 +540,41 @@ impl SegmentLog {
                 skip_through: Some(skip),
             },
         )?;
-        self.skip_through = Some(skip);
-        let doomed: Vec<u64> = self.locs.range(..=through).map(|(k, _)| *k).collect();
-        let mut touched = Vec::new();
-        for index in doomed {
-            if let Some(loc) = self.locs.remove(&index) {
-                touched.push(loc.segment);
+        writer.skip_through = Some(skip);
+        self.forget_through(&writer, through)
+    }
+
+    /// [`SegmentLog::purge_through`] for a caller that has already made the
+    /// cut durable, and passes it to [`SegmentLog::open_with`] on the next
+    /// open. Writes no meta file.
+    pub fn drop_through(&self, through: u64) -> io::Result<()> {
+        let mut writer = self.writer()?;
+        writer.skip_through = writer.skip_through.max(Some(through));
+        self.forget_through(&writer, through)
+    }
+
+    fn forget_through(&self, writer: &Writer, through: u64) -> io::Result<()> {
+        let doomed_segments = {
+            let mut index = self.index()?;
+            let doomed: Vec<u64> = index.locs.range(..=through).map(|(k, _)| *k).collect();
+            let mut touched = Vec::new();
+            for at in &doomed {
+                if let Some(loc) = index.locs.remove(at) {
+                    touched.push(loc.segment);
+                }
             }
-        }
-        touched.sort_unstable();
-        touched.dedup();
-        for segment in touched {
-            let still = self.locs.values().any(|loc| loc.segment == segment);
-            if !still && segment != self.active_segment {
-                let _ = fs::remove_file(segment_path(&self.dir, segment));
-            }
+            index.forget(doomed);
+            touched.sort_unstable();
+            touched.dedup();
+            touched.retain(|segment| {
+                *segment != writer.active_segment
+                    && !index.locs.values().any(|loc| loc.segment == *segment)
+            });
+            index.close_unused();
+            touched
+        };
+        for segment in doomed_segments {
+            let _ = fs::remove_file(segment_path(&self.dir, segment));
         }
         Ok(())
     }
@@ -528,11 +742,9 @@ fn scan_segment(
     }
 }
 
-fn read_payload(dir: &Path, loc: Loc) -> io::Result<Vec<u8>> {
-    let mut file = File::open(segment_path(dir, loc.segment))?;
-    file.seek(SeekFrom::Start(loc.header + HEADER as u64))?;
+fn read_payload(file: &File, loc: Loc) -> io::Result<Vec<u8>> {
     let mut payload = vec![0u8; loc.len as usize];
-    file.read_exact(&mut payload)?;
+    file.read_exact_at(&mut payload, loc.header + HEADER as u64)?;
     Ok(payload)
 }
 
@@ -543,7 +755,7 @@ mod tests {
     #[test]
     fn append_reopen_and_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = SegmentLog::open_with_segment_size(dir.path(), 1024).unwrap();
+        let log = SegmentLog::open_with_segment_size(dir.path(), 1024).unwrap();
         log.append_batch(&[(1, b"one"), (2, b"two")]).unwrap();
         drop(log);
 
@@ -555,34 +767,34 @@ mod tests {
         raw.sync_all().unwrap();
         drop(raw);
 
-        let mut log = SegmentLog::open(dir.path()).unwrap();
-        assert_eq!(log.get(1).unwrap().unwrap(), b"one");
-        assert_eq!(log.get(2).unwrap().unwrap(), b"two");
+        let log = SegmentLog::open(dir.path()).unwrap();
+        assert_eq!(log.get(1).unwrap().unwrap().as_slice(), b"one");
+        assert_eq!(log.get(2).unwrap().unwrap().as_slice(), b"two");
         assert_eq!(log.last_index(), Some(2));
         assert!(log.get(3).unwrap().is_none());
         log.append_batch(&[(3, b"three")]).unwrap();
-        assert_eq!(log.get(1).unwrap().unwrap(), b"one");
-        assert_eq!(log.get(3).unwrap().unwrap(), b"three");
+        assert_eq!(log.get(1).unwrap().unwrap().as_slice(), b"one");
+        assert_eq!(log.get(3).unwrap().unwrap().as_slice(), b"three");
     }
 
     #[test]
     fn truncate_and_purge() {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = SegmentLog::open_with_segment_size(dir.path(), 80).unwrap();
+        let log = SegmentLog::open_with_segment_size(dir.path(), 80).unwrap();
         log.append_batch(&[(1, b"aaaa"), (2, b"bbbb"), (3, b"cccc"), (4, b"dddd")])
             .unwrap();
         log.truncate_from(3).unwrap();
         assert!(log.get(3).unwrap().is_none());
-        assert_eq!(log.get(2).unwrap().unwrap(), b"bbbb");
+        assert_eq!(log.get(2).unwrap().unwrap().as_slice(), b"bbbb");
         log.append_batch(&[(3, b"eee")]).unwrap();
-        assert_eq!(log.get(3).unwrap().unwrap(), b"eee");
+        assert_eq!(log.get(3).unwrap().unwrap().as_slice(), b"eee");
         log.purge_through(2).unwrap();
         assert!(log.get(1).unwrap().is_none());
         assert!(log.get(2).unwrap().is_none());
-        assert_eq!(log.get(3).unwrap().unwrap(), b"eee");
+        assert_eq!(log.get(3).unwrap().unwrap().as_slice(), b"eee");
         drop(log);
         let log = SegmentLog::open(dir.path()).unwrap();
-        assert_eq!(log.get(3).unwrap().unwrap(), b"eee");
+        assert_eq!(log.get(3).unwrap().unwrap().as_slice(), b"eee");
         assert!(log.get(1).unwrap().is_none());
         assert_eq!(log.last_index(), Some(3));
     }
@@ -604,8 +816,159 @@ mod tests {
         let path = segment_path(dir.path(), 0);
         std::fs::write(&path, &buf).unwrap();
         let log = SegmentLog::open(dir.path()).unwrap();
-        assert_eq!(log.get(1).unwrap().unwrap(), b"one");
+        assert_eq!(log.get(1).unwrap().unwrap().as_slice(), b"one");
         assert_eq!(log.last_index(), Some(1));
         assert!(log.get(u64::MAX).unwrap().is_none());
+    }
+
+    fn shared(records: &[(u64, &str)]) -> Vec<(u64, Payload)> {
+        records
+            .iter()
+            .map(|(index, text)| (*index, Arc::new(text.as_bytes().to_vec())))
+            .collect()
+    }
+
+    #[test]
+    fn reads_do_not_wait_for_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(SegmentLog::open_with(dir.path(), 1024, None, 0).unwrap());
+        log.append_batch(&[(1, b"one"), (2, b"two")]).unwrap();
+        // A writer mid-fsync holds this lock.
+        let held = log.writer.lock().unwrap();
+        let reader = log.clone();
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(reader.range(Bound::Unbounded, Bound::Unbounded).unwrap());
+        });
+        let read = wait
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a read blocked on the writer lock");
+        drop(held);
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[1].1.as_slice(), b"two");
+    }
+
+    #[test]
+    fn recent_appends_are_read_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SegmentLog::open_with(dir.path(), 1024, None, 1024).unwrap();
+        log.append_shared(shared(&[(1, "one"), (2, "two")]))
+            .unwrap();
+        // Wipe the bytes on disk. Only the tail can still answer.
+        OpenOptions::new()
+            .write(true)
+            .open(segment_path(dir.path(), 0))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert_eq!(log.get(2).unwrap().unwrap().as_slice(), b"two");
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = SegmentLog::open_with(dir.path(), 1024, None, 0).unwrap();
+        log.append_shared(shared(&[(1, "one")])).unwrap();
+        assert!(
+            log.index.lock().unwrap().tail.is_empty(),
+            "budget 0 keeps nothing"
+        );
+        assert_eq!(log.get(1).unwrap().unwrap().as_slice(), b"one");
+    }
+
+    #[test]
+    fn the_tail_stays_within_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SegmentLog::open_with(dir.path(), 1024, None, 10).unwrap();
+        log.append_shared(shared(&[(1, "aaaa"), (2, "bbbb"), (3, "cccc")]))
+            .unwrap();
+        log.append_shared(shared(&[(4, "this is longer than ten")]))
+            .unwrap();
+        {
+            let index = log.index.lock().unwrap();
+            assert_eq!(index.tail.keys().copied().collect::<Vec<_>>(), vec![2, 3]);
+            assert_eq!(index.tail_bytes, 8);
+        }
+        log.truncate_from(3).unwrap();
+        log.drop_through(2).unwrap();
+        let index = log.index.lock().unwrap();
+        assert!(index.tail.is_empty());
+        assert_eq!(index.tail_bytes, 0);
+    }
+
+    #[test]
+    fn drop_through_relies_on_the_callers_purge_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SegmentLog::open_with(dir.path(), 64, None, 0).unwrap();
+        log.append_batch(&[(1, b"aaaa"), (2, b"bbbb"), (3, b"cccc")])
+            .unwrap();
+        log.drop_through(2).unwrap();
+        assert!(log.get(2).unwrap().is_none());
+        assert!(
+            !meta_path(dir.path()).exists(),
+            "the caller persists the purge point, not the log"
+        );
+        drop(log);
+        let log = SegmentLog::open_with(dir.path(), 64, Some(2), 0).unwrap();
+        assert!(log.get(1).unwrap().is_none());
+        assert!(log.get(2).unwrap().is_none());
+        assert_eq!(log.get(3).unwrap().unwrap().as_slice(), b"cccc");
+    }
+
+    /// Readers race a writer that keeps truncating and rewriting the same
+    /// indexes with new contents. Every record a reader returns has to be
+    /// whole: its payload names its own index.
+    #[test]
+    fn reads_racing_truncation_never_return_torn_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(SegmentLog::open_with(dir.path(), 4096, None, 0).unwrap());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let log = log.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut seen = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        for (index, payload) in
+                            log.range(Bound::Unbounded, Bound::Unbounded).unwrap()
+                        {
+                            let text = std::str::from_utf8(&payload).expect("torn utf-8");
+                            let (named, _) = text.split_once(':').expect("torn record");
+                            assert_eq!(named.parse::<u64>().unwrap(), index, "{text}");
+                            seen += 1;
+                        }
+                    }
+                    seen
+                })
+            })
+            .collect();
+        // Indexes 1-4 stay. 5-20 are cut and rewritten in place each round,
+        // with lengths that change, so a stale location lands mid-record.
+        let keep: Vec<(u64, Vec<u8>)> = (1..=4)
+            .map(|index| (index, format!("{index}:keep").into_bytes()))
+            .collect();
+        let borrowed: Vec<(u64, &[u8])> = keep
+            .iter()
+            .map(|(index, bytes)| (*index, bytes.as_slice()))
+            .collect();
+        log.append_batch(&borrowed).unwrap();
+        for round in 0..300u64 {
+            let records: Vec<(u64, Vec<u8>)> = (5..=20)
+                .map(|index| {
+                    let pad = "x".repeat(((index * 7 + round) % 50) as usize);
+                    (index, format!("{index}:{round}:{pad}").into_bytes())
+                })
+                .collect();
+            let borrowed: Vec<(u64, &[u8])> = records
+                .iter()
+                .map(|(index, bytes)| (*index, bytes.as_slice()))
+                .collect();
+            log.append_batch(&borrowed).unwrap();
+            log.truncate_from(5).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let seen: usize = readers
+            .into_iter()
+            .map(|reader| reader.join().unwrap())
+            .sum();
+        assert!(seen > 0, "readers never overlapped the writer");
     }
 }

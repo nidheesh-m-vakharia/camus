@@ -96,7 +96,7 @@ fn run_segment(
         let payload = owned.clone();
         let id = next.fetch_add(1, Ordering::Relaxed);
         let log_dir = dir.path().join(id.to_string());
-        let mut log = SegmentLog::open(&log_dir).unwrap();
+        let log = SegmentLog::open(&log_dir).unwrap();
         let mut index = 1u64;
         move || {
             let records: Vec<(u64, &[u8])> = (0..batch)
