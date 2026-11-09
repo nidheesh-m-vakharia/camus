@@ -923,6 +923,7 @@ impl Kafka {
                 .as_ref()
                 .map(|id| id.to_string())
                 .unwrap_or_default(),
+            client_host: format!("/{}", caller.host),
             version,
         };
         // Kafka needs READ on the group and DESCRIBE on each named topic; a

@@ -567,6 +567,17 @@ pub fn clock(raw: &str) -> Result<TxnClock, String> {
     })
 }
 
+/// The ranges of the ongoing transaction at `txn/{id}`, or none when it is
+/// not ongoing.
+pub fn spans(raw: &str) -> Result<Vec<TxnSpan>, String> {
+    let txn: Txn = serde_json::from_str(raw).map_err(|err| err.to_string())?;
+    Ok(if txn.state == "ongoing" {
+        txn.spans
+    } else {
+        Vec::new()
+    })
+}
+
 /// Read one stored transaction. `raw` is the JSON at `txn/{id}`.
 pub fn inspect(transactional_id: &str, raw: &str) -> Result<TxnInfo, String> {
     let txn: Txn = serde_json::from_str(raw).map_err(|err| err.to_string())?;

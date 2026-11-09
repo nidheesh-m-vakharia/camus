@@ -50,6 +50,8 @@ pub struct ConsumerHeartbeat {
     /// Partitions the member still owns. `None` when it left the field out.
     pub owned: Option<Vec<(Uuid, Vec<i32>)>>,
     pub client_id: String,
+    /// `/<ip>` of the client, as Kafka reports it.
+    pub client_host: String,
     pub version: i16,
 }
 
@@ -455,7 +457,7 @@ fn upsert_member(
     }
     let member = group.members.get_mut(member_id).expect("member");
     member.record.client_id = request.client_id.clone();
-    member.record.client_host = "/unknown".into();
+    member.record.client_host = request.client_host.clone();
     member.record.session_timeout_ms = millis(config.consumer_session_timeout);
     if request.rebalance_timeout_ms >= 0 {
         member.record.rebalance_timeout_ms = request.rebalance_timeout_ms;
@@ -1041,6 +1043,7 @@ mod tests {
             server_assignor: Some("range".into()),
             owned: owned.map(|parts| vec![(topic().id, parts)]),
             client_id: member.into(),
+            client_host: "/127.0.0.1".into(),
             version: 1,
         }
     }
