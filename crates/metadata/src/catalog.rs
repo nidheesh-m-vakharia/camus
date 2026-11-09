@@ -172,6 +172,10 @@ pub struct Partition {
     /// `OffsetForLeaderEpoch` answers from this.
     #[serde(default)]
     pub epochs: Vec<EpochStart>,
+    /// WAL shard the partition lives on, chosen at creation (ADR 0014).
+    /// Rows written before shards had ids are on shard 0.
+    #[serde(default)]
+    pub shard: u32,
 }
 
 /// An offset range, inclusive start, exclusive end.
@@ -246,6 +250,64 @@ fn names(raw: Option<String>) -> Result<Vec<String>, String> {
     }
 }
 
+/// Metadata key of the WAL shard layout: `{"count": N}`. Absent means one
+/// shard, as every cluster created before ADR 0014 has.
+pub const SHARDS: &str = "wal/shards";
+
+/// Metadata key of the next shard to place a partition on.
+const NEXT_SHARD: &str = "wal/next-shard";
+
+/// Places new partitions on WAL shards round-robin across the whole cluster,
+/// so topics with few partitions still spread over every shard (ADR 0014).
+pub(crate) struct Placer {
+    count: u64,
+    next: u64,
+    used: bool,
+}
+
+impl Placer {
+    pub(crate) fn load(
+        get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    ) -> Result<Self, String> {
+        let count = match get(SHARDS)? {
+            Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                .map_err(|err| err.to_string())?["count"]
+                .as_u64()
+                .unwrap_or(1)
+                .max(1),
+            None => 1,
+        };
+        let next = match get(NEXT_SHARD)? {
+            Some(raw) => raw
+                .parse()
+                .map_err(|err: std::num::ParseIntError| err.to_string())?,
+            None => 0,
+        };
+        Ok(Self {
+            count,
+            next,
+            used: false,
+        })
+    }
+
+    /// The shard for the next new partition.
+    pub(crate) fn next(&mut self) -> u32 {
+        if self.count == 1 {
+            return 0;
+        }
+        let shard = self.next % self.count;
+        self.next += 1;
+        self.used = true;
+        u32::try_from(shard).unwrap_or(0)
+    }
+
+    /// The counter to store, when any partition was placed on several shards.
+    pub(crate) fn put(&self) -> Option<(String, String)> {
+        self.used
+            .then(|| (NEXT_SHARD.to_string(), self.next.to_string()))
+    }
+}
+
 /// Create a topic. `partitions` must be at least 1. `durability` is `r2` or `wal`.
 /// `id` is chosen by the proposer and carried in the command, so every
 /// replica stores the same one. `configs` are checked here as well as by the
@@ -299,6 +361,7 @@ pub fn create_topic(
         ),
         (id_key(&id), name.to_string()),
     ];
+    let mut placer = Placer::load(get)?;
     for partition in 0..partitions {
         let state = Partition {
             next_offset: 0,
@@ -308,12 +371,14 @@ pub fn create_topic(
             txn_committed: Vec::new(),
             txn_aborted: Vec::new(),
             epochs: Vec::new(),
+            shard: placer.next(),
         };
         put.push((
             part_key(&id, partition),
             serde_json::to_string(&state).map_err(|err| err.to_string())?,
         ));
     }
+    put.extend(placer.put());
     let mut list = names(get(TOPICS)?)?;
     list.push(name.to_string());
     put.push((
@@ -661,5 +726,39 @@ mod tests {
                 EpochStart { epoch: 3, start: 4 }
             ]
         );
+    }
+
+    #[test]
+    fn partitions_are_placed_round_robin_across_topics() {
+        let shards_of = |map: &HashMap<String, String>, id: &str, count: i32| -> Vec<u32> {
+            (0..count)
+                .map(|partition| {
+                    parse_partition(&map[&partition_storage_key(id, partition)])
+                        .unwrap()
+                        .shard
+                })
+                .collect()
+        };
+        let create = |map: &mut HashMap<String, String>, name: &str, id: &str, count: i32| {
+            let get = |key: &str| Ok(map.get(key).cloned());
+            let Outcome::Change { put, .. } =
+                create_topic(&get, name, id, count, "wal", &[]).unwrap()
+            else {
+                panic!("create");
+            };
+            for (key, value) in put {
+                map.insert(key, value);
+            }
+        };
+        let mut single = HashMap::new();
+        create(&mut single, "a", "id-a", 3);
+        assert_eq!(shards_of(&single, "id-a", 3), vec![0, 0, 0]);
+        assert!(!single.contains_key("wal/next-shard"));
+
+        let mut three = HashMap::from([(SHARDS.to_string(), r#"{"count":3}"#.to_string())]);
+        create(&mut three, "a", "id-a", 2);
+        create(&mut three, "b", "id-b", 2);
+        assert_eq!(shards_of(&three, "id-a", 2), vec![0, 1]);
+        assert_eq!(shards_of(&three, "id-b", 2), vec![2, 0]);
     }
 }

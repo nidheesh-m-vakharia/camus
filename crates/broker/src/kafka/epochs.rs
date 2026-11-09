@@ -56,9 +56,12 @@ impl Kafka {
                     Some(found) if asked.partition < 0 || asked.partition >= found.partitions => {
                         UNKNOWN_TOPIC
                     }
-                    Some(found) if !self.leads_topic(found) => NOT_LEADER,
-                    Some(found) => match self.check_leader_epoch(found, asked.current_leader_epoch)
-                    {
+                    Some(found) if !self.leads_partition(found, asked.partition) => NOT_LEADER,
+                    Some(found) => match self.check_leader_epoch(
+                        found,
+                        asked.partition,
+                        asked.current_leader_epoch,
+                    ) {
                         Err(code) => code,
                         Ok(()) => {
                             let (epoch, end) = self
@@ -80,7 +83,7 @@ impl Kafka {
     /// The largest epoch at or below `requested`, and the offset where it
     /// ended, as `(epoch, end_offset)`.
     async fn epoch_end(&self, topic: &Topic, partition: i32, requested: i32) -> (i32, i64) {
-        let current = self.leading_epoch(topic);
+        let current = self.leading_epoch(topic, partition);
         let Some(high_watermark) = self.high_watermark(topic, partition) else {
             return (-1, -1);
         };
@@ -126,13 +129,12 @@ impl Kafka {
         starts: &mut Vec<EpochStart>,
     ) {
         let id = topic_id(topic);
+        let Some(wal) = self.wal_of(topic, partition) else {
+            return;
+        };
         let mut offset = sealed;
         while offset < high_watermark {
-            let Ok(bytes) = self
-                .wal()
-                .read(&id, partition, sealed, offset, SCAN_CHUNK)
-                .await
-            else {
+            let Ok(bytes) = wal.read(&id, partition, sealed, offset, SCAN_CHUNK).await else {
                 return;
             };
             let Ok(batches) = batch::inspect(&bytes, batch::MAX_BATCH_CEILING) else {

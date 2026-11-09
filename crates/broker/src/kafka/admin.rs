@@ -306,7 +306,6 @@ impl Kafka {
         let mut local: Vec<Option<Item>> = Vec::new();
         for topic in &request.topics {
             let stored = self.topic(topic.name.0.as_str());
-            let led = stored.as_ref().is_some_and(|topic| self.leads_topic(topic));
             let allowed = self.allows(caller, auth::TOPIC, topic.name.0.as_str(), auth::DELETE);
             for partition in &topic.partitions {
                 if !allowed {
@@ -320,6 +319,9 @@ impl Kafka {
                     local.push(Some(Item { code: 3, low: -1 }));
                     continue;
                 }
+                let led = stored
+                    .as_ref()
+                    .is_some_and(|found| self.leads_partition(found, partition.partition_index));
                 if !led {
                     local.push(Some(Item {
                         code: NOT_LEADER,
@@ -374,9 +376,11 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    pub(super) fn leads_topic(&self, topic: &Topic) -> bool {
+    /// This broker leads the partition: the leader of its WAL shard for a
+    /// `wal` topic, the metadata leader for an `r2` topic.
+    pub(super) fn leads_partition(&self, topic: &Topic, partition: i32) -> bool {
         if topic.durability == "wal" {
-            self.wal().is_leader()
+            self.leads_wal(topic, partition)
         } else {
             self.leader()
         }
