@@ -4,17 +4,21 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use camus_protocol::messages::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+use camus_protocol::messages::create_topics_response::CreateTopicsResponse;
 use camus_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use camus_protocol::messages::fetch_response::FetchResponse;
 use camus_protocol::messages::metadata_request::MetadataRequestTopic;
 use camus_protocol::messages::metadata_response::MetadataResponse;
 use camus_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use camus_protocol::messages::produce_response::ProduceResponse;
-use camus_protocol::messages::{ApiKey, FetchRequest, MetadataRequest, ProduceRequest, TopicName};
+use camus_protocol::messages::{
+    ApiKey, CreateTopicsRequest, FetchRequest, MetadataRequest, ProduceRequest, TopicName,
+};
 use camus_protocol::protocol::StrBytes;
 use support::*;
 
@@ -23,6 +27,16 @@ const PARTITIONS: i32 = 3;
 /// `(leader id, leader address)` of each partition, from `via`'s Metadata,
 /// once every partition has a reachable leader that is not `excluded`.
 fn leaders(via: &str, excluded: Option<i32>) -> Vec<(i32, String)> {
+    leaders_of(via, TOPIC, PARTITIONS, excluded)
+}
+
+/// `(leader id, leader address)` of each partition of `topic`.
+fn leaders_of(
+    via: &str,
+    topic: &'static str,
+    count: i32,
+    excluded: Option<i32>,
+) -> Vec<(i32, String)> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let mut stream = connect(via);
@@ -31,7 +45,7 @@ fn leaders(via: &str, excluded: Option<i32>) -> Vec<(i32, String)> {
             ApiKey::Metadata,
             12,
             &MetadataRequest::default().with_topics(Some(vec![MetadataRequestTopic::default()
-                .with_name(Some(TopicName(StrBytes::from_static_str(TOPIC))))])),
+                .with_name(Some(TopicName(StrBytes::from_static_str(topic))))])),
         );
         let metadata = recv::<MetadataResponse>(&mut stream, 12);
         let found: Vec<(i32, String)> = metadata.topics[0]
@@ -47,7 +61,7 @@ fn leaders(via: &str, excluded: Option<i32>) -> Vec<(i32, String)> {
                 Some((id, format!("{}:{}", broker.host.as_str(), broker.port)))
             })
             .collect();
-        if found.len() == PARTITIONS as usize {
+        if found.len() == count as usize {
             return found;
         }
         let seen: Vec<(i16, i32)> = metadata.topics[0]
@@ -107,6 +121,26 @@ fn has_records(addr: &str, partition: i32) -> bool {
             .is_some_and(|bytes: &Bytes| !bytes.is_empty())
 }
 
+fn create_named(controller: &str, name: &'static str, partitions: i32) {
+    let mut stream = connect(controller);
+    let mut created = CreatableTopic::default();
+    created.name = TopicName(StrBytes::from_static_str(name));
+    created.num_partitions = partitions;
+    created.replication_factor = -1;
+    let mut durability = CreatableTopicConfig::default();
+    durability.name = StrBytes::from_static_str("durability.mode");
+    durability.value = Some(StrBytes::from_static_str("wal"));
+    created.configs = vec![durability];
+    send(
+        &mut stream,
+        ApiKey::CreateTopics,
+        7,
+        &CreateTopicsRequest::default().with_topics(vec![created]),
+    );
+    let created = recv::<CreateTopicsResponse>(&mut stream, 7);
+    assert_eq!(created.topics[0].error_code, 0, "{created:?}");
+}
+
 /// Produce to every partition through its leader, retrying while
 /// leadership settles, then read each one back.
 fn write_and_read_everywhere(via: &str, excluded: Option<i32>, value: &str) {
@@ -150,6 +184,24 @@ fn three_brokers_lead_three_shards_and_survive_losing_one() {
         assert!(
             Instant::now() < deadline,
             "leaders never spread: {distinct:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Six partitions on three shards: each broker leads two.
+    create_named(&controller, "wide", 6);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let led = leaders_of(&controller, "wide", 6, None);
+        let mut counts = BTreeMap::new();
+        for (id, _) in &led {
+            *counts.entry(*id).or_insert(0) += 1;
+        }
+        if counts.len() == 3 && counts.values().all(|count| *count == 2) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "six partitions did not split two per broker: {counts:?}"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
