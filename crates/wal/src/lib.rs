@@ -167,6 +167,8 @@ pub struct Shard {
     storage_failed: Arc<AtomicBool>,
     log_stats: Arc<camus_raft::AppendStats>,
     queue: tokio::sync::mpsc::UnboundedSender<Vec<Queued>>,
+    /// The shard's background loop stops once this is dropped.
+    _alive: Arc<()>,
 }
 
 /// One produce batch waiting for the committer. A request's batches for one
@@ -313,6 +315,63 @@ async fn commit_loop(
     }
 }
 
+/// How often the shard writes what apply changed. Apply itself touches only
+/// memory; this bounds how much of the log a restart re-applies.
+const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Every [`FLUSH_EVERY`] until the shard is dropped: flush the state machine
+/// off the async runtime, then purge what the log no longer needs. A failed
+/// flush keeps its changes for the next one. Every voter purges here, not
+/// only the shard leader that uploads.
+///
+/// The machine is held weakly between ticks, so a closed shard's database
+/// can be opened again.
+async fn flush_loop(
+    alive: std::sync::Weak<()>,
+    raft: Raft<TypeConfig>,
+    machine: std::sync::Weak<Machine>,
+) {
+    let mut tick = tokio::time::interval(FLUSH_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let (Some(_alive), Some(machine)) = (alive.upgrade(), machine.upgrade()) else {
+            return;
+        };
+        let flushing = machine.clone();
+        match tokio::task::spawn_blocking(move || flushing.flush()).await {
+            Ok(Ok(())) => purge_to(&raft, &machine, u64::MAX).await,
+            Ok(Err(err)) => tracing::warn!(%err, "wal state flush failed; retrying"),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Purge the log up to `upto`, but not into an entry that still holds an
+/// unsealed batch and not past the latest snapshot (openraft's own bound).
+async fn purge_to(raft: &Raft<TypeConfig>, machine: &Machine, upto: u64) {
+    let Some(floor) = machine.purge_floor() else {
+        return;
+    };
+    let (snapshot, purged) = {
+        let metrics = raft.metrics().borrow().clone();
+        (
+            metrics.snapshot.map(|id| id.index),
+            metrics.purged.map(|id| id.index),
+        )
+    };
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let upto = upto.min(floor).min(snapshot);
+    if purged.is_some_and(|purged| upto <= purged) {
+        return;
+    }
+    if let Err(err) = raft.trigger().purge_log(upto).await {
+        tracing::warn!(%err, "wal log purge failed");
+    }
+}
+
 /// Move batches from `ready`, then from the queue, into `group` until it
 /// reaches `GROUP_BYTES` or `MAX_PACKED`.
 fn pack(
@@ -408,6 +467,10 @@ impl Shard {
             // client batch). Eight per AppendEntries keeps an RPC far below
             // the broker's HTTP body limit even with JSON encoding.
             max_payload_entries: 8,
+            // openraft would purge everything but the last 1000 entries after
+            // each snapshot, unsealed batches' entries too. Every purge goes
+            // through `purge_to` instead, which stops below the oldest one.
+            max_in_snapshot_log_to_keep: u64::MAX,
             ..Default::default()
         };
         let config = Arc::new(config.validate()?);
@@ -415,6 +478,12 @@ impl Shard {
         let log_stats = log.stats();
         let machine = Arc::new(Machine::open(&dir.join("state.redb"), log.clone())?);
         let raft = Raft::new(node_id, config, network, log, machine.clone()).await?;
+        let alive = Arc::new(());
+        tokio::spawn(flush_loop(
+            Arc::downgrade(&alive),
+            raft.clone(),
+            Arc::downgrade(&machine),
+        ));
         let storage_failed = Arc::new(AtomicBool::new(false));
         let (queue, waiting) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(commit_loop(raft.clone(), storage_failed.clone(), waiting));
@@ -425,6 +494,7 @@ impl Shard {
             storage_failed,
             log_stats,
             queue,
+            _alive: alive,
         })
     }
 
@@ -589,8 +659,9 @@ impl Shard {
     pub async fn purge(&self, index: u64) -> anyhow::Result<()> {
         // openraft purges only entries a snapshot covers, and building a
         // snapshot makes the applied state durable first, so no flush here.
-        // One here cost an fsync per upload pass.
-        self.raft.trigger().purge_log(index).await?;
+        // One here cost an fsync per upload pass. `purge_to` keeps every
+        // entry an unsealed batch is still in.
+        purge_to(&self.raft, &self.machine, index).await;
         Ok(())
     }
 
@@ -982,8 +1053,31 @@ mod tests {
         }
     }
 
+    async fn wait_snapshot(shard: &Shard, index: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while shard.raft.metrics().borrow().snapshot.map(|log| log.index) < Some(index) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no snapshot at {index}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn drops_of(batches: &[Batch]) -> Vec<SealDrop> {
+        batches
+            .iter()
+            .map(|batch| SealDrop {
+                topic: batch.topic.clone(),
+                topic_id: batch.topic_id,
+                partition: batch.partition,
+                start: batch.start,
+            })
+            .collect()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unsealed_batches_survive_a_snapshot_purge_and_a_restart() {
+    async fn a_purge_keeps_unsealed_batches_in_the_log_across_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let last = {
             let shard = Shard::open(1, dir.path()).await.unwrap();
@@ -992,29 +1086,21 @@ mod tests {
                 shard.append(append_of(value)).await.unwrap();
             }
             let last = shard.raft.metrics().borrow().last_applied.unwrap().index;
+            let oldest = shard.pending(u64::MAX).await.unwrap()[0].log_index;
             shard.raft.trigger().snapshot().await.unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while shard.raft.metrics().borrow().snapshot.map(|log| log.index) < Some(last) {
-                assert!(std::time::Instant::now() < deadline, "no snapshot");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            shard.raft.trigger().purge_log(last).await.unwrap();
-            wait_purged(&shard, last).await;
-            // The entries are gone from the log; the bytes come from the copy
-            // the snapshot made.
-            let tail = shard.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
-            assert_eq!(
-                camus_protocol::batch::inspect(&tail, 1 << 20)
-                    .unwrap()
-                    .len(),
-                3
+            wait_snapshot(&shard, last).await;
+            shard.purge(last).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let purged = shard.raft.metrics().borrow().purged.map(|log| log.index);
+            assert!(
+                purged < Some(oldest),
+                "purged to {purged:?}, into the unsealed entry at {oldest}"
             );
             shard.raft.shutdown().await.unwrap();
             last
         };
         let shard = Shard::open(1, dir.path()).await.unwrap();
         shard.ensure_voter().await.unwrap();
-        assert!(shard.raft.metrics().borrow().purged.map(|log| log.index) >= Some(last));
         let tail = shard.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
         assert_eq!(
             camus_protocol::batch::inspect(&tail, 1 << 20)
@@ -1027,22 +1113,11 @@ mod tests {
             pending.iter().map(|batch| batch.start).collect::<Vec<_>>(),
             [0, 1, 2]
         );
-        // Sealing drops the detached copies with the heads.
-        shard
-            .seal(
-                pending
-                    .iter()
-                    .map(|batch| SealDrop {
-                        topic: batch.topic.clone(),
-                        topic_id: batch.topic_id,
-                        partition: batch.partition,
-                        start: batch.start,
-                    })
-                    .collect(),
-            )
-            .await
-            .unwrap();
+        // Once sealed, nothing holds the log back but the snapshot.
+        let sealed = shard.seal(drops_of(&pending)).await.unwrap();
         assert_eq!(shard.unsealed_bytes(), 0);
+        shard.purge(sealed).await.unwrap();
+        wait_purged(&shard, last).await;
         assert!(shard
             .read(&[1; 16], 0, 0, 0, usize::MAX)
             .await
@@ -1086,15 +1161,19 @@ mod tests {
         for value in [b"a", b"b", b"c"] {
             lead.append(append_of(value)).await.unwrap();
         }
+        // Seal the first two, so the log can be purged up to the third.
+        let pending = lead.pending(u64::MAX).await.unwrap();
+        let kept = pending[2].log_index;
+        lead.seal(drops_of(&pending[..2])).await.unwrap();
         let last = lead.raft.metrics().borrow().last_applied.unwrap().index;
         lead.raft.trigger().snapshot().await.unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while lead.raft.metrics().borrow().snapshot.map(|log| log.index) < Some(last) {
-            assert!(std::time::Instant::now() < deadline, "no snapshot");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        lead.raft.trigger().purge_log(last).await.unwrap();
-        wait_purged(lead, last).await;
+        wait_snapshot(lead, last).await;
+        lead.purge(last).await.unwrap();
+        wait_purged(lead, kept - 1).await;
+        assert!(
+            lead.raft.metrics().borrow().purged.map(|log| log.index) < Some(kept),
+            "the unsealed batch's entry stays"
+        );
 
         // The follower comes back with an empty log past its old end. The
         // leader no longer has those entries, so it sends the snapshot.
@@ -1109,21 +1188,14 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // Metrics are published after the install; wait for them.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while back.raft.metrics().borrow().snapshot.map(|log| log.index) < Some(last) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "caught up without a snapshot"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_snapshot(&back, last).await;
         let tail = back.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
         assert_eq!(
             camus_protocol::batch::inspect(&tail, 1 << 20)
                 .unwrap()
                 .len(),
-            3
+            1,
+            "only the unsealed batch"
         );
         assert_eq!(
             tail,
