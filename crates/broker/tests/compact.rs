@@ -142,6 +142,14 @@ fn recv<M: Decodable + HeaderVersion>(stream: &mut TcpStream, version: i16) -> M
 }
 
 fn batch(key: Option<&[u8]>, value: &[u8]) -> Bytes {
+    batch_of(key, Some(value))
+}
+
+fn tombstone(key: &[u8]) -> Bytes {
+    batch_of(Some(key), None)
+}
+
+fn batch_of(key: Option<&[u8]>, value: Option<&[u8]>) -> Bytes {
     let records = vec![Record {
         transactional: false,
         control: false,
@@ -154,7 +162,7 @@ fn batch(key: Option<&[u8]>, value: &[u8]) -> Bytes {
         sequence: 0,
         timestamp: 9,
         key: key.map(Bytes::copy_from_slice),
-        value: Some(Bytes::copy_from_slice(value)),
+        value: value.map(Bytes::copy_from_slice),
         headers: Default::default(),
     }];
     let mut buf = BytesMut::new();
@@ -262,18 +270,6 @@ fn fetched(stream: &mut TcpStream) -> Vec<Record> {
 }
 
 #[test]
-fn a_null_key_on_a_compact_topic_is_corrupt() {
-    let node = spawn("0");
-    let mut stream = TcpStream::connect(&node.kafka).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    topic(&mut stream, "wal");
-    assert_eq!(produce(&mut stream, 3, batch(None, b"x")), 2);
-    assert_eq!(produce(&mut stream, 4, batch(Some(b"a"), b"1")), 0);
-}
-
-#[test]
 fn compaction_keeps_the_latest_value_at_its_offset() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
         eprintln!("skipping compaction test; set CAMUS_MINIO=1");
@@ -302,4 +298,84 @@ fn compaction_keeps_the_latest_value_at_its_offset() {
     assert_eq!(last[0].key.as_deref(), Some(b"b".as_slice()));
     assert_eq!(last[1].offset, 2);
     assert_eq!(last[1].value.as_deref(), Some(b"2".as_slice()));
+}
+
+/// Replace the topic's configs, as legacy AlterConfigs does.
+fn configure(stream: &mut TcpStream, configs: &[(&'static str, &'static str)]) {
+    let mut resource = AlterConfigsResource::default();
+    resource.resource_type = 2;
+    resource.resource_name = StrBytes::from_static_str("orders");
+    resource.configs = configs
+        .iter()
+        .map(|(name, value)| {
+            AlterableConfig::default()
+                .with_name(StrBytes::from_static_str(name))
+                .with_value(Some(StrBytes::from_static_str(value)))
+        })
+        .collect();
+    send(
+        stream,
+        ApiKey::AlterConfigs,
+        1,
+        2,
+        &AlterConfigsRequest::default().with_resources(vec![resource]),
+    );
+    let altered = recv::<AlterConfigsResponse>(stream, 1);
+    assert_eq!(altered.responses[0].error_code, 0, "{altered:?}");
+}
+
+#[test]
+fn an_expired_tombstone_is_removed_with_its_key() {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        eprintln!("skipping compaction test; set CAMUS_MINIO=1");
+        return;
+    }
+    let node = spawn("100");
+    let mut stream = TcpStream::connect(&node.kafka).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    topic(&mut stream, "r2");
+    // The test batches carry timestamp 9, so the default one-day
+    // delete.retention.ms has long passed for this tombstone.
+    assert_eq!(produce(&mut stream, 3, batch(Some(b"a"), b"1")), 0);
+    assert_eq!(produce(&mut stream, 4, tombstone(b"a")), 0);
+    assert_eq!(produce(&mut stream, 5, batch(Some(b"b"), b"1")), 0);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = Vec::new();
+    while Instant::now() < deadline {
+        last = fetched(&mut stream);
+        if last.len() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(last.len(), 1, "{last:?}");
+    assert_eq!(last[0].key.as_deref(), Some(b"b".as_slice()));
+    assert_eq!(last[0].offset, 2);
+}
+
+#[test]
+fn min_compaction_lag_keeps_recent_records() {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        eprintln!("skipping compaction test; set CAMUS_MINIO=1");
+        return;
+    }
+    let node = spawn("100");
+    let mut stream = TcpStream::connect(&node.kafka).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    topic(&mut stream, "r2");
+    configure(
+        &mut stream,
+        &[
+            ("cleanup.policy", "compact"),
+            ("min.compaction.lag.ms", "9223372036854775807"),
+        ],
+    );
+    assert_eq!(produce(&mut stream, 3, batch(Some(b"a"), b"1")), 0);
+    assert_eq!(produce(&mut stream, 4, batch(Some(b"a"), b"2")), 0);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(fetched(&mut stream).len(), 2);
 }

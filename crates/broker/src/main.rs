@@ -46,12 +46,24 @@ struct Args {
     /// `--tls-cert` and `--tls-key`.
     #[arg(long)]
     kafka_addr: Option<String>,
+    /// `host:port` clients should connect to, as Kafka's
+    /// `advertised.listeners`. Defaults to the bound address, or 127.0.0.1
+    /// when bound to every interface. Needed behind NAT, in containers, and
+    /// whenever clients reach the broker by another name.
+    #[arg(long)]
+    advertised_addr: Option<String>,
     /// PEM certificate for the SASL_SSL listener.
     #[arg(long)]
     tls_cert: Option<PathBuf>,
     /// PEM private key for the SASL_SSL listener.
     #[arg(long)]
     tls_key: Option<PathBuf>,
+    /// PEM CA bundle for client certificates. With it the TLS listener
+    /// requires a certificate from that CA and, as Kafka's SSL listener, takes
+    /// the principal from its subject; SASL is then off unless
+    /// `--require-sasl` is set.
+    #[arg(long)]
+    tls_client_ca: Option<PathBuf>,
     /// Allow a PLAINTEXT Kafka listener. Refused for a non-loopback bind unless
     /// `--allow-non-loopback` is also set.
     #[arg(long, default_value_t = false)]
@@ -59,13 +71,27 @@ struct Args {
     /// Allow the PLAINTEXT listener to bind outside the loopback interface.
     #[arg(long, default_value_t = false)]
     allow_non_loopback: bool,
-    /// Require SASL/PLAIN before any API other than ApiVersions and the SASL pair.
+    /// Require SASL (PLAIN or SCRAM) before any API other than ApiVersions and the SASL pair.
     #[arg(long, default_value_t = false)]
     require_sasl: bool,
 }
 
 /// Largest Raft RPC body the HTTP routes accept.
 const RAFT_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// `/admin/init` body: the peers, as before shards had ids, or the peers and
+/// a shard count (ADR 0014). Without a count there is one shard per WAL
+/// voter.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InitBody {
+    Peers(Vec<Peer>),
+    Layout {
+        peers: Vec<Peer>,
+        #[serde(default)]
+        shards: Option<u32>,
+    },
+}
 
 #[derive(Deserialize)]
 struct Peer {
@@ -85,6 +111,9 @@ fn yes() -> bool {
 struct Truncate {
     #[serde(default)]
     i_accept_data_loss: bool,
+    /// The WAL shard to truncate. Shard 0, the only one, when absent.
+    #[serde(default)]
+    shard: u32,
 }
 
 /// State for routes that touch both groups.
@@ -121,6 +150,12 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| args.data_dir.join("wal"));
     let wal = Arc::new(WalSlot::new(Shard::open(args.node_id, &wal_dir).await?));
+    tokio::spawn(open_shards(
+        Arc::clone(&node),
+        Arc::clone(&wal),
+        args.node_id,
+        wal_dir.clone(),
+    ));
     let admin = Arc::new(Admin {
         node: Arc::clone(&node),
         wal: Arc::clone(&wal),
@@ -156,6 +191,10 @@ async fn main() -> anyhow::Result<()> {
                 .route("/wal/raft-vote", post(wal_vote))
                 .route("/wal/raft-append", post(wal_append))
                 .route("/wal/raft-snapshot", post(wal_snapshot))
+                .route("/wal/{shard}/init", post(shard_init))
+                .route("/wal/{shard}/raft-vote", post(shard_vote))
+                .route("/wal/{shard}/raft-append", post(shard_append))
+                .route("/wal/{shard}/raft-snapshot", post(shard_snapshot))
                 .with_state(Arc::clone(&wal)),
         );
 
@@ -185,6 +224,8 @@ async fn health() -> &'static str {
 }
 
 async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let stats = &camus_compactor::STATS;
     let metrics = node.raft.metrics().borrow().clone();
     let leader = metrics
         .current_leader
@@ -202,13 +243,33 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
          camus_raft_leader {}\n\
          # HELP camus_raft_current_leader Node id of the current leader, or NaN.\n\
          # TYPE camus_raft_current_leader gauge\n\
-         camus_raft_current_leader {leader}\n",
+         camus_raft_current_leader {leader}\n\
+         # HELP camus_retention_cuts_total Partitions whose log start retention moved.\n\
+         # TYPE camus_retention_cuts_total counter\n\
+         camus_retention_cuts_total {}\n\
+         # HELP camus_sweeps_total Completed orphan object sweeps.\n\
+         # TYPE camus_sweeps_total counter\n\
+         camus_sweeps_total {}\n\
+         # HELP camus_sweep_objects_deleted_total Objects the orphan sweep deleted.\n\
+         # TYPE camus_sweep_objects_deleted_total counter\n\
+         camus_sweep_objects_deleted_total {}\n\
+         # HELP camus_sweep_bytes_deleted_total Bytes in the objects the orphan sweep deleted.\n\
+         # TYPE camus_sweep_bytes_deleted_total counter\n\
+         camus_sweep_bytes_deleted_total {}\n\
+         # HELP camus_produce_hold_ms_total Milliseconds produce requests were held at the WAL disk limit.\n\
+         # TYPE camus_produce_hold_ms_total counter\n\
+         camus_produce_hold_ms_total {}\n",
         metrics.current_term,
         if metrics.current_leader == Some(metrics.id) {
             1
         } else {
             0
         },
+        stats.retention_cuts.load(Relaxed),
+        stats.sweeps.load(Relaxed),
+        stats.objects_deleted.load(Relaxed),
+        stats.bytes_deleted.load(Relaxed),
+        kafka::PRODUCE_HOLD_MS.load(Relaxed),
     )
 }
 
@@ -231,44 +292,168 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "wal_rpc_handled_count": camus_wal::RPC_TIMES.handled_count.load(std::sync::atomic::Ordering::Relaxed),
         "wal_rpc_handled_us": camus_wal::RPC_TIMES.handled_us.load(std::sync::atomic::Ordering::Relaxed),
         "wal_storage_failed": wal.storage_failed(),
+        "retention_cuts": camus_compactor::STATS.retention_cuts.load(std::sync::atomic::Ordering::Relaxed),
+        "sweeps": camus_compactor::STATS.sweeps.load(std::sync::atomic::Ordering::Relaxed),
+        "sweep_objects_deleted": camus_compactor::STATS.objects_deleted.load(std::sync::atomic::Ordering::Relaxed),
+        "sweep_bytes_deleted": camus_compactor::STATS.bytes_deleted.load(std::sync::atomic::Ordering::Relaxed),
+        "produce_hold_ms": kafka::PRODUCE_HOLD_MS.load(std::sync::atomic::Ordering::Relaxed),
+        "wal_shards": admin
+            .wal
+            .all()
+            .into_iter()
+            .map(|(id, shard)| serde_json::json!({
+                "id": id,
+                "leader": shard.leader(),
+                "voters": shard.voters(),
+                "unsealed_bytes": shard.unsealed_bytes(),
+            }))
+            .collect::<Vec<_>>(),
     }))
 }
 
 /// Create the metadata group from every peer and the WAL shard from the
 /// peers marked `wal`. Each `addr` is that broker's HTTP address; both
 /// groups' RPC goes there. The shard is initialized on its first voter.
+/// Where shard `shard` keeps its log: shard 0 in `wal_dir`, as before shards
+/// had ids, and shard `n` beside it in `<wal_dir>-shards/<n>` (ADR 0014).
+fn shard_dir(wal_dir: &std::path::Path, shard: u32) -> PathBuf {
+    if shard == 0 {
+        return wal_dir.to_path_buf();
+    }
+    let name = wal_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wal".into());
+    wal_dir
+        .with_file_name(format!("{name}-shards"))
+        .join(shard.to_string())
+}
+
+/// Open every shard in the stored layout that this broker has not opened
+/// yet. A shard this broker is not a voter of stays empty.
+async fn open_shards(
+    node: Arc<MetadataNode>,
+    wal: Arc<WalSlot>,
+    node_id: NodeId,
+    wal_dir: PathBuf,
+) {
+    loop {
+        let count = node
+            .read_local(camus_metadata::SHARDS)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|layout| layout["count"].as_u64())
+            .unwrap_or(1);
+        for shard in 1..u32::try_from(count).unwrap_or(1) {
+            if wal.shard(shard).is_some() {
+                continue;
+            }
+            let dir = shard_dir(&wal_dir, shard);
+            match Shard::open_shard(node_id, &dir, shard).await {
+                Ok(opened) => {
+                    wal.replace(shard, opened);
+                    tracing::info!(shard, "opened wal shard");
+                }
+                Err(err) => tracing::warn!(shard, %err, "opening wal shard"),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Each shard's voters: every WAL voter for a one-shard cluster, as before
+/// shards had ids; otherwise `min(3, voters)` of them, starting at a
+/// different voter for each shard so each is the first, preferred, voter of
+/// some shard (ADR 0014).
+fn shard_voters(voters: &[NodeId], shards: u32) -> Vec<Vec<NodeId>> {
+    if shards <= 1 {
+        return vec![voters.to_vec()];
+    }
+    let each = voters.len().min(3);
+    (0..shards as usize)
+        .map(|shard| {
+            (0..each)
+                .map(|offset| voters[(shard + offset) % voters.len()])
+                .collect()
+        })
+        .collect()
+}
+
 async fn init(
     State(admin): State<Arc<Admin>>,
-    Json(peers): Json<Vec<Peer>>,
+    Json(body): Json<InitBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let (peers, shards) = match body {
+        InitBody::Peers(peers) => (peers, None),
+        InitBody::Layout { peers, shards } => (peers, shards),
+    };
     let mut nodes = BTreeMap::new();
-    let mut shard = BTreeMap::new();
+    let mut voters = Vec::new();
     for peer in peers {
         let node = BasicNode { addr: peer.addr };
         if peer.wal {
-            shard.insert(peer.id, node.clone());
+            voters.push(peer.id);
         }
         nodes.insert(peer.id, node);
     }
-    let Some(first) = shard.values().next().cloned() else {
+    if voters.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no wal voter".into()));
-    };
+    }
+    voters.sort_unstable();
+    let count = shards.unwrap_or(voters.len() as u32).max(1);
+    let layout = shard_voters(&voters, count);
     admin
         .node
-        .initialize(nodes)
+        .initialize(nodes.clone())
         .await
         .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
-    let response = admin
-        .http
-        .post(format!("http://{}/wal/init", first.addr))
-        .json(&shard)
-        .send()
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    if !response.status().is_success() {
-        let status =
-            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return Err((status, response.text().await.unwrap_or_default()));
+    if count > 1 {
+        let raw = serde_json::json!({ "count": count, "voters": layout }).to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Err(err) = metadata_write(&admin, camus_metadata::SHARDS, &raw).await {
+            if std::time::Instant::now() > deadline {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, err.to_string()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    // Initialize each shard on its first voter, which then usually leads it.
+    // A broker opens a new shard once it sees the layout, so retry until it
+    // has.
+    for (shard, members) in layout.iter().enumerate() {
+        let map: BTreeMap<NodeId, BasicNode> =
+            members.iter().map(|id| (*id, nodes[id].clone())).collect();
+        let first = &nodes[&members[0]];
+        let path = if shard == 0 {
+            "wal/init".to_string()
+        } else {
+            format!("wal/{shard}/init")
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let sent = admin
+                .http
+                .post(format!("http://{}/{path}", first.addr))
+                .json(&map)
+                .send()
+                .await;
+            match sent {
+                Ok(response) if response.status().is_success() => break,
+                Ok(response)
+                    if response.status() != StatusCode::NOT_FOUND
+                        || std::time::Instant::now() > deadline =>
+                {
+                    let status = StatusCode::from_u16(response.status().as_u16())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    return Err((status, response.text().await.unwrap_or_default()));
+                }
+                Err(err) if std::time::Instant::now() > deadline => {
+                    return Err((StatusCode::BAD_GATEWAY, err.to_string()));
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
     }
     Ok(StatusCode::OK)
 }
@@ -277,7 +462,26 @@ async fn wal_init(
     State(wal): State<Arc<WalSlot>>,
     Json(nodes): Json<BTreeMap<NodeId, BasicNode>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    wal.get()
+    initialize_shard(&wal, 0, nodes).await
+}
+
+async fn shard_init(
+    State(wal): State<Arc<WalSlot>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(nodes): Json<BTreeMap<NodeId, BasicNode>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    initialize_shard(&wal, shard, nodes).await
+}
+
+async fn initialize_shard(
+    wal: &WalSlot,
+    shard: u32,
+    nodes: BTreeMap<NodeId, BasicNode>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(opened) = wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard} yet")));
+    };
+    opened
         .initialize(nodes)
         .await
         .map(|_| StatusCode::OK)
@@ -306,7 +510,12 @@ async fn truncate_to_sealed(
     }
     let _one = admin.truncating.lock().await;
     let me = admin.node_id;
-    let old = admin.wal.get();
+    let Some(old) = admin.wal.shard(body.shard) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("node {me} has no wal shard {}", body.shard),
+        ));
+    };
     if !old.voters().contains(&me) {
         return Err((
             StatusCode::CONFLICT,
@@ -336,8 +545,26 @@ async fn truncate_to_sealed(
         .map(|node| node.addr.clone())
         .ok_or_else(|| (StatusCode::CONFLICT, format!("node {me} has no address")))?;
     let internal = |err: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    // The fresh shard starts at term 1. Raise the epoch base past every epoch
+    // the old shard used first, so clients see the truncation as a new epoch
+    // and OffsetForLeaderEpoch can tell them where their history ended.
+    let base: i64 = admin
+        .node
+        .read_local(&kafka::epoch_base_key(body.shard))
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0);
+    let raised = base.saturating_add(old.term() as i64);
+    metadata_write(
+        &admin,
+        &kafka::epoch_base_key(body.shard),
+        &raised.to_string(),
+    )
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
     let _ = old.raft.shutdown().await;
-    let dir = admin.wal_dir.clone();
+    let dir = shard_dir(&admin.wal_dir, body.shard);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
@@ -348,17 +575,46 @@ async fn truncate_to_sealed(
         .unwrap_or_else(|| "wal".into());
     let aside = dir.with_file_name(format!("{name}.truncated-{stamp}"));
     std::fs::rename(&dir, &aside).map_err(|err| internal(err.into()))?;
-    let fresh = Shard::open(me, &dir).await.map_err(internal)?;
+    let fresh = Shard::open_shard(me, &dir, body.shard)
+        .await
+        .map_err(internal)?;
     fresh
         .initialize(BTreeMap::from([(me, BasicNode { addr })]))
         .await
         .map_err(internal)?;
-    admin.wal.replace(fresh);
+    admin.wal.replace(body.shard, fresh);
     tracing::warn!(node_id = me, aside = %aside.display(), "wal shard truncated to sealed");
     Ok(Json(serde_json::json!({
         "voters": [me],
         "moved_aside": aside.display().to_string(),
     })))
+}
+
+/// Write one metadata key here when this node leads the group, otherwise
+/// through the leader's `/admin/write`.
+async fn metadata_write(admin: &Admin, key: &str, value: &str) -> anyhow::Result<()> {
+    let metrics = admin.node.raft.metrics().borrow().clone();
+    let leader = metrics
+        .current_leader
+        .ok_or_else(|| anyhow::anyhow!("no metadata leader"))?;
+    if leader == metrics.id {
+        admin.node.write(key, value).await?;
+        return Ok(());
+    }
+    let addr = metrics
+        .membership_config
+        .membership()
+        .get_node(&leader)
+        .map(|node| node.addr.clone())
+        .ok_or_else(|| anyhow::anyhow!("metadata leader has no address"))?;
+    let response = admin
+        .http
+        .post(format!("http://{addr}/admin/write"))
+        .json(&serde_json::json!({ "key": key, "value": value }))
+        .send()
+        .await?;
+    anyhow::ensure!(response.status().is_success(), "metadata write failed");
+    Ok(())
 }
 
 async fn write(
@@ -470,43 +726,100 @@ async fn snapshot(
     rpc_reply(&node.raft.install_snapshot(req).await)
 }
 
-async fn wal_vote(
-    State(wal): State<Arc<WalSlot>>,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    let req: VoteRequest<NodeId> = match rpc_body(&body) {
+/// Shard `id`, or a 404 when this broker does not have it open.
+fn open_shard(wal: &WalSlot, id: u32) -> Result<Arc<Shard>, axum::response::Response> {
+    use axum::response::IntoResponse;
+    wal.shard(id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no wal shard {id}")).into_response())
+}
+
+async fn vote_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
+    let shard = match open_shard(wal, id) {
+        Ok(shard) => shard,
+        Err(reply) => return reply,
+    };
+    let req: VoteRequest<NodeId> = match rpc_body(body) {
         Ok(req) => req,
         Err(reply) => return reply,
     };
-    rpc_reply(&wal.get().raft.vote(req).await)
+    rpc_reply(&shard.raft.vote(req).await)
 }
 
-async fn wal_append(
-    State(wal): State<Arc<WalSlot>>,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    let req: AppendEntriesRequest<camus_wal::TypeConfig> = match rpc_body(&body) {
+async fn append_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
+    let shard = match open_shard(wal, id) {
+        Ok(shard) => shard,
+        Err(reply) => return reply,
+    };
+    let req: AppendEntriesRequest<camus_wal::TypeConfig> = match rpc_body(body) {
         Ok(req) => req,
         Err(reply) => return reply,
     };
     let carries = !req.entries.is_empty();
     let started = std::time::Instant::now();
-    let result = wal.get().raft.append_entries(req).await;
+    let result = shard.raft.append_entries(req).await;
     if carries {
         camus_wal::RPC_TIMES.handled(started.elapsed());
     }
     rpc_reply(&result)
 }
 
+async fn snapshot_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
+    let shard = match open_shard(wal, id) {
+        Ok(shard) => shard,
+        Err(reply) => return reply,
+    };
+    let req: InstallSnapshotRequest<camus_wal::TypeConfig> = match rpc_body(body) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    rpc_reply(&shard.raft.install_snapshot(req).await)
+}
+
+/// Shard 0's routes from before shards had ids. They stay so brokers of
+/// both versions can replicate during a rolling upgrade (ADR 0014).
+async fn wal_vote(
+    State(wal): State<Arc<WalSlot>>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    vote_on(&wal, 0, &body).await
+}
+
+async fn wal_append(
+    State(wal): State<Arc<WalSlot>>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    append_on(&wal, 0, &body).await
+}
+
 async fn wal_snapshot(
     State(wal): State<Arc<WalSlot>>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    let req: InstallSnapshotRequest<camus_wal::TypeConfig> = match rpc_body(&body) {
-        Ok(req) => req,
-        Err(reply) => return reply,
-    };
-    rpc_reply(&wal.get().raft.install_snapshot(req).await)
+    snapshot_on(&wal, 0, &body).await
+}
+
+async fn shard_vote(
+    State(wal): State<Arc<WalSlot>>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    vote_on(&wal, id, &body).await
+}
+
+async fn shard_append(
+    State(wal): State<Arc<WalSlot>>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    append_on(&wal, id, &body).await
+}
+
+async fn shard_snapshot(
+    State(wal): State<Arc<WalSlot>>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    snapshot_on(&wal, id, &body).await
 }
 
 async fn start_kafka(
@@ -517,7 +830,7 @@ async fn start_kafka(
     args: &Args,
 ) -> anyhow::Result<()> {
     let tls = match (&args.tls_cert, &args.tls_key) {
-        (Some(cert), Some(key)) => Some(load_tls(cert, key)?),
+        (Some(cert), Some(key)) => Some(load_tls(cert, key, args.tls_client_ca.as_deref())?),
         (None, None) => None,
         _ => anyhow::bail!("--tls-cert and --tls-key are set together"),
     };
@@ -531,7 +844,34 @@ async fn start_kafka(
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let bound = listener.local_addr()?;
     std::fs::write(args.data_dir.join("kafka-addr"), bound.to_string())?;
-    let (host, port) = advertised_kafka(bind, bound.port());
+    let (host, port) = match &args.advertised_addr {
+        Some(advertised) => {
+            let (host, port) = advertised
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow::anyhow!("--advertised-addr must be host:port"))?;
+            (host.to_string(), port.parse()?)
+        }
+        None => advertised_kafka(bind, bound.port()),
+    };
+    // The MinIO fallbacks are for development. A broker serving TLS must be
+    // told where its log lives instead of silently using a local stand-in.
+    if !args.dev_plaintext {
+        let missing: Vec<&str> = [
+            "CAMUS_S3_ENDPOINT",
+            "CAMUS_S3_BUCKET",
+            "CAMUS_S3_ACCESS_KEY",
+            "CAMUS_S3_SECRET_KEY",
+        ]
+        .into_iter()
+        .filter(|name| std::env::var(name).map_or(true, |value| value.is_empty()))
+        .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "object storage is not configured; set {} (the MinIO defaults apply only with --dev-plaintext)",
+                missing.join(", ")
+            );
+        }
+    }
     let bucket = Bucket::connect(&BucketConfig {
         endpoint: std::env::var("CAMUS_S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),
@@ -540,11 +880,14 @@ async fn start_kafka(
         access_key: std::env::var("CAMUS_S3_ACCESS_KEY").unwrap_or_else(|_| "camus".into()),
         secret_key: std::env::var("CAMUS_S3_SECRET_KEY")
             .unwrap_or_else(|_| "camus-dev-secret".into()),
+        prefix: std::env::var("CAMUS_S3_PREFIX").unwrap_or_default(),
         virtual_hosted: env_flag("CAMUS_S3_VIRTUAL_HOST"),
     })?;
     let user = std::env::var("CAMUS_SASL_USER").unwrap_or_default();
     let password = std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default();
-    let require_sasl = args.require_sasl || tls.is_some();
+    // TLS alone means SASL_SSL. With a client CA it is Kafka's SSL listener,
+    // where the certificate is the identity.
+    let require_sasl = args.require_sasl || (tls.is_some() && args.tls_client_ca.is_none());
     if require_sasl && (user.is_empty() || password.is_empty()) {
         anyhow::bail!("SASL requires CAMUS_SASL_USER and CAMUS_SASL_PASSWORD");
     }
@@ -615,6 +958,7 @@ fn advertised_endpoint(
 fn load_tls(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
+    client_ca: Option<&std::path::Path>,
 ) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cert_file = std::fs::File::open(cert_path)?;
@@ -624,9 +968,24 @@ fn load_tls(
     let mut key_reader = std::io::BufReader::new(key_file);
     let key = rustls_pemfile::private_key(&mut key_reader)?
         .ok_or_else(|| anyhow::anyhow!("no private key in {key_path:?}"))?;
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+    let builder = rustls::ServerConfig::builder();
+    let config = match client_ca {
+        None => builder.with_no_client_auth().with_single_cert(certs, key)?,
+        Some(path) => {
+            let mut roots = rustls::RootCertStore::empty();
+            let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+            for cert in rustls_pemfile::certs(&mut reader) {
+                roots.add(cert?)?;
+            }
+            anyhow::ensure!(!roots.is_empty(), "no CA certificate in {path:?}");
+            let verifier =
+                rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
+                    .build()?;
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)?
+        }
+    };
     Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
 }
 

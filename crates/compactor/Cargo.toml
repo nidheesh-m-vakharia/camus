@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "Object compaction and retention. Not started."
+description = "Retention and the orphan object sweep. Planning only; the broker does the I/O."
 
 [dependencies]
+camus-metadata = { path = "../metadata" }
+ulid = "3"

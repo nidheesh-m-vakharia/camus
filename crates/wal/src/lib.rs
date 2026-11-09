@@ -325,7 +325,12 @@ impl Shard {
     /// shard waits for [`Shard::initialize`]; a restarted one rejoins from
     /// its stored membership.
     pub async fn open(node_id: NodeId, dir: &Path) -> anyhow::Result<Self> {
-        Self::start(node_id, dir, network::HttpFactory).await
+        Self::open_shard(node_id, dir, 0).await
+    }
+
+    /// Open shard `shard` with HTTP RPC under its own path (ADR 0014).
+    pub async fn open_shard(node_id: NodeId, dir: &Path, shard: u32) -> anyhow::Result<Self> {
+        Self::start(node_id, dir, network::HttpFactory::for_shard(shard)).await
     }
 
     /// Open a shard whose RPC stays in this process, for tests.
@@ -444,6 +449,11 @@ impl Shard {
     }
 
     /// Whether this process is the shard leader.
+    /// The shard's current Raft term.
+    pub fn term(&self) -> u64 {
+        self.raft.metrics().borrow().current_term
+    }
+
     pub fn is_leader(&self) -> bool {
         self.raft.metrics().borrow().current_leader == Some(self.node_id)
     }

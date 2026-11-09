@@ -342,7 +342,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "bytes",
+ "camus-compactor",
  "camus-coordinator",
  "camus-metadata",
  "camus-protocol",
@@ -355,6 +357,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -365,6 +368,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -380,6 +384,10 @@ dependencies = [
 [[package]]
 name = "camus-compactor"
 version = "0.1.0"
+dependencies = [
+ "camus-metadata",
+ "ulid",
+]
 
 [[package]]
 name = "camus-coordinator"
@@ -455,6 +463,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures",
  "object_store",
  "tokio",
  "url",

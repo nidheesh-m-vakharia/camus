@@ -9,6 +9,7 @@ description = "R2/S3 object storage. MinIO is the local stand-in."
 [dependencies]
 anyhow = "1"
 bytes = "1"
+futures = "0.3"
 object_store = { version = "0.14", features = ["aws"] }
 url = "2"
 

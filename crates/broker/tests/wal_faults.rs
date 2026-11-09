@@ -4,7 +4,8 @@
 //! - R2 slow or answering 503: acks continue from the WAL and the upload
 //!   catches up when R2 recovers.
 //! - R2 gone: once unsealed bytes pass `wal.disk.limit`, produce is held and
-//!   reports `throttle_time_ms`; it times out only at the client's
+//!   the hold is counted in `produce_hold_ms` (not `throttle_time_ms`, so a
+//!   client does not wait twice); it times out only at the client's
 //!   `timeout_ms`, and no acknowledged batch is dropped.
 //! - Crash between the metadata publish and the WAL seal: the restart does
 //!   not publish the same offsets twice.
@@ -112,9 +113,10 @@ fn r2_outage_throttles_at_the_disk_limit_and_catches_up() {
             continue;
         }
         assert_eq!(code, 7, "held until timeout_ms, then REQUEST_TIMED_OUT");
+        assert_eq!(throttle, 0, "the hold is not reported as a throttle");
         assert!(
-            throttle >= 700,
-            "throttle_time_ms reports the hold: {throttle}"
+            hold_ms(&node.http) >= 700,
+            "produce_hold_ms counts the hold"
         );
         held = Some(index);
         break;
@@ -125,6 +127,7 @@ fn r2_outage_throttles_at_the_disk_limit_and_catches_up() {
 
     // R2 comes back while a produce is held. It is released, not dropped.
     let started = Instant::now();
+    let held_before = hold_ms(&node.http);
     let pending = std::thread::spawn({
         let kafka = kafka.clone();
         let next = value(held, 1000);
@@ -135,7 +138,11 @@ fn r2_outage_throttles_at_the_disk_limit_and_catches_up() {
     let (code, offset, throttle) = pending.join().unwrap();
     assert_eq!(code, 0);
     assert_eq!(offset, acked.len() as i64);
-    assert!(throttle > 0, "the released produce reports its hold");
+    assert_eq!(throttle, 0);
+    assert!(
+        hold_ms(&node.http) > held_before,
+        "the released produce's hold is counted"
+    );
     assert!(started.elapsed() >= Duration::from_millis(900));
     acked.push(value(held, 1000));
 
@@ -274,4 +281,10 @@ fn full_wal_disk_answers_storage_error() {
     assert_eq!(produce(&kafka, "after").0, 56, "and stays that way");
     assert_eq!(admin(&node.http).unwrap()["wal_storage_failed"], true);
     node.kill();
+}
+
+fn hold_ms(http: &str) -> u64 {
+    support::admin(http)
+        .and_then(|json| json["produce_hold_ms"].as_u64())
+        .unwrap_or(0)
 }

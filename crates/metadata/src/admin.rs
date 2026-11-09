@@ -1,18 +1,19 @@
 //! Phase 4 admin commands: more partitions, topic configs, log start, offset delete.
 //!
-//! `DeleteRecords` follows ADR 0010. A cut in the middle of an object moves
-//! the log start to that object's end, and the response low watermark is the
-//! offset actually removed. An offset past the sealed end is
-//! `OFFSET_OUT_OF_RANGE`.
+//! `DeleteRecords` moves the log start to the requested offset, as in Kafka.
+//! Extents wholly below it are dropped; an extent the cut falls inside stays,
+//! and fetch starts at the log start within it. The offset may be anything up
+//! to the high watermark the proposer saw, including records still only in
+//! the WAL; past that it is `OFFSET_OUT_OF_RANGE`.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{self, Outcome, Partition, Topic};
+use crate::config;
 use crate::groups::{self, GroupRecord};
 
-const INVALID_CONFIG: i16 = 40;
 const UNKNOWN_TOPIC: i16 = 3;
 const OFFSET_OUT_OF_RANGE: i16 = 1;
 const INVALID_PARTITIONS: i16 = 37;
@@ -73,6 +74,10 @@ pub struct ConfigChange {
     pub validate_only: bool,
     /// Edits, applied only if every one is valid.
     pub edits: Vec<ConfigEdit>,
+    /// Legacy `AlterConfigs`: configs not named in `edits` return to their
+    /// defaults, as in Kafka.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 /// One partition to trim.
@@ -82,8 +87,16 @@ pub struct RecordCut {
     pub topic: String,
     /// Partition.
     pub partition: i32,
-    /// Delete records before this offset. `-1` means the sealed end.
+    /// Delete records before this offset. `-1` means the high watermark.
     pub offset: i64,
+    /// The partition's high watermark as the proposer saw it, sealed or
+    /// not. `-1` limits the cut to the sealed end.
+    #[serde(default = "no_offset")]
+    pub high_watermark: i64,
+}
+
+fn no_offset() -> i64 {
+    -1
 }
 
 /// Partitions whose committed offsets should be removed.
@@ -120,6 +133,7 @@ pub fn create_partitions(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     topics: &[PartitionIncrease],
 ) -> Result<Done, String> {
+    let mut placer = catalog::Placer::load(get)?;
     let mut put = Vec::new();
     let mut items = Vec::new();
     for topic in topics {
@@ -159,6 +173,8 @@ pub fn create_partitions(
                 extents: Vec::new(),
                 txn_committed: Vec::new(),
                 txn_aborted: Vec::new(),
+                epochs: Vec::new(),
+                shard: placer.next(),
             };
             put.push((
                 catalog::partition_storage_key(&stored.id, partition),
@@ -172,6 +188,7 @@ pub fn create_partitions(
         ));
         items.push(Item { code: 0, low: 0 });
     }
+    put.extend(placer.put());
     Ok(Done {
         put,
         del: Vec::new(),
@@ -201,8 +218,9 @@ pub fn alter_configs(
             });
             continue;
         };
-        match apply_edits(&mut topic, &change.edits) {
-            Ok(()) => {
+        match config::apply_change(&topic, &change.edits, change.replace) {
+            Ok(next) => {
+                topic = next;
                 if !change.validate_only {
                     put.push((
                         catalog::topic_storage_key(&change.name),
@@ -211,7 +229,10 @@ pub fn alter_configs(
                 }
                 items.push(Item { code: 0, low: 0 });
             }
-            Err(code) => items.push(Item { code, low: 0 }),
+            Err(rejected) => items.push(Item {
+                code: rejected.code,
+                low: 0,
+            }),
         }
     }
     Ok(Done {
@@ -221,96 +242,7 @@ pub fn alter_configs(
     })
 }
 
-fn apply_edits(topic: &mut Topic, edits: &[ConfigEdit]) -> Result<(), i16> {
-    let mut next = topic.clone();
-    for edit in edits {
-        match edit.name.as_str() {
-            "retention.ms" => assign_long(&mut next.retention_ms, edit, 604_800_000)?,
-            "retention.bytes" => assign_long(&mut next.retention_bytes, edit, -1)?,
-            "cleanup.policy" => assign_policy(&mut next.cleanup_policy, edit)?,
-            _ => return Err(INVALID_CONFIG),
-        }
-    }
-    *topic = next;
-    Ok(())
-}
-
-fn assign_long(slot: &mut i64, edit: &ConfigEdit, default: i64) -> Result<(), i16> {
-    match edit.op {
-        0 => *slot = parse_long(edit.value.as_deref().unwrap_or(""))?,
-        1 => *slot = default,
-        _ => return Err(INVALID_CONFIG),
-    }
-    Ok(())
-}
-
-fn parse_long(value: &str) -> Result<i64, i16> {
-    let parsed: i64 = value.parse().map_err(|_| INVALID_CONFIG)?;
-    if parsed == -1 || parsed > 0 {
-        Ok(parsed)
-    } else {
-        Err(INVALID_CONFIG)
-    }
-}
-
-fn assign_policy(slot: &mut String, edit: &ConfigEdit) -> Result<(), i16> {
-    let value = match edit.op {
-        0 => edit.value.clone().unwrap_or_default(),
-        1 => "delete".into(),
-        2 => join_policy(slot, edit.value.as_deref().unwrap_or(""), true),
-        3 => join_policy(slot, edit.value.as_deref().unwrap_or(""), false),
-        _ => return Err(INVALID_CONFIG),
-    };
-    let mut delete = false;
-    let mut compact = false;
-    for part in value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        match part {
-            "delete" => delete = true,
-            "compact" => compact = true,
-            _ => return Err(INVALID_CONFIG),
-        }
-    }
-    if !delete && !compact {
-        return Err(INVALID_CONFIG);
-    }
-    let mut tokens = Vec::new();
-    if delete {
-        tokens.push("delete");
-    }
-    if compact {
-        tokens.push("compact");
-    }
-    *slot = tokens.join(",");
-    Ok(())
-}
-
-fn join_policy(current: &str, extra: &str, append: bool) -> String {
-    let mut parts: Vec<&str> = current
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
-    for part in extra
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        if append {
-            if !parts.contains(&part) {
-                parts.push(part);
-            }
-        } else {
-            parts.retain(|have| *have != part);
-        }
-    }
-    parts.join(",")
-}
-
-/// Move log starts to an object boundary at or after the requested offset.
+/// Move log starts to the requested offsets.
 pub fn delete_records(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     cuts: &[RecordCut],
@@ -339,20 +271,16 @@ pub fn delete_records(
             ids.insert(cut.topic.clone(), topic.id.clone());
         }
         let state = pending.get_mut(&key).expect("inserted");
-        let offset = if cut.offset < 0 {
-            state.next_offset
-        } else {
-            cut.offset
-        };
-        if offset > state.next_offset {
+        let limit = state.next_offset.max(cut.high_watermark);
+        let offset = if cut.offset < 0 { limit } else { cut.offset };
+        if offset > limit {
             items.push(Item {
                 code: OFFSET_OUT_OF_RANGE,
                 low: -1,
             });
             continue;
         }
-        let low = boundary(state, offset);
-        state.log_start = state.log_start.max(low);
+        state.log_start = state.log_start.max(offset);
         state.extents.retain(|extent| extent.end > state.log_start);
         items.push(Item {
             code: 0,
@@ -372,20 +300,6 @@ pub fn delete_records(
         del: Vec::new(),
         items,
     })
-}
-
-/// The sealed boundary at or after `offset`. Inside an object, that is the
-/// object's end. On a boundary, it is `offset` itself.
-fn boundary(state: &Partition, offset: i64) -> i64 {
-    if offset <= state.log_start {
-        return state.log_start;
-    }
-    for extent in &state.extents {
-        if offset < extent.end && offset > extent.start {
-            return extent.end;
-        }
-    }
-    offset
 }
 
 /// Delete committed offsets. A group with members cannot drop a topic it
@@ -485,7 +399,7 @@ mod tests {
         let mut map = HashMap::new();
         let get = |key: &str| Ok(map.get(key).cloned());
         let Outcome::Change { put, .. } =
-            catalog::create_topic(&get, "events", "topic-1", 1, "r2").unwrap()
+            catalog::create_topic(&get, "events", "topic-1", 1, "r2", &[]).unwrap()
         else {
             panic!("create");
         };
@@ -496,10 +410,11 @@ mod tests {
     }
 
     #[test]
-    fn a_mid_object_delete_jumps_to_the_object_end() {
+    fn a_delete_moves_the_log_start_to_the_exact_offset() {
         let mut map = world();
         let get = |key: &str| Ok(map.get(key).cloned());
         let part = PublishPart {
+            epoch: -1,
             topic: "events".into(),
             partition: 0,
             start: 0,
@@ -523,13 +438,66 @@ mod tests {
                 topic: "events".into(),
                 partition: 0,
                 offset: 4,
+                high_watermark: -1,
             }],
         )
         .unwrap();
-        assert_eq!(done.items[0].low, 10);
+        assert_eq!(done.items[0].low, 4);
         let state: Partition = serde_json::from_str(&done.put[0].1).unwrap();
+        assert_eq!(state.extents.len(), 1, "the extent holding offset 4 stays");
+        assert_eq!(state.log_start, 4);
+
+        let cut = |offset: i64, high_watermark: i64| RecordCut {
+            topic: "events".into(),
+            partition: 0,
+            offset,
+            high_watermark,
+        };
+        let past = delete_records(&get, &[cut(15, -1)]).unwrap();
+        assert_eq!(past.items[0].code, OFFSET_OUT_OF_RANGE);
+        let unsealed = delete_records(&get, &[cut(15, 20)]).unwrap();
+        assert_eq!(unsealed.items[0].low, 15);
+        let state: Partition = serde_json::from_str(&unsealed.put[0].1).unwrap();
         assert!(state.extents.is_empty());
-        assert_eq!(state.log_start, 10);
+    }
+
+    #[test]
+    fn an_extent_published_below_the_log_start_is_dropped() {
+        let mut map = world();
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let done = delete_records(
+            &get,
+            &[RecordCut {
+                topic: "events".into(),
+                partition: 0,
+                offset: 5,
+                high_watermark: 10,
+            }],
+        )
+        .unwrap();
+        for (key, value) in done.put {
+            map.insert(key, value);
+        }
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let part = |start: i64, end: i64| PublishPart {
+            epoch: -1,
+            topic: "events".into(),
+            partition: 0,
+            start,
+            end,
+            object_key: format!("bundle/{start}"),
+            file_offset: 0,
+            length: 4,
+            base_timestamp: 0,
+            max_timestamp: 0,
+        };
+        let Outcome::Change { put, .. } = publish(&get, &[part(0, 3), part(3, 8)], &[]).unwrap()
+        else {
+            panic!("publish");
+        };
+        let state: Partition = serde_json::from_str(&put[0].1).unwrap();
+        assert_eq!(state.extents.len(), 1);
+        assert_eq!(state.extents[0].start, 3);
     }
 
     #[test]
@@ -547,11 +515,38 @@ mod tests {
                     op: 0,
                     value: Some("compact".into()),
                 }],
+                replace: false,
             }],
         )
         .unwrap();
         assert_eq!(done.items[0].code, 0);
         let topic: crate::catalog::Topic = serde_json::from_str(&done.put[0].1).unwrap();
         assert_eq!(topic.cleanup_policy, "compact");
+    }
+
+    #[test]
+    fn legacy_alter_resets_configs_it_does_not_name() {
+        let mut map = world();
+        let change = |name: &str, value: &str, replace: bool| ConfigChange {
+            resource_type: 2,
+            name: "events".into(),
+            validate_only: false,
+            edits: vec![ConfigEdit {
+                name: name.into(),
+                op: 0,
+                value: Some(value.into()),
+            }],
+            replace,
+        };
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let done = alter_configs(&get, &[change("retention.ms", "60000", false)]).unwrap();
+        let (key, value) = done.put[0].clone();
+        map.insert(key, value);
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let done = alter_configs(&get, &[change("segment.bytes", "1048576", true)]).unwrap();
+        let topic: crate::catalog::Topic = serde_json::from_str(&done.put[0].1).unwrap();
+        assert_eq!(topic.retention_ms, 604_800_000);
+        assert!(!topic.is_set("retention.ms"));
+        assert_eq!(topic.config("segment.bytes"), "1048576");
     }
 }

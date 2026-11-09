@@ -52,7 +52,10 @@ use crate::slot::WalSlot;
 
 mod acl;
 mod admin;
+mod describe;
+mod epochs;
 mod groups;
+mod scram;
 mod txn;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -62,7 +65,7 @@ use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 const MAX_FRAME: usize = 100 * 1024 * 1024;
-const MAX_BATCH: usize = 1024 * 1024;
+const MAX_BATCH: usize = batch::MAX_BATCH_CEILING;
 const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 /// Most unsealed bytes one upload pass takes: up to four objects of
 /// `FLUSH_BYTES`, put in parallel, then one publish and one seal for all.
@@ -76,6 +79,20 @@ const LEADER_NOT_AVAILABLE: i16 = 5;
 const NOT_LEADER: i16 = 6;
 const REQUEST_TIMED_OUT: i16 = 7;
 const TOO_LARGE: i16 = 10;
+const INVALID_RECORD: i16 = 87;
+const INVALID_PARTITIONS: i16 = 37;
+const INVALID_TOPIC: i16 = 17;
+const FENCED_LEADER_EPOCH: i16 = 74;
+const UNKNOWN_LEADER_EPOCH: i16 = 76;
+const INVALID_TRANSACTION_TIMEOUT: i16 = 50;
+const INVALID_REPLICATION_FACTOR: i16 = 38;
+const INVALID_REPLICA_ASSIGNMENT: i16 = 39;
+/// `DescribeConfigs` sources: set on the topic, set on the broker, default.
+const CONFIG_SOURCE_TOPIC: i8 = 1;
+const CONFIG_SOURCE_BROKER: i8 = 4;
+const CONFIG_SOURCE_DEFAULT: i8 = 5;
+/// `DescribeConfigs` resource type of a broker.
+const BROKER_RESOURCE: i8 = 4;
 const SASL_MECHANISM: i16 = 33;
 const ILLEGAL_SASL: i16 = 34;
 const INVALID_CONFIG: i16 = 40;
@@ -123,15 +140,79 @@ impl Socket {
             Self::Tls(socket) => socket.write_all(buf).await,
         }
     }
+    /// `User:<subject>` from the client's TLS certificate, formatted as
+    /// Kafka's default principal builder does (RFC 2253, most specific
+    /// first). `None` without a client certificate.
+    fn certificate_principal(&self) -> Option<String> {
+        let Self::Tls(stream) = self else {
+            return None;
+        };
+        let der = stream.get_ref().1.peer_certificates()?.first()?;
+        let (_, certificate) = x509_parser::parse_x509_certificate(der.as_ref()).ok()?;
+        Some(format!("User:{}", rfc2253(certificate.subject())))
+    }
+}
+
+/// A distinguished name as Java's `X500Principal.getName()` prints it.
+fn rfc2253(name: &x509_parser::x509::X509Name<'_>) -> String {
+    let rdns: Vec<String> = name
+        .iter_rdn()
+        .map(|rdn| {
+            rdn.iter()
+                .map(|attribute| {
+                    let oid = attribute.attr_type().to_id_string();
+                    let key = match oid.as_str() {
+                        "2.5.4.3" => "CN".to_string(),
+                        "2.5.4.6" => "C".to_string(),
+                        "2.5.4.7" => "L".to_string(),
+                        "2.5.4.8" => "ST".to_string(),
+                        "2.5.4.9" => "STREET".to_string(),
+                        "2.5.4.10" => "O".to_string(),
+                        "2.5.4.11" => "OU".to_string(),
+                        "0.9.2342.19200300.100.1.25" => "DC".to_string(),
+                        "0.9.2342.19200300.100.1.1" => "UID".to_string(),
+                        other => other.to_string(),
+                    };
+                    let value = attribute.as_str().unwrap_or_default();
+                    let mut escaped = String::new();
+                    for (at, c) in value.chars().enumerate() {
+                        let edge = at == 0 && (c == '#' || c == ' ')
+                            || at + 1 == value.chars().count() && c == ' ';
+                        if edge || matches!(c, ',' | '+' | '"' | '\\' | '<' | '>' | ';') {
+                            escaped.push('\\');
+                        }
+                        escaped.push(c);
+                    }
+                    format!("{key}={escaped}")
+                })
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect();
+    rdns.into_iter().rev().collect::<Vec<_>>().join(",")
 }
 
 /// Metadata key for shard 0's leader and voters. Phase 2 runs one shard.
-const SHARD_KEY: &str = "wal/0";
+/// Metadata key of a WAL shard's view, which its leader announces.
+fn shard_key(shard: u32) -> String {
+    format!("wal/{shard}")
+}
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
 struct ShardView {
     leader: Option<NodeId>,
     voters: Vec<NodeId>,
+    /// The leader's epoch for every `wal` partition: the shard term plus
+    /// the base kept across `truncate-to-sealed`.
+    #[serde(default)]
+    epoch: i32,
+}
+
+/// Metadata key of the amount added to a WAL shard's Raft term to get its
+/// leader epoch. `truncate-to-sealed` starts a fresh shard at term 1 and
+/// raises this, so epochs never go backwards.
+pub fn epoch_base_key(shard: u32) -> String {
+    format!("wal/{shard}/epoch-base")
 }
 
 /// One broker's Kafka endpoint.
@@ -143,13 +224,55 @@ pub struct Kafka {
     port: i32,
     flush_ms: u64,
     /// How often to compact sealed extents of `cleanup.policy=compact` topics.
-    /// `0` leaves compaction off.
+    /// `0` turns compaction off. Kafka's cleaner is on by default, and so is
+    /// this.
     compact_ms: u64,
     /// `wal.disk.limit`: unsealed bytes past which produce is held.
     wal_limit: u64,
+    /// Kafka's `log.retention.check.interval.ms`: how often the metadata
+    /// leader applies `retention.ms` and `retention.bytes`.
+    retention_check_ms: u64,
+    /// How often the metadata leader looks for orphaned objects.
+    sweep_ms: u64,
+    /// An object younger than this is never swept, so an upload waiting
+    /// for its metadata commit survives (ADR 0007).
+    sweep_min_age_ms: i64,
+    /// Kafka's `file.delete.delay.ms`: how long an object stays after it is
+    /// first seen unreferenced.
+    sweep_delay_ms: i64,
+    sweeper: Mutex<camus_compactor::sweep::Sweeper>,
+    /// Kafka's `transaction.max.timeout.ms`.
+    txn_max_timeout_ms: i64,
+    /// Kafka's `transaction.abort.timed.out.transaction.cleanup.interval.ms`.
+    txn_abort_interval_ms: u64,
+    /// Kafka's `transactional.id.expiration.ms`.
+    txn_id_expiration_ms: i64,
+    /// Kafka's `transaction.remove.expired.transaction.cleanup.interval.ms`.
+    txn_cleanup_interval_ms: u64,
+    /// Kafka's `producer.id.expiration.ms`.
+    producer_id_expiration_ms: i64,
+    /// Kafka's `producer.id.expiration.check.interval.ms`.
+    producer_id_check_ms: u64,
+    /// Kafka's `offsets.retention.minutes`, in milliseconds.
+    offsets_retention_ms: i64,
+    /// Kafka's `offsets.retention.check.interval.ms`.
+    offsets_check_ms: u64,
     /// `durability.mode` for a topic created without one. `wal` per ADR 0005.
     default_durability: String,
+    /// Kafka's `auto.create.topics.enable`.
+    auto_create_topics: bool,
+    /// Kafka's `num.partitions`, for auto-created topics and CreateTopics
+    /// with `-1`.
+    default_partitions: i32,
+    /// `message.max.bytes`: the batch limit for a topic without
+    /// `max.message.bytes`. Kafka's default, 1048588.
+    message_max_bytes: usize,
     require_sasl: bool,
+    /// Kafka's `super.users`. The SASL user from the environment is always one,
+    /// so a new cluster has someone who may create the first ACLs.
+    super_users: std::collections::BTreeSet<String>,
+    /// Kafka's `allow.everyone.if.no.acl.found`.
+    allow_if_no_acl: bool,
     sasl_user: String,
     sasl_pass: String,
     tls: Option<TlsAcceptor>,
@@ -187,10 +310,70 @@ impl Kafka {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(250);
+        let env_ms = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(default)
+        };
+        let retention_check_ms = env_ms("CAMUS_RETENTION_CHECK_MS", 300_000);
+        let sweep_ms = env_ms("CAMUS_SWEEP_MS", 300_000);
+        let sweep_min_age_ms = env_ms("CAMUS_SWEEP_MIN_AGE_MS", 3_600_000) as i64;
+        let sweep_delay_ms = env_ms("CAMUS_FILE_DELETE_DELAY_MS", 60_000) as i64;
+        // Kafka's `super.users` is a semicolon-separated principal list.
+        let mut super_users: std::collections::BTreeSet<String> =
+            std::env::var("CAMUS_SUPER_USERS")
+                .unwrap_or_default()
+                .split(';')
+                .map(str::trim)
+                .filter(|principal| !principal.is_empty())
+                .map(str::to_string)
+                .collect();
+        if require_sasl && !sasl_user.is_empty() {
+            super_users.insert(format!("User:{sasl_user}"));
+        }
+        // On the dev PLAINTEXT listener every client is `User:ANONYMOUS`, as
+        // on a Kafka listener with no authorizer, so a resource no ACL names
+        // stays open. An authenticated listener (SASL or mTLS) denies it.
+        let allow_if_no_acl = match std::env::var("CAMUS_ACL_ALLOW_IF_NO_ACL").ok().as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => !require_sasl && tls.is_none(),
+        };
+        let txn_max_timeout_ms = env_ms("CAMUS_TXN_MAX_TIMEOUT_MS", 900_000) as i64;
+        let txn_abort_interval_ms = env_ms("CAMUS_TXN_ABORT_INTERVAL_MS", 10_000);
+        let txn_id_expiration_ms =
+            env_ms("CAMUS_TRANSACTIONAL_ID_EXPIRATION_MS", 604_800_000) as i64;
+        let txn_cleanup_interval_ms = env_ms("CAMUS_TXN_CLEANUP_INTERVAL_MS", 3_600_000);
+        let producer_id_expiration_ms =
+            env_ms("CAMUS_PRODUCER_ID_EXPIRATION_MS", 86_400_000) as i64;
+        let producer_id_check_ms = env_ms("CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS", 600_000);
+        // Kafka's setting is in minutes; `CAMUS_OFFSETS_RETENTION_MS`
+        // overrides it for tests that cannot wait a minute.
+        let offsets_retention_ms = std::env::var("CAMUS_OFFSETS_RETENTION_MS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_else(|| {
+                env_ms("CAMUS_OFFSETS_RETENTION_MINUTES", 10_080).saturating_mul(60_000) as i64
+            });
+        let offsets_check_ms = env_ms("CAMUS_OFFSETS_RETENTION_CHECK_INTERVAL_MS", 600_000);
+        let auto_create_topics = std::env::var("CAMUS_AUTO_CREATE_TOPICS")
+            .map(|value| value != "false")
+            .unwrap_or(true);
+        let default_partitions = std::env::var("CAMUS_NUM_PARTITIONS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(1);
+        let message_max_bytes = std::env::var("CAMUS_MESSAGE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(camus_metadata::config::DEFAULT_MESSAGE_MAX_BYTES as usize)
+            .min(batch::MAX_BATCH_CEILING);
         let compact_ms = std::env::var("CAMUS_COMPACT_MS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(300_000);
         let store = Arc::new(groups::MetadataStore {
             node: Arc::clone(&node),
         });
@@ -202,10 +385,28 @@ impl Kafka {
             port,
             flush_ms,
             compact_ms,
+            auto_create_topics,
+            default_partitions,
+            message_max_bytes,
+            retention_check_ms,
+            sweep_ms,
+            sweep_min_age_ms,
+            sweep_delay_ms,
+            sweeper: Mutex::new(camus_compactor::sweep::Sweeper::default()),
+            txn_max_timeout_ms,
+            txn_abort_interval_ms,
+            txn_id_expiration_ms,
+            txn_cleanup_interval_ms,
+            producer_id_expiration_ms,
+            producer_id_check_ms,
+            offsets_retention_ms,
+            offsets_check_ms,
             wal_limit,
             default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
                 .unwrap_or_else(|_| "wal".into()),
             require_sasl,
+            super_users,
+            allow_if_no_acl,
             sasl_user,
             sasl_pass,
             tls,
@@ -227,10 +428,6 @@ impl Kafka {
     }
 
     /// The shard serving requests now.
-    fn wal(&self) -> Arc<Shard> {
-        self.wal.get()
-    }
-
     fn gone_long_enough(&self, id: [u8; 16]) -> bool {
         let mut unknown = self.unknown.lock().expect("unknown topics");
         let since = *unknown.entry(id).or_insert_with(Instant::now);
@@ -313,44 +510,137 @@ impl Kafka {
         Ok(response.json().await?)
     }
 
+    /// The WAL shard a partition lives on (ADR 0014).
+    fn partition_shard(&self, topic: &Topic, partition: i32) -> u32 {
+        self.partition_state(topic, partition)
+            .map(|state| state.shard)
+            .unwrap_or(0)
+    }
+
+    /// The open WAL shard holding a partition, if this broker has it.
+    fn wal_of(&self, topic: &Topic, partition: i32) -> Option<Arc<Shard>> {
+        self.wal.shard(self.partition_shard(topic, partition))
+    }
+
+    /// This broker leads the WAL shard holding a partition.
+    fn leads_wal(&self, topic: &Topic, partition: i32) -> bool {
+        self.wal_of(topic, partition)
+            .is_some_and(|shard| shard.is_leader())
+    }
+
+    /// A partition's WAL end, or 0 when this broker does not have its shard.
+    fn wal_end(&self, topic: &Topic, partition: i32) -> i64 {
+        self.wal_of(topic, partition)
+            .map(|shard| shard.end_offset(&topic_id(topic), partition))
+            .unwrap_or(0)
+    }
+
     /// Shard leader and voters as clients should see them. The shard leader
     /// records itself in metadata so brokers outside the shard can answer
     /// Metadata; until it has, this broker's own view is used.
-    fn shard_view(&self) -> ShardView {
+    fn shard_view(&self, shard: u32) -> ShardView {
         self.node
-            .read_local(SHARD_KEY)
+            .read_local(&shard_key(shard))
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_else(|| self.local_shard_view())
+            .unwrap_or_else(|| self.local_shard_view(shard))
     }
 
-    fn local_shard_view(&self) -> ShardView {
-        let wal = self.wal();
+    fn local_shard_view(&self, shard: u32) -> ShardView {
+        let Some(wal) = self.wal.shard(shard) else {
+            return ShardView {
+                leader: None,
+                voters: Vec::new(),
+                epoch: -1,
+            };
+        };
         ShardView {
             leader: wal.leader(),
             voters: wal.voters(),
+            epoch: self.shard_epoch(shard),
         }
     }
 
-    /// Record this broker as shard leader in metadata when it leads and the
-    /// stored view differs.
-    async fn announce_shard(&self) {
-        if !self.wal().leads_quorum(Duration::from_millis(500)) {
-            return;
-        }
-        let mine = self.local_shard_view();
-        let stored: Option<ShardView> = self
+    /// This broker's epoch for a WAL shard: the base from metadata plus the
+    /// shard's term.
+    fn shard_epoch(&self, shard: u32) -> i32 {
+        let base: i64 = self
             .node
-            .read_local(SHARD_KEY)
+            .read_local(&epoch_base_key(shard))
             .ok()
             .flatten()
-            .and_then(|raw| serde_json::from_str(&raw).ok());
-        if stored.as_ref() == Some(&mine) {
-            return;
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(0);
+        let term = self.wal.shard(shard).map(|wal| wal.term()).unwrap_or(0);
+        i32::try_from(base.saturating_add(term as i64)).unwrap_or(i32::MAX)
+    }
+
+    /// The metadata group's term, the epoch of every `r2` partition.
+    fn metadata_epoch(&self) -> i32 {
+        i32::try_from(self.node.raft.metrics().borrow().current_term).unwrap_or(i32::MAX)
+    }
+
+    /// The leader epoch clients should see for a partition.
+    fn partition_epoch(&self, topic: &Topic, partition: i32) -> i32 {
+        if topic.durability == "wal" {
+            self.shard_view(self.partition_shard(topic, partition))
+                .epoch
+        } else {
+            self.metadata_epoch()
         }
-        if let Ok(raw) = serde_json::to_string(&mine) {
-            let _ = self.meta_write(SHARD_KEY.to_string(), raw).await;
+    }
+
+    /// Kafka's check of a client's `current_leader_epoch`: `-1` skips it, an
+    /// older epoch is `FENCED_LEADER_EPOCH`, and a newer one, which this
+    /// broker has not seen yet, is `UNKNOWN_LEADER_EPOCH`.
+    fn check_leader_epoch(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        current_leader_epoch: i32,
+    ) -> Result<(), i16> {
+        if current_leader_epoch < 0 {
+            return Ok(());
+        }
+        let mine = self.leading_epoch(topic, partition);
+        match current_leader_epoch.cmp(&mine) {
+            std::cmp::Ordering::Less => Err(FENCED_LEADER_EPOCH),
+            std::cmp::Ordering::Greater => Err(UNKNOWN_LEADER_EPOCH),
+            std::cmp::Ordering::Equal => Ok(()),
+        }
+    }
+
+    /// The epoch this broker leads a partition in, for checking a client's
+    /// `current_leader_epoch`.
+    fn leading_epoch(&self, topic: &Topic, partition: i32) -> i32 {
+        if topic.durability == "wal" {
+            self.shard_epoch(self.partition_shard(topic, partition))
+        } else {
+            self.metadata_epoch()
+        }
+    }
+
+    /// Record this broker as leader in metadata for each shard it leads, when
+    /// the stored view differs.
+    async fn announce_shard(&self) {
+        for (id, wal) in self.wal.all() {
+            if !wal.leads_quorum(Duration::from_millis(500)) {
+                continue;
+            }
+            let mine = self.local_shard_view(id);
+            let stored: Option<ShardView> = self
+                .node
+                .read_local(&shard_key(id))
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str(&raw).ok());
+            if stored.as_ref() == Some(&mine) {
+                continue;
+            }
+            if let Ok(raw) = serde_json::to_string(&mine) {
+                let _ = self.meta_write(shard_key(id), raw).await;
+            }
         }
     }
 
@@ -411,8 +701,134 @@ impl Kafka {
         )))
     }
 
-    /// A compacting topic rejects a record with no key. Kafka reports that as
-    /// a corrupt message.
+    /// Broker settings DescribeConfigs reports for this broker, under Kafka's
+    /// names: `(name, value, Kafka 4.4.0 default, ConfigType)`. They are set
+    /// at startup, so all are read-only.
+    fn broker_configs(&self) -> Vec<(&'static str, String, &'static str, i8)> {
+        const BOOLEAN: i8 = 1;
+        const STRING: i8 = 2;
+        const INT: i8 = 3;
+        const LONG: i8 = 5;
+        let super_users: Vec<&str> = self.super_users.iter().map(String::as_str).collect();
+        vec![
+            ("broker.id", self.node_id.to_string(), "-1", INT),
+            (
+                "auto.create.topics.enable",
+                self.auto_create_topics.to_string(),
+                "true",
+                BOOLEAN,
+            ),
+            (
+                "num.partitions",
+                self.default_partitions.to_string(),
+                "1",
+                INT,
+            ),
+            (
+                "message.max.bytes",
+                self.message_max_bytes.to_string(),
+                "1048588",
+                INT,
+            ),
+            ("compression.type", "producer".into(), "producer", STRING),
+            ("delete.topic.enable", "true".into(), "true", BOOLEAN),
+            (
+                "unclean.leader.election.enable",
+                "false".into(),
+                "false",
+                BOOLEAN,
+            ),
+            ("log.cleanup.policy", "delete".into(), "delete", STRING),
+            ("log.retention.ms", "604800000".into(), "604800000", LONG),
+            ("log.retention.bytes", "-1".into(), "-1", LONG),
+            (
+                "log.retention.check.interval.ms",
+                self.retention_check_ms.to_string(),
+                "300000",
+                LONG,
+            ),
+            (
+                "log.cleaner.enable",
+                (self.compact_ms > 0).to_string(),
+                "true",
+                BOOLEAN,
+            ),
+            (
+                "file.delete.delay.ms",
+                self.sweep_delay_ms.to_string(),
+                "60000",
+                LONG,
+            ),
+            (
+                "offsets.retention.minutes",
+                (self.offsets_retention_ms / 60_000).to_string(),
+                "10080",
+                INT,
+            ),
+            (
+                "offsets.retention.check.interval.ms",
+                self.offsets_check_ms.to_string(),
+                "600000",
+                LONG,
+            ),
+            (
+                "transaction.max.timeout.ms",
+                self.txn_max_timeout_ms.to_string(),
+                "900000",
+                INT,
+            ),
+            (
+                "transactional.id.expiration.ms",
+                self.txn_id_expiration_ms.to_string(),
+                "604800000",
+                INT,
+            ),
+            (
+                "producer.id.expiration.ms",
+                self.producer_id_expiration_ms.to_string(),
+                "86400000",
+                INT,
+            ),
+            (
+                "allow.everyone.if.no.acl.found",
+                self.allow_if_no_acl.to_string(),
+                "false",
+                BOOLEAN,
+            ),
+            ("super.users", super_users.join(";"), "", STRING),
+        ]
+    }
+
+    /// The log directory DescribeLogDirs names: the bucket and key prefix.
+    fn log_dir(&self) -> String {
+        let bucket = std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into());
+        let prefix = std::env::var("CAMUS_S3_PREFIX").unwrap_or_default();
+        format!("s3://{bucket}/{prefix}")
+    }
+
+    /// The partition's high watermark: the sealed end, or the WAL end for a
+    /// `wal` topic when that is further.
+    fn high_watermark(&self, topic: &Topic, partition: i32) -> Option<i64> {
+        let sealed = self.partition_state(topic, partition)?.next_offset;
+        if topic.durability == "wal" {
+            Some(sealed.max(self.wal_end(topic, partition)))
+        } else {
+            Some(sealed)
+        }
+    }
+
+    /// The largest batch `topic` accepts: its `max.message.bytes`, or the
+    /// broker's `message.max.bytes`.
+    fn batch_limit(&self, topic: &Topic) -> usize {
+        if topic.is_set("max.message.bytes") {
+            usize::try_from(topic.config_i64("max.message.bytes")).unwrap_or(0)
+        } else {
+            self.message_max_bytes
+        }
+    }
+
+    /// A compacting topic rejects a record with no key, with `INVALID_RECORD`
+    /// as in Kafka.
     fn reject_null_key(&self, topic: &Topic, raw: &[u8]) -> Result<(), i16> {
         if !camus_protocol::compact::compacts(&topic.cleanup_policy) {
             return Ok(());
@@ -425,8 +841,272 @@ impl Kafka {
             .flat_map(|set| &set.records)
             .any(|record| record.key.is_none())
         {
-            return Err(CORRUPT);
+            return Err(INVALID_RECORD);
         }
+        Ok(())
+    }
+
+    /// Move each partition's log start past the sealed extents that
+    /// `retention.ms` or `retention.bytes` no longer keeps.
+    async fn enforce_retention(&self) {
+        if !self.leader() {
+            return;
+        }
+        let now = txn::now_ms();
+        let mut cuts = Vec::new();
+        for name in self.topic_names() {
+            let Some(topic) = self.topic(&name) else {
+                continue;
+            };
+            if !topic
+                .cleanup_policy
+                .split(',')
+                .any(|policy| policy == "delete")
+            {
+                continue;
+            }
+            for partition in 0..topic.partitions {
+                let Some(state) = self.partition_state(&topic, partition) else {
+                    continue;
+                };
+                if let Some(offset) = camus_compactor::retention::cut(
+                    &state.extents,
+                    state.log_start,
+                    topic.retention_ms,
+                    topic.retention_bytes,
+                    now,
+                ) {
+                    cuts.push(camus_metadata::RecordCut {
+                        topic: name.clone(),
+                        partition,
+                        offset,
+                        high_watermark: -1,
+                    });
+                }
+            }
+        }
+        if cuts.is_empty() {
+            return;
+        }
+        let count = cuts.len() as u64;
+        match self.meta_apply(Command::DeleteRecords { cuts }).await {
+            Ok(_) => {
+                camus_compactor::STATS
+                    .retention_cuts
+                    .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(partitions = count, "retention moved log starts");
+            }
+            Err(err) => tracing::warn!(%err, "retention commit failed"),
+        }
+    }
+
+    /// Abort transactions that have been ongoing longer than their timeout.
+    async fn abort_timed_out_transactions(&self) {
+        if !self.leader() {
+            return;
+        }
+        let Ok(rows) = self.node.scan_local("txn/") else {
+            return;
+        };
+        let now = txn::now_ms();
+        for (key, raw) in rows {
+            let Ok(clock) = camus_metadata::txn_clock(&raw) else {
+                continue;
+            };
+            if !clock.ongoing
+                || clock.started_ms < 0
+                || now.saturating_sub(clock.started_ms) <= i64::from(clock.timeout_ms)
+            {
+                continue;
+            }
+            let id = key.trim_start_matches("txn/").to_string();
+            let applied = self
+                .meta_apply(Command::AbortTimedOutTxn {
+                    transactional_id: id.clone(),
+                    producer_id: clock.producer_id,
+                    producer_epoch: clock.epoch,
+                    now_ms: now,
+                })
+                .await;
+            if let Ok(response) = applied {
+                if response.value.as_deref() == Some("1") {
+                    tracing::info!(transactional_id = %id, "aborted a transaction past its timeout");
+                }
+            }
+        }
+    }
+
+    /// Remove transactional ids idle for `transactional.id.expiration.ms`.
+    async fn expire_transactional_ids(&self) {
+        if !self.leader() {
+            return;
+        }
+        let Ok(rows) = self.node.scan_local("txn/") else {
+            return;
+        };
+        let now = txn::now_ms();
+        for (key, raw) in rows {
+            let Ok(clock) = camus_metadata::txn_clock(&raw) else {
+                continue;
+            };
+            let idle = clock.updated_ms < 0
+                || now.saturating_sub(clock.updated_ms) >= self.txn_id_expiration_ms;
+            if clock.ongoing || !idle {
+                continue;
+            }
+            let _ = self
+                .meta_apply(Command::ExpireTransactionalId {
+                    transactional_id: key.trim_start_matches("txn/").to_string(),
+                    producer_id: clock.producer_id,
+                    producer_epoch: clock.epoch,
+                    now_ms: now,
+                    expiration_ms: self.txn_id_expiration_ms,
+                })
+                .await;
+        }
+    }
+
+    /// Remove committed offsets of empty groups past `offsets.retention.minutes`.
+    async fn expire_offsets(&self) {
+        if !self.leader() {
+            return;
+        }
+        let Ok(rows) = self.node.scan_local(camus_metadata::groups::group_prefix()) else {
+            return;
+        };
+        let now = txn::now_ms();
+        for (key, _) in rows {
+            let Some(group) = camus_metadata::groups::group_from_key(&key) else {
+                continue;
+            };
+            let applied = self
+                .node
+                .group_write(Command::ExpireOffsets {
+                    group: group.clone(),
+                    now_ms: now,
+                    retention_ms: self.offsets_retention_ms,
+                })
+                .await;
+            let gone = applied.is_ok()
+                && self
+                    .node
+                    .read_local(&key)
+                    .is_ok_and(|stored| stored.is_none());
+            if gone {
+                self.coordinator.forget(&group);
+            }
+        }
+    }
+
+    /// Remove idempotent producer state Kafka would expire. Metadata decides
+    /// per key; this only names the candidates.
+    async fn expire_producer_state(&self) {
+        if !self.leader() {
+            return;
+        }
+        let Ok(rows) = self.node.scan_local("seq/") else {
+            return;
+        };
+        let keys: Vec<(String, i32, i64)> = rows
+            .iter()
+            .filter_map(|(key, _)| {
+                let rest = key.strip_prefix("seq/")?;
+                let (rest, producer) = rest.rsplit_once('/')?;
+                let (topic, partition) = rest.rsplit_once('/')?;
+                Some((
+                    topic.to_string(),
+                    partition.parse().ok()?,
+                    producer.parse().ok()?,
+                ))
+            })
+            .collect();
+        let now = txn::now_ms();
+        for chunk in keys.chunks(500) {
+            let _ = self
+                .meta_apply(Command::ExpireProducers {
+                    keys: chunk.to_vec(),
+                    now_ms: now,
+                    expiration_ms: self.producer_id_expiration_ms,
+                })
+                .await;
+        }
+    }
+
+    /// Every object key an extent points into. Any read or parse failure is
+    /// an error, because a missing reference would delete live data.
+    fn referenced_objects(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let mut keys = std::collections::BTreeSet::new();
+        let names: Vec<String> = match self.node.read_local(camus_metadata::topic_index_key())? {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        };
+        for name in names {
+            let Some(raw) = self
+                .node
+                .read_local(&camus_metadata::topic_storage_key(&name))?
+            else {
+                continue;
+            };
+            let topic = camus_metadata::parse_topic(&raw).map_err(anyhow::Error::msg)?;
+            for partition in 0..topic.partitions {
+                let raw = self
+                    .node
+                    .read_local(&camus_metadata::partition_storage_key(&topic.id, partition))?
+                    .ok_or_else(|| anyhow::anyhow!("{name}-{partition} has no partition row"))?;
+                let state = camus_metadata::parse_partition(&raw).map_err(anyhow::Error::msg)?;
+                keys.extend(state.extents.into_iter().map(|extent| extent.key));
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Delete bundle objects that no extent has referenced for the delete
+    /// delay. Runs on the metadata leader only.
+    async fn sweep_objects(&self) -> anyhow::Result<()> {
+        if !self.leader() {
+            return Ok(());
+        }
+        // List before reading references: an object published in between is
+        // then either referenced or too young to delete.
+        let listed: Vec<camus_compactor::sweep::Listed> = self
+            .bucket
+            .list("bundle/")
+            .await?
+            .into_iter()
+            .map(|(key, size, modified_ms)| camus_compactor::sweep::Listed {
+                key,
+                size,
+                modified_ms,
+            })
+            .collect();
+        let referenced = self.referenced_objects()?;
+        let plan = self.sweeper.lock().await.plan(
+            &listed,
+            &referenced,
+            txn::now_ms(),
+            self.sweep_min_age_ms,
+            self.sweep_delay_ms,
+        );
+        let stats = &camus_compactor::STATS;
+        for object in plan {
+            if !self.leader() {
+                break;
+            }
+            match self.bucket.delete(&object.key).await {
+                Ok(()) => {
+                    stats
+                        .objects_deleted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stats
+                        .bytes_deleted
+                        .fetch_add(object.size, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(err) => tracing::warn!(key = %object.key, %err, "orphan delete failed"),
+            }
+        }
+        stats
+            .sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -452,13 +1132,27 @@ impl Kafka {
         let Some(state) = self.partition_state(topic, partition) else {
             return;
         };
-        if state.extents.is_empty() {
+        // `min.compaction.lag.ms`: only the leading extents whose newest
+        // record is at least that old are compacted.
+        let now = txn::now_ms();
+        let lag = topic.config_i64("min.compaction.lag.ms");
+        let eligible: Vec<&camus_metadata::Extent> = state
+            .extents
+            .iter()
+            .take_while(|extent| now.saturating_sub(extent.max_timestamp) >= lag)
+            .collect();
+        let Some(last) = eligible.last() else {
             return;
-        }
+        };
+        let covered_end = last.end;
+        let tombstones_before = now.saturating_sub(topic.config_i64("delete.retention.ms"));
         let mut records = Vec::new();
         let mut base_timestamp = i64::MAX;
         let mut max_timestamp = i64::MIN;
-        for extent in &state.extents {
+        for extent in eligible {
+            if extent.length == 0 {
+                continue;
+            }
             let end = extent.file_offset + u64::from(extent.length);
             let Ok(bytes) = self
                 .bucket
@@ -494,24 +1188,27 @@ impl Kafka {
                 }
             }
         }
-        let Some(kept) = camus_protocol::compact::plan(&records) else {
+        let Some(kept) = camus_protocol::compact::plan_expiring(&records, tombstones_before) else {
             return;
         };
-        let Ok(body) = camus_protocol::compact::rebuild(&kept) else {
-            return;
+        // When nothing survives, the prefix becomes an extent with no
+        // object and no bytes. The log start stays where it is, as Kafka's
+        // cleaner leaves it, and a fetch there moves on to the next record.
+        let (object_key, length) = if kept.is_empty() {
+            (String::new(), 0)
+        } else {
+            let Ok(body) = camus_protocol::compact::rebuild(&kept) else {
+                return;
+            };
+            let Ok(length) = u32::try_from(body.len()) else {
+                return;
+            };
+            let object_key = camus_uploader::object_key();
+            if self.bucket.put_new(&object_key, body).await.is_err() {
+                return;
+            }
+            (object_key, length)
         };
-        let Ok(length) = u32::try_from(body.len()) else {
-            return;
-        };
-        let covered_end = state
-            .extents
-            .last()
-            .map(|extent| extent.end)
-            .unwrap_or(state.next_offset);
-        let object_key = camus_uploader::object_key();
-        if self.bucket.put_new(&object_key, body).await.is_err() {
-            return;
-        }
         if base_timestamp == i64::MAX {
             base_timestamp = 0;
             max_timestamp = 0;
@@ -546,6 +1243,62 @@ impl Kafka {
                 loop {
                     tokio::time::sleep(Duration::from_millis(compact.compact_ms)).await;
                     compact.compact_sealed().await;
+                }
+            });
+        }
+        if self.retention_check_ms > 0 {
+            let retention = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(retention.retention_check_ms)).await;
+                    retention.enforce_retention().await;
+                }
+            });
+        }
+        if self.txn_abort_interval_ms > 0 {
+            let txns = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(txns.txn_abort_interval_ms)).await;
+                    txns.abort_timed_out_transactions().await;
+                }
+            });
+        }
+        if self.txn_cleanup_interval_ms > 0 {
+            let txns = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(txns.txn_cleanup_interval_ms)).await;
+                    txns.expire_transactional_ids().await;
+                }
+            });
+        }
+        if self.offsets_check_ms > 0 {
+            let offsets = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(offsets.offsets_check_ms)).await;
+                    offsets.expire_offsets().await;
+                }
+            });
+        }
+        if self.producer_id_check_ms > 0 {
+            let producers = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(producers.producer_id_check_ms)).await;
+                    producers.expire_producer_state().await;
+                }
+            });
+        }
+        if self.sweep_ms > 0 {
+            let sweep = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(sweep.sweep_ms)).await;
+                    if let Err(err) = sweep.sweep_objects().await {
+                        tracing::warn!(%err, "object sweep skipped");
+                    }
                 }
             });
         }
@@ -595,7 +1348,7 @@ impl Kafka {
             }
         });
         loop {
-            let Ok((tcp, _)) = listener.accept().await else {
+            let Ok((tcp, peer)) = listener.accept().await else {
                 break;
             };
             let _ = tcp.set_nodelay(true);
@@ -612,13 +1365,22 @@ impl Kafka {
                 } else {
                     Socket::Plain(tcp)
                 };
-                let _ = kafka.connection(socket).await;
+                let _ = kafka.connection(socket, peer.ip().to_string()).await;
             });
         }
     }
 
-    async fn connection(&self, mut socket: Socket) -> anyhow::Result<()> {
-        let mut authed = !self.require_sasl;
+    async fn connection(&self, mut socket: Socket, host: String) -> anyhow::Result<()> {
+        // A client certificate is the principal on an mTLS listener, as on
+        // Kafka's SSL listener, unless SASL is also required.
+        let certified = socket.certificate_principal();
+        let mut session = Session {
+            authed: !self.require_sasl,
+            host,
+            principal: if self.require_sasl { None } else { certified },
+            mechanism: "PLAIN".into(),
+            scram: None,
+        };
         loop {
             let mut size_buf = [0u8; 4];
             if socket.read_exact(&mut size_buf).await.is_err() {
@@ -632,7 +1394,7 @@ impl Kafka {
             if socket.read_exact(&mut body).await.is_err() {
                 break;
             }
-            match self.handle(&body, &mut authed).await {
+            match self.handle(&body, &mut session).await {
                 Reply::Frame(frame) => {
                     if socket.write_all(&frame).await.is_err() {
                         break;
@@ -645,7 +1407,7 @@ impl Kafka {
         Ok(())
     }
 
-    async fn handle(&self, body: &[u8], authed: &mut bool) -> Reply {
+    async fn handle(&self, body: &[u8], session: &mut Session) -> Reply {
         let mut buf = Bytes::copy_from_slice(body);
         let header = match decode_request_header_from_buffer(&mut buf) {
             Ok(header) => header,
@@ -665,57 +1427,88 @@ impl Kafka {
             key,
             ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate
         );
-        if self.require_sasl && !(*authed) && !allowed_before_auth {
+        if self.require_sasl && !session.authed && !allowed_before_auth {
             return self.illegal_sasl(key, version, header.correlation_id);
         }
         if !frame::is_implemented(key, version) {
             return unsupported(key, version, header.correlation_id);
         }
-        let principal = self.principal(*authed);
+        let caller = Caller {
+            principal: session
+                .principal
+                .clone()
+                .unwrap_or_else(|| "User:ANONYMOUS".into()),
+            host: session.host.clone(),
+        };
         match key {
             ApiKey::ApiVersions => self.api_versions(&header, &mut buf),
-            ApiKey::Metadata => self.metadata(&header, &mut buf).await,
-            ApiKey::CreateTopics => self.create_topics(&header, &mut buf, &principal).await,
-            ApiKey::DeleteTopics => self.delete_topics(&header, &mut buf, &principal).await,
-            ApiKey::DescribeConfigs => self.describe_configs(&header, &mut buf),
-            ApiKey::Produce => self.produce(&header, &mut buf, &principal).await,
-            ApiKey::Fetch => self.fetch(&header, &mut buf, &principal).await,
-            ApiKey::ListOffsets => self.list_offsets(&header, &mut buf).await,
-            ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf),
-            ApiKey::SaslAuthenticate => self.sasl_authenticate(&header, &mut buf, authed),
-            ApiKey::FindCoordinator => self.find_coordinator(&header, &mut buf).await,
-            ApiKey::JoinGroup => self.join_group(&header, &mut buf).await,
-            ApiKey::SyncGroup => self.sync_group(&header, &mut buf).await,
-            ApiKey::Heartbeat => self.heartbeat(&header, &mut buf).await,
-            ApiKey::LeaveGroup => self.leave_group(&header, &mut buf).await,
-            ApiKey::OffsetCommit => self.offset_commit(&header, &mut buf).await,
-            ApiKey::OffsetFetch => self.offset_fetch(&header, &mut buf).await,
-            ApiKey::ListGroups => self.list_groups(&header, &mut buf).await,
-            ApiKey::DescribeGroups => self.describe_groups(&header, &mut buf).await,
-            ApiKey::DeleteGroups => self.delete_groups(&header, &mut buf).await,
-            ApiKey::InitProducerId => self.init_producer_id(&header, &mut buf).await,
-            ApiKey::CreatePartitions => self.create_partitions(&header, &mut buf).await,
-            ApiKey::AlterConfigs => self.alter_configs(&header, &mut buf).await,
+            ApiKey::Metadata => self.metadata(&header, &mut buf, &caller).await,
+            ApiKey::CreateTopics => self.create_topics(&header, &mut buf, &caller).await,
+            ApiKey::DeleteTopics => self.delete_topics(&header, &mut buf, &caller).await,
+            ApiKey::DescribeConfigs => self.describe_configs(&header, &mut buf, &caller),
+            ApiKey::Produce => self.produce(&header, &mut buf, &caller).await,
+            ApiKey::Fetch => self.fetch(&header, &mut buf, &caller).await,
+            ApiKey::ListOffsets => self.list_offsets(&header, &mut buf, &caller).await,
+            ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf, session),
+            ApiKey::SaslAuthenticate => self.sasl_authenticate(&header, &mut buf, session),
+            ApiKey::FindCoordinator => self.find_coordinator(&header, &mut buf, &caller).await,
+            ApiKey::JoinGroup => self.join_group(&header, &mut buf, &caller).await,
+            ApiKey::SyncGroup => self.sync_group(&header, &mut buf, &caller).await,
+            ApiKey::Heartbeat => self.heartbeat(&header, &mut buf, &caller).await,
+            ApiKey::LeaveGroup => self.leave_group(&header, &mut buf, &caller).await,
+            ApiKey::OffsetCommit => self.offset_commit(&header, &mut buf, &caller).await,
+            ApiKey::OffsetFetch => self.offset_fetch(&header, &mut buf, &caller).await,
+            ApiKey::ListGroups => self.list_groups(&header, &mut buf, &caller).await,
+            ApiKey::DescribeGroups => self.describe_groups(&header, &mut buf, &caller).await,
+            ApiKey::DeleteGroups => self.delete_groups(&header, &mut buf, &caller).await,
+            ApiKey::InitProducerId => self.init_producer_id(&header, &mut buf, &caller).await,
+            ApiKey::CreatePartitions => self.create_partitions(&header, &mut buf, &caller).await,
+            ApiKey::AlterConfigs => self.alter_configs(&header, &mut buf, &caller).await,
             ApiKey::IncrementalAlterConfigs => {
-                self.incremental_alter_configs(&header, &mut buf).await
-            }
-            ApiKey::DeleteRecords => self.delete_records(&header, &mut buf).await,
-            ApiKey::OffsetDelete => self.offset_delete(&header, &mut buf).await,
-            ApiKey::DescribeCluster => self.describe_cluster(&header, &mut buf),
-            ApiKey::AddPartitionsToTxn => self.add_partitions_to_txn(&header, &mut buf).await,
-            ApiKey::AddOffsetsToTxn => self.add_offsets_to_txn(&header, &mut buf).await,
-            ApiKey::TxnOffsetCommit => self.txn_offset_commit(&header, &mut buf).await,
-            ApiKey::EndTxn => self.end_txn(&header, &mut buf).await,
-            ApiKey::DescribeTransactions => {
-                self.describe_transactions(&header, &mut buf, &principal)
+                self.incremental_alter_configs(&header, &mut buf, &caller)
                     .await
             }
-            ApiKey::ListTransactions => self.list_transactions(&header, &mut buf, &principal).await,
-            ApiKey::DescribeAcls => self.describe_acls(&header, &mut buf, &principal).await,
-            ApiKey::CreateAcls => self.create_acls(&header, &mut buf, &principal).await,
-            ApiKey::DeleteAcls => self.delete_acls(&header, &mut buf, &principal).await,
+            ApiKey::DeleteRecords => self.delete_records(&header, &mut buf, &caller).await,
+            ApiKey::OffsetDelete => self.offset_delete(&header, &mut buf, &caller).await,
+            ApiKey::DescribeCluster => self.describe_cluster(&header, &mut buf, &caller),
+            ApiKey::AddPartitionsToTxn => {
+                self.add_partitions_to_txn(&header, &mut buf, &caller).await
+            }
+            ApiKey::AddOffsetsToTxn => self.add_offsets_to_txn(&header, &mut buf, &caller).await,
+            ApiKey::TxnOffsetCommit => self.txn_offset_commit(&header, &mut buf, &caller).await,
+            ApiKey::EndTxn => self.end_txn(&header, &mut buf, &caller).await,
+            ApiKey::DescribeTransactions => {
+                self.describe_transactions(&header, &mut buf, &caller).await
+            }
+            ApiKey::ListTransactions => self.list_transactions(&header, &mut buf, &caller).await,
+            ApiKey::DescribeAcls => self.describe_acls(&header, &mut buf, &caller).await,
+            ApiKey::CreateAcls => self.create_acls(&header, &mut buf, &caller).await,
+            ApiKey::DeleteAcls => self.delete_acls(&header, &mut buf, &caller).await,
+            ApiKey::ConsumerGroupDescribe => {
+                self.consumer_group_describe(&header, &mut buf, &caller)
+                    .await
+            }
+            ApiKey::DescribeTopicPartitions => {
+                self.describe_topic_partitions(&header, &mut buf, &caller)
+                    .await
+            }
+            ApiKey::DescribeProducers => self.describe_producers(&header, &mut buf, &caller).await,
+            ApiKey::DescribeLogDirs => self.describe_log_dirs(&header, &mut buf, &caller).await,
+            ApiKey::DescribeUserScramCredentials => {
+                self.describe_user_scram_credentials(&header, &mut buf, &caller)
+                    .await
+            }
+            ApiKey::AlterUserScramCredentials => {
+                self.alter_user_scram_credentials(&header, &mut buf, &caller)
+                    .await
+            }
+            ApiKey::OffsetForLeaderEpoch => {
+                self.offset_for_leader_epoch(&header, &mut buf, &caller)
+                    .await
+            }
             ApiKey::ConsumerGroupHeartbeat => {
-                self.consumer_group_heartbeat(&header, &mut buf).await
+                self.consumer_group_heartbeat(&header, &mut buf, &caller)
+                    .await
             }
             _ => unsupported(key, version, header.correlation_id),
         }
@@ -752,10 +1545,15 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    async fn metadata(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    async fn metadata(&self, header: &RequestHeader, buf: &mut Bytes, caller: &Caller) -> Reply {
         let Ok(request) = MetadataRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
+        // Kafka leaves out topics the caller may not describe when it lists
+        // every topic, and reports them as unauthorized when they are named.
+        let listing = request.topics.is_none();
+        let auto_create = self.auto_create_topics
+            && (header.request_api_version < 4 || request.allow_auto_topic_creation);
         let names = match request.topics {
             None => self.topic_names(),
             Some(topics) => topics
@@ -782,9 +1580,56 @@ impl Kafka {
         response.controller_id = BrokerId(leader.unwrap_or(-1));
         response.brokers = self.broker_list();
         for name in names {
-            response.topics.push(self.metadata_topic(&name, leader));
+            if !listing && auto_create && self.topic(&name).is_none() {
+                response.topics.push(self.auto_create(&name, caller).await);
+                continue;
+            }
+            if self.allows(caller, auth::TOPIC, &name, auth::DESCRIBE) {
+                response.topics.push(self.metadata_topic(&name, leader));
+            } else if !listing {
+                let mut denied = MetadataResponseTopic::default();
+                denied.name = Some(topic_name(&name));
+                denied.error_code = auth::TOPIC_FAILED;
+                response.topics.push(denied);
+            }
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
+    }
+
+    /// Create a topic a Metadata request named, as Kafka's
+    /// `auto.create.topics.enable` does: with `CREATE` on the cluster or the
+    /// topic, the broker's partition count, and the default durability. The
+    /// first answer is `LEADER_NOT_AVAILABLE`, so the client asks again.
+    async fn auto_create(&self, name: &str, caller: &Caller) -> MetadataResponseTopic {
+        let mut topic = MetadataResponseTopic::default();
+        topic.name = Some(topic_name(name));
+        let allowed = self.allows(caller, auth::CLUSTER, auth::CLUSTER_NAME, auth::CREATE)
+            || self.allows(caller, auth::TOPIC, name, auth::CREATE);
+        if !allowed {
+            topic.error_code = auth::TOPIC_FAILED;
+            return topic;
+        }
+        if self.check_topic_name(name).is_err() {
+            topic.error_code = INVALID_TOPIC;
+            return topic;
+        }
+        let created = self
+            .meta_apply(Command::CreateTopic {
+                name: name.to_string(),
+                id: Uuid::new_v4().to_string(),
+                partitions: self.default_partitions,
+                durability: self.default_durability.clone(),
+                configs: Vec::new(),
+            })
+            .await;
+        topic.error_code = match created {
+            Ok(response) if response.error_code == 0 || response.error_code == 36 => {
+                LEADER_NOT_AVAILABLE
+            }
+            Ok(response) => response.error_code,
+            Err(_) => LEADER_NOT_AVAILABLE,
+        };
+        topic
     }
 
     fn topic_names(&self) -> Vec<String> {
@@ -828,31 +1673,29 @@ impl Kafka {
             return topic;
         };
         topic.topic_id = Uuid::parse_str(&stored.id).unwrap_or_else(|_| Uuid::nil());
-        // A `wal` partition is led by its shard leader (ADR 0006), not by the
-        // metadata leader.
-        let (leader, replicas) = if stored.durability == "wal" {
-            let view = self.shard_view();
-            let replicas: Vec<BrokerId> = view
-                .voters
-                .into_iter()
-                .filter_map(|id| i32::try_from(id).ok().map(BrokerId))
-                .collect();
-            (view.leader.map(|id| id as i32), replicas)
-        } else {
-            (leader, leader.map(BrokerId).into_iter().collect())
-        };
-        let leader_id = leader.unwrap_or(-1);
-        let error = if leader.is_some() {
-            0
-        } else {
-            LEADER_NOT_AVAILABLE
-        };
         for index in 0..stored.partitions {
+            // A `wal` partition is led by the leader of its shard (ADR 0006,
+            // ADR 0014), not by the metadata leader.
+            let (leader, replicas) = if stored.durability == "wal" {
+                let view = self.shard_view(self.partition_shard(&stored, index));
+                let replicas: Vec<BrokerId> = view
+                    .voters
+                    .into_iter()
+                    .filter_map(|id| i32::try_from(id).ok().map(BrokerId))
+                    .collect();
+                (view.leader.map(|id| id as i32), replicas)
+            } else {
+                (leader, leader.map(BrokerId).into_iter().collect())
+            };
             let mut partition = MetadataResponsePartition::default();
             partition.partition_index = index;
-            partition.error_code = error;
-            partition.leader_id = BrokerId(leader_id);
-            partition.leader_epoch = stored.leader_epoch;
+            partition.error_code = if leader.is_some() {
+                0
+            } else {
+                LEADER_NOT_AVAILABLE
+            };
+            partition.leader_id = BrokerId(leader.unwrap_or(-1));
+            partition.leader_epoch = self.partition_epoch(&stored, index);
             if leader.is_some() {
                 partition.replica_nodes = replicas.clone();
                 partition.isr_nodes = replicas.clone();
@@ -862,24 +1705,30 @@ impl Kafka {
         topic
     }
 
-    fn principal(&self, authed: bool) -> String {
-        if authed && self.require_sasl && !self.sasl_user.is_empty() {
-            format!("User:{}", self.sasl_user)
-        } else {
-            "User:ANONYMOUS".into()
+    /// Kafka's authorizer: super users may do anything; otherwise the ACLs
+    /// decide, and a resource no ACL names follows
+    /// `allow.everyone.if.no.acl.found`.
+    fn allows(&self, caller: &Caller, resource_type: i8, name: &str, operation: i8) -> bool {
+        if self.super_users.contains(&caller.principal) {
+            return true;
         }
-    }
-
-    fn allows(&self, principal: &str, resource_type: i8, name: &str, operation: i8) -> bool {
         let raw = self.node.read_local("acls").ok().flatten();
-        camus_metadata::acl_allows(raw.as_deref(), principal, resource_type, name, operation)
+        camus_metadata::acl_allows(
+            raw.as_deref(),
+            &caller.principal,
+            &caller.host,
+            resource_type,
+            name,
+            operation,
+            self.allow_if_no_acl,
+        )
     }
 
     async fn create_topics(
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        principal: &str,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = CreateTopicsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
@@ -887,51 +1736,98 @@ impl Kafka {
         if !self.leader() {
             return self.create_error(&request, header, NOT_LEADER);
         }
-        if !self.allows(principal, 4, "kafka-cluster", 5) {
-            return self.create_error(&request, header, 31);
-        }
+        let cluster_create = self.allows(caller, auth::CLUSTER, auth::CLUSTER_NAME, auth::CREATE);
         let mut response = CreateTopicsResponse::default();
+        let version = header.request_api_version;
         for topic in request.topics {
             let name = topic.name.0.to_string();
-            let partitions = if topic.num_partitions < 1 {
-                1
+            let configs: Vec<(String, Option<String>)> = topic
+                .configs
+                .iter()
+                .map(|config| {
+                    (
+                        config.name.to_string(),
+                        config.value.as_ref().map(|value| value.to_string()),
+                    )
+                })
+                .collect();
+            let durability = configs
+                .iter()
+                .find(|(config, _)| config == "durability.mode")
+                .map(|(_, value)| value.clone().unwrap_or_default())
+                .unwrap_or_else(|| self.default_durability.clone());
+            let partitions = if topic.num_partitions == -1 {
+                self.default_partitions
             } else {
                 topic.num_partitions
             };
-            let durability = topic
-                .configs
-                .iter()
-                .find(|config| config.name.as_str() == "durability.mode")
-                .map(|config| {
-                    config
-                        .value
-                        .as_ref()
-                        .map(|value| value.to_string())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_else(|| self.default_durability.clone());
-            let code = if request.validate_only {
-                if self.topic(&name).is_some() {
-                    36
-                } else if durability != "r2" && durability != "wal" {
-                    INVALID_CONFIG
-                } else {
-                    0
-                }
-            } else {
-                match self.node.create_topic(&name, partitions, durability).await {
-                    Ok(result) => result.error_code,
-                    Err(_) => NOT_LEADER,
-                }
-            };
             let mut result = CreatableTopicResult::default();
             result.name = topic_name(&name);
-            result.error_code = code;
-            result.num_partitions = partitions;
-            result.replication_factor = 1;
-            if code == 0 {
-                if let Some(stored) = self.topic(&name) {
-                    result.topic_id = Uuid::parse_str(&stored.id).unwrap_or_else(|_| Uuid::nil());
+            let mut checked =
+                if cluster_create || self.allows(caller, auth::TOPIC, &name, auth::CREATE) {
+                    self.check_new_topic(&name, &topic, partitions, &configs)
+                } else {
+                    Err((auth::TOPIC_FAILED, None))
+                };
+            if checked.is_ok() && !request.validate_only {
+                checked = match self
+                    .node
+                    .create_topic(&name, partitions, durability.clone(), configs.clone())
+                    .await
+                {
+                    Ok(created) if created.error_code == 0 => Ok(()),
+                    Ok(created) => Err((created.error_code, None)),
+                    Err(_) => Err((NOT_LEADER, None)),
+                };
+            }
+            match checked {
+                Ok(()) => {
+                    let stored = if request.validate_only {
+                        let mut draft = Topic::new(&name, "", partitions, &durability);
+                        for (config, value) in &configs {
+                            let _ = camus_metadata::config::edit(
+                                &mut draft,
+                                config,
+                                camus_metadata::config::Op::Set,
+                                value.as_deref(),
+                                true,
+                            );
+                        }
+                        Some(draft)
+                    } else {
+                        self.topic(&name)
+                    };
+                    result.num_partitions = partitions;
+                    result.replication_factor = self.replication_factor(&durability);
+                    if let Some(stored) = stored {
+                        result.topic_id =
+                            Uuid::parse_str(&stored.id).unwrap_or_else(|_| Uuid::nil());
+                        if version >= 5 {
+                            result.configs = Some(
+                                self.topic_configs(&stored)
+                                    .into_iter()
+                                    .map(|row| {
+                                        let mut out = camus_protocol::messages::create_topics_response::CreatableTopicConfigs::default();
+                                        out.name = StrBytes::from_static_str(row.spec.name);
+                                        out.value = Some(StrBytes::from_string(row.value));
+                                        out.read_only = row.spec.create_only;
+                                        out.config_source = row.source;
+                                        out
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+                Err((code, message)) => {
+                    result.error_code = code;
+                    result.error_message = message.map(StrBytes::from_string).or_else(|| {
+                        (code == 36).then(|| {
+                            StrBytes::from_string(format!("Topic '{name}' already exists."))
+                        })
+                    });
+                    result.num_partitions = -1;
+                    result.replication_factor = -1;
                 }
             }
             response.topics.push(result);
@@ -955,11 +1851,125 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
+    /// Check a CreateTopics entry the way Kafka does, with its message.
+    fn check_new_topic(
+        &self,
+        name: &str,
+        topic: &camus_protocol::messages::create_topics_request::CreatableTopic,
+        partitions: i32,
+        configs: &[(String, Option<String>)],
+    ) -> Result<(), (i16, Option<String>)> {
+        if self.topic(name).is_some() {
+            return Err((36, None));
+        }
+        self.check_topic_name(name)?;
+        if !topic.assignments.is_empty() {
+            return Err((
+                INVALID_REPLICA_ASSIGNMENT,
+                Some("Camus places replicas itself; replica assignments are not accepted.".into()),
+            ));
+        }
+        if partitions < 1 {
+            return Err((
+                INVALID_PARTITIONS,
+                Some(format!(
+                    "Number of partitions must be larger than 0, or -1 for the default; got {}.",
+                    topic.num_partitions
+                )),
+            ));
+        }
+        let brokers = self.broker_list().len().max(1) as i16;
+        if topic.replication_factor != -1
+            && (topic.replication_factor < 1 || topic.replication_factor > brokers)
+        {
+            return Err((
+                INVALID_REPLICATION_FACTOR,
+                Some(format!(
+                    "Replication factor must be -1 or between 1 and the {brokers} available brokers; got {}.",
+                    topic.replication_factor
+                )),
+            ));
+        }
+        camus_metadata::config::check_create(configs)
+            .map_err(|rejected| (rejected.code, Some(rejected.message)))
+    }
+
+    /// Kafka's topic name rules: 1 to 249 characters from `[a-zA-Z0-9._-]`,
+    /// not `.` or `..`, and no collision with an existing name once `.` and
+    /// `_` are treated as the same, since metric names cannot tell them apart.
+    fn check_topic_name(&self, name: &str) -> Result<(), (i16, Option<String>)> {
+        let invalid = |why: String| Err((INVALID_TOPIC, Some(why)));
+        if name.is_empty() || name == "." || name == ".." {
+            return invalid(format!("Topic name '{name}' is illegal."));
+        }
+        if name.len() > 249 {
+            return invalid(format!(
+                "Topic name '{name}' is longer than 249 characters."
+            ));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return invalid(format!(
+                "Topic name '{name}' contains a character other than ASCII alphanumerics, '.', '_', and '-'."
+            ));
+        }
+        let folded = name.replace('.', "_");
+        if let Some(existing) = self
+            .topic_names()
+            .into_iter()
+            .find(|existing| existing != name && existing.replace('.', "_") == folded)
+        {
+            return invalid(format!(
+                "Topic '{name}' collides with existing topic: {existing}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The replica count Metadata reports for a topic of this durability.
+    fn replication_factor(&self, durability: &str) -> i16 {
+        if durability == "wal" {
+            i16::try_from(self.shard_view(0).voters.len().max(1)).unwrap_or(i16::MAX)
+        } else {
+            1
+        }
+    }
+
+    /// Every config of `topic` with its effective value and Kafka source.
+    fn topic_configs(&self, topic: &Topic) -> Vec<ConfigView> {
+        camus_metadata::config::SPECS
+            .iter()
+            .map(|spec| {
+                let broker_value = match spec.name {
+                    "max.message.bytes" => Some(self.message_max_bytes.to_string()),
+                    "durability.mode" => Some(self.default_durability.clone()),
+                    _ => None,
+                };
+                let (value, source) = if topic.is_set(spec.name) {
+                    (topic.config(spec.name), CONFIG_SOURCE_TOPIC)
+                } else if let Some(value) = broker_value.filter(|value| value != spec.default) {
+                    (value, CONFIG_SOURCE_BROKER)
+                } else if spec.name == "durability.mode" {
+                    (topic.durability.clone(), CONFIG_SOURCE_DEFAULT)
+                } else {
+                    (spec.default.to_string(), CONFIG_SOURCE_DEFAULT)
+                };
+                ConfigView {
+                    spec,
+                    value,
+                    source,
+                }
+            })
+            .collect()
+    }
+
     async fn delete_topics(
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        principal: &str,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = DeleteTopicsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
@@ -978,7 +1988,7 @@ impl Kafka {
         }
         let mut response = DeleteTopicsResponse::default();
         for name in names {
-            let code = if !self.allows(principal, 2, &name, 6) {
+            let code = if !self.allows(caller, auth::TOPIC, &name, auth::DELETE) {
                 29
             } else if !self.leader() {
                 NOT_LEADER
@@ -1007,7 +2017,7 @@ impl Kafka {
         self.node.read_local(&format!("id/{id}")).ok().flatten()
     }
 
-    fn describe_configs(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    fn describe_configs(&self, header: &RequestHeader, buf: &mut Bytes, caller: &Caller) -> Reply {
         let Ok(request) = DescribeConfigsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -1016,15 +2026,86 @@ impl Kafka {
             let mut result = DescribeConfigsResult::default();
             result.resource_type = resource.resource_type;
             result.resource_name = resource.resource_name.clone();
-            if resource.resource_type != 2 {
+            if resource.resource_type == BROKER_RESOURCE {
+                let name = resource.resource_name.as_str();
+                if !self.allows(
+                    caller,
+                    auth::CLUSTER,
+                    auth::CLUSTER_NAME,
+                    auth::DESCRIBE_CONFIGS,
+                ) {
+                    result.error_code = auth::CLUSTER_FAILED;
+                } else if !name.is_empty() && name != self.node_id.to_string() {
+                    result.error_code = INVALID_REQUEST;
+                    result.error_message = Some(StrBytes::from_string(format!(
+                        "Broker {} answers only for itself, not {name}",
+                        self.node_id
+                    )));
+                } else {
+                    let wanted = resource
+                        .configuration_keys
+                        .as_ref()
+                        .filter(|keys| !keys.is_empty());
+                    result.configs = self
+                        .broker_configs()
+                        .into_iter()
+                        .filter(|(config, ..)| {
+                            wanted.is_none_or(|keys| keys.iter().any(|key| key.as_str() == *config))
+                        })
+                        .map(|(config, value, kafka_default, config_type)| {
+                            let mut out = DescribeConfigsResourceResult::default();
+                            out.name = StrBytes::from_static_str(config);
+                            out.config_source = if value == kafka_default {
+                                CONFIG_SOURCE_DEFAULT
+                            } else {
+                                CONFIG_SOURCE_BROKER
+                            };
+                            out.value = Some(StrBytes::from_string(value));
+                            out.read_only = true;
+                            out.config_type = config_type;
+                            out
+                        })
+                        .collect();
+                }
+            } else if resource.resource_type != 2 {
                 result.error_code = INVALID_REQUEST;
+            } else if !self.allows(
+                caller,
+                auth::TOPIC,
+                resource.resource_name.as_str(),
+                auth::DESCRIBE_CONFIGS,
+            ) {
+                result.error_code = auth::TOPIC_FAILED;
             } else if let Some(topic) = self.topic(resource.resource_name.as_str()) {
-                result.configs = vec![
-                    config_row("durability.mode", &topic.durability),
-                    config_row("cleanup.policy", &topic.cleanup_policy),
-                    config_row("retention.ms", &topic.retention_ms.to_string()),
-                    config_row("retention.bytes", &topic.retention_bytes.to_string()),
-                ];
+                // Null asks for every config. An empty list is treated the
+                // same way, since asking for no configs has no use.
+                let wanted = resource
+                    .configuration_keys
+                    .as_ref()
+                    .filter(|keys| !keys.is_empty());
+                result.configs = self
+                    .topic_configs(&topic)
+                    .into_iter()
+                    .filter(|row| {
+                        wanted.is_none_or(|keys| keys.iter().any(|key| key.as_str() == row.spec.name))
+                    })
+                    .map(|row| {
+                        let mut out = DescribeConfigsResourceResult::default();
+                        out.name = StrBytes::from_static_str(row.spec.name);
+                        out.value = Some(StrBytes::from_string(row.value.clone()));
+                        out.read_only = row.spec.create_only;
+                        out.config_source = row.source;
+                        out.config_type = row.spec.config_type();
+                        if request.include_synonyms {
+                            let mut synonym = camus_protocol::messages::describe_configs_response::DescribeConfigsSynonym::default();
+                            synonym.name = StrBytes::from_static_str(row.spec.name);
+                            synonym.value = Some(StrBytes::from_string(row.value));
+                            synonym.source = row.source;
+                            out.synonyms.push(synonym);
+                        }
+                        out
+                    })
+                    .collect();
             } else {
                 result.error_code = UNKNOWN_TOPIC;
             }
@@ -1033,7 +2114,12 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    async fn init_producer_id(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    async fn init_producer_id(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = InitProducerIdRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -1048,6 +2134,37 @@ impl Kafka {
             .as_ref()
             .filter(|id| !id.0.is_empty())
             .map(|id| id.0.to_string());
+        // A transactional id needs WRITE on it. An idempotent producer needs
+        // IDEMPOTENT_WRITE on the cluster or WRITE on some topic (KIP-679).
+        let authorized = match &transactional {
+            Some(id) => self.allows(caller, auth::TXN_ID, id, auth::WRITE),
+            None => {
+                self.allows(
+                    caller,
+                    auth::CLUSTER,
+                    auth::CLUSTER_NAME,
+                    auth::IDEMPOTENT_WRITE,
+                ) || self
+                    .topic_names()
+                    .iter()
+                    .any(|name| self.allows(caller, auth::TOPIC, name, auth::WRITE))
+            }
+        };
+        if !authorized {
+            response.error_code = if transactional.is_some() {
+                auth::TXN_ID_FAILED
+            } else {
+                auth::CLUSTER_FAILED
+            };
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
+        if transactional.is_some()
+            && (request.transaction_timeout_ms <= 0
+                || i64::from(request.transaction_timeout_ms) > self.txn_max_timeout_ms)
+        {
+            response.error_code = INVALID_TRANSACTION_TIMEOUT;
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
         let applied = match &transactional {
             Some(id) => {
                 self.node
@@ -1056,6 +2173,7 @@ impl Kafka {
                         producer_id: request.producer_id.0,
                         producer_epoch: request.producer_epoch,
                         timeout_ms: request.transaction_timeout_ms,
+                        now_ms: txn::now_ms(),
                     })
                     .await
             }
@@ -1084,7 +2202,7 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    async fn produce(&self, header: &RequestHeader, buf: &mut Bytes, principal: &str) -> Reply {
+    async fn produce(&self, header: &RequestHeader, buf: &mut Bytes, caller: &Caller) -> Reply {
         let Ok(request) = ProduceRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -1096,6 +2214,11 @@ impl Kafka {
             .as_ref()
             .filter(|id| !id.0.is_empty())
             .map(|id| id.0.to_string());
+        if let Some(id) = &txn_id {
+            if !self.allows(caller, auth::TXN_ID, id, auth::WRITE) {
+                return self.produce_all_error(&request, header, auth::TXN_ID_FAILED);
+            }
+        }
         let mut response = ProduceResponse::default();
         let mut waiters = Vec::new();
         let mut held = Duration::ZERO;
@@ -1110,7 +2233,7 @@ impl Kafka {
             topic_response.name = topic_name(&name);
             topic_response.topic_id = topic.topic_id;
             let stored = self.topic(&name);
-            if !self.allows(principal, 2, &name, 4) {
+            if !self.allows(caller, auth::TOPIC, &name, auth::WRITE) {
                 for partition in topic.partition_data {
                     if request.acks != 0 {
                         topic_response
@@ -1170,10 +2293,20 @@ impl Kafka {
             let row = &mut response.responses[topic_index].partition_responses[partition_index];
             match settled {
                 Ok(offset) => row.base_offset = offset,
-                Err(code) => row.error_code = code,
+                Err(code) => {
+                    row.error_code = code;
+                    row.error_message = produce_message(code);
+                }
             }
         }
-        response.throttle_time_ms = i32::try_from(held.as_millis()).unwrap_or(i32::MAX);
+        // The hold already slowed this producer. Reporting it as
+        // `throttle_time_ms` too would make a client that honors the throttle
+        // wait a second time, so the time goes to a metric instead.
+        PRODUCE_HOLD_MS.fetch_add(
+            u64::try_from(held.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        response.throttle_time_ms = 0;
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
@@ -1234,7 +2367,7 @@ impl Kafka {
         if raw.is_empty() {
             return Ok(None);
         }
-        let info = match batch::inspect(raw, MAX_BATCH) {
+        let info = match batch::inspect(raw, self.batch_limit(topic)) {
             Ok(info) => info,
             Err(BatchError::TooLarge) => return Err(TOO_LARGE),
             Err(BatchError::Corrupt) => return Err(CORRUPT),
@@ -1278,7 +2411,10 @@ impl Kafka {
         txn_id: Option<&str>,
         held: &mut Duration,
     ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
-        let wal = self.wal();
+        let shard = self.partition_shard(topic, partition);
+        let Some(wal) = self.wal.shard(shard) else {
+            return Err(NOT_LEADER);
+        };
         if wal.storage_failed() {
             return Err(STORAGE);
         }
@@ -1297,7 +2433,7 @@ impl Kafka {
         if raw.is_empty() {
             return Ok(None);
         }
-        let info = match batch::inspect(raw, MAX_BATCH) {
+        let info = match batch::inspect(raw, self.batch_limit(topic)) {
             Ok(info) => info,
             Err(BatchError::TooLarge) => return Err(TOO_LARGE),
             Err(BatchError::Corrupt) => return Err(CORRUPT),
@@ -1313,7 +2449,7 @@ impl Kafka {
             topic: name.to_string(),
             partition,
             topic_id: topic_id(topic),
-            epoch: topic.leader_epoch,
+            epoch: self.shard_epoch(shard),
             raw: raw.clone(),
             records: info.iter().map(|batch| batch.records).sum(),
             base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
@@ -1335,7 +2471,14 @@ impl Kafka {
         let size = append.raw.len() as u64;
         let hold_start = Instant::now();
         loop {
-            let unsealed = wal.unsealed_bytes();
+            // `wal.disk.limit` bounds the broker's disk, so it counts every
+            // shard this broker holds, not just this one (ADR 0014).
+            let unsealed: u64 = self
+                .wal
+                .all()
+                .iter()
+                .map(|(_, shard)| shard.unsealed_bytes())
+                .sum();
             if unsealed == 0 || unsealed + size <= self.wal_limit {
                 break;
             }
@@ -1430,6 +2573,7 @@ impl Kafka {
                         batch.end,
                         batch.base_timestamp,
                         batch.max_timestamp,
+                        batch::leader_epoch(&batch.bytes),
                     ));
                     pieces.push(Piece {
                         topic_id: batch.topic_id,
@@ -1465,10 +2609,13 @@ impl Kafka {
                 continue;
             }
             producers.extend(notes);
-            for ((topic, topic_id, partition, start, end, base, max), (file_offset, length)) in
-                heads.into_iter().zip(index)
+            for (
+                (topic, topic_id, partition, start, end, base, max, epoch),
+                (file_offset, length),
+            ) in heads.into_iter().zip(index)
             {
                 parts.push(PublishPart {
+                    epoch,
                     topic: topic.clone(),
                     partition,
                     start,
@@ -1493,9 +2640,21 @@ impl Kafka {
     /// One upload pass: at most `upload.flush.bytes` (8 MiB, ADR 0006) of
     /// the oldest unsealed batches go into one object.
     async fn upload_wal(&self) -> Upload {
-        // One shard for the whole pass, so a truncate mid-upload cannot seal
-        // into the shard that replaced it.
-        let wal = self.wal();
+        let mut outcome = Upload::Done;
+        for (_, wal) in self.wal.all() {
+            match self.upload_shard(wal).await {
+                Upload::Failed => outcome = Upload::Failed,
+                Upload::Full if outcome != Upload::Failed => outcome = Upload::Full,
+                _ => {}
+            }
+        }
+        outcome
+    }
+
+    /// One upload pass for one shard this broker leads. The shard is fixed
+    /// for the whole pass, so a truncate mid-upload cannot seal into the
+    /// shard that replaced it.
+    async fn upload_shard(&self, wal: Arc<Shard>) -> Upload {
         if !wal.is_leader() {
             return Upload::Done;
         }
@@ -1653,7 +2812,7 @@ impl Kafka {
                 return fail(items, UNKNOWN_TOPIC);
             };
             next.insert(key.clone(), state.next_offset);
-            epochs.insert(key, state.leader_epoch);
+            epochs.insert(key, self.metadata_epoch());
             let id = Uuid::parse_str(&topic.id).unwrap_or_else(|_| Uuid::nil());
             ids.insert(item.topic.clone(), *id.as_bytes());
         }
@@ -1776,6 +2935,10 @@ impl Kafka {
             for (item, (file_offset, length)) in appended.zip(index) {
                 let start = pieces[parts.len()].start;
                 parts.push(PublishPart {
+                    epoch: epochs
+                        .get(&(item.topic.clone(), item.partition))
+                        .copied()
+                        .unwrap_or(-1),
                     topic: item.topic.clone(),
                     partition: item.partition,
                     start,
@@ -1843,7 +3006,7 @@ impl Kafka {
         }
     }
 
-    async fn fetch(&self, header: &RequestHeader, buf: &mut Bytes, principal: &str) -> Reply {
+    async fn fetch(&self, header: &RequestHeader, buf: &mut Bytes, caller: &Caller) -> Reply {
         let Ok(request) = FetchRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -1862,7 +3025,7 @@ impl Kafka {
                 topic_response.topic = topic_name(&name);
                 topic_response.topic_id = topic.topic_id;
                 let stored = self.topic(&name);
-                if !self.allows(principal, 2, &name, 3) {
+                if !self.allows(caller, auth::TOPIC, &name, auth::READ) {
                     for partition in &topic.partitions {
                         let mut row =
                             camus_protocol::messages::fetch_response::PartitionData::default();
@@ -1878,6 +3041,7 @@ impl Kafka {
                         .fetch_partition(
                             stored.as_ref(),
                             partition.partition,
+                            partition.current_leader_epoch,
                             partition.fetch_offset,
                             partition.partition_max_bytes,
                             request.isolation_level,
@@ -1902,6 +3066,7 @@ impl Kafka {
         &self,
         topic: Option<&Topic>,
         partition: i32,
+        current_leader_epoch: i32,
         offset: i64,
         max_bytes: i32,
         isolation: i8,
@@ -1912,8 +3077,12 @@ impl Kafka {
             row.error_code = UNKNOWN_TOPIC;
             return row;
         };
-        if topic.durability == "wal" && !self.wal().is_leader() {
+        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
             row.error_code = NOT_LEADER;
+            return row;
+        }
+        if let Err(code) = self.check_leader_epoch(topic, partition, current_leader_epoch) {
+            row.error_code = code;
             return row;
         }
         let limit = max_bytes.max(0) as usize;
@@ -1926,7 +3095,7 @@ impl Kafka {
                 return row;
             };
             let sealed = state.next_offset;
-            let wal_end = self.wal().end_offset(&topic_id(topic), partition);
+            let wal_end = self.wal_end(topic, partition);
             let high_watermark = sealed.max(wal_end);
             let mut stable = high_watermark;
             row.high_watermark = high_watermark;
@@ -1941,7 +3110,8 @@ impl Kafka {
             let mut out = BytesMut::new();
             let mut stopped = false;
             'extents: for extent in &state.extents {
-                if extent.end <= offset {
+                // A compacted range whose records all expired has no bytes.
+                if extent.end <= offset || extent.length == 0 {
                     continue;
                 }
                 let end = extent.file_offset + u64::from(extent.length);
@@ -1986,11 +3156,14 @@ impl Kafka {
             }
             if !stopped && offset < stable {
                 let remaining = limit.saturating_sub(out.len());
-                let extra = match self
-                    .wal()
-                    .read(&topic_id(topic), partition, sealed, offset, remaining)
-                    .await
-                {
+                let unsealed = match self.wal_of(topic, partition) {
+                    Some(wal) => {
+                        wal.read(&topic_id(topic), partition, sealed, offset, remaining)
+                            .await
+                    }
+                    None => Ok(Vec::new()),
+                };
+                let extra = match unsealed {
                     Ok(extra) => extra,
                     Err(_) => {
                         row.error_code = STORAGE;
@@ -2023,7 +3196,12 @@ impl Kafka {
         row
     }
 
-    async fn list_offsets(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    async fn list_offsets(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = ListOffsetsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -2033,15 +3211,32 @@ impl Kafka {
             let mut topic_response = ListOffsetsTopicResponse::default();
             topic_response.name = topic_name(&name);
             let stored = self.topic(&name);
+            let allowed = self.allows(caller, auth::TOPIC, &name, auth::DESCRIBE);
             for partition in topic.partitions {
-                topic_response.partitions.push(
-                    self.list_one(
+                if !allowed {
+                    let mut row = ListOffsetsPartitionResponse::default();
+                    row.partition_index = partition.partition_index;
+                    row.error_code = auth::TOPIC_FAILED;
+                    row.timestamp = -1;
+                    row.offset = -1;
+                    topic_response.partitions.push(row);
+                    continue;
+                }
+                let mut row = self
+                    .list_one(
                         stored.as_ref(),
                         partition.partition_index,
+                        partition.current_leader_epoch,
                         partition.timestamp,
                     )
-                    .await,
-                );
+                    .await;
+                // The epoch is in the response from v4. The encoder refuses a
+                // field the version does not have, and that would close the
+                // connection of a client on v1-3, such as KafkaJS.
+                if header.request_api_version < 4 {
+                    row.leader_epoch = -1;
+                }
+                topic_response.partitions.push(row);
             }
             response.topics.push(topic_response);
         }
@@ -2052,6 +3247,7 @@ impl Kafka {
         &self,
         topic: Option<&Topic>,
         partition: i32,
+        current_leader_epoch: i32,
         timestamp: i64,
     ) -> ListOffsetsPartitionResponse {
         let mut row = ListOffsetsPartitionResponse::default();
@@ -2062,8 +3258,13 @@ impl Kafka {
             row.offset = -1;
             return row;
         };
-        if topic.durability == "wal" && !self.wal().is_leader() {
+        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
             row.error_code = NOT_LEADER;
+            row.offset = -1;
+            return row;
+        }
+        if let Err(code) = self.check_leader_epoch(topic, partition, current_leader_epoch) {
+            row.error_code = code;
             row.offset = -1;
             return row;
         }
@@ -2072,19 +3273,17 @@ impl Kafka {
             row.offset = -1;
             return row;
         };
-        row.leader_epoch = state.leader_epoch;
+        row.leader_epoch = self.partition_epoch(topic, partition);
         if timestamp == -2 {
             row.offset = state.log_start;
             return row;
         }
         if timestamp == -1 {
-            row.offset = state
-                .next_offset
-                .max(self.wal().end_offset(&topic_id(topic), partition));
+            row.offset = state.next_offset.max(self.wal_end(topic, partition));
             return row;
         }
         for extent in &state.extents {
-            if extent.max_timestamp < timestamp {
+            if extent.max_timestamp < timestamp || extent.length == 0 {
                 continue;
             }
             let end = extent.file_offset + u64::from(extent.length);
@@ -2116,13 +3315,25 @@ impl Kafka {
         row
     }
 
-    fn sasl_handshake(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    fn sasl_handshake(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        session: &mut Session,
+    ) -> Reply {
         let Ok(request) = SaslHandshakeRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let mut response = SaslHandshakeResponse::default();
-        response.mechanisms = vec![StrBytes::from_static_str("PLAIN")];
-        if request.mechanism.as_str() != "PLAIN" {
+        response.mechanisms = ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"]
+            .into_iter()
+            .map(StrBytes::from_static_str)
+            .collect();
+        let mechanism = request.mechanism.to_string();
+        if mechanism == "PLAIN" || scram::Mechanism::from_name(&mechanism).is_some() {
+            session.mechanism = mechanism;
+            session.scram = None;
+        } else {
             response.error_code = SASL_MECHANISM;
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
@@ -2132,13 +3343,41 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        authed: &mut bool,
+        session: &mut Session,
     ) -> Reply {
         let Ok(request) = SaslAuthenticateRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let mut response = SaslAuthenticateResponse::default();
         let bytes = request.auth_bytes.as_ref();
+        let fail = |response: &mut SaslAuthenticateResponse| {
+            response.error_code = SASL_AUTH_FAILED;
+            response.error_message = Some(StrBytes::from_static_str("authentication failed"));
+        };
+        if let Some(mechanism) = scram::Mechanism::from_name(&session.mechanism) {
+            match session.scram.take() {
+                None => {
+                    match scram::Exchange::start(mechanism, bytes, |user| {
+                        self.scram_credential(mechanism, user)
+                    }) {
+                        Some((exchange, reply)) => {
+                            session.scram = Some(exchange);
+                            response.auth_bytes = Bytes::from(reply);
+                        }
+                        None => fail(&mut response),
+                    }
+                }
+                Some(exchange) => match exchange.finish(bytes) {
+                    Some((user, reply)) => {
+                        session.authed = true;
+                        session.principal = Some(format!("User:{user}"));
+                        response.auth_bytes = Bytes::from(reply);
+                    }
+                    None => fail(&mut response),
+                },
+            }
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
         let mut parts = bytes.split(|byte| *byte == 0);
         let _authzid = parts.next();
         let user = parts.next().unwrap_or_default();
@@ -2147,13 +3386,57 @@ impl Kafka {
             && constant_eq(pass, self.sasl_pass.as_bytes())
             && !self.sasl_user.is_empty()
         {
-            *authed = true;
+            session.authed = true;
+            session.principal = Some(format!("User:{}", self.sasl_user));
         } else {
-            response.error_code = SASL_AUTH_FAILED;
-            response.error_message = Some(StrBytes::from_static_str("authentication failed"));
+            fail(&mut response);
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
+}
+
+/// Milliseconds produce requests spent held at `wal.disk.limit`, in total.
+pub static PRODUCE_HOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Kafka ACL resource types, operations, and authorization errors.
+pub(crate) mod auth {
+    pub(crate) const TOPIC: i8 = 2;
+    pub(crate) const GROUP: i8 = 3;
+    pub(crate) const CLUSTER: i8 = 4;
+    pub(crate) const TXN_ID: i8 = 5;
+    pub(crate) const READ: i8 = 3;
+    pub(crate) const WRITE: i8 = 4;
+    pub(crate) const CREATE: i8 = 5;
+    pub(crate) const DELETE: i8 = 6;
+    pub(crate) const ALTER: i8 = 7;
+    pub(crate) const DESCRIBE: i8 = 8;
+    pub(crate) const DESCRIBE_CONFIGS: i8 = 10;
+    pub(crate) const ALTER_CONFIGS: i8 = 11;
+    pub(crate) const IDEMPOTENT_WRITE: i8 = 12;
+    pub(crate) const CLUSTER_NAME: &str = "kafka-cluster";
+    pub(crate) const TOPIC_FAILED: i16 = 29;
+    pub(crate) const GROUP_FAILED: i16 = 30;
+    pub(crate) const CLUSTER_FAILED: i16 = 31;
+    pub(crate) const TXN_ID_FAILED: i16 = 53;
+}
+
+/// Who sent a request: the principal and the client's IP address.
+pub(crate) struct Caller {
+    pub(crate) principal: String,
+    pub(crate) host: String,
+}
+
+/// What a connection knows about its client.
+struct Session {
+    authed: bool,
+    host: String,
+    /// Who the client is once authenticated: from SASL, or from its TLS
+    /// certificate. `None` is `User:ANONYMOUS`.
+    principal: Option<String>,
+    /// The SASL mechanism from SaslHandshake.
+    mechanism: String,
+    /// A SCRAM exchange waiting for the client-final message.
+    scram: Option<scram::Exchange>,
 }
 
 /// How an upload pass ended.
@@ -2219,19 +3502,28 @@ fn partition_error(index: i32, code: i16) -> PartitionProduceResponse {
     let mut row = PartitionProduceResponse::default();
     row.index = index;
     row.error_code = code;
+    row.error_message = produce_message(code);
     row.base_offset = -1;
     row.log_append_time_ms = -1;
     row.log_start_offset = 0;
     row
 }
 
-fn config_row(name: &str, value: &str) -> DescribeConfigsResourceResult {
-    let mut row = DescribeConfigsResourceResult::default();
-    row.name = StrBytes::from_string(name.to_string());
-    row.value = Some(StrBytes::from_string(value.to_string()));
-    row.config_source = 1;
-    row.config_type = 2;
-    row
+/// The message Kafka sends with a produce error, where it sends one.
+fn produce_message(code: i16) -> Option<StrBytes> {
+    let text = match code {
+        INVALID_RECORD => "Compacted topic cannot accept message without key.",
+        TOO_LARGE => "The record batch is larger than the topic's max.message.bytes.",
+        _ => return None,
+    };
+    Some(StrBytes::from_static_str(text))
+}
+
+/// One topic config as CreateTopics and DescribeConfigs report it.
+struct ConfigView {
+    spec: &'static camus_metadata::config::Spec,
+    value: String,
+    source: i8,
 }
 
 /// `NoteTxn` applies the abort and reports the Kafka code in `value` when the
@@ -2336,4 +3628,33 @@ fn constant_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod principal_tests {
+    use super::rfc2253;
+
+    #[test]
+    fn a_subject_prints_in_reverse_encoded_order_as_java_does() {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "example");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "alice, the admin");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).unwrap();
+        // rcgen encodes CN before O. Java's `X500Principal.getName()` prints
+        // the encoded RDNs last to first, so the same certificate is
+        // `O=...,CN=...` there too.
+        let encoded: Vec<String> = parsed
+            .subject()
+            .iter_rdn()
+            .map(|rdn| rdn.iter().next().unwrap().attr_type().to_id_string())
+            .collect();
+        assert_eq!(encoded, vec!["2.5.4.3", "2.5.4.10"]);
+        assert_eq!(rfc2253(parsed.subject()), "O=example,CN=alice\\, the admin");
+    }
 }

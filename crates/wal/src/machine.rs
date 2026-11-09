@@ -44,8 +44,9 @@ const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots"
 const STATE: &str = "state";
 const SNAPSHOT: &str = "current";
 
-/// Largest client batch the shard re-seals when it reads one back.
-const MAX_BATCH: usize = 1024 * 1024;
+/// Largest client batch the shard accepts or re-seals. The broker applies the
+/// topic's `max.message.bytes` before a batch reaches the shard.
+const MAX_BATCH: usize = camus_protocol::batch::MAX_BATCH_CEILING;
 
 /// Most batches one packed entry may hold; the storage key reserves 12 bits.
 pub const MAX_PACKED: usize = 4096;
@@ -728,8 +729,8 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
         let subject = || ErrorSubject::Snapshot(Some(meta.signature()));
-        let parsed = decode_snapshot(&data)
-            .map_err(|err| io(subject(), &std::io::Error::other(err)))?;
+        let parsed =
+            decode_snapshot(&data).map_err(|err| io(subject(), &std::io::Error::other(err)))?;
         let state = State {
             last_applied: meta.last_log_id,
             membership: Some(meta.last_membership.clone()),

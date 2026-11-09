@@ -572,6 +572,15 @@ pub fn partition_leader(via: &str, exclude: Option<i32>) -> (i32, String) {
 }
 
 pub fn batch(value: &str) -> Bytes {
+    encode_batch(None, value)
+}
+
+/// One record with `key`, for compacted topics.
+pub fn keyed_batch(key: &str, value: &str) -> Bytes {
+    encode_batch(Some(key), value)
+}
+
+fn encode_batch(key: Option<&str>, value: &str) -> Bytes {
     let records = vec![Record {
         transactional: false,
         control: false,
@@ -583,7 +592,7 @@ pub fn batch(value: &str) -> Bytes {
         timestamp_type: TimestampType::Creation,
         offset: 0,
         timestamp: 9,
-        key: None,
+        key: key.map(|key| Bytes::copy_from_slice(key.as_bytes())),
         value: Some(Bytes::copy_from_slice(value.as_bytes())),
         headers: Default::default(),
     }];
@@ -609,6 +618,17 @@ pub fn produce(addr: &str, value: &str) -> (i16, i64) {
 /// Produce one batch with `acks=all` and `timeout_ms`. Returns the partition
 /// error, the base offset, and the response's `throttle_time_ms`.
 pub fn produce_full(addr: &str, value: &str, timeout_ms: i32) -> (i16, i64, i32) {
+    produce_raw(addr, batch(value), timeout_ms)
+}
+
+/// Produce `records` as one batch with `acks=all`. Returns the partition
+/// error and offset.
+pub fn produce_batch(addr: &str, records: Bytes) -> (i16, i64) {
+    let (code, offset, _) = produce_raw(addr, records, 5_000);
+    (code, offset)
+}
+
+fn produce_raw(addr: &str, records: Bytes, timeout_ms: i32) -> (i16, i64, i32) {
     let mut stream = connect(addr);
     stream
         .set_read_timeout(Some(Duration::from_millis(timeout_ms as u64 + 15_000)))
@@ -617,7 +637,7 @@ pub fn produce_full(addr: &str, value: &str, timeout_ms: i32) -> (i16, i64, i32)
     topic.name = TopicName(StrBytes::from_static_str(TOPIC));
     topic.partition_data = vec![PartitionProduceData::default()
         .with_index(0)
-        .with_records(Some(batch(value)))];
+        .with_records(Some(records))];
     send(
         &mut stream,
         ApiKey::Produce,
@@ -720,7 +740,7 @@ pub fn create_topic_with(controller: &str, durability_mode: &'static str, partit
     let mut created = CreatableTopic::default();
     created.name = TopicName(StrBytes::from_static_str(TOPIC));
     created.num_partitions = partitions;
-    created.replication_factor = 3;
+    created.replication_factor = -1;
     let mut durability = CreatableTopicConfig::default();
     durability.name = StrBytes::from_static_str("durability.mode");
     durability.value = Some(StrBytes::from_static_str(durability_mode));
@@ -759,4 +779,66 @@ pub fn init(nodes: &[Node], wal: &[i32]) {
         .send()
         .unwrap();
     assert!(init.status().is_success(), "{}", init.text().unwrap());
+}
+
+/// Partition 0's leader epoch as Metadata through `via` reports it.
+pub fn partition_epoch(via: &str) -> i32 {
+    let mut stream = connect(via);
+    let mut topic = MetadataRequestTopic::default();
+    topic.name = Some(TopicName(StrBytes::from_static_str(TOPIC)));
+    send(
+        &mut stream,
+        ApiKey::Metadata,
+        12,
+        &MetadataRequest::default().with_topics(Some(vec![topic])),
+    );
+    let metadata = recv::<MetadataResponse>(&mut stream, 12);
+    metadata.topics[0].partitions[0].leader_epoch
+}
+
+/// `OffsetForLeaderEpoch` for partition 0: `(error, epoch, end_offset)`.
+pub fn epoch_end(addr: &str, current_leader_epoch: i32, leader_epoch: i32) -> (i16, i32, i64) {
+    use camus_protocol::messages::offset_for_leader_epoch_request::{
+        OffsetForLeaderPartition, OffsetForLeaderTopic,
+    };
+    use camus_protocol::messages::offset_for_leader_epoch_response::OffsetForLeaderEpochResponse;
+    let mut stream = connect(addr);
+    send(
+        &mut stream,
+        ApiKey::OffsetForLeaderEpoch,
+        4,
+        &camus_protocol::messages::OffsetForLeaderEpochRequest::default()
+            .with_replica_id(camus_protocol::messages::BrokerId(-1))
+            .with_topics(vec![OffsetForLeaderTopic::default()
+                .with_topic(TopicName(StrBytes::from_static_str(TOPIC)))
+                .with_partitions(vec![OffsetForLeaderPartition::default()
+                    .with_partition(0)
+                    .with_current_leader_epoch(current_leader_epoch)
+                    .with_leader_epoch(leader_epoch)])]),
+    );
+    let response = recv::<OffsetForLeaderEpochResponse>(&mut stream, 4);
+    let row = &response.topics[0].partitions[0];
+    (row.error_code, row.leader_epoch, row.end_offset)
+}
+
+/// Fetch partition 0 at `offset` naming `current_leader_epoch`; the error.
+pub fn fetch_in_epoch(addr: &str, current_leader_epoch: i32, offset: i64) -> i16 {
+    let mut stream = connect(addr);
+    let mut part = FetchPartition::default();
+    part.partition = 0;
+    part.fetch_offset = offset;
+    part.current_leader_epoch = current_leader_epoch;
+    part.partition_max_bytes = 1024 * 1024;
+    let mut topic = FetchTopic::default();
+    topic.topic = TopicName(StrBytes::from_static_str(TOPIC));
+    topic.partitions = vec![part];
+    send(
+        &mut stream,
+        ApiKey::Fetch,
+        11,
+        &FetchRequest::default()
+            .with_max_wait_ms(0)
+            .with_topics(vec![topic]),
+    );
+    recv::<FetchResponse>(&mut stream, 11).responses[0].partitions[0].error_code
 }

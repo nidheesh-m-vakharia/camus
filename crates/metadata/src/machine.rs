@@ -181,7 +181,10 @@ fn apply_command(
     command: Command,
 ) -> Result<Response, StorageError<NodeId>> {
     match command {
-        Command::SaveGroup { .. } | Command::CommitOffsets { .. } | Command::DeleteGroup { .. } => {
+        Command::SaveGroup { .. }
+        | Command::CommitOffsets { .. }
+        | Command::DeleteGroup { .. }
+        | Command::ExpireOffsets { .. } => {
             return apply_group(kv, command);
         }
         Command::InitProducer {
@@ -200,6 +203,13 @@ fn apply_command(
             .map(|old| old.value().to_owned());
         return Ok(Response::ok(previous));
     }
+    if let Command::Delete { key } = command {
+        let previous = kv
+            .remove(key.as_str())
+            .map_err(|err| io(ErrorSubject::StateMachine, &err))?
+            .map(|old| old.value().to_owned());
+        return Ok(Response::ok(previous));
+    }
     let outcome = {
         let read = |key: &str| -> Result<Option<String>, String> {
             match kv.get(key) {
@@ -209,13 +219,14 @@ fn apply_command(
             }
         };
         match command {
-            Command::Put { .. } => unreachable!("handled above"),
+            Command::Put { .. } | Command::Delete { .. } => unreachable!("handled above"),
             Command::CreateTopic {
                 name,
                 id,
                 partitions,
                 durability,
-            } => catalog::create_topic(&read, &name, &id, partitions, &durability),
+                configs,
+            } => catalog::create_topic(&read, &name, &id, partitions, &durability, &configs),
             Command::DeleteTopic { name } => catalog::delete_topic(&read, &name),
             Command::Publish { parts } => catalog::publish(&read, &parts, &[]),
             Command::PublishWithProducers { parts, producers } => {
@@ -244,6 +255,7 @@ fn apply_command(
                 producer_id,
                 producer_epoch,
                 60_000,
+                0,
             )),
             Command::AddTxnPartitions {
                 transactional_id,
@@ -291,13 +303,46 @@ fn apply_command(
                 producer_id,
                 producer_epoch,
                 timeout_ms,
+                now_ms,
             } => txn::outcome(txn::init(
                 &read,
                 &transactional_id,
                 producer_id,
                 producer_epoch,
                 if timeout_ms > 0 { timeout_ms } else { 60_000 },
+                now_ms,
             )),
+            Command::AbortTimedOutTxn {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                now_ms,
+            } => txn::outcome(txn::abort_timed_out(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                now_ms,
+            )),
+            Command::ExpireTransactionalId {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                now_ms,
+                expiration_ms,
+            } => txn::expire_id(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                now_ms,
+                expiration_ms,
+            ),
+            Command::ExpireProducers {
+                keys,
+                now_ms,
+                expiration_ms,
+            } => crate::producers::expire(&read, &keys, now_ms, expiration_ms),
             Command::AddTxnPartitionsAt {
                 transactional_id,
                 producer_id,
@@ -337,16 +382,19 @@ fn apply_command(
                 producer_id,
                 producer_epoch,
                 committed,
+                now_ms,
             } => txn::outcome(txn::end(
                 &read,
                 &transactional_id,
                 producer_id,
                 producer_epoch,
                 committed,
+                now_ms,
             )),
             Command::SaveGroup { .. }
             | Command::CommitOffsets { .. }
-            | Command::DeleteGroup { .. } => {
+            | Command::DeleteGroup { .. }
+            | Command::ExpireOffsets { .. } => {
                 unreachable!("handled above")
             }
         }
@@ -419,11 +467,19 @@ fn apply_group(
         }
     };
     match command {
-        Command::SaveGroup { group, record } => {
-            if let Some(stored) = read_group(kv, &group)? {
+        Command::SaveGroup { group, mut record } => {
+            let stored = read_group(kv, &group)?;
+            if let Some(stored) = &stored {
                 if stored.generation > record.generation {
                     return Ok(Response::reject(groups::codes::ILLEGAL_GENERATION));
                 }
+            }
+            if !record.members.is_empty() {
+                record.empty_since_ms = -1;
+            } else if let Some(stored) =
+                stored.filter(|stored| stored.members.is_empty() && stored.empty_since_ms >= 0)
+            {
+                record.empty_since_ms = stored.empty_since_ms;
             }
             let raw = serde_json::to_string(&record).map_err(|e| err(&e))?;
             kv.insert(groups::group_key(&group).as_str(), raw.as_str())
@@ -483,6 +539,57 @@ fn apply_group(
             kv.remove(groups::group_key(&group).as_str())
                 .map_err(|e| err(&e))?;
             Ok(Response::ok(None))
+        }
+        Command::ExpireOffsets {
+            group,
+            now_ms,
+            retention_ms,
+        } => {
+            let Some(mut stored) = read_group(kv, &group)? else {
+                return Ok(Response::ok(Some("0".into())));
+            };
+            if !stored.members.is_empty() {
+                return Ok(Response::ok(Some("0".into())));
+            }
+            let standalone = stored.protocol_type.is_none();
+            if !standalone && stored.empty_since_ms < 0 {
+                // Written before the time was recorded: start the clock now.
+                stored.empty_since_ms = now_ms;
+                let raw = serde_json::to_string(&stored).map_err(|e| err(&e))?;
+                kv.insert(groups::group_key(&group).as_str(), raw.as_str())
+                    .map_err(|e| err(&e))?;
+                return Ok(Response::ok(Some("0".into())));
+            }
+            let prefix = groups::offset_prefix(&group);
+            let mut expired = Vec::new();
+            let mut kept = 0usize;
+            for row in kv.range(prefix.as_str()..).map_err(|e| err(&e))? {
+                let (key, value) = row.map_err(|e| err(&e))?;
+                if !key.value().starts_with(&prefix) {
+                    break;
+                }
+                let record: groups::OffsetRecord =
+                    serde_json::from_str(value.value()).map_err(|e| err(&e))?;
+                let since = if standalone {
+                    record.commit_timestamp
+                } else {
+                    stored.empty_since_ms
+                };
+                if now_ms.saturating_sub(since) >= retention_ms {
+                    expired.push(key.value().to_string());
+                } else {
+                    kept += 1;
+                }
+            }
+            let removed = expired.len();
+            for key in expired {
+                kv.remove(key.as_str()).map_err(|e| err(&e))?;
+            }
+            if kept == 0 {
+                kv.remove(groups::group_key(&group).as_str())
+                    .map_err(|e| err(&e))?;
+            }
+            Ok(Response::ok(Some(removed.to_string())))
         }
         _ => unreachable!("only group commands"),
     }

@@ -31,6 +31,92 @@ pub struct Topic {
     /// `cleanup.policy`. `delete`, `compact`, or `delete,compact`.
     #[serde(default = "default_cleanup")]
     pub cleanup_policy: String,
+    /// Configs set on this topic, by name, in stored form. A name that is
+    /// absent uses its default. The typed fields above mirror their entries.
+    #[serde(default)]
+    pub overrides: BTreeMap<String, String>,
+}
+
+impl Topic {
+    /// A topic with every config at its default.
+    pub fn new(name: &str, id: &str, partitions: i32, durability: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            id: id.to_string(),
+            partitions,
+            durability: durability.to_string(),
+            leader_epoch: 0,
+            retention_ms: default_retention_ms(),
+            retention_bytes: default_retention_bytes(),
+            cleanup_policy: default_cleanup(),
+            overrides: BTreeMap::new(),
+        }
+    }
+
+    /// The value of a config, set or default. Unknown names are empty.
+    pub fn config(&self, name: &str) -> String {
+        match name {
+            "cleanup.policy" => return self.cleanup_policy.clone(),
+            "retention.ms" => return self.retention_ms.to_string(),
+            "retention.bytes" => return self.retention_bytes.to_string(),
+            "durability.mode" => return self.durability.clone(),
+            _ => {}
+        }
+        if let Some(value) = self.overrides.get(name) {
+            return value.clone();
+        }
+        crate::config::spec(name)
+            .map(|spec| spec.default.to_string())
+            .unwrap_or_default()
+    }
+
+    /// A numeric config, set or default.
+    pub fn config_i64(&self, name: &str) -> i64 {
+        self.config(name).parse().unwrap_or_default()
+    }
+
+    /// The config was set on this topic rather than left at its default.
+    pub fn is_set(&self, name: &str) -> bool {
+        self.overrides.contains_key(name)
+    }
+
+    /// Set a checked value, or return to the default with `None`.
+    pub(crate) fn set_config(&mut self, name: &str, value: Option<String>) {
+        let default = || {
+            crate::config::spec(name)
+                .map(|spec| spec.default.to_string())
+                .unwrap_or_default()
+        };
+        let effective = value.clone().unwrap_or_else(default);
+        match name {
+            "cleanup.policy" => self.cleanup_policy = effective,
+            "retention.ms" => self.retention_ms = effective.parse().unwrap_or_default(),
+            "retention.bytes" => self.retention_bytes = effective.parse().unwrap_or_default(),
+            "durability.mode" => self.durability = effective,
+            _ => {}
+        }
+        match value {
+            Some(value) => {
+                self.overrides.insert(name.to_string(), value);
+            }
+            None => {
+                self.overrides.remove(name);
+            }
+        }
+    }
+}
+
+fn no_epoch() -> i32 {
+    -1
+}
+
+/// Where a leader epoch's records begin in a partition.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EpochStart {
+    /// Leader epoch.
+    pub epoch: i32,
+    /// First offset written in it.
+    pub start: i64,
 }
 
 fn default_retention_ms() -> i64 {
@@ -82,6 +168,14 @@ pub struct Partition {
     /// `read_committed`.
     #[serde(default)]
     pub txn_aborted: Vec<Span>,
+    /// Leader epochs in order, each with the first offset sealed in it.
+    /// `OffsetForLeaderEpoch` answers from this.
+    #[serde(default)]
+    pub epochs: Vec<EpochStart>,
+    /// WAL shard the partition lives on, chosen at creation (ADR 0014).
+    /// Rows written before shards had ids are on shard 0.
+    #[serde(default)]
+    pub shard: u32,
 }
 
 /// An offset range, inclusive start, exclusive end.
@@ -96,6 +190,9 @@ pub struct Span {
 /// One partition slice inside a publish command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PublishPart {
+    /// Leader epoch the part's batches were sealed with, or `-1`.
+    #[serde(default = "no_epoch")]
+    pub epoch: i32,
     /// Topic name.
     pub topic: String,
     /// Partition index.
@@ -153,15 +250,75 @@ fn names(raw: Option<String>) -> Result<Vec<String>, String> {
     }
 }
 
+/// Metadata key of the WAL shard layout: `{"count": N}`. Absent means one
+/// shard, as every cluster created before ADR 0014 has.
+pub const SHARDS: &str = "wal/shards";
+
+/// Metadata key of the next shard to place a partition on.
+const NEXT_SHARD: &str = "wal/next-shard";
+
+/// Places new partitions on WAL shards round-robin across the whole cluster,
+/// so topics with few partitions still spread over every shard (ADR 0014).
+pub(crate) struct Placer {
+    count: u64,
+    next: u64,
+    used: bool,
+}
+
+impl Placer {
+    pub(crate) fn load(
+        get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    ) -> Result<Self, String> {
+        let count = match get(SHARDS)? {
+            Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                .map_err(|err| err.to_string())?["count"]
+                .as_u64()
+                .unwrap_or(1)
+                .max(1),
+            None => 1,
+        };
+        let next = match get(NEXT_SHARD)? {
+            Some(raw) => raw
+                .parse()
+                .map_err(|err: std::num::ParseIntError| err.to_string())?,
+            None => 0,
+        };
+        Ok(Self {
+            count,
+            next,
+            used: false,
+        })
+    }
+
+    /// The shard for the next new partition.
+    pub(crate) fn next(&mut self) -> u32 {
+        if self.count == 1 {
+            return 0;
+        }
+        let shard = self.next % self.count;
+        self.next += 1;
+        self.used = true;
+        u32::try_from(shard).unwrap_or(0)
+    }
+
+    /// The counter to store, when any partition was placed on several shards.
+    pub(crate) fn put(&self) -> Option<(String, String)> {
+        self.used
+            .then(|| (NEXT_SHARD.to_string(), self.next.to_string()))
+    }
+}
+
 /// Create a topic. `partitions` must be at least 1. `durability` is `r2` or `wal`.
 /// `id` is chosen by the proposer and carried in the command, so every
-/// replica stores the same one.
+/// replica stores the same one. `configs` are checked here as well as by the
+/// proposer, so every replica decides the same way.
 pub fn create_topic(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     name: &str,
     id: &str,
     partitions: i32,
     durability: &str,
+    configs: &[(String, Option<String>)],
 ) -> Result<Outcome, String> {
     if id.is_empty() {
         return Ok(Outcome::Reject(42));
@@ -173,16 +330,30 @@ pub fn create_topic(
         return Ok(Outcome::Reject(36));
     }
     let id = id.to_string();
-    let topic = Topic {
-        name: name.to_string(),
-        id: id.clone(),
-        partitions,
-        durability: durability.to_string(),
-        leader_epoch: 0,
-        retention_ms: default_retention_ms(),
-        retention_bytes: default_retention_bytes(),
-        cleanup_policy: default_cleanup(),
-    };
+    let mut topic = Topic::new(name, &id, partitions, durability);
+    for (config, value) in configs {
+        if config == "durability.mode" {
+            continue;
+        }
+        let edited = crate::config::edit(
+            &mut topic,
+            config,
+            crate::config::Op::Set,
+            value.as_deref(),
+            true,
+        );
+        if let Err(rejected) = edited {
+            return Ok(Outcome::Reject(rejected.code));
+        }
+    }
+    if configs
+        .iter()
+        .any(|(config, _)| config == "durability.mode")
+    {
+        topic
+            .overrides
+            .insert("durability.mode".into(), durability.to_string());
+    }
     let mut put = vec![
         (
             topic_key(name),
@@ -190,6 +361,7 @@ pub fn create_topic(
         ),
         (id_key(&id), name.to_string()),
     ];
+    let mut placer = Placer::load(get)?;
     for partition in 0..partitions {
         let state = Partition {
             next_offset: 0,
@@ -198,12 +370,15 @@ pub fn create_topic(
             extents: Vec::new(),
             txn_committed: Vec::new(),
             txn_aborted: Vec::new(),
+            epochs: Vec::new(),
+            shard: placer.next(),
         };
         put.push((
             part_key(&id, partition),
             serde_json::to_string(&state).map_err(|err| err.to_string())?,
         ));
     }
+    put.extend(placer.put());
     let mut list = names(get(TOPICS)?)?;
     list.push(name.to_string());
     put.push((
@@ -287,6 +462,22 @@ pub fn publish(
             max_timestamp: part.max_timestamp,
         });
         state.next_offset = part.end;
+        if part.epoch >= 0
+            && state
+                .epochs
+                .last()
+                .is_none_or(|last| part.epoch > last.epoch)
+        {
+            state.epochs.push(EpochStart {
+                epoch: part.epoch,
+                start: part.start,
+            });
+        }
+        // `DeleteRecords` may have moved the log start past records that were
+        // still in the WAL. Their extent is not kept; the sweep removes the
+        // object once nothing else points into it.
+        let log_start = state.log_start;
+        state.extents.retain(|extent| extent.end > log_start);
     }
     let mut put = Vec::new();
     for ((topic, partition), state) in pending {
@@ -404,9 +595,15 @@ mod tests {
         let mut map = HashMap::new();
         let put = {
             let get = |key: &str| Ok(map.get(key).cloned());
-            let Outcome::Change { put, .. } =
-                create_topic(&get, "events", &uuid::Uuid::new_v4().to_string(), 1, "r2").unwrap()
-            else {
+            let Outcome::Change { put, .. } = create_topic(
+                &get,
+                "events",
+                &uuid::Uuid::new_v4().to_string(),
+                1,
+                "r2",
+                &[],
+            )
+            .unwrap() else {
                 panic!("create");
             };
             put
@@ -416,6 +613,7 @@ mod tests {
         }
         let get = |key: &str| Ok(map.get(key).cloned());
         let part = PublishPart {
+            epoch: -1,
             topic: "events".into(),
             partition: 0,
             start: 1,
@@ -438,7 +636,7 @@ mod tests {
         let put = {
             let get = |key: &str| Ok(map.get(key).cloned());
             let Outcome::Change { put, .. } =
-                create_topic(&get, "events", "topic-1", 1, "r2").unwrap()
+                create_topic(&get, "events", "topic-1", 1, "r2", &[]).unwrap()
             else {
                 panic!("create");
             };
@@ -452,6 +650,7 @@ mod tests {
             publish(
                 &get,
                 &[PublishPart {
+                    epoch: -1,
                     topic: "events".into(),
                     partition: 0,
                     start: 0,
@@ -484,5 +683,82 @@ mod tests {
         assert_eq!(state.extents.len(), 1);
         assert_eq!(state.extents[0].key, "bundle/new.seg");
         assert_eq!(state.extents[0].end, 3);
+    }
+
+    #[test]
+    fn publish_records_where_each_epoch_starts() {
+        let mut map = HashMap::new();
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let Outcome::Change { put, .. } =
+            create_topic(&get, "events", "topic-1", 1, "wal", &[]).unwrap()
+        else {
+            panic!("create");
+        };
+        for (key, value) in put {
+            map.insert(key, value);
+        }
+        let part = |start: i64, end: i64, epoch: i32| PublishPart {
+            epoch,
+            topic: "events".into(),
+            partition: 0,
+            start,
+            end,
+            object_key: "bundle/a".into(),
+            file_offset: 0,
+            length: 1,
+            base_timestamp: 0,
+            max_timestamp: 0,
+        };
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let Outcome::Change { put, .. } = publish(
+            &get,
+            &[part(0, 2, 1), part(2, 4, 1), part(4, 6, 3), part(6, 7, -1)],
+            &[],
+        )
+        .unwrap() else {
+            panic!("publish");
+        };
+        let state: Partition = serde_json::from_str(&put[0].1).unwrap();
+        assert_eq!(
+            state.epochs,
+            vec![
+                EpochStart { epoch: 1, start: 0 },
+                EpochStart { epoch: 3, start: 4 }
+            ]
+        );
+    }
+
+    #[test]
+    fn partitions_are_placed_round_robin_across_topics() {
+        let shards_of = |map: &HashMap<String, String>, id: &str, count: i32| -> Vec<u32> {
+            (0..count)
+                .map(|partition| {
+                    parse_partition(&map[&partition_storage_key(id, partition)])
+                        .unwrap()
+                        .shard
+                })
+                .collect()
+        };
+        let create = |map: &mut HashMap<String, String>, name: &str, id: &str, count: i32| {
+            let get = |key: &str| Ok(map.get(key).cloned());
+            let Outcome::Change { put, .. } =
+                create_topic(&get, name, id, count, "wal", &[]).unwrap()
+            else {
+                panic!("create");
+            };
+            for (key, value) in put {
+                map.insert(key, value);
+            }
+        };
+        let mut single = HashMap::new();
+        create(&mut single, "a", "id-a", 3);
+        assert_eq!(shards_of(&single, "id-a", 3), vec![0, 0, 0]);
+        assert!(!single.contains_key("wal/next-shard"));
+
+        let mut three = HashMap::from([(SHARDS.to_string(), r#"{"count":3}"#.to_string())]);
+        create(&mut three, "a", "id-a", 2);
+        create(&mut three, "b", "id-b", 2);
+        assert_eq!(shards_of(&three, "id-a", 2), vec![0, 1]);
+        assert_eq!(shards_of(&three, "id-b", 2), vec![2, 0]);
     }
 }

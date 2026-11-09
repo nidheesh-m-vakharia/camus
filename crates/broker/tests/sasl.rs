@@ -74,6 +74,10 @@ fn spawn(dir: &Path, cert: &Path, key: &Path) -> Node {
             "--tls-key",
             key.to_str().unwrap(),
         ])
+        .env("CAMUS_S3_ENDPOINT", s3_endpoint())
+        .env("CAMUS_S3_BUCKET", "camus")
+        .env("CAMUS_S3_ACCESS_KEY", "camus")
+        .env("CAMUS_S3_SECRET_KEY", "camus-dev-secret")
         .env("CAMUS_SASL_USER", "camus")
         .env("CAMUS_SASL_PASSWORD", "camus-secret")
         .env("CAMUS_FLUSH_MS", "40")
@@ -226,14 +230,15 @@ fn sasl_ssl_rejects_bad_credentials_and_accepts_plain() {
         ApiKey::SaslHandshake,
         1,
         2,
-        &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("SCRAM-SHA-256")),
+        &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("GSSAPI")),
     );
     let handshake = recv::<SaslHandshakeResponse>(&mut stream, 1);
     assert_eq!(
         handshake.error_code,
         ResponseError::UnsupportedSaslMechanism.code()
     );
-    assert_eq!(handshake.mechanisms[0].as_str(), "PLAIN");
+    let offered: Vec<&str> = handshake.mechanisms.iter().map(|m| m.as_str()).collect();
+    assert_eq!(offered, vec!["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"]);
 
     send(
         &mut stream,
@@ -576,4 +581,49 @@ fn franz_go_round_trip() {
         .output()
         .unwrap();
     assert_client(dir.path(), ran, "franz-go");
+}
+
+fn s3_endpoint() -> String {
+    std::env::var("CAMUS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9100".into())
+}
+
+#[test]
+fn a_tls_broker_without_object_storage_settings_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let signed = params.self_signed(&key_pair).unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, signed.pem()).unwrap();
+    std::fs::write(&key, key_pair.serialize_pem()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .args([
+            "--node-id",
+            "1",
+            "--http-addr",
+            "127.0.0.1:0",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--kafka-addr",
+            "127.0.0.1:0",
+            "--tls-cert",
+            cert.to_str().unwrap(),
+            "--tls-key",
+            key.to_str().unwrap(),
+        ])
+        .env_remove("CAMUS_S3_ENDPOINT")
+        .env_remove("CAMUS_S3_BUCKET")
+        .env("CAMUS_S3_ACCESS_KEY", "camus")
+        .env_remove("CAMUS_S3_SECRET_KEY")
+        .env("CAMUS_SASL_USER", "camus")
+        .env("CAMUS_SASL_PASSWORD", "camus-secret")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CAMUS_S3_ENDPOINT, CAMUS_S3_BUCKET, CAMUS_S3_SECRET_KEY"),
+        "{stderr}"
+    );
 }

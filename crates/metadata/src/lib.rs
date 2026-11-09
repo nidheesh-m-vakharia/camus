@@ -10,6 +10,7 @@
 mod acl;
 mod admin;
 mod catalog;
+pub mod config;
 pub mod groups;
 mod machine;
 mod network;
@@ -22,12 +23,12 @@ pub use acl::{
 pub use admin::{ConfigChange, ConfigEdit, Item, OffsetDrop, PartitionIncrease, RecordCut};
 pub use catalog::{
     parse_partition, parse_topic, partition_storage_key, topic_index_key, topic_storage_key,
-    Extent, Partition, PublishPart, Span, Topic,
+    EpochStart, Extent, Partition, PublishPart, Span, Topic, SHARDS,
 };
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{
-    check as txn_allows, ensure as txn_ongoing, inspect as txn_inspect, known_state as txn_state,
-    TxnInfo, TxnSpan,
+    check as txn_allows, clock as txn_clock, ensure as txn_ongoing, inspect as txn_inspect,
+    known_state as txn_state, spans as txn_spans, TxnClock, TxnInfo, TxnSpan,
 };
 
 use std::collections::BTreeMap;
@@ -58,6 +59,8 @@ openraft::declare_raft_types!(
 pub enum Command {
     /// Insert or replace one key.
     Put { key: String, value: String },
+    /// Remove one key. Missing keys are not an error.
+    Delete { key: String },
     /// Create a topic and its partitions at offset 0.
     CreateTopic {
         /// Topic name.
@@ -70,6 +73,9 @@ pub enum Command {
         partitions: i32,
         /// `r2` or `wal`.
         durability: String,
+        /// Topic configs from the request, checked again at apply time.
+        #[serde(default)]
+        configs: Vec<(String, Option<String>)>,
     },
     /// Delete a topic by name.
     DeleteTopic {
@@ -98,6 +104,18 @@ pub enum Command {
         producer_id: i64,
         /// Current epoch. Must match the stored epoch when `producer_id` is set.
         producer_epoch: i16,
+    },
+    /// Remove a group's committed offsets that `offsets.retention.minutes`
+    /// has expired. Only an empty group loses offsets. Its retention counts
+    /// from when it became empty, or from each commit for a group that only
+    /// has offsets. The group itself goes once no offsets are left.
+    ExpireOffsets {
+        /// Group id.
+        group: String,
+        /// Proposer's clock.
+        now_ms: i64,
+        /// Kafka's `offsets.retention.minutes`, in milliseconds.
+        retention_ms: i64,
     },
     /// Store a consumer group's record. Rejected with ILLEGAL_GENERATION when
     /// the stored generation is newer.
@@ -198,6 +216,9 @@ pub enum Command {
         producer_epoch: i16,
         /// `true` commits.
         committed: bool,
+        /// Proposer's clock. `0` in commands written before it was carried.
+        #[serde(default)]
+        now_ms: i64,
     },
     /// Replace a sealed offset prefix with one object. The high watermark stays.
     Compact {
@@ -238,6 +259,9 @@ pub enum Command {
         producer_epoch: i16,
         /// Client timeout in milliseconds. `0` means 60 seconds.
         timeout_ms: i32,
+        /// Proposer's clock. `0` in commands written before it was carried.
+        #[serde(default)]
+        now_ms: i64,
     },
     /// Start or continue a transaction and record when it became ongoing.
     AddTxnPartitionsAt {
@@ -251,6 +275,40 @@ pub enum Command {
         partitions: Vec<(String, i32)>,
         /// Milliseconds since the epoch. Replicas share this value.
         started_ms: i64,
+    },
+    /// Abort a transaction that outlived its timeout and fence its producer.
+    /// Applied only if the id is still at this producer and epoch.
+    AbortTimedOutTxn {
+        /// Transactional id.
+        transactional_id: String,
+        /// Producer id the proposer saw.
+        producer_id: i64,
+        /// Producer epoch the proposer saw.
+        producer_epoch: i16,
+        /// Proposer's clock.
+        now_ms: i64,
+    },
+    /// Remove a transactional id idle for `expiration_ms`.
+    ExpireTransactionalId {
+        /// Transactional id.
+        transactional_id: String,
+        /// Producer id the proposer saw.
+        producer_id: i64,
+        /// Producer epoch the proposer saw.
+        producer_epoch: i16,
+        /// Proposer's clock.
+        now_ms: i64,
+        /// Kafka's `transactional.id.expiration.ms`.
+        expiration_ms: i64,
+    },
+    /// Remove producer sequence state that Kafka would expire.
+    ExpireProducers {
+        /// `(topic, partition, producer_id)` of each candidate.
+        keys: Vec<(String, i32, i64)>,
+        /// Proposer's clock.
+        now_ms: i64,
+        /// Kafka's `producer.id.expiration.ms`.
+        expiration_ms: i64,
     },
 }
 
@@ -364,6 +422,7 @@ impl MetadataNode {
         name: impl Into<String>,
         partitions: i32,
         durability: impl Into<String>,
+        configs: Vec<(String, Option<String>)>,
     ) -> anyhow::Result<Response> {
         let response = self
             .raft
@@ -372,6 +431,7 @@ impl MetadataNode {
                 id: uuid::Uuid::new_v4().to_string(),
                 partitions,
                 durability: durability.into(),
+                configs,
             })
             .await?;
         Ok(response.data)

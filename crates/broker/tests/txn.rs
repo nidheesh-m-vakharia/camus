@@ -232,7 +232,8 @@ fn read_committed_hides_an_open_transaction_and_an_abort() {
         4,
         2,
         &InitProducerIdRequest::default()
-            .with_transactional_id(Some(TransactionalId(StrBytes::from_static_str("checkout")))),
+            .with_transactional_id(Some(TransactionalId(StrBytes::from_static_str("checkout"))))
+            .with_transaction_timeout_ms(60_000),
     );
     let started = recv::<InitProducerIdResponse>(&mut stream, 4);
     assert_eq!(started.error_code, 0, "{started:?}");
@@ -562,4 +563,268 @@ fn produce(stream: &mut TcpStream, correlation: i32, raw: Bytes, _producer: i64)
     let produced = recv::<ProduceResponse>(stream, 9);
     let part = &produced.responses[0].partition_responses[0];
     assert_eq!(part.error_code, 0, "{produced:?}");
+}
+
+/// One broker with `orders` created, and its connection.
+fn start(root: &Path, env: &[(&str, &str)]) -> (Node, TcpStream) {
+    let log = std::fs::File::create(root.join("broker.log")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .args([
+            "--node-id",
+            "1",
+            "--http-addr",
+            "127.0.0.1:0",
+            "--data-dir",
+            root.to_str().unwrap(),
+            "--kafka-addr",
+            "127.0.0.1:0",
+            "--dev-plaintext",
+        ])
+        .env("CAMUS_FLUSH_MS", "40")
+        .envs(env.iter().copied())
+        .stdout(std::fs::File::create(root.join("out.log")).unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let http = wait_file(&root.join("listen-addr"));
+    let kafka = wait_file(&root.join("kafka-addr"));
+    let node = Node { child, http, kafka };
+    let init = reqwest::blocking::Client::new()
+        .post(format!("http://{}/admin/init", node.http))
+        .json(&serde_json::json!([{"id": 1, "addr": node.http}]))
+        .send()
+        .unwrap();
+    assert!(init.status().is_success(), "{}", init.text().unwrap());
+    wait_leader(&node.http);
+    let mut stream = TcpStream::connect(&node.kafka).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut created = CreatableTopic::default();
+    created.name = TopicName(StrBytes::from_static_str("orders"));
+    created.num_partitions = 1;
+    created.replication_factor = 1;
+    send(
+        &mut stream,
+        ApiKey::CreateTopics,
+        7,
+        1,
+        &CreateTopicsRequest::default().with_topics(vec![created]),
+    );
+    let created = recv::<CreateTopicsResponse>(&mut stream, 7);
+    assert_eq!(created.topics[0].error_code, 0, "{created:?}");
+    (node, stream)
+}
+
+fn init_producer(
+    stream: &mut TcpStream,
+    correlation: i32,
+    timeout_ms: i32,
+    current: Option<(i64, i16)>,
+) -> InitProducerIdResponse {
+    let (producer, epoch) = current.unwrap_or((-1, -1));
+    send(
+        stream,
+        ApiKey::InitProducerId,
+        4,
+        correlation,
+        &InitProducerIdRequest::default()
+            .with_transactional_id(Some(TransactionalId(StrBytes::from_static_str("checkout"))))
+            .with_transaction_timeout_ms(timeout_ms)
+            .with_producer_id(producer.into())
+            .with_producer_epoch(epoch),
+    );
+    recv::<InitProducerIdResponse>(stream, 4)
+}
+
+#[test]
+fn a_transaction_past_its_timeout_is_aborted_and_its_producer_fenced() {
+    let root = tempfile::tempdir().unwrap();
+    let (_node, mut stream) = start(root.path(), &[("CAMUS_TXN_ABORT_INTERVAL_MS", "100")]);
+
+    let too_long = init_producer(&mut stream, 1, 900_001, None);
+    assert_eq!(too_long.error_code, 50, "{too_long:?}");
+    let zero = init_producer(&mut stream, 2, 0, None);
+    assert_eq!(zero.error_code, 50, "{zero:?}");
+
+    let started = init_producer(&mut stream, 3, 1_000, None);
+    assert_eq!(started.error_code, 0, "{started:?}");
+    let producer = started.producer_id.0;
+    let epoch = started.producer_epoch;
+    send(
+        &mut stream,
+        ApiKey::AddPartitionsToTxn,
+        3,
+        4,
+        &AddPartitionsToTxnRequest::default()
+            .with_v3_and_below_transactional_id(TransactionalId(StrBytes::from_static_str(
+                "checkout",
+            )))
+            .with_v3_and_below_producer_id(producer.into())
+            .with_v3_and_below_producer_epoch(epoch)
+            .with_v3_and_below_topics(vec![AddPartitionsToTxnTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("orders")))
+                .with_partitions(vec![0])]),
+    );
+    let added = recv::<AddPartitionsToTxnResponse>(&mut stream, 3);
+    assert_eq!(
+        added.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code, 0,
+        "{added:?}"
+    );
+    produce(&mut stream, 5, batch(b"one", producer, epoch, 0), producer);
+    assert_eq!(
+        fetch_at(&mut stream, 1).high_watermark,
+        0,
+        "open batch is hidden"
+    );
+
+    // The producer stops without ending the transaction. The coordinator
+    // aborts it once its 1 s timeout passes, so read_committed moves on.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if describe_txn(&mut stream, 6).transaction_state.as_str() == "CompleteAbort" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never aborted");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let after = fetch_at(&mut stream, 1);
+    assert_eq!(after.high_watermark, 1, "{after:?}");
+
+    send(
+        &mut stream,
+        ApiKey::EndTxn,
+        3,
+        7,
+        &EndTxnRequest::default()
+            .with_transactional_id(TransactionalId(StrBytes::from_static_str("checkout")))
+            .with_producer_id(producer.into())
+            .with_producer_epoch(epoch)
+            .with_committed(true),
+    );
+    let fenced = recv::<EndTxnResponse>(&mut stream, 3);
+    assert_eq!(fenced.error_code, 90, "{fenced:?}");
+
+    // KIP-360: the same producer may recover from the epoch it had.
+    let recovered = init_producer(&mut stream, 8, 1_000, Some((producer, epoch)));
+    assert_eq!(recovered.error_code, 0, "{recovered:?}");
+    assert_eq!(recovered.producer_id.0, producer);
+    assert_eq!(recovered.producer_epoch, epoch + 2);
+}
+
+fn add_partition(stream: &mut TcpStream, correlation: i32, producer: i64, epoch: i16) {
+    send(
+        stream,
+        ApiKey::AddPartitionsToTxn,
+        3,
+        correlation,
+        &AddPartitionsToTxnRequest::default()
+            .with_v3_and_below_transactional_id(TransactionalId(StrBytes::from_static_str(
+                "checkout",
+            )))
+            .with_v3_and_below_producer_id(producer.into())
+            .with_v3_and_below_producer_epoch(epoch)
+            .with_v3_and_below_topics(vec![AddPartitionsToTxnTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("orders")))
+                .with_partitions(vec![0])]),
+    );
+    let added = recv::<AddPartitionsToTxnResponse>(stream, 3);
+    assert_eq!(
+        added.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code, 0,
+        "{added:?}"
+    );
+}
+
+fn end(stream: &mut TcpStream, correlation: i32, producer: i64, epoch: i16, commit: bool) {
+    send(
+        stream,
+        ApiKey::EndTxn,
+        3,
+        correlation,
+        &EndTxnRequest::default()
+            .with_transactional_id(TransactionalId(StrBytes::from_static_str("checkout")))
+            .with_producer_id(producer.into())
+            .with_producer_epoch(epoch)
+            .with_committed(commit),
+    );
+    assert_eq!(recv::<EndTxnResponse>(stream, 3).error_code, 0);
+}
+
+/// Offsets and values a fetch from `offset` returns.
+fn read_from(stream: &mut TcpStream, isolation: i8, offset: i64) -> Vec<(i64, String)> {
+    let mut part = FetchPartition::default();
+    part.partition = 0;
+    part.fetch_offset = offset;
+    part.partition_max_bytes = 1024 * 1024;
+    let mut topic = FetchTopic::default();
+    topic.topic = TopicName(StrBytes::from_static_str("orders"));
+    topic.partitions = vec![part];
+    send(
+        stream,
+        ApiKey::Fetch,
+        11,
+        30,
+        &FetchRequest::default()
+            .with_max_wait_ms(50)
+            .with_isolation_level(isolation)
+            .with_topics(vec![topic]),
+    );
+    let data = recv::<FetchResponse>(stream, 11)
+        .responses
+        .remove(0)
+        .partitions
+        .remove(0);
+    let Some(mut bytes) = data.records else {
+        return Vec::new();
+    };
+    camus_protocol::records::RecordBatchDecoder::decode_all(&mut bytes)
+        .unwrap()
+        .into_iter()
+        .flat_map(|set| set.records)
+        .filter(|record| record.offset >= offset)
+        .map(|record| {
+            (
+                record.offset,
+                String::from_utf8(record.value.unwrap().to_vec()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Camus writes no control records, so a `read_committed` consumer that
+/// seeks into or past an aborted range must still get the committed records
+/// at their own offsets, as with Kafka.
+#[test]
+fn a_read_committed_seek_skips_an_aborted_range_and_keeps_offsets() {
+    let root = tempfile::tempdir().unwrap();
+    let (node, mut stream) = start(root.path(), &[]);
+    let started = init_producer(&mut stream, 1, 60_000, None);
+    assert_eq!(started.error_code, 0);
+    let (producer, epoch) = (started.producer_id.0, started.producer_epoch);
+    for (round, (value, commit)) in [("a", true), ("b", false), ("c", true)]
+        .into_iter()
+        .enumerate()
+    {
+        let base = 10 * (round as i32 + 1);
+        add_partition(&mut stream, base, producer, epoch);
+        produce(
+            &mut stream,
+            base + 1,
+            batch(value.as_bytes(), producer, epoch, round as i32),
+            producer,
+        );
+        end(&mut stream, base + 2, producer, epoch, commit);
+    }
+    let committed = |offset| {
+        let mut stream = TcpStream::connect(&node.kafka).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        read_from(&mut stream, 1, offset)
+    };
+    assert_eq!(committed(0), vec![(0, "a".into()), (2, "c".into())]);
+    assert_eq!(committed(1), vec![(2, "c".into())], "seek into the abort");
+    assert_eq!(committed(2), vec![(2, "c".into())]);
+    // read_uncommitted sees the aborted record too, as in Kafka.
+    assert_eq!(read_from(&mut stream, 0, 0).len(), 3);
 }

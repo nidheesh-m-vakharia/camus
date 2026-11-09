@@ -392,7 +392,8 @@ fn a_committed_produce_stays_visible_when_end_txn_races_it() {
             4,
             10,
             &InitProducerIdRequest::default()
-                .with_transactional_id(Some(TransactionalId(StrBytes::from_string(id.clone())))),
+                .with_transactional_id(Some(TransactionalId(StrBytes::from_string(id.clone()))))
+                .with_transaction_timeout_ms(60_000),
         );
         let started = recv::<InitProducerIdResponse>(&mut setup, 4);
         assert_eq!(started.error_code, 0, "{started:?}");

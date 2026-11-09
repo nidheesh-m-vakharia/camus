@@ -10,6 +10,11 @@ use bytes::{Bytes, BytesMut};
 use crate::records::crc32c;
 
 const HEADER: usize = 12;
+
+/// Largest record batch any topic may accept, counted as Kafka counts
+/// `max.message.bytes`: the whole batch including the 12-byte log overhead.
+/// The broker, WAL, and uploader all check against this.
+pub const MAX_BATCH_CEILING: usize = 8 * 1024 * 1024;
 const EPOCH_AT: usize = 12;
 const MAGIC_AT: usize = 16;
 const CRC_AT: usize = 17;
@@ -66,6 +71,14 @@ pub struct BatchInfo {
     pub max_timestamp: i64,
     /// The transactional attribute is set.
     pub transactional: bool,
+}
+
+/// The `partitionLeaderEpoch` of the first batch in `bytes`, or `-1`.
+pub fn leader_epoch(bytes: &[u8]) -> i32 {
+    bytes
+        .get(EPOCH_AT..EPOCH_AT + 4)
+        .map(|raw| i32::from_be_bytes(raw.try_into().expect("four bytes")))
+        .unwrap_or(-1)
 }
 
 /// Walk `bytes` and check magic, length, and CRC. Does not decompress.

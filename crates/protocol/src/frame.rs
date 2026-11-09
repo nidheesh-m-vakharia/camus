@@ -50,6 +50,41 @@ const IMPLEMENTED: &[ImplementedApi] = &[
         max: 11,
     },
     ImplementedApi {
+        key: ApiKey::DescribeUserScramCredentials,
+        min: 0,
+        max: 0,
+    },
+    ImplementedApi {
+        key: ApiKey::AlterUserScramCredentials,
+        min: 0,
+        max: 0,
+    },
+    ImplementedApi {
+        key: ApiKey::ConsumerGroupDescribe,
+        min: 0,
+        max: 1,
+    },
+    ImplementedApi {
+        key: ApiKey::DescribeTopicPartitions,
+        min: 0,
+        max: 0,
+    },
+    ImplementedApi {
+        key: ApiKey::DescribeProducers,
+        min: 0,
+        max: 0,
+    },
+    ImplementedApi {
+        key: ApiKey::DescribeLogDirs,
+        min: 1,
+        max: 4,
+    },
+    ImplementedApi {
+        key: ApiKey::OffsetForLeaderEpoch,
+        min: 3,
+        max: 4,
+    },
+    ImplementedApi {
         key: ApiKey::Metadata,
         min: 0,
         max: 13,
