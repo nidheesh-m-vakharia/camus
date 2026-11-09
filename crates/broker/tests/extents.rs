@@ -47,6 +47,12 @@ fn a_row_from_before_extent_keys_is_served_and_then_migrated() {
         wait_sealed(&node.http, index + 1);
     }
     let id = topic_id(&node.http);
+    // Metadata applies fsync at most once a second; the rest come back by
+    // replaying the log, which would re-add the keys this test removes. A
+    // write a second after the last one is durable and takes every earlier
+    // apply with it.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    create_topic_named(&addr, "durable", "wal", 1);
     let _ = node.child.kill();
     let _ = node.child.wait();
     move_extents_into_the_row(dir.path(), &id);
