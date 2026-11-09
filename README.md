@@ -72,8 +72,9 @@ v1.22.0.
   alter configs, create partitions, delete records, delete topics, and
   ACLs.
 - `cleanup.policy=compact` keeps the latest record for each key, at its
-  original offset. Compaction runs only when `CAMUS_COMPACT_MS` is greater
-  than 0, and only over sealed extents. Tombstones are kept.
+  original offset, over sealed extents, every `CAMUS_COMPACT_MS` (default
+  300000; 0 turns it off). Tombstones go after `delete.retention.ms`, and
+  `min.compaction.lag.ms` keeps recent records uncompacted.
 
 A few Kafka behaviors are different on purpose:
 
