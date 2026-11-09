@@ -65,8 +65,7 @@ The format:
   correctness.
 - No `mmap`. On Linux, a segment append whose offset and length are multiples
   of 4096 is one direct write with force-unit-access (`O_DIRECT` and
-  `RWF_DSYNC`). The completion of that write is the ack, and the ring polls
-  for it when the kernel accepts `IORING_SETUP_IOPOLL`. The bytes are padded
+  `RWF_DSYNC`). The completion of that write is the ack. The bytes are padded
   with a record whose index is `u64::MAX`, which open skips. A drive or
   filesystem that rejects the direct write, and every other operating
   system, uses a buffered write linked to one `fsync`. The active segment is
@@ -81,8 +80,10 @@ The format:
   torn tail is served.
 - These `io_uring` features are not used. `IORING_SETUP_SQPOLL` would keep a
   kernel thread polling for a syscall that is noise next to the fsync.
-  `IORING_SETUP_IOPOLL` applies to polled `O_DIRECT` reads and writes, and
-  this ring's completion is an `fsync`, which is not a polled opcode.
+  `IORING_SETUP_IOPOLL` is not used. The kernel accepts that flag on a disk
+  whose `queue/io_poll` is 0, and the direct write then does not complete.
+  The same ring also has to `fsync` when the direct write is refused, and an
+  `fsync` is not a polled opcode.
   `IORING_OP_SEND_ZC` and multishot accept or receive would replace the
   tokio socket loop. `IORING_OP_URING_CMD` would bypass the filesystem the
   torn-tail recovery depends on, and it only exists on NVMe.

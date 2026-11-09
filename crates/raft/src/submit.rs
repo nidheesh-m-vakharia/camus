@@ -1,8 +1,9 @@
 //! Durable append submission.
 //!
 //! On Linux an aligned append is one direct write with force-unit-access.
-//! Completing that write is the ack, and the ring polls for it when the
-//! kernel allows. Anything else links a buffered write to an `fsync`. The
+//! Completing that write is the ack. Anything else links a buffered write
+//! to an `fsync`. The ring does not poll: a polling ring cannot `fsync`,
+//! and a disk that does not poll never completes the direct write. The
 //! segment file is registered, and the write buffer is pinned. Elsewhere,
 //! and when direct I/O is refused, the call seeks, writes, and `sync_all`s.
 //! `Ok` means the bytes survived a crash.
@@ -171,17 +172,14 @@ fn std_write_at_sync(file: &mut File, offset: u64, bytes: &[u8]) -> io::Result<(
 
 #[cfg(target_os = "linux")]
 fn open_ring() -> Option<Ring> {
-    let (ring, iopoll) = match io_uring::IoUring::builder().setup_iopoll().build(8) {
-        Ok(ring) => (ring, true),
+    // `IORING_SETUP_IOPOLL` is not requested. The kernel accepts it on a disk
+    // whose `queue/io_poll` is 0, and the direct write then never completes.
+    // The same ring has to `fsync` when that write is refused.
+    let (ring, iopoll) = match io_uring::IoUring::new(8) {
+        Ok(ring) => (ring, false),
         Err(err) => {
-            tracing::debug!(%err, "io_uring completion polling is unavailable");
-            match io_uring::IoUring::new(8) {
-                Ok(ring) => (ring, false),
-                Err(err) => {
-                    tracing::warn!(%err, "io_uring is unavailable; using pwrite and fsync");
-                    return None;
-                }
-            }
+            tracing::warn!(%err, "io_uring is unavailable; using pwrite and fsync");
+            return None;
         }
     };
     let mut probe = io_uring::Probe::new();
@@ -276,9 +274,8 @@ impl Ring {
         mut bytes: &[u8],
     ) -> io::Result<()> {
         self.bind(file, file_gen)?;
-        let aligned = self.direct
-            && offset % self.align as u64 == 0
-            && bytes.len() % self.align == 0;
+        let aligned =
+            self.direct && offset % self.align as u64 == 0 && bytes.len() % self.align == 0;
         if aligned {
             match self.direct_write(file, offset, bytes) {
                 Ok(()) => return Ok(()),
@@ -396,7 +393,6 @@ impl Ring {
                 .build()
                 .user_data(FSYNC)
         };
-        let want = if sync { 2 } else { 1 };
         // SAFETY: `ptr` addresses either `self.fixed` or `bytes`. Both stay
         // put until `submit_and_wait` returns, and this ring has no other
         // submission in flight. `bytes` is borrowed for this call. `fixed`
@@ -413,24 +409,17 @@ impl Ring {
                     .map_err(|err| io::Error::other(format!("io_uring push: {err:?}")))?;
             }
         }
-        self.ring.submit_and_wait(want)?;
-        let mut write_res = None;
-        let mut sync_res = None;
-        for completed in self.ring.completion() {
-            match completed.user_data() {
-                WRITE => write_res = Some(completed.result()),
-                FSYNC => sync_res = Some(completed.result()),
-                _ => {}
-            }
+        let mut ids = vec![WRITE];
+        if sync {
+            ids.push(FSYNC);
         }
-        let write_res =
-            write_res.ok_or_else(|| io::Error::other("io_uring write did not complete"))?;
+        let results = self.reap(&ids)?;
+        let write_res = results[0];
         if write_res < 0 {
             return Err(io::Error::from_raw_os_error(-write_res));
         }
         if sync {
-            let sync_res =
-                sync_res.ok_or_else(|| io::Error::other("io_uring fsync did not complete"))?;
+            let sync_res = results[1];
             if sync_res < 0 {
                 return Err(io::Error::from_raw_os_error(-sync_res));
             }
@@ -501,19 +490,48 @@ impl Ring {
                 .push(&write)
                 .map_err(|err| io::Error::other(format!("io_uring push: {err:?}")))?;
         }
-        self.ring.submit_and_wait(1)?;
-        let mut write_res = None;
-        for completed in self.ring.completion() {
-            if completed.user_data() == WRITE {
-                write_res = Some(completed.result());
-            }
-        }
-        let write_res =
-            write_res.ok_or_else(|| io::Error::other("io_uring write did not complete"))?;
+        let write_res = self.reap(&[WRITE])?[0];
         if write_res < 0 {
             Err(io::Error::from_raw_os_error(-write_res))
         } else {
             Ok(write_res as usize)
         }
+    }
+
+    /// Wait for `ids` and return one result each, in that order.
+    ///
+    /// A completion whose `user_data` is not one of `ids` is still consumed.
+    /// Exactly one batch is in flight, and a kernel that echoes `0` would
+    /// otherwise leave the result unread and fail the append.
+    fn reap(&mut self, ids: &[u64]) -> io::Result<Vec<i32>> {
+        let submitted = self.ring.submit_and_wait(ids.len())?;
+        let mut got = self.drain_completions();
+        if got.is_empty() && submitted > 0 {
+            self.ring.submit_and_wait(ids.len())?;
+            got = self.drain_completions();
+        }
+        let mut ordered = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(pos) = got.iter().position(|(user, _)| user == id) {
+                ordered.push(got.remove(pos).1);
+            }
+        }
+        if ordered.len() == ids.len() {
+            return Ok(ordered);
+        }
+        if got.len() + ordered.len() == ids.len() {
+            ordered.extend(got.into_iter().map(|(_, result)| result));
+            return Ok(ordered);
+        }
+        // Nothing was submitted, or the completion could not be matched.
+        // `EOPNOTSUPP` is the signal the caller uses to leave this ring.
+        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    }
+
+    fn drain_completions(&mut self) -> Vec<(u64, i32)> {
+        self.ring
+            .completion()
+            .map(|completed| (completed.user_data(), completed.result()))
+            .collect()
     }
 }
