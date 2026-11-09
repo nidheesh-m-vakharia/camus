@@ -15,17 +15,18 @@ disagreement in `docs/adr/0002-kafka-compatibility-pin.md`.
 
 The `protocol` crate is generated from this tag's JSON schemas, not from
 the crates.io `kafka-protocol` 0.18.0 release (that crate is Kafka 4.1.0).
-`ApiVersions` request versions in the schema are 0–5. Phase 0 does not
-advertise any key. A known key gets `UNSUPPORTED_VERSION` (35). An unknown
-key gets `INVALID_REQUEST` (42). The broker process does not speak Kafka
-TCP yet.
+`ApiVersions` advertises only the keys and versions in the matrix below. A
+key Camus knows but does not implement, or a version outside the advertised
+range, gets `UNSUPPORTED_VERSION` (35) and the connection stays open. A key
+the schema does not name closes the connection, because there is no
+response body to put `INVALID_REQUEST` (42) in.
 
 Kafka source is Apache-2.0. See `NOTICE`.
 
 ## Deliberate differences
 
-These are accepted in the ADRs and apply once the relevant phase exists.
-Until then the API returns an error rather than a partial imitation.
+These are accepted in the ADRs. An API Camus does not implement returns an
+error rather than a partial imitation.
 
 | Topic | Camus | Kafka 4.4.0 | ADR |
 | --- | --- | --- | --- |
@@ -35,50 +36,85 @@ Until then the API returns an error rather than a partial imitation.
 | Idempotence | `InitProducerId` allocates a producer id. A retried sequence returns the original offset and is not appended | Supported | 0009 |
 | Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. There is no control-batch marker | Control batches plus `read_committed` | 0013 |
 | Compaction | Latest key, original offset, sealed extents only, on a timer rather than a dirty ratio. A tombstone's `delete.retention.ms` counts from its own timestamp | `LogCleaner` by dirty ratio; tombstone horizon counts from the first cleaning (KIP-534) | 0010 |
-| ACLs | A resource with no ACL is denied when SASL is on and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
+| ACLs | A resource with no ACL is denied on an authenticated listener (SASL or mTLS) and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
+| Partition leadership | One WAL shard: its leader leads every `wal` partition, and every broker is a voter. No per-partition leaders, reassignment, or preferred-leader election | Leaders spread across brokers; reassignment and `ElectLeaders` | 0006 |
+| Topic configs | Segment, flush, and `min.insync.replicas` configs are accepted and stored with no effect; `LogAppendTime`, broker-side recompression, and tiered storage are rejected | All applied | — |
+| Broker configs and quotas | Broker settings come from the environment at startup and are read-only in `DescribeConfigs`; client quotas are not implemented | Dynamic broker configs and quotas | — |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
+
+## Defaults
+
+Camus matches Kafka 4.4.0's default unless Kafka's can lose acknowledged
+data or weaken security; then the safer value is used and listed above. Each
+is set by an environment variable.
+
+| Setting | Kafka 4.4.0 | Camus | Variable |
+| --- | --- | --- | --- |
+| `allow.everyone.if.no.acl.found` | `false` | `false`, except on the dev PLAINTEXT listener | `CAMUS_ACL_ALLOW_IF_NO_ACL` |
+| `super.users` | none | none, plus the SASL user from the environment | `CAMUS_SUPER_USERS` |
+| `auto.create.topics.enable` | `true` | `true`, with `CREATE` permission | `CAMUS_AUTO_CREATE_TOPICS` |
+| `num.partitions` | 1 | 1 | `CAMUS_NUM_PARTITIONS` |
+| `message.max.bytes` | 1048588 | 1048588, at most 8388608 | `CAMUS_MESSAGE_MAX_BYTES` |
+| `unclean.leader.election.enable` | `false` | never automatic | — |
+| `acks=1` | leader write | full quorum write (safer) | — |
+| `min.insync.replicas` | 1 | WAL majority (safer) | — |
+| `retention.ms` / `retention.bytes` | 604800000 / -1 | same, enforced | topic config |
+| `log.retention.check.interval.ms` | 300000 | 300000 | `CAMUS_RETENTION_CHECK_MS` |
+| `log.cleaner.enable` | `true` | on, every 300000 ms | `CAMUS_COMPACT_MS` (`0` turns it off) |
+| `delete.retention.ms` / `min.compaction.lag.ms` | 86400000 / 0 | same | topic config |
+| `file.delete.delay.ms` | 60000 | 60000 | `CAMUS_FILE_DELETE_DELAY_MS` |
+| `transaction.max.timeout.ms` | 900000 | 900000 | `CAMUS_TXN_MAX_TIMEOUT_MS` |
+| Timed-out transaction abort interval | 10000 | 10000 | `CAMUS_TXN_ABORT_INTERVAL_MS` |
+| `transactional.id.expiration.ms` | 604800000 | 604800000 | `CAMUS_TRANSACTIONAL_ID_EXPIRATION_MS` |
+| `producer.id.expiration.ms` | 86400000 | 86400000 | `CAMUS_PRODUCER_ID_EXPIRATION_MS` |
+| `offsets.retention.minutes` | 10080 | 10080 | `CAMUS_OFFSETS_RETENTION_MINUTES` |
+| `group.initial.rebalance.delay.ms` | 3000 | 3000 | `CAMUS_GROUP_INITIAL_DELAY_MS` |
+| `group.min.session.timeout.ms` | 6000 | 6000 | `CAMUS_GROUP_MIN_SESSION_MS` |
+| `group.consumer.session.timeout.ms` / heartbeat | 45000 / 5000 | same | `CAMUS_CONSUMER_SESSION_MS` / `CAMUS_CONSUMER_HEARTBEAT_MS` |
+| `group.consumer.assignors` | `uniform` (sticky), `range` | same | — |
+| `ssl.client.auth` | `none` | `none`; `required` with `--tls-client-ca` | — |
+| PLAINTEXT listener | allowed | opt-in with `--dev-plaintext`, loopback unless `--allow-non-loopback` | — |
+| Object storage settings | — | required when serving TLS | `CAMUS_S3_*` |
 
 ## API matrix
 
 Status values: `unimplemented`, `partial`, `implemented`.
 
-Phase 1 answers `ApiVersions`, `Metadata`, `Produce`, `Fetch`, `ListOffsets`,
-`CreateTopics`, `DeleteTopics`, `DescribeConfigs`, `SaslHandshake`, and
-`SaslAuthenticate`. `ApiVersions` advertises only those keys. Produce acks
-in `r2` mode after the object is stored and the extent is committed.
-`wal` produce acks after the WAL shard commits, which means a majority of
-its voters has fsynced the batch. Every broker is a voter. Metadata reports
-the shard leader as the leader of each `wal` partition and the voters as
-replicas and ISR. A broker that is not the shard leader answers produce,
-fetch, and list-offsets with `NOT_LEADER_OR_FOLLOWER` (6). A produce that
-cannot commit within `timeout_ms`, for example with no quorum, gets
-`REQUEST_TIMED_OUT` (7); the entry may still commit later, so a client
-without idempotence can duplicate on retry. The upload to object storage
-follows the ack. A `wal` partition's leader epoch is the WAL shard's Raft term plus a base
-kept in metadata; `truncate-to-sealed` raises the base, so the epoch only
-grows. An `r2` partition's epoch is the metadata group's term. Batches are
-sealed with that epoch, publish records where each epoch starts, and
-`OffsetForLeaderEpoch` (v3–4) answers from that history and, on the shard
-leader, from the epochs of batches still in the WAL, so a consumer detects a
-truncation and a failover is not mistaken for one. Fetch, ListOffsets, and
-`OffsetForLeaderEpoch` check `current_leader_epoch`: older is
-`FENCED_LEADER_EPOCH` (74), newer is `UNKNOWN_LEADER_EPOCH` (76). The shard leader records itself in metadata so every broker
-names the same leader; a broker that has just restarted can name a stale
-leader for about a second, and clients recover through the usual
-`NOT_LEADER_OR_FOLLOWER` retry. After a shard loses a majority, its
-partitions stay offline until a lost voter returns or an operator runs
-`camus admin truncate-to-sealed`, which resumes them at the sealed end and
-drops acknowledged offsets past it (ADR 0008).
-A topic created without `durability.mode` is `wal` (`CAMUS_DEFAULT_DURABILITY`
-changes the cluster default). When unsealed WAL bytes pass `wal.disk.limit`
-(`CAMUS_WAL_DISK_LIMIT`, default 8 GiB), produce is held; it is answered
-with `REQUEST_TIMED_OUT` only when the client's `timeout_ms` runs out, and a
-held batch is not appended, so nothing acknowledged is lost. The hold has
-already slowed the producer, so `throttle_time_ms` stays 0 and the time held
-is counted in `produce_hold_ms` (`camus_produce_hold_ms_total`). A failed WAL
-write (for example a full disk) answers `KAFKA_STORAGE_ERROR` (56) and stops
-that broker's shard until restart.
+Produce acks in `r2` mode after the object is stored and the extent is
+committed. `wal` produce acks after the WAL shard commits, which means a
+majority of its voters has fsynced the batch. Every broker is a voter.
+Metadata reports the shard leader as the leader of each `wal` partition and
+the voters as replicas and ISR. A broker that is not the shard leader
+answers produce, fetch, and list-offsets with `NOT_LEADER_OR_FOLLOWER` (6).
+A produce that cannot commit within `timeout_ms`, for example with no
+quorum, gets `REQUEST_TIMED_OUT` (7); the entry may still commit later, so a
+client without idempotence can duplicate on retry. The upload to object
+storage follows the ack. A `wal` partition's leader epoch is the WAL shard's
+Raft term plus a base kept in metadata; `truncate-to-sealed` raises the
+base, so the epoch only grows. An `r2` partition's epoch is the metadata
+group's term. Batches are sealed with that epoch, publish records where each
+epoch starts, and `OffsetForLeaderEpoch` (v3–4) answers from that history
+and, on the shard leader, from the epochs of batches still in the WAL, so a
+consumer detects a truncation and a failover is not mistaken for one. Fetch,
+ListOffsets, and `OffsetForLeaderEpoch` check `current_leader_epoch`: older
+is `FENCED_LEADER_EPOCH` (74), newer is `UNKNOWN_LEADER_EPOCH` (76). The
+shard leader records itself in metadata so every broker names the same
+leader; a broker that has just restarted can name a stale leader for about a
+second, and clients recover through the usual `NOT_LEADER_OR_FOLLOWER`
+retry. After a shard loses a majority, its partitions stay offline until a
+lost voter returns or an operator runs `camus admin truncate-to-sealed`,
+which resumes them at the sealed end and drops acknowledged offsets past it
+(ADR 0008). A topic created without `durability.mode` is `wal`
+(`CAMUS_DEFAULT_DURABILITY` changes the cluster default). When unsealed WAL
+bytes pass `wal.disk.limit` (`CAMUS_WAL_DISK_LIMIT`, default 8 GiB), produce
+is held; it is answered with `REQUEST_TIMED_OUT` only when the client's
+`timeout_ms` runs out, and a held batch is not appended, so nothing
+acknowledged is lost. The hold has already slowed the producer, so
+`throttle_time_ms` stays 0 and the time held is counted in `produce_hold_ms`
+(`camus_produce_hold_ms_total`). A failed WAL write (for example a full
+disk) answers `KAFKA_STORAGE_ERROR` (56) and stops that broker's shard until
+restart.
 
 Consumer groups use the classic protocol. The metadata leader coordinates
 every group; another broker answers group requests with
@@ -187,6 +223,14 @@ still waiting for its metadata commit is safe, and has been unreferenced for
 The sweep owns every `bundle/` object under the cluster's key prefix: give each
 cluster its own bucket or its own `CAMUS_S3_PREFIX`.
 
+Camus writes no transaction control records: `read_committed` filtering is
+done by the broker from the committed and aborted offset ranges. Kafka
+clients do not need the markers, and a `read_committed` consumer that seeks
+into an aborted range gets the next committed record at its own offset. A
+`read_uncommitted` consumer sees aborted records, as in Kafka. A tool that
+reads the raw log expecting control batches, or counts them, will not find
+any.
+
 Transactions follow Kafka's coordinator timers. `InitProducerId` with a
 `transaction_timeout_ms` of 0 or less, or above `CAMUS_TXN_MAX_TIMEOUT_MS`
 (default 900000, Kafka's `transaction.max.timeout.ms`), is
@@ -238,7 +282,7 @@ acceptance test. `-` means not run.
 | CreateTopics | 19 | 1 | 2-7 | implemented | pass | pass | pass |
 | DeleteTopics | 20 | 1 | 1-6 | implemented | pass | pass | pass |
 | DeleteRecords | 21 | 4 | 0-2 | implemented | pass | pass | pass |
-| InitProducerId | 22 | 4 | 0-4 | implemented | pass | - | - |
+| InitProducerId | 22 | 4 | 0-4 | implemented | pass | pass | pass |
 | OffsetForLeaderEpoch | 23 | | 3-4 | implemented | - | - | - |
 | AddPartitionsToTxn | 24 | 5 | 0-3 | implemented | pass | pass | pass |
 | AddOffsetsToTxn | 25 | 5 | 0-3 | implemented | pass | pass | - |
@@ -251,7 +295,7 @@ acceptance test. `-` means not run.
 | DescribeConfigs | 32 | 1 | 1-4 | implemented | pass | pass | pass |
 | AlterConfigs | 33 | 4 | 0-2 | implemented | - | pass | pass |
 | AlterReplicaLogDirs | 34 | | not planned | unimplemented | - | - | - |
-| DescribeLogDirs | 35 | | 1-4 | implemented | - | - | - |
+| DescribeLogDirs | 35 | | 1-4 | implemented | pass | - | - |
 | SaslAuthenticate | 36 | 1 | 0-2 | implemented (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512) | pass | pass | pass |
 | CreatePartitions | 37 | 4 | 0-3 | implemented | pass | pass | pass |
 | CreateDelegationToken | 38 | | not planned | unimplemented | - | - | - |

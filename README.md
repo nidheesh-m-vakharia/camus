@@ -56,9 +56,10 @@ private until you change that in the package settings.
 
 ## What clients can do
 
-Change the bootstrap server. These clients have been run against Camus:
-`kafka-clients` 4.4.0, librdkafka (confluent-kafka 2.16.1), and franz-go
-v1.22.0.
+Change the bootstrap server. These have been run against Camus:
+`kafka-clients` 4.4.0, librdkafka (confluent-kafka 2.16.1), franz-go
+v1.22.0, KafkaJS 2, and, from Apache Kafka 4.4.0, the CLI tools, Kafka
+Connect, Kafka Streams with `exactly_once_v2`, and MirrorMaker 2.
 
 - Produce and fetch, including idempotent produce. A retried sequence
   returns the original offset.
@@ -68,9 +69,16 @@ v1.22.0.
 - Transactions. `read_committed` hides a batch until `EndTxn` commits it.
   An abort stays hidden. There are no control-batch markers; visibility is
   the committed and aborted offset ranges.
-- Topic admin that those libraries expose: describe cluster, describe and
-  alter configs, create partitions, delete records, delete topics, and
-  ACLs.
+- Topic admin: create topics with configs (or auto-create them), describe
+  cluster, topic and broker configs, create partitions, delete records at
+  any offset, delete topics, ACLs, log dirs, producers, and KIP-848 group
+  descriptions.
+- Retention by time and size, and deletion of objects nothing references.
+- Leader epochs and `OffsetForLeaderEpoch`, so consumers detect a
+  truncated log.
+- Users: SASL/PLAIN, SASL/SCRAM-SHA-256 and -512 (managed with the Kafka
+  admin APIs), and mTLS client certificates, with Kafka's ACL rules on
+  every API.
 - `cleanup.policy=compact` keeps the latest record for each key, at its
   original offset, over sealed extents, every `CAMUS_COMPACT_MS` (default
   300000; 0 turns it off). Tombstones go after `delete.retention.ms`, and
@@ -82,7 +90,9 @@ A few Kafka behaviors are different on purpose:
 | --- | --- |
 | `acks=1` | Same barrier as `acks=all` |
 | `acks=0` | No wait, and the batch may be lost |
-| No ACL on a resource | Denied with SASL, allowed on the dev PLAINTEXT listener; `CAMUS_ACL_ALLOW_IF_NO_ACL` overrides |
+| No ACL on a resource | Denied with SASL or mTLS, allowed on the dev PLAINTEXT listener; `CAMUS_ACL_ALLOW_IF_NO_ACL` overrides |
+| Partition leaders | One WAL shard leads every `wal` partition; no reassignment |
+| Broker configs | Set at startup, read-only; no client quotas |
 
 The full list is in [docs/compatibility.md](docs/compatibility.md).
 
@@ -99,6 +109,53 @@ See [ADR 0005](docs/adr/0005-durability-and-acks.md).
 
 Set the mode at topic creation with `durability.mode`. The cluster default
 is `CAMUS_DEFAULT_DURABILITY`.
+
+`acks=1` waits for the same barrier as `acks=all`, so it costs what
+`acks=all` costs rather than a leader-local write: in
+[Benchmarks/](Benchmarks/README.md), one producer on three brokers sees a p50
+of about 7 ms and a p99 of about 17 ms in `wal` mode, and about 294 ms and
+576 ms in `r2` mode, where each ack waits for an object store write. In
+exchange, an acknowledged record survives the loss of the leader.
+
+## Configuration
+
+Broker settings come from the environment at startup. Kafka's name is in
+parentheses where there is one; [docs/compatibility.md](docs/compatibility.md#defaults)
+lists each default next to Kafka's.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CAMUS_S3_ENDPOINT`, `CAMUS_S3_BUCKET`, `CAMUS_S3_ACCESS_KEY`, `CAMUS_S3_SECRET_KEY` | local MinIO, only with `--dev-plaintext` | Object storage |
+| `CAMUS_S3_PREFIX` | empty | Key prefix; one per cluster sharing a bucket |
+| `CAMUS_SASL_USER`, `CAMUS_SASL_PASSWORD` | — | Bootstrap SASL/PLAIN user, always a super user |
+| `CAMUS_SUPER_USERS` | — | `;`-separated principals (`super.users`) |
+| `CAMUS_ACL_ALLOW_IF_NO_ACL` | `false` on authenticated listeners | `allow.everyone.if.no.acl.found` |
+| `CAMUS_DEFAULT_DURABILITY` | `wal` | `durability.mode` for new topics |
+| `CAMUS_AUTO_CREATE_TOPICS` | `true` | `auto.create.topics.enable` |
+| `CAMUS_NUM_PARTITIONS` | 1 | `num.partitions` |
+| `CAMUS_MESSAGE_MAX_BYTES` | 1048588 | `message.max.bytes` |
+| `CAMUS_WAL_DISK_LIMIT` | 8 GiB | Unsealed WAL bytes before produce is held |
+| `CAMUS_FLUSH_MS` | 250 | How often unsealed data is uploaded |
+| `CAMUS_RETENTION_CHECK_MS` | 300000 | `log.retention.check.interval.ms` |
+| `CAMUS_COMPACT_MS` | 300000 | Compaction interval; `0` turns it off |
+| `CAMUS_SWEEP_MS` | 300000 | Orphaned-object sweep interval |
+| `CAMUS_SWEEP_MIN_AGE_MS` | 3600000 | An object younger than this is never swept |
+| `CAMUS_FILE_DELETE_DELAY_MS` | 60000 | `file.delete.delay.ms` |
+| `CAMUS_TXN_MAX_TIMEOUT_MS` | 900000 | `transaction.max.timeout.ms` |
+| `CAMUS_TXN_ABORT_INTERVAL_MS` | 10000 | How often timed-out transactions are aborted |
+| `CAMUS_TRANSACTIONAL_ID_EXPIRATION_MS` | 604800000 | `transactional.id.expiration.ms` |
+| `CAMUS_TXN_CLEANUP_INTERVAL_MS` | 3600000 | How often idle transactional ids are removed |
+| `CAMUS_PRODUCER_ID_EXPIRATION_MS` | 86400000 | `producer.id.expiration.ms` |
+| `CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS` | 600000 | `producer.id.expiration.check.interval.ms` |
+| `CAMUS_OFFSETS_RETENTION_MINUTES` | 10080 | `offsets.retention.minutes` (`CAMUS_OFFSETS_RETENTION_MS` overrides, for tests) |
+| `CAMUS_OFFSETS_RETENTION_CHECK_INTERVAL_MS` | 600000 | `offsets.retention.check.interval.ms` |
+| `CAMUS_GROUP_INITIAL_DELAY_MS` | 3000 | `group.initial.rebalance.delay.ms` |
+| `CAMUS_GROUP_MIN_SESSION_MS` | 6000 | `group.min.session.timeout.ms` |
+| `CAMUS_CONSUMER_SESSION_MS`, `CAMUS_CONSUMER_HEARTBEAT_MS` | 45000, 5000 | KIP-848 session and heartbeat |
+
+Flags: `--kafka-addr`, `--advertised-addr` (`advertised.listeners`),
+`--tls-cert`/`--tls-key` (SASL_SSL), `--tls-client-ca` (mTLS),
+`--require-sasl`, `--dev-plaintext`, `--allow-non-loopback`.
 
 ## Develop
 
