@@ -63,9 +63,11 @@ this change, is on shard 0.
 
 ### Runtime
 
-The broker's single `WalSlot` becomes a set of shards keyed by id. A broker
-opens the shards it is a voter of, each in `wal_dir/<shard>`. On startup a
-`wal_dir` in the old single-shard layout is moved to `wal_dir/0`.
+The broker's single `WalSlot` becomes a set of shards keyed by id. Shard 0
+stays in `wal_dir`, where the single-shard build keeps it, so an upgraded
+broker moves nothing; shard `n > 0` lives in `<data-dir>/wal-shards/<n>`. A
+broker opens every shard in `wal/shards` as soon as it sees the layout; a
+shard it is not a voter of stays empty and receives no RPC.
 
 WAL RPC moves to `/wal/<shard>/raft-*` and `/wal/<shard>/init`. The current
 `/wal/raft-*` routes stay as aliases for shard 0 for one release, so a rolling
@@ -160,10 +162,10 @@ Each step lands with its tests and leaves the cluster working.
 - **Moving partitions between shards to balance load.** Resharding; needs
   a copy protocol and is a separate decision.
 
-## Open questions
+## Resolved in review
 
-- Should the default shard count be the broker count, or a fixed number
-  larger than it (say 3 × brokers) so a broker loss spreads its shards'
-  leadership over several survivors?
-- Is a per-shard bundle acceptable for cost, or should one upload pass
-  bundle every shard a broker leads into one object?
+- Default shard count: one per broker, as above. A multiple of the broker
+  count would spread a lost broker's leadership wider but multiplies Raft
+  groups, heartbeats, and object puts.
+- Bundling: one object per shard per flush, as above, so a slow or
+  truncated shard never holds up another's publish.
