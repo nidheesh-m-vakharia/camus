@@ -376,6 +376,11 @@ pub fn publish(
             max_timestamp: part.max_timestamp,
         });
         state.next_offset = part.end;
+        // `DeleteRecords` may have moved the log start past records that were
+        // still in the WAL. Their extent is not kept; the sweep removes the
+        // object once nothing else points into it.
+        let log_start = state.log_start;
+        state.extents.retain(|extent| extent.end > log_start);
     }
     let mut put = Vec::new();
     for ((topic, partition), state) in pending {

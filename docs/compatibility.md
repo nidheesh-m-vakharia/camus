@@ -32,7 +32,6 @@ Until then the API returns an error rather than a partial imitation.
 | `ApiVersions` contents | Only implemented keys and versions | Every key the broker implements | 0003 |
 | `acks=1` | Same barrier as `acks=all`: WAL quorum fsync, or R2 put plus metadata commit | Leader-local ack | 0005 |
 | Unclean leader election | Never automatic. Operator truncate only | Default off, can be enabled | 0008 |
-| `DeleteRecords` midpoint | Advances to the next whole-object boundary | Can split a segment | 0010 |
 | Idempotence | `InitProducerId` allocates a producer id. A retried sequence returns the original offset and is not appended | Supported | 0009 |
 | Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. There is no control-batch marker | Control batches plus `read_committed` | 0013 |
 | Compaction | Latest key, original offset, sealed extents only, on a timer rather than a dirty ratio. A tombstone's `delete.retention.ms` counts from its own timestamp | `LogCleaner` by dirty ratio; tombstone horizon counts from the first cleaning (KIP-534) | 0010 |
@@ -66,12 +65,11 @@ partitions stay offline until a lost voter returns or an operator runs
 drops acknowledged offsets past it (ADR 0008).
 A topic created without `durability.mode` is `wal` (`CAMUS_DEFAULT_DURABILITY`
 changes the cluster default). When unsealed WAL bytes pass `wal.disk.limit`
-(`CAMUS_WAL_DISK_LIMIT`, default 8 GiB), produce is held and the response's
-`throttle_time_ms` is the time held; it is answered with `REQUEST_TIMED_OUT`
-only when the client's `timeout_ms` runs out, and a held batch is not
-appended, so nothing acknowledged is lost. Kafka 4.4.0 answers a quota
-breach at once and lets the client wait out `throttle_time_ms`; Camus holds
-first, so a client that also honors the throttle waits twice. A failed WAL
+(`CAMUS_WAL_DISK_LIMIT`, default 8 GiB), produce is held; it is answered
+with `REQUEST_TIMED_OUT` only when the client's `timeout_ms` runs out, and a
+held batch is not appended, so nothing acknowledged is lost. The hold has
+already slowed the producer, so `throttle_time_ms` stays 0 and the time held
+is counted in `produce_hold_ms` (`camus_produce_hold_ms_total`). A failed WAL
 write (for example a full disk) answers `KAFKA_STORAGE_ERROR` (56) and stops
 that broker's shard until restart.
 
@@ -91,10 +89,19 @@ regexes are Rust regexes. An offset commit is accepted at the member's
 current epoch or the previous one. The Java client's default remains
 `group.protocol=classic`. `group.protocol=consumer` is exercised by
 `GroupConsumerRoundTrip`.
-`DeleteRecords` moves the log start to the next whole-object boundary at or
-after the requested offset, and the response low watermark is that offset.
-An offset past the sealed end is `OFFSET_OUT_OF_RANGE` (1), including
-records that are still only in the WAL. `cleanup.policy=compact` keeps the
+`DeleteRecords` moves the log start to the requested offset, as in Kafka, up
+to the high watermark, which includes records still only in the WAL; `-1`
+means the high watermark, and an offset past it is `OFFSET_OUT_OF_RANGE` (1).
+A fetch below the log start is out of range; a fetch at it may receive the
+whole batch it falls in, as with Kafka, and the client skips the earlier
+records. Storage is reclaimed a whole object at a time by the sweep.
+Metadata creates a missing topic it is asked about when
+`CAMUS_AUTO_CREATE_TOPICS` (Kafka's `auto.create.topics.enable`, default
+`true`) is on, the request allows it, and the caller has `CREATE` on the
+cluster or the topic; it has `CAMUS_NUM_PARTITIONS` partitions (default 1)
+and the first answer is `LEADER_NOT_AVAILABLE` (5). Topic names follow
+Kafka's rules (1–249 of `[a-zA-Z0-9._-]`, not `.` or `..`, no collision when
+`.` and `_` are treated alike); others are `INVALID_TOPIC_EXCEPTION` (17). `cleanup.policy=compact` keeps the
 latest record for each key at its original offset. Compaction runs every
 `CAMUS_COMPACT_MS` (default 300000; `0` turns it off) over the leading sealed
 extents whose newest record is at least `min.compaction.lag.ms` old; the

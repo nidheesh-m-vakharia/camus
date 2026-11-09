@@ -328,10 +328,17 @@ impl Kafka {
                     continue;
                 }
                 local.push(None);
+                // Kafka lets DeleteRecords reach the high watermark, so the
+                // cut may include records still only in the WAL.
+                let high_watermark = stored
+                    .as_ref()
+                    .and_then(|stored| self.high_watermark(stored, partition.partition_index))
+                    .unwrap_or(-1);
                 cuts.push(RecordCut {
                     topic: topic.name.0.to_string(),
                     partition: partition.partition_index,
                     offset: partition.offset,
+                    high_watermark,
                 });
             }
         }

@@ -1,9 +1,10 @@
 //! Phase 4 admin commands: more partitions, topic configs, log start, offset delete.
 //!
-//! `DeleteRecords` follows ADR 0010. A cut in the middle of an object moves
-//! the log start to that object's end, and the response low watermark is the
-//! offset actually removed. An offset past the sealed end is
-//! `OFFSET_OUT_OF_RANGE`.
+//! `DeleteRecords` moves the log start to the requested offset, as in Kafka.
+//! Extents wholly below it are dropped; an extent the cut falls inside stays,
+//! and fetch starts at the log start within it. The offset may be anything up
+//! to the high watermark the proposer saw, including records still only in
+//! the WAL; past that it is `OFFSET_OUT_OF_RANGE`.
 
 use std::collections::BTreeMap;
 
@@ -86,8 +87,16 @@ pub struct RecordCut {
     pub topic: String,
     /// Partition.
     pub partition: i32,
-    /// Delete records before this offset. `-1` means the sealed end.
+    /// Delete records before this offset. `-1` means the high watermark.
     pub offset: i64,
+    /// The partition's high watermark as the proposer saw it, sealed or
+    /// not. `-1` limits the cut to the sealed end.
+    #[serde(default = "no_offset")]
+    pub high_watermark: i64,
+}
+
+fn no_offset() -> i64 {
+    -1
 }
 
 /// Partitions whose committed offsets should be removed.
@@ -229,7 +238,7 @@ pub fn alter_configs(
     })
 }
 
-/// Move log starts to an object boundary at or after the requested offset.
+/// Move log starts to the requested offsets.
 pub fn delete_records(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     cuts: &[RecordCut],
@@ -258,20 +267,16 @@ pub fn delete_records(
             ids.insert(cut.topic.clone(), topic.id.clone());
         }
         let state = pending.get_mut(&key).expect("inserted");
-        let offset = if cut.offset < 0 {
-            state.next_offset
-        } else {
-            cut.offset
-        };
-        if offset > state.next_offset {
+        let limit = state.next_offset.max(cut.high_watermark);
+        let offset = if cut.offset < 0 { limit } else { cut.offset };
+        if offset > limit {
             items.push(Item {
                 code: OFFSET_OUT_OF_RANGE,
                 low: -1,
             });
             continue;
         }
-        let low = boundary(state, offset);
-        state.log_start = state.log_start.max(low);
+        state.log_start = state.log_start.max(offset);
         state.extents.retain(|extent| extent.end > state.log_start);
         items.push(Item {
             code: 0,
@@ -291,20 +296,6 @@ pub fn delete_records(
         del: Vec::new(),
         items,
     })
-}
-
-/// The sealed boundary at or after `offset`. Inside an object, that is the
-/// object's end. On a boundary, it is `offset` itself.
-fn boundary(state: &Partition, offset: i64) -> i64 {
-    if offset <= state.log_start {
-        return state.log_start;
-    }
-    for extent in &state.extents {
-        if offset < extent.end && offset > extent.start {
-            return extent.end;
-        }
-    }
-    offset
 }
 
 /// Delete committed offsets. A group with members cannot drop a topic it
@@ -415,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mid_object_delete_jumps_to_the_object_end() {
+    fn a_delete_moves_the_log_start_to_the_exact_offset() {
         let mut map = world();
         let get = |key: &str| Ok(map.get(key).cloned());
         let part = PublishPart {
@@ -442,13 +433,65 @@ mod tests {
                 topic: "events".into(),
                 partition: 0,
                 offset: 4,
+                high_watermark: -1,
             }],
         )
         .unwrap();
-        assert_eq!(done.items[0].low, 10);
+        assert_eq!(done.items[0].low, 4);
         let state: Partition = serde_json::from_str(&done.put[0].1).unwrap();
+        assert_eq!(state.extents.len(), 1, "the extent holding offset 4 stays");
+        assert_eq!(state.log_start, 4);
+
+        let cut = |offset: i64, high_watermark: i64| RecordCut {
+            topic: "events".into(),
+            partition: 0,
+            offset,
+            high_watermark,
+        };
+        let past = delete_records(&get, &[cut(15, -1)]).unwrap();
+        assert_eq!(past.items[0].code, OFFSET_OUT_OF_RANGE);
+        let unsealed = delete_records(&get, &[cut(15, 20)]).unwrap();
+        assert_eq!(unsealed.items[0].low, 15);
+        let state: Partition = serde_json::from_str(&unsealed.put[0].1).unwrap();
         assert!(state.extents.is_empty());
-        assert_eq!(state.log_start, 10);
+    }
+
+    #[test]
+    fn an_extent_published_below_the_log_start_is_dropped() {
+        let mut map = world();
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let done = delete_records(
+            &get,
+            &[RecordCut {
+                topic: "events".into(),
+                partition: 0,
+                offset: 5,
+                high_watermark: 10,
+            }],
+        )
+        .unwrap();
+        for (key, value) in done.put {
+            map.insert(key, value);
+        }
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let part = |start: i64, end: i64| PublishPart {
+            topic: "events".into(),
+            partition: 0,
+            start,
+            end,
+            object_key: format!("bundle/{start}"),
+            file_offset: 0,
+            length: 4,
+            base_timestamp: 0,
+            max_timestamp: 0,
+        };
+        let Outcome::Change { put, .. } = publish(&get, &[part(0, 3), part(3, 8)], &[]).unwrap()
+        else {
+            panic!("publish");
+        };
+        let state: Partition = serde_json::from_str(&put[0].1).unwrap();
+        assert_eq!(state.extents.len(), 1);
+        assert_eq!(state.extents[0].start, 3);
     }
 
     #[test]

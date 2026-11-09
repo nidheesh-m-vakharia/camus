@@ -78,11 +78,10 @@ const REQUEST_TIMED_OUT: i16 = 7;
 const TOO_LARGE: i16 = 10;
 const INVALID_RECORD: i16 = 87;
 const INVALID_PARTITIONS: i16 = 37;
+const INVALID_TOPIC: i16 = 17;
 const INVALID_TRANSACTION_TIMEOUT: i16 = 50;
 const INVALID_REPLICATION_FACTOR: i16 = 38;
 const INVALID_REPLICA_ASSIGNMENT: i16 = 39;
-/// Kafka `num.partitions`, used when CreateTopics sends -1.
-const DEFAULT_PARTITIONS: i32 = 1;
 /// `DescribeConfigs` sources: set on the topic, set on the broker, default.
 const CONFIG_SOURCE_TOPIC: i8 = 1;
 const CONFIG_SOURCE_BROKER: i8 = 4;
@@ -185,6 +184,11 @@ pub struct Kafka {
     producer_id_check_ms: u64,
     /// `durability.mode` for a topic created without one. `wal` per ADR 0005.
     default_durability: String,
+    /// Kafka's `auto.create.topics.enable`.
+    auto_create_topics: bool,
+    /// Kafka's `num.partitions`, for auto-created topics and CreateTopics
+    /// with `-1`.
+    default_partitions: i32,
     /// `message.max.bytes`: the batch limit for a topic without
     /// `max.message.bytes`. Kafka's default, 1048588.
     message_max_bytes: usize,
@@ -268,6 +272,14 @@ impl Kafka {
         let producer_id_expiration_ms =
             env_ms("CAMUS_PRODUCER_ID_EXPIRATION_MS", 86_400_000) as i64;
         let producer_id_check_ms = env_ms("CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS", 600_000);
+        let auto_create_topics = std::env::var("CAMUS_AUTO_CREATE_TOPICS")
+            .map(|value| value != "false")
+            .unwrap_or(true);
+        let default_partitions = std::env::var("CAMUS_NUM_PARTITIONS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(1);
         let message_max_bytes = std::env::var("CAMUS_MESSAGE_MAX_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -288,6 +300,8 @@ impl Kafka {
             port,
             flush_ms,
             compact_ms,
+            auto_create_topics,
+            default_partitions,
             message_max_bytes,
             retention_check_ms,
             sweep_ms,
@@ -511,6 +525,17 @@ impl Kafka {
         )))
     }
 
+    /// The partition's high watermark: the sealed end, or the WAL end for a
+    /// `wal` topic when that is further.
+    fn high_watermark(&self, topic: &Topic, partition: i32) -> Option<i64> {
+        let sealed = self.partition_state(topic, partition)?.next_offset;
+        if topic.durability == "wal" {
+            Some(sealed.max(self.wal().end_offset(&topic_id(topic), partition)))
+        } else {
+            Some(sealed)
+        }
+    }
+
     /// The largest batch `topic` accepts: its `max.message.bytes`, or the
     /// broker's `message.max.bytes`.
     fn batch_limit(&self, topic: &Topic) -> usize {
@@ -574,6 +599,7 @@ impl Kafka {
                         topic: name.clone(),
                         partition,
                         offset,
+                        high_watermark: -1,
                     });
                 }
             }
@@ -1175,6 +1201,8 @@ impl Kafka {
         // Kafka leaves out topics the caller may not describe when it lists
         // every topic, and reports them as unauthorized when they are named.
         let listing = request.topics.is_none();
+        let auto_create = self.auto_create_topics
+            && (header.request_api_version < 4 || request.allow_auto_topic_creation);
         let names = match request.topics {
             None => self.topic_names(),
             Some(topics) => topics
@@ -1201,6 +1229,10 @@ impl Kafka {
         response.controller_id = BrokerId(leader.unwrap_or(-1));
         response.brokers = self.broker_list();
         for name in names {
+            if !listing && auto_create && self.topic(&name).is_none() {
+                response.topics.push(self.auto_create(&name, caller).await);
+                continue;
+            }
             if self.allows(caller, auth::TOPIC, &name, auth::DESCRIBE) {
                 response.topics.push(self.metadata_topic(&name, leader));
             } else if !listing {
@@ -1211,6 +1243,42 @@ impl Kafka {
             }
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
+    }
+
+    /// Create a topic a Metadata request named, as Kafka's
+    /// `auto.create.topics.enable` does: with `CREATE` on the cluster or the
+    /// topic, the broker's partition count, and the default durability. The
+    /// first answer is `LEADER_NOT_AVAILABLE`, so the client asks again.
+    async fn auto_create(&self, name: &str, caller: &Caller) -> MetadataResponseTopic {
+        let mut topic = MetadataResponseTopic::default();
+        topic.name = Some(topic_name(name));
+        let allowed = self.allows(caller, auth::CLUSTER, auth::CLUSTER_NAME, auth::CREATE)
+            || self.allows(caller, auth::TOPIC, name, auth::CREATE);
+        if !allowed {
+            topic.error_code = auth::TOPIC_FAILED;
+            return topic;
+        }
+        if self.check_topic_name(name).is_err() {
+            topic.error_code = INVALID_TOPIC;
+            return topic;
+        }
+        let created = self
+            .meta_apply(Command::CreateTopic {
+                name: name.to_string(),
+                id: Uuid::new_v4().to_string(),
+                partitions: self.default_partitions,
+                durability: self.default_durability.clone(),
+                configs: Vec::new(),
+            })
+            .await;
+        topic.error_code = match created {
+            Ok(response) if response.error_code == 0 || response.error_code == 36 => {
+                LEADER_NOT_AVAILABLE
+            }
+            Ok(response) => response.error_code,
+            Err(_) => LEADER_NOT_AVAILABLE,
+        };
+        topic
     }
 
     fn topic_names(&self) -> Vec<String> {
@@ -1348,7 +1416,7 @@ impl Kafka {
                 .map(|(_, value)| value.clone().unwrap_or_default())
                 .unwrap_or_else(|| self.default_durability.clone());
             let partitions = if topic.num_partitions == -1 {
-                DEFAULT_PARTITIONS
+                self.default_partitions
             } else {
                 topic.num_partitions
             };
@@ -1453,6 +1521,7 @@ impl Kafka {
         if self.topic(name).is_some() {
             return Err((36, None));
         }
+        self.check_topic_name(name)?;
         if !topic.assignments.is_empty() {
             return Err((
                 INVALID_REPLICA_ASSIGNMENT,
@@ -1482,6 +1551,40 @@ impl Kafka {
         }
         camus_metadata::config::check_create(configs)
             .map_err(|rejected| (rejected.code, Some(rejected.message)))
+    }
+
+    /// Kafka's topic name rules: 1 to 249 characters from `[a-zA-Z0-9._-]`,
+    /// not `.` or `..`, and no collision with an existing name once `.` and
+    /// `_` are treated as the same, since metric names cannot tell them apart.
+    fn check_topic_name(&self, name: &str) -> Result<(), (i16, Option<String>)> {
+        let invalid = |why: String| Err((INVALID_TOPIC, Some(why)));
+        if name.is_empty() || name == "." || name == ".." {
+            return invalid(format!("Topic name '{name}' is illegal."));
+        }
+        if name.len() > 249 {
+            return invalid(format!(
+                "Topic name '{name}' is longer than 249 characters."
+            ));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return invalid(format!(
+                "Topic name '{name}' contains a character other than ASCII alphanumerics, '.', '_', and '-'."
+            ));
+        }
+        let folded = name.replace('.', "_");
+        if let Some(existing) = self
+            .topic_names()
+            .into_iter()
+            .find(|existing| existing != name && existing.replace('.', "_") == folded)
+        {
+            return invalid(format!(
+                "Topic '{name}' collides with existing topic: {existing}"
+            ));
+        }
+        Ok(())
     }
 
     /// The replica count Metadata reports for a topic of this durability.
@@ -1814,7 +1917,14 @@ impl Kafka {
                 }
             }
         }
-        response.throttle_time_ms = i32::try_from(held.as_millis()).unwrap_or(i32::MAX);
+        // The hold already slowed this producer. Reporting it as
+        // `throttle_time_ms` too would make a client that honors the throttle
+        // wait a second time, so the time goes to a metric instead.
+        PRODUCE_HOLD_MS.fetch_add(
+            u64::try_from(held.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        response.throttle_time_ms = 0;
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
@@ -2812,6 +2922,9 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 }
+
+/// Milliseconds produce requests spent held at `wal.disk.limit`, in total.
+pub static PRODUCE_HOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Kafka ACL resource types, operations, and authorization errors.
 pub(crate) mod auth {

@@ -216,7 +216,10 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
          camus_sweep_objects_deleted_total {}\n\
          # HELP camus_sweep_bytes_deleted_total Bytes in the objects the orphan sweep deleted.\n\
          # TYPE camus_sweep_bytes_deleted_total counter\n\
-         camus_sweep_bytes_deleted_total {}\n",
+         camus_sweep_bytes_deleted_total {}\n\
+         # HELP camus_produce_hold_ms_total Milliseconds produce requests were held at the WAL disk limit.\n\
+         # TYPE camus_produce_hold_ms_total counter\n\
+         camus_produce_hold_ms_total {}\n",
         metrics.current_term,
         if metrics.current_leader == Some(metrics.id) {
             1
@@ -227,6 +230,7 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
         stats.sweeps.load(Relaxed),
         stats.objects_deleted.load(Relaxed),
         stats.bytes_deleted.load(Relaxed),
+        kafka::PRODUCE_HOLD_MS.load(Relaxed),
     )
 }
 
@@ -253,6 +257,7 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "sweeps": camus_compactor::STATS.sweeps.load(std::sync::atomic::Ordering::Relaxed),
         "sweep_objects_deleted": camus_compactor::STATS.objects_deleted.load(std::sync::atomic::Ordering::Relaxed),
         "sweep_bytes_deleted": camus_compactor::STATS.bytes_deleted.load(std::sync::atomic::Ordering::Relaxed),
+        "produce_hold_ms": kafka::PRODUCE_HOLD_MS.load(std::sync::atomic::Ordering::Relaxed),
     }))
 }
 

@@ -83,7 +83,6 @@ A few Kafka behaviors are different on purpose:
 | `acks=1` | Same barrier as `acks=all` |
 | `acks=0` | No wait, and the batch may be lost |
 | No ACL on a resource | Denied with SASL, allowed on the dev PLAINTEXT listener; `CAMUS_ACL_ALLOW_IF_NO_ACL` overrides |
-| `DeleteRecords` | Deletes through the next whole object, not an arbitrary offset |
 
 The full list is in [docs/compatibility.md](docs/compatibility.md).
 
