@@ -768,15 +768,30 @@ pub fn single(dir: &Path, opts: Opts) -> Node {
 }
 
 pub fn init(nodes: &[Node], wal: &[i32]) {
-    let peers: Vec<_> = nodes
+    post_init(nodes, &serde_json::json!(peers(nodes, wal)));
+}
+
+/// [`init`] with exactly `shards` WAL shards.
+pub fn init_shards(nodes: &[Node], wal: &[i32], shards: u32) {
+    post_init(
+        nodes,
+        &serde_json::json!({"peers": peers(nodes, wal), "shards": shards}),
+    );
+}
+
+fn peers(nodes: &[Node], wal: &[i32]) -> Vec<serde_json::Value> {
+    nodes
         .iter()
         .map(|node| {
             serde_json::json!({"id": node.id, "addr": node.http, "wal": wal.contains(&node.id)})
         })
-        .collect();
+        .collect()
+}
+
+fn post_init(nodes: &[Node], body: &serde_json::Value) {
     let init = reqwest::blocking::Client::new()
         .post(format!("http://{}/admin/init", nodes[0].http))
-        .json(&peers)
+        .json(body)
         .send()
         .unwrap();
     assert!(init.status().is_success(), "{}", init.text().unwrap());

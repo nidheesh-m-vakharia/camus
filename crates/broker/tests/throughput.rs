@@ -121,7 +121,8 @@ fn run(producers: usize, seconds: u64) -> Row {
             )
         })
         .collect();
-    init(&nodes, &(1..=brokers).collect::<Vec<_>>());
+    // One shard, so every partition is on the leader the producers dial.
+    init_shards(&nodes, &(1..=brokers).collect::<Vec<_>>(), 1);
     let meta_leader = wait_settled(&nodes.iter().collect::<Vec<_>>());
     let controller = nodes.iter().find(|node| node.id == meta_leader).unwrap();
     create_topic_with(&kafka_addr(controller), "wal", producers as i32);
