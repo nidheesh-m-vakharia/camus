@@ -37,7 +37,7 @@ error rather than a partial imitation.
 | Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. There is no control-batch marker | Control batches plus `read_committed` | 0013 |
 | Compaction | Latest key, original offset, sealed extents only, on a timer rather than a dirty ratio. A tombstone's `delete.retention.ms` counts from its own timestamp | `LogCleaner` by dirty ratio; tombstone horizon counts from the first cleaning (KIP-534) | 0010 |
 | ACLs | A resource with no ACL is denied on an authenticated listener (SASL or mTLS) and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
-| Partition leadership | Leadership belongs to WAL shards, one per broker by default, each with up to three voters; partitions are placed on shards round-robin at creation and never move. A shard's first voter leads it after `init`; after a failover leadership does not move back yet, and there is no `ElectLeaders` (ADR 0014 step 3) | Leaders per partition, preferred-leader rebalance, reassignment, `ElectLeaders` | 0006, 0014 |
+| Partition leadership | Leadership belongs to WAL shards, one per broker by default, each with up to three voters; partitions are placed on shards round-robin at creation and never move. A shard's first voter is its preferred leader: the balancer and `ElectLeaders PREFERRED` move all of the shard's partitions together, by election, so the shard pauses briefly and its epoch rises | Leaders and preferred replicas per partition, reassignment | 0006, 0014 |
 | Topic configs | Segment, flush, and `min.insync.replicas` configs are accepted and stored with no effect; `LogAppendTime`, broker-side recompression, and tiered storage are rejected | All applied | — |
 | Broker configs and quotas | Broker settings come from the environment at startup and are read-only in `DescribeConfigs`; client quotas are not implemented | Dynamic broker configs and quotas | — |
 
@@ -73,6 +73,8 @@ is set by an environment variable.
 | `group.min.session.timeout.ms` | 6000 | 6000 | `CAMUS_GROUP_MIN_SESSION_MS` |
 | `group.consumer.session.timeout.ms` / heartbeat | 45000 / 5000 | same | `CAMUS_CONSUMER_SESSION_MS` / `CAMUS_CONSUMER_HEARTBEAT_MS` |
 | `group.consumer.assignors` | `uniform` (sticky), `range` | same | — |
+| `auto.leader.rebalance.enable` | `true` | `true`, per WAL shard | `CAMUS_AUTO_LEADER_REBALANCE` |
+| `leader.imbalance.check.interval.seconds` | 300 | 300000 ms | `CAMUS_LEADER_IMBALANCE_CHECK_MS` |
 | `ssl.client.auth` | `none` | `none`; `required` with `--tls-client-ca` | — |
 | PLAINTEXT listener | allowed | opt-in with `--dev-plaintext`, loopback unless `--allow-non-loopback` | — |
 | Object storage settings | — | required when serving TLS | `CAMUS_S3_*` |
@@ -303,7 +305,7 @@ acceptance test. `-` means not run.
 | ExpireDelegationToken | 40 | | not planned | unimplemented | - | - | - |
 | DescribeDelegationToken | 41 | | not planned | unimplemented | - | - | - |
 | DeleteGroups | 42 | 3 | 0-3 | implemented | pass | pass | pass |
-| ElectLeaders | 43 | | internal leader changes follow Raft; API not planned | unimplemented | - | - | - |
+| ElectLeaders | 43 | | 0-2 (`PREFERRED`; `UNCLEAN` answers 83) | implemented | - | - | - |
 | IncrementalAlterConfigs | 44 | 4 | 0-1 | implemented | pass | pass | pass |
 | AlterPartitionReassignments | 45 | | not planned | unimplemented | - | - | - |
 | ListPartitionReassignments | 46 | | not planned | unimplemented | - | - | - |

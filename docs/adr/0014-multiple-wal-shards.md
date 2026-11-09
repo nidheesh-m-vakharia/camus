@@ -125,6 +125,21 @@ for each partition requested:
 `ELIGIBLE_LEADERS_NOT_AVAILABLE` (83). Authorization is cluster `ALTER`, as
 in Kafka.
 
+## As built
+
+- `init` sets each shard's membership on every voter, not just the first,
+  and returns only once every voter of every shard has it. A voter that
+  granted a vote before its own initialize learns the membership from the
+  leader instead; without the wait, a shard whose first leader died at
+  once was left with no voter able to elect.
+- Handovers are driven by the current leader, which alone can see whether
+  the preferred voter has every entry. The balancer runs on each shard's
+  leader. `ElectLeaders` asks the leader through `/wal/<id>/hand-over`.
+- Followers that heard from a leader within its lease refuse votes, so one
+  campaign can end in an election someone else wins. A handover therefore
+  campaigns again, past the lease, until the preferred voter leads (up to
+  about three seconds); `ElectLeaders` answers `0` only once it has.
+
 ## Delivery
 
 Each step lands with its tests and leaves the cluster working.

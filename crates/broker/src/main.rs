@@ -183,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/admin/metrics", get(admin_metrics))
                 .route("/admin/init", post(init))
                 .route("/admin/truncate-to-sealed", post(truncate_to_sealed))
+                .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .with_state(Arc::clone(&admin)),
         )
         .merge(
@@ -192,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/wal/raft-append", post(wal_append))
                 .route("/wal/raft-snapshot", post(wal_snapshot))
                 .route("/wal/{shard}/init", post(shard_init))
+                .route("/wal/{shard}/campaign", post(shard_campaign))
                 .route("/wal/{shard}/raft-vote", post(shard_vote))
                 .route("/wal/{shard}/raft-append", post(shard_append))
                 .route("/wal/{shard}/raft-snapshot", post(shard_snapshot))
@@ -418,40 +420,106 @@ async fn init(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
-    // Initialize each shard on its first voter, which then usually leads it.
-    // A broker opens a new shard once it sees the layout, so retry until it
-    // has.
+    // Initialize each shard on every voter, with the same membership, so
+    // any majority of them can elect even if one dies before it first
+    // leads. A broker opens a new shard once it sees the layout, so retry
+    // until it has; a voter that is already initialized answers 409. Then
+    // the first voter campaigns, so it usually leads the shard.
     for (shard, members) in layout.iter().enumerate() {
-        let map: BTreeMap<NodeId, BasicNode> =
-            members.iter().map(|id| (*id, nodes[id].clone())).collect();
-        let first = &nodes[&members[0]];
+        let map: BTreeMap<NodeId, BasicNode> = members
+            .iter()
+            .map(|id| (*id, nodes[id].clone()))
+            .collect();
         let path = if shard == 0 {
             "wal/init".to_string()
         } else {
             format!("wal/{shard}/init")
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let sent = admin
+        for member in members {
+            let addr = &nodes[member].addr;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let sent = admin
+                    .http
+                    .post(format!("http://{addr}/{path}"))
+                    .json(&map)
+                    .send()
+                    .await;
+                match sent {
+                    Ok(response)
+                        if response.status().is_success()
+                            || response.status() == StatusCode::CONFLICT =>
+                    {
+                        break
+                    }
+                    Ok(response)
+                        if response.status() != StatusCode::NOT_FOUND
+                            || std::time::Instant::now() > deadline =>
+                    {
+                        let status = StatusCode::from_u16(response.status().as_u16())
+                            .unwrap_or(StatusCode::BAD_GATEWAY);
+                        return Err((status, response.text().await.unwrap_or_default()));
+                    }
+                    Err(err) if std::time::Instant::now() > deadline => {
+                        return Err((StatusCode::BAD_GATEWAY, err.to_string()));
+                    }
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                }
+            }
+        }
+        if layout.len() > 1 {
+            let first = &nodes[&members[0]].addr;
+            let _ = admin
                 .http
-                .post(format!("http://{}/{path}", first.addr))
-                .json(&map)
+                .post(format!("http://{first}/wal/{shard}/campaign"))
                 .send()
                 .await;
-            match sent {
-                Ok(response) if response.status().is_success() => break,
-                Ok(response)
-                    if response.status() != StatusCode::NOT_FOUND
-                        || std::time::Instant::now() > deadline =>
-                {
-                    let status = StatusCode::from_u16(response.status().as_u16())
-                        .unwrap_or(StatusCode::BAD_GATEWAY);
-                    return Err((status, response.text().await.unwrap_or_default()));
+        }
+    }
+    // A voter that granted a vote before its own initialize refuses it and
+    // learns the membership from the leader instead. Return only once every
+    // voter of every shard has it, so any majority can elect even if the
+    // first leader dies at once.
+    for (shard, members) in layout.iter().enumerate() {
+        for member in members {
+            let addr = &nodes[member].addr;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let formed = admin
+                    .http
+                    .get(format!("http://{addr}/admin/metrics"))
+                    .send()
+                    .await
+                    .ok();
+                let formed = match formed {
+                    Some(response) => response
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|metrics| {
+                            metrics["wal_shards"].as_array().and_then(|shards| {
+                                shards
+                                    .iter()
+                                    .find(|row| row["id"].as_u64() == Some(shard as u64))
+                                    .map(|row| {
+                                        row["voters"].as_array().map_or(0, Vec::len)
+                                            == members.len()
+                                    })
+                            })
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if formed {
+                    break;
                 }
-                Err(err) if std::time::Instant::now() > deadline => {
-                    return Err((StatusCode::BAD_GATEWAY, err.to_string()));
+                if std::time::Instant::now() > deadline {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("wal shard {shard} has no membership on broker {member}"),
+                    ));
                 }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
     }
@@ -471,6 +539,75 @@ async fn shard_init(
     Json(nodes): Json<BTreeMap<NodeId, BasicNode>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     initialize_shard(&wal, shard, nodes).await
+}
+
+/// Make this broker campaign for a shard. Only the shard's leader asks,
+/// after checking this broker has every entry (ADR 0014).
+async fn shard_campaign(
+    State(wal): State<Arc<WalSlot>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(opened) = wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    opened
+        .campaign()
+        .await
+        .map(|()| StatusCode::OK)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+#[derive(Deserialize)]
+struct HandOver {
+    to: NodeId,
+}
+
+/// On a shard's leader: hand the shard to voter `to` when it has caught up,
+/// by asking it to campaign. `409` when this broker does not lead the shard
+/// or `to` is behind.
+async fn shard_hand_over(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<HandOver>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    if body.to == admin.node_id {
+        return Ok(StatusCode::OK);
+    }
+    if !opened.follower_caught_up(body.to) {
+        return Err((StatusCode::CONFLICT, format!("voter {} is behind", body.to)));
+    }
+    let addr = opened
+        .voter_addr(body.to)
+        .ok_or_else(|| (StatusCode::CONFLICT, format!("{} is not a voter", body.to)))?;
+    // openraft 0.9 has no leadership transfer, and followers that heard from
+    // a leader within its lease refuse votes, so one campaign can end in an
+    // election someone else wins. Campaign again, past the lease, until `to`
+    // leads.
+    for _ in 0..6 {
+        if opened.leader() == Some(body.to) {
+            return Ok(StatusCode::OK);
+        }
+        let _ = admin
+            .http
+            .post(format!("http://{addr}/wal/{shard}/campaign"))
+            .send()
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if opened.leader() == Some(body.to) {
+        Ok(StatusCode::OK)
+    } else {
+        Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("voter {} did not take shard {shard}", body.to),
+        ))
+    }
 }
 
 async fn initialize_shard(

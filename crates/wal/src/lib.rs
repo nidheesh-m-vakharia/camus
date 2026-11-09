@@ -449,6 +449,40 @@ impl Shard {
     }
 
     /// Whether this process is the shard leader.
+    /// Campaign for leadership. openraft 0.9 has no leadership transfer, so
+    /// a preferred leader takes the shard back by winning an election
+    /// (ADR 0014).
+    pub async fn campaign(&self) -> anyhow::Result<()> {
+        self.raft.trigger().elect().await?;
+        Ok(())
+    }
+
+    /// On the leader: `follower` has every entry the leader has, so it can
+    /// win an election without losing anything.
+    pub fn follower_caught_up(&self, follower: NodeId) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        let Some(replication) = metrics.replication else {
+            return false;
+        };
+        let matched = replication
+            .get(&follower)
+            .copied()
+            .flatten()
+            .map(|log| log.index);
+        matched.is_some() && matched == metrics.last_log_index
+    }
+
+    /// The HTTP address of a voter, from the shard's membership.
+    pub fn voter_addr(&self, node: NodeId) -> Option<String> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .get_node(&node)
+            .map(|node| node.addr.clone())
+    }
+
     /// The shard's current Raft term.
     pub fn term(&self) -> u64 {
         self.raft.metrics().borrow().current_term

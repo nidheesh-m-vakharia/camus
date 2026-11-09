@@ -125,7 +125,7 @@ A few Kafka behaviors are different on purpose:
 | `acks=1` | Same barrier as `acks=all` |
 | `acks=0` | No wait, and the batch may be lost |
 | No ACL on a resource | Denied with SASL or mTLS, allowed on the dev PLAINTEXT listener; `CAMUS_ACL_ALLOW_IF_NO_ACL` overrides |
-| Partition leaders | Leadership belongs to WAL shards (one per broker by default), each leading the partitions placed on it; no reassignment, and no rebalancing yet after a failover (ADR 0014) |
+| Partition leaders | Leadership belongs to WAL shards (one per broker by default); a shard's partitions move together when it rebalances or on `ElectLeaders`; no reassignment (ADR 0014) |
 | Broker configs | Set at startup, read-only; no client quotas |
 
 The full list is in [docs/compatibility.md](docs/compatibility.md).
@@ -186,6 +186,8 @@ lists each default next to Kafka's.
 | `CAMUS_GROUP_INITIAL_DELAY_MS` | 3000 | `group.initial.rebalance.delay.ms` |
 | `CAMUS_GROUP_MIN_SESSION_MS` | 6000 | `group.min.session.timeout.ms` |
 | `CAMUS_CONSUMER_SESSION_MS`, `CAMUS_CONSUMER_HEARTBEAT_MS` | 45000, 5000 | KIP-848 session and heartbeat |
+| `CAMUS_AUTO_LEADER_REBALANCE` | `true` | `auto.leader.rebalance.enable` |
+| `CAMUS_LEADER_IMBALANCE_CHECK_MS` | 300000 | `leader.imbalance.check.interval.seconds` |
 
 Flags: `--kafka-addr`, `--advertised-addr` (`advertised.listeners`),
 `--tls-cert`/`--tls-key` (SASL_SSL), `--tls-client-ca` (mTLS),

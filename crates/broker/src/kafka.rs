@@ -53,6 +53,7 @@ use crate::slot::WalSlot;
 mod acl;
 mod admin;
 mod describe;
+mod elect;
 mod epochs;
 mod groups;
 mod scram;
@@ -253,6 +254,9 @@ pub struct Kafka {
     producer_id_expiration_ms: i64,
     /// Kafka's `producer.id.expiration.check.interval.ms`.
     producer_id_check_ms: u64,
+    /// Kafka's `leader.imbalance.check.interval.seconds`, in milliseconds;
+    /// `0` is Kafka's `auto.leader.rebalance.enable=false`.
+    leader_balance_ms: u64,
     /// Kafka's `offsets.retention.minutes`, in milliseconds.
     offsets_retention_ms: i64,
     /// Kafka's `offsets.retention.check.interval.ms`.
@@ -348,6 +352,13 @@ impl Kafka {
         let producer_id_expiration_ms =
             env_ms("CAMUS_PRODUCER_ID_EXPIRATION_MS", 86_400_000) as i64;
         let producer_id_check_ms = env_ms("CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS", 600_000);
+        let leader_balance_ms = if std::env::var("CAMUS_AUTO_LEADER_REBALANCE").as_deref()
+            == Ok("false")
+        {
+            0
+        } else {
+            env_ms("CAMUS_LEADER_IMBALANCE_CHECK_MS", 300_000)
+        };
         // Kafka's setting is in minutes; `CAMUS_OFFSETS_RETENTION_MS`
         // overrides it for tests that cannot wait a minute.
         let offsets_retention_ms = std::env::var("CAMUS_OFFSETS_RETENTION_MS")
@@ -399,6 +410,7 @@ impl Kafka {
             txn_cleanup_interval_ms,
             producer_id_expiration_ms,
             producer_id_check_ms,
+            leader_balance_ms,
             offsets_retention_ms,
             offsets_check_ms,
             wal_limit,
@@ -1273,6 +1285,16 @@ impl Kafka {
                 }
             });
         }
+        if self.leader_balance_ms > 0 {
+            let balancer = Arc::clone(&self);
+            tokio::spawn(async move {
+                let mut seen = std::collections::BTreeSet::new();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(balancer.leader_balance_ms)).await;
+                    balancer.balance_leaders(&mut seen).await;
+                }
+            });
+        }
         if self.offsets_check_ms > 0 {
             let offsets = Arc::clone(&self);
             tokio::spawn(async move {
@@ -1502,6 +1524,7 @@ impl Kafka {
                 self.alter_user_scram_credentials(&header, &mut buf, &caller)
                     .await
             }
+            ApiKey::ElectLeaders => self.elect_leaders(&header, &mut buf, &caller).await,
             ApiKey::OffsetForLeaderEpoch => {
                 self.offset_for_leader_epoch(&header, &mut buf, &caller)
                     .await
