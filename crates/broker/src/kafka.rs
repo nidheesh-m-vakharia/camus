@@ -78,6 +78,7 @@ const REQUEST_TIMED_OUT: i16 = 7;
 const TOO_LARGE: i16 = 10;
 const INVALID_RECORD: i16 = 87;
 const INVALID_PARTITIONS: i16 = 37;
+const INVALID_TRANSACTION_TIMEOUT: i16 = 50;
 const INVALID_REPLICATION_FACTOR: i16 = 38;
 const INVALID_REPLICA_ASSIGNMENT: i16 = 39;
 /// Kafka `num.partitions`, used when CreateTopics sends -1.
@@ -169,6 +170,18 @@ pub struct Kafka {
     /// first seen unreferenced.
     sweep_delay_ms: i64,
     sweeper: Mutex<camus_compactor::sweep::Sweeper>,
+    /// Kafka's `transaction.max.timeout.ms`.
+    txn_max_timeout_ms: i64,
+    /// Kafka's `transaction.abort.timed.out.transaction.cleanup.interval.ms`.
+    txn_abort_interval_ms: u64,
+    /// Kafka's `transactional.id.expiration.ms`.
+    txn_id_expiration_ms: i64,
+    /// Kafka's `transaction.remove.expired.transaction.cleanup.interval.ms`.
+    txn_cleanup_interval_ms: u64,
+    /// Kafka's `producer.id.expiration.ms`.
+    producer_id_expiration_ms: i64,
+    /// Kafka's `producer.id.expiration.check.interval.ms`.
+    producer_id_check_ms: u64,
     /// `durability.mode` for a topic created without one. `wal` per ADR 0005.
     default_durability: String,
     /// `message.max.bytes`: the batch limit for a topic without
@@ -222,6 +235,14 @@ impl Kafka {
         let sweep_ms = env_ms("CAMUS_SWEEP_MS", 300_000);
         let sweep_min_age_ms = env_ms("CAMUS_SWEEP_MIN_AGE_MS", 3_600_000) as i64;
         let sweep_delay_ms = env_ms("CAMUS_FILE_DELETE_DELAY_MS", 60_000) as i64;
+        let txn_max_timeout_ms = env_ms("CAMUS_TXN_MAX_TIMEOUT_MS", 900_000) as i64;
+        let txn_abort_interval_ms = env_ms("CAMUS_TXN_ABORT_INTERVAL_MS", 10_000);
+        let txn_id_expiration_ms =
+            env_ms("CAMUS_TRANSACTIONAL_ID_EXPIRATION_MS", 604_800_000) as i64;
+        let txn_cleanup_interval_ms = env_ms("CAMUS_TXN_CLEANUP_INTERVAL_MS", 3_600_000);
+        let producer_id_expiration_ms =
+            env_ms("CAMUS_PRODUCER_ID_EXPIRATION_MS", 86_400_000) as i64;
+        let producer_id_check_ms = env_ms("CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS", 600_000);
         let message_max_bytes = std::env::var("CAMUS_MESSAGE_MAX_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -248,6 +269,12 @@ impl Kafka {
             sweep_min_age_ms,
             sweep_delay_ms,
             sweeper: Mutex::new(camus_compactor::sweep::Sweeper::default()),
+            txn_max_timeout_ms,
+            txn_abort_interval_ms,
+            txn_id_expiration_ms,
+            txn_cleanup_interval_ms,
+            producer_id_expiration_ms,
+            producer_id_check_ms,
             wal_limit,
             default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
                 .unwrap_or_else(|_| "wal".into()),
@@ -539,6 +566,106 @@ impl Kafka {
         }
     }
 
+    /// Abort transactions that have been ongoing longer than their timeout.
+    async fn abort_timed_out_transactions(&self) {
+        if !self.leader() {
+            return;
+        }
+        let Ok(rows) = self.node.scan_local("txn/") else {
+            return;
+        };
+        let now = txn::now_ms();
+        for (key, raw) in rows {
+            let Ok(clock) = camus_metadata::txn_clock(&raw) else {
+                continue;
+            };
+            if !clock.ongoing
+                || clock.started_ms < 0
+                || now.saturating_sub(clock.started_ms) <= i64::from(clock.timeout_ms)
+            {
+                continue;
+            }
+            let id = key.trim_start_matches("txn/").to_string();
+            let applied = self
+                .meta_apply(Command::AbortTimedOutTxn {
+                    transactional_id: id.clone(),
+                    producer_id: clock.producer_id,
+                    producer_epoch: clock.epoch,
+                    now_ms: now,
+                })
+                .await;
+            if let Ok(response) = applied {
+                if response.value.as_deref() == Some("1") {
+                    tracing::info!(transactional_id = %id, "aborted a transaction past its timeout");
+                }
+            }
+        }
+    }
+
+    /// Remove transactional ids idle for `transactional.id.expiration.ms`.
+    async fn expire_transactional_ids(&self) {
+        if !self.leader() {
+            return;
+        }
+        let Ok(rows) = self.node.scan_local("txn/") else {
+            return;
+        };
+        let now = txn::now_ms();
+        for (key, raw) in rows {
+            let Ok(clock) = camus_metadata::txn_clock(&raw) else {
+                continue;
+            };
+            let idle = clock.updated_ms < 0
+                || now.saturating_sub(clock.updated_ms) >= self.txn_id_expiration_ms;
+            if clock.ongoing || !idle {
+                continue;
+            }
+            let _ = self
+                .meta_apply(Command::ExpireTransactionalId {
+                    transactional_id: key.trim_start_matches("txn/").to_string(),
+                    producer_id: clock.producer_id,
+                    producer_epoch: clock.epoch,
+                    now_ms: now,
+                    expiration_ms: self.txn_id_expiration_ms,
+                })
+                .await;
+        }
+    }
+
+    /// Remove idempotent producer state Kafka would expire. Metadata decides
+    /// per key; this only names the candidates.
+    async fn expire_producer_state(&self) {
+        if !self.leader() {
+            return;
+        }
+        let Ok(rows) = self.node.scan_local("seq/") else {
+            return;
+        };
+        let keys: Vec<(String, i32, i64)> = rows
+            .iter()
+            .filter_map(|(key, _)| {
+                let rest = key.strip_prefix("seq/")?;
+                let (rest, producer) = rest.rsplit_once('/')?;
+                let (topic, partition) = rest.rsplit_once('/')?;
+                Some((
+                    topic.to_string(),
+                    partition.parse().ok()?,
+                    producer.parse().ok()?,
+                ))
+            })
+            .collect();
+        let now = txn::now_ms();
+        for chunk in keys.chunks(500) {
+            let _ = self
+                .meta_apply(Command::ExpireProducers {
+                    keys: chunk.to_vec(),
+                    now_ms: now,
+                    expiration_ms: self.producer_id_expiration_ms,
+                })
+                .await;
+        }
+    }
+
     /// Every object key an extent points into. Any read or parse failure is
     /// an error, because a missing reference would delete live data.
     fn referenced_objects(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
@@ -742,6 +869,33 @@ impl Kafka {
                 loop {
                     tokio::time::sleep(Duration::from_millis(retention.retention_check_ms)).await;
                     retention.enforce_retention().await;
+                }
+            });
+        }
+        if self.txn_abort_interval_ms > 0 {
+            let txns = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(txns.txn_abort_interval_ms)).await;
+                    txns.abort_timed_out_transactions().await;
+                }
+            });
+        }
+        if self.txn_cleanup_interval_ms > 0 {
+            let txns = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(txns.txn_cleanup_interval_ms)).await;
+                    txns.expire_transactional_ids().await;
+                }
+            });
+        }
+        if self.producer_id_check_ms > 0 {
+            let producers = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(producers.producer_id_check_ms)).await;
+                    producers.expire_producer_state().await;
                 }
             });
         }
@@ -1401,6 +1555,13 @@ impl Kafka {
             .as_ref()
             .filter(|id| !id.0.is_empty())
             .map(|id| id.0.to_string());
+        if transactional.is_some()
+            && (request.transaction_timeout_ms <= 0
+                || i64::from(request.transaction_timeout_ms) > self.txn_max_timeout_ms)
+        {
+            response.error_code = INVALID_TRANSACTION_TIMEOUT;
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
         let applied = match &transactional {
             Some(id) => {
                 self.node
@@ -1409,6 +1570,7 @@ impl Kafka {
                         producer_id: request.producer_id.0,
                         producer_epoch: request.producer_epoch,
                         timeout_ms: request.transaction_timeout_ms,
+                        now_ms: txn::now_ms(),
                     })
                     .await
             }

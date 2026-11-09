@@ -27,8 +27,8 @@ pub use catalog::{
 };
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{
-    check as txn_allows, ensure as txn_ongoing, inspect as txn_inspect, known_state as txn_state,
-    TxnInfo, TxnSpan,
+    check as txn_allows, clock as txn_clock, ensure as txn_ongoing, inspect as txn_inspect,
+    known_state as txn_state, TxnClock, TxnInfo, TxnSpan,
 };
 
 use std::collections::BTreeMap;
@@ -202,6 +202,9 @@ pub enum Command {
         producer_epoch: i16,
         /// `true` commits.
         committed: bool,
+        /// Proposer's clock. `0` in commands written before it was carried.
+        #[serde(default)]
+        now_ms: i64,
     },
     /// Replace a sealed offset prefix with one object. The high watermark stays.
     Compact {
@@ -242,6 +245,9 @@ pub enum Command {
         producer_epoch: i16,
         /// Client timeout in milliseconds. `0` means 60 seconds.
         timeout_ms: i32,
+        /// Proposer's clock. `0` in commands written before it was carried.
+        #[serde(default)]
+        now_ms: i64,
     },
     /// Start or continue a transaction and record when it became ongoing.
     AddTxnPartitionsAt {
@@ -255,6 +261,40 @@ pub enum Command {
         partitions: Vec<(String, i32)>,
         /// Milliseconds since the epoch. Replicas share this value.
         started_ms: i64,
+    },
+    /// Abort a transaction that outlived its timeout and fence its producer.
+    /// Applied only if the id is still at this producer and epoch.
+    AbortTimedOutTxn {
+        /// Transactional id.
+        transactional_id: String,
+        /// Producer id the proposer saw.
+        producer_id: i64,
+        /// Producer epoch the proposer saw.
+        producer_epoch: i16,
+        /// Proposer's clock.
+        now_ms: i64,
+    },
+    /// Remove a transactional id idle for `expiration_ms`.
+    ExpireTransactionalId {
+        /// Transactional id.
+        transactional_id: String,
+        /// Producer id the proposer saw.
+        producer_id: i64,
+        /// Producer epoch the proposer saw.
+        producer_epoch: i16,
+        /// Proposer's clock.
+        now_ms: i64,
+        /// Kafka's `transactional.id.expiration.ms`.
+        expiration_ms: i64,
+    },
+    /// Remove producer sequence state that Kafka would expire.
+    ExpireProducers {
+        /// `(topic, partition, producer_id)` of each candidate.
+        keys: Vec<(String, i32, i64)>,
+        /// Proposer's clock.
+        now_ms: i64,
+        /// Kafka's `producer.id.expiration.ms`.
+        expiration_ms: i64,
     },
 }
 

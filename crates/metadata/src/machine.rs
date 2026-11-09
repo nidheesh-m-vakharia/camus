@@ -245,6 +245,7 @@ fn apply_command(
                 producer_id,
                 producer_epoch,
                 60_000,
+                0,
             )),
             Command::AddTxnPartitions {
                 transactional_id,
@@ -292,13 +293,46 @@ fn apply_command(
                 producer_id,
                 producer_epoch,
                 timeout_ms,
+                now_ms,
             } => txn::outcome(txn::init(
                 &read,
                 &transactional_id,
                 producer_id,
                 producer_epoch,
                 if timeout_ms > 0 { timeout_ms } else { 60_000 },
+                now_ms,
             )),
+            Command::AbortTimedOutTxn {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                now_ms,
+            } => txn::outcome(txn::abort_timed_out(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                now_ms,
+            )),
+            Command::ExpireTransactionalId {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                now_ms,
+                expiration_ms,
+            } => txn::expire_id(
+                &read,
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                now_ms,
+                expiration_ms,
+            ),
+            Command::ExpireProducers {
+                keys,
+                now_ms,
+                expiration_ms,
+            } => crate::producers::expire(&read, &keys, now_ms, expiration_ms),
             Command::AddTxnPartitionsAt {
                 transactional_id,
                 producer_id,
@@ -338,12 +372,14 @@ fn apply_command(
                 producer_id,
                 producer_epoch,
                 committed,
+                now_ms,
             } => txn::outcome(txn::end(
                 &read,
                 &transactional_id,
                 producer_id,
                 producer_epoch,
                 committed,
+                now_ms,
             )),
             Command::SaveGroup { .. }
             | Command::CommitOffsets { .. }

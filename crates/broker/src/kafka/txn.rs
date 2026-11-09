@@ -213,6 +213,7 @@ impl Kafka {
                 producer_id: request.producer_id.0,
                 producer_epoch: request.producer_epoch,
                 committed: request.committed,
+                now_ms: now_ms(),
             })
             .await;
         response.error_code = match applied {
