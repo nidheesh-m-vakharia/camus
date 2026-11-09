@@ -129,16 +129,56 @@ enum Reply {
     Close,
 }
 
+/// What handling one request gives the connection: its reply, or, for a
+/// produce whose batches are queued but not yet committed, the rest of the
+/// work, which may run while later requests are read and handled.
+enum Handled<'a> {
+    Now(Reply),
+    Later(std::pin::Pin<Box<dyn std::future::Future<Output = Reply> + Send + 'a>>),
+}
+
+/// Requests a connection may have read but not answered. Kafka clients send
+/// up to five unanswered produces (`max.in.flight.requests.per.connection`).
+const MAX_IN_FLIGHT: usize = 5;
+
+/// A frame cut from the bytes read so far.
+enum Framed {
+    Body(Bytes),
+    Partial,
+    Bad,
+}
+
+/// Cut one length-prefixed frame off the front of `inbound`, without copying
+/// its body.
+fn take_frame(inbound: &mut BytesMut) -> Framed {
+    if inbound.len() < 4 {
+        return Framed::Partial;
+    }
+    let size = i32::from_be_bytes(inbound[..4].try_into().expect("four bytes"));
+    if size <= 0 || size as usize > MAX_FRAME {
+        return Framed::Bad;
+    }
+    let size = size as usize;
+    if inbound.len() < 4 + size {
+        inbound.reserve(4 + size - inbound.len());
+        return Framed::Partial;
+    }
+    let _ = inbound.split_to(4);
+    Framed::Body(inbound.split_to(size).freeze())
+}
+
 enum Socket {
     Plain(TcpStream),
     Tls(TlsStream<TcpStream>),
 }
 
 impl Socket {
-    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    /// Read what is available into `buf`. Cancel safe: a read that loses a
+    /// `select!` has taken no bytes.
+    async fn read_buf(&mut self, buf: &mut BytesMut) -> std::io::Result<usize> {
         match self {
-            Self::Plain(socket) => socket.read_exact(buf).await.map(|_| ()),
-            Self::Tls(socket) => socket.read_exact(buf).await.map(|_| ()),
+            Self::Plain(socket) => socket.read_buf(buf).await,
+            Self::Tls(socket) => socket.read_buf(buf).await,
         }
     }
 
@@ -1483,40 +1523,72 @@ impl Kafka {
             mechanism: "PLAIN".into(),
             scram: None,
         };
+        // Requests are read and handled in order; a produce's wait for its
+        // commit may overlap the next requests, and replies go out in order.
+        let mut inbound = BytesMut::with_capacity(64 * 1024);
+        let mut queue: std::collections::VecDeque<Handled<'_>> = std::collections::VecDeque::new();
         loop {
-            let mut size_buf = [0u8; 4];
-            if socket.read_exact(&mut size_buf).await.is_err() {
-                break;
+            while matches!(queue.front(), Some(Handled::Now(_))) {
+                let Some(Handled::Now(reply)) = queue.pop_front() else {
+                    unreachable!("the front is a reply");
+                };
+                match reply {
+                    Reply::Frame(frame) => {
+                        if socket.write_all(&frame).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Reply::Silent => {}
+                    Reply::Close => return Ok(()),
+                }
             }
-            let size = i32::from_be_bytes(size_buf);
-            if size <= 0 || size as usize > MAX_FRAME {
-                break;
+            let room = queue.len() < MAX_IN_FLIGHT;
+            if room {
+                match take_frame(&mut inbound) {
+                    Framed::Body(body) => {
+                        let handled = self.handle(body, &mut session).await;
+                        queue.push_back(handled);
+                        continue;
+                    }
+                    Framed::Bad => break,
+                    Framed::Partial => {}
+                }
             }
-            let mut body = vec![0u8; size as usize];
-            if socket.read_exact(&mut body).await.is_err() {
-                break;
+            enum Event {
+                Read(std::io::Result<usize>),
+                Done(Reply),
             }
-            match self.handle(&body, &mut session).await {
-                Reply::Frame(frame) => {
-                    if socket.write_all(&frame).await.is_err() {
-                        break;
+            let waiting = matches!(queue.front(), Some(Handled::Later(_)));
+            let event = tokio::select! {
+                read = socket.read_buf(&mut inbound), if room => Event::Read(read),
+                reply = async {
+                    match queue.front_mut() {
+                        Some(Handled::Later(rest)) => rest.as_mut().await,
+                        _ => unreachable!("the front is waiting"),
+                    }
+                }, if waiting => Event::Done(reply),
+            };
+            match event {
+                Event::Read(Ok(0)) | Event::Read(Err(_)) => break,
+                Event::Read(Ok(_)) => {}
+                Event::Done(reply) => {
+                    if let Some(front) = queue.front_mut() {
+                        *front = Handled::Now(reply);
                     }
                 }
-                Reply::Silent => {}
-                Reply::Close => break,
             }
         }
         Ok(())
     }
 
-    async fn handle(&self, body: &[u8], session: &mut Session) -> Reply {
-        let mut buf = Bytes::copy_from_slice(body);
+    async fn handle(&self, body: Bytes, session: &mut Session) -> Handled<'_> {
+        let mut buf = body;
         let header = match decode_request_header_from_buffer(&mut buf) {
             Ok(header) => header,
-            Err(_) => return Reply::Close,
+            Err(_) => return Handled::Now(Reply::Close),
         };
         let Ok(key) = ApiKey::try_from(header.request_api_key) else {
-            return Reply::Close;
+            return Handled::Now(Reply::Close);
         };
         let version = header.request_api_version;
         tracing::debug!(
@@ -1530,10 +1602,10 @@ impl Kafka {
             ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate
         );
         if self.require_sasl && !session.authed && !allowed_before_auth {
-            return self.illegal_sasl(key, version, header.correlation_id);
+            return Handled::Now(self.illegal_sasl(key, version, header.correlation_id));
         }
         if !frame::is_implemented(key, version) {
-            return unsupported(key, version, header.correlation_id);
+            return Handled::Now(unsupported(key, version, header.correlation_id));
         }
         let caller = Caller {
             principal: session
@@ -1542,13 +1614,13 @@ impl Kafka {
                 .unwrap_or_else(|| "User:ANONYMOUS".into()),
             host: session.host.clone(),
         };
-        match key {
+        Handled::Now(match key {
             ApiKey::ApiVersions => self.api_versions(&header, &mut buf),
             ApiKey::Metadata => self.metadata(&header, &mut buf, &caller).await,
             ApiKey::CreateTopics => self.create_topics(&header, &mut buf, &caller).await,
             ApiKey::DeleteTopics => self.delete_topics(&header, &mut buf, &caller).await,
             ApiKey::DescribeConfigs => self.describe_configs(&header, &mut buf, &caller),
-            ApiKey::Produce => self.produce(&header, &mut buf, &caller).await,
+            ApiKey::Produce => return self.produce(&header, &mut buf, &caller).await,
             ApiKey::Fetch => self.fetch(&header, &mut buf, &caller).await,
             ApiKey::ListOffsets => self.list_offsets(&header, &mut buf, &caller).await,
             ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf, session),
@@ -1614,7 +1686,7 @@ impl Kafka {
                     .await
             }
             _ => unsupported(key, version, header.correlation_id),
-        }
+        })
     }
 
     fn illegal_sasl(&self, key: ApiKey, version: i16, correlation: i32) -> Reply {
@@ -2305,12 +2377,19 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    async fn produce(&self, header: &RequestHeader, buf: &mut Bytes, caller: &Caller) -> Reply {
+    /// Validate and queue every partition now, in request order; the wait for
+    /// their commits is returned for the connection to run.
+    async fn produce(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Handled<'_> {
         let Ok(request) = ProduceRequest::decode(buf, header.request_api_version) else {
-            return Reply::Close;
+            return Handled::Now(Reply::Close);
         };
         if request.acks != 0 && request.acks != 1 && request.acks != -1 {
-            return self.produce_all_error(&request, header, INVALID_REQUEST);
+            return Handled::Now(self.produce_all_error(&request, header, INVALID_REQUEST));
         }
         let txn_id = request
             .transactional_id
@@ -2319,7 +2398,7 @@ impl Kafka {
             .map(|id| id.0.to_string());
         if let Some(id) = &txn_id {
             if !self.allows(caller, auth::TXN_ID, id, auth::WRITE) {
-                return self.produce_all_error(&request, header, auth::TXN_ID_FAILED);
+                return Handled::Now(self.produce_all_error(&request, header, auth::TXN_ID_FAILED));
             }
         }
         let mut response = ProduceResponse::default();
@@ -2391,43 +2470,47 @@ impl Kafka {
         }
         let mut submitted = self.submit_wal(&mut waiters).await;
         if request.acks == 0 {
-            return Reply::Silent;
+            return Handled::Now(Reply::Silent);
         }
-        for ((topic_index, partition_index, queued), submitted) in
-            waiters.into_iter().zip(submitted.drain(..))
-        {
-            let settled = match (queued, submitted) {
-                (Queued::R2(rx), _) => {
-                    let wait = deadline.saturating_duration_since(Instant::now());
-                    match tokio::time::timeout(wait, rx).await {
-                        Ok(settled) => settled.unwrap_or(Err(NOT_LEADER)),
-                        Err(_) => Err(REQUEST_TIMED_OUT),
+        let version = header.request_api_version;
+        let correlation = header.correlation_id;
+        Handled::Later(Box::pin(async move {
+            for ((topic_index, partition_index, queued), submitted) in
+                waiters.into_iter().zip(submitted.drain(..))
+            {
+                let settled = match (queued, submitted) {
+                    (Queued::R2(rx), _) => {
+                        let wait = deadline.saturating_duration_since(Instant::now());
+                        match tokio::time::timeout(wait, rx).await {
+                            Ok(settled) => settled.unwrap_or(Err(NOT_LEADER)),
+                            Err(_) => Err(REQUEST_TIMED_OUT),
+                        }
+                    }
+                    (Queued::Wal(produce), Some(Ok(pending))) => {
+                        self.settle_wal(produce, pending).await
+                    }
+                    (Queued::Wal(_), Some(Err(code))) => Err(code),
+                    (Queued::Wal(_), None) => Err(NOT_LEADER),
+                };
+                let row = &mut response.responses[topic_index].partition_responses[partition_index];
+                match settled {
+                    Ok(offset) => row.base_offset = offset,
+                    Err(code) => {
+                        row.error_code = code;
+                        row.error_message = produce_message(code);
                     }
                 }
-                (Queued::Wal(produce), Some(Ok(pending))) => {
-                    self.settle_wal(produce, pending).await
-                }
-                (Queued::Wal(_), Some(Err(code))) => Err(code),
-                (Queued::Wal(_), None) => Err(NOT_LEADER),
-            };
-            let row = &mut response.responses[topic_index].partition_responses[partition_index];
-            match settled {
-                Ok(offset) => row.base_offset = offset,
-                Err(code) => {
-                    row.error_code = code;
-                    row.error_message = produce_message(code);
-                }
             }
-        }
-        // The hold already slowed this producer. Reporting it as
-        // `throttle_time_ms` too would make a client that honors the throttle
-        // wait a second time, so the time goes to a metric instead.
-        PRODUCE_HOLD_MS.fetch_add(
-            u64::try_from(held.as_millis()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        response.throttle_time_ms = 0;
-        frame_of(header.request_api_version, header.correlation_id, &response)
+            // The hold already slowed this producer. Reporting it as
+            // `throttle_time_ms` too would make a client that honors the throttle
+            // wait a second time, so the time goes to a metric instead.
+            PRODUCE_HOLD_MS.fetch_add(
+                u64::try_from(held.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            response.throttle_time_ms = 0;
+            frame_of(version, correlation, &response)
+        }))
     }
 
     /// Queue every WAL batch in `waiters`, one submission per shard in
