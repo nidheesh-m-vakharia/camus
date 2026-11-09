@@ -14,8 +14,20 @@ fn topic_id(http: &str) -> String {
     topic["id"].as_str().unwrap().to_string()
 }
 
+/// Sealing uploads to object storage, which these tests need.
+fn minio() -> bool {
+    let on = std::env::var("CAMUS_MINIO").ok().as_deref() == Some("1");
+    if !on {
+        eprintln!("skipping extent test; set CAMUS_MINIO=1");
+    }
+    on
+}
+
 #[test]
 fn batches_sealed_together_are_one_extent() {
+    if !minio() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     // A long upload interval, so all five batches are sealed in one pass.
     let node = single(dir.path(), Opts::default().env("CAMUS_FLUSH_MS", "2000"));
@@ -38,6 +50,9 @@ fn batches_sealed_together_are_one_extent() {
 
 #[test]
 fn a_row_from_before_extent_keys_is_served_and_then_migrated() {
+    if !minio() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let mut node = single(dir.path(), Opts::default());
     let addr = kafka_addr(&node);
