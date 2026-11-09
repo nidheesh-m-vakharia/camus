@@ -182,6 +182,10 @@ pub struct Kafka {
     producer_id_expiration_ms: i64,
     /// Kafka's `producer.id.expiration.check.interval.ms`.
     producer_id_check_ms: u64,
+    /// Kafka's `offsets.retention.minutes`, in milliseconds.
+    offsets_retention_ms: i64,
+    /// Kafka's `offsets.retention.check.interval.ms`.
+    offsets_check_ms: u64,
     /// `durability.mode` for a topic created without one. `wal` per ADR 0005.
     default_durability: String,
     /// Kafka's `auto.create.topics.enable`.
@@ -272,6 +276,15 @@ impl Kafka {
         let producer_id_expiration_ms =
             env_ms("CAMUS_PRODUCER_ID_EXPIRATION_MS", 86_400_000) as i64;
         let producer_id_check_ms = env_ms("CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS", 600_000);
+        // Kafka's setting is in minutes; `CAMUS_OFFSETS_RETENTION_MS`
+        // overrides it for tests that cannot wait a minute.
+        let offsets_retention_ms = std::env::var("CAMUS_OFFSETS_RETENTION_MS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_else(|| {
+                env_ms("CAMUS_OFFSETS_RETENTION_MINUTES", 10_080).saturating_mul(60_000) as i64
+            });
+        let offsets_check_ms = env_ms("CAMUS_OFFSETS_RETENTION_CHECK_INTERVAL_MS", 600_000);
         let auto_create_topics = std::env::var("CAMUS_AUTO_CREATE_TOPICS")
             .map(|value| value != "false")
             .unwrap_or(true);
@@ -314,6 +327,8 @@ impl Kafka {
             txn_cleanup_interval_ms,
             producer_id_expiration_ms,
             producer_id_check_ms,
+            offsets_retention_ms,
+            offsets_check_ms,
             wal_limit,
             default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
                 .unwrap_or_else(|_| "wal".into()),
@@ -685,6 +700,38 @@ impl Kafka {
         }
     }
 
+    /// Remove committed offsets of empty groups past `offsets.retention.minutes`.
+    async fn expire_offsets(&self) {
+        if !self.leader() {
+            return;
+        }
+        let Ok(rows) = self.node.scan_local(camus_metadata::groups::group_prefix()) else {
+            return;
+        };
+        let now = txn::now_ms();
+        for (key, _) in rows {
+            let Some(group) = camus_metadata::groups::group_from_key(&key) else {
+                continue;
+            };
+            let applied = self
+                .node
+                .group_write(Command::ExpireOffsets {
+                    group: group.clone(),
+                    now_ms: now,
+                    retention_ms: self.offsets_retention_ms,
+                })
+                .await;
+            let gone = applied.is_ok()
+                && self
+                    .node
+                    .read_local(&key)
+                    .is_ok_and(|stored| stored.is_none());
+            if gone {
+                self.coordinator.forget(&group);
+            }
+        }
+    }
+
     /// Remove idempotent producer state Kafka would expire. Metadata decides
     /// per key; this only names the candidates.
     async fn expire_producer_state(&self) {
@@ -957,6 +1004,15 @@ impl Kafka {
                 loop {
                     tokio::time::sleep(Duration::from_millis(txns.txn_cleanup_interval_ms)).await;
                     txns.expire_transactional_ids().await;
+                }
+            });
+        }
+        if self.offsets_check_ms > 0 {
+            let offsets = Arc::clone(&self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(offsets.offsets_check_ms)).await;
+                    offsets.expire_offsets().await;
                 }
             });
         }

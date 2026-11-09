@@ -65,7 +65,7 @@ pub struct MemberRecord {
 }
 
 /// A classic group as of its latest generation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GroupRecord {
     /// Generation id. Starts at 0 and only increases.
     pub generation: i32,
@@ -83,6 +83,30 @@ pub struct GroupRecord {
     /// Target assignment at `generation`: member id, topic id, partitions.
     #[serde(default)]
     pub target: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
+    /// When the group last became empty, ms since the epoch, or `-1`. The
+    /// saver stamps every empty record; the state machine keeps the earlier
+    /// time while the group stays empty. Offset retention counts from here.
+    #[serde(default = "no_time")]
+    pub empty_since_ms: i64,
+}
+
+fn no_time() -> i64 {
+    -1
+}
+
+impl Default for GroupRecord {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            protocol_type: None,
+            protocol: None,
+            leader: None,
+            members: Vec::new(),
+            kind: String::new(),
+            target: BTreeMap::new(),
+            empty_since_ms: no_time(),
+        }
+    }
 }
 
 /// One committed offset.

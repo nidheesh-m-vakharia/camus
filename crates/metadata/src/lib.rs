@@ -103,6 +103,18 @@ pub enum Command {
         /// Current epoch. Must match the stored epoch when `producer_id` is set.
         producer_epoch: i16,
     },
+    /// Remove a group's committed offsets that `offsets.retention.minutes`
+    /// has expired. Only an empty group loses offsets. Its retention counts
+    /// from when it became empty, or from each commit for a group that only
+    /// has offsets. The group itself goes once no offsets are left.
+    ExpireOffsets {
+        /// Group id.
+        group: String,
+        /// Proposer's clock.
+        now_ms: i64,
+        /// Kafka's `offsets.retention.minutes`, in milliseconds.
+        retention_ms: i64,
+    },
     /// Store a consumer group's record. Rejected with ILLEGAL_GENERATION when
     /// the stored generation is newer.
     SaveGroup {

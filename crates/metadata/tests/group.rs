@@ -138,3 +138,78 @@ async fn every_replica_stores_the_same_topic_id() {
         .collect();
     assert_eq!(ids.len(), 1, "replicas disagree on the topic id: {ids:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_group_loses_its_offsets_a_retention_after_it_emptied() {
+    use camus_metadata::groups::{
+        group_key, offset_key, GroupRecord, MemberRecord, OffsetCommit, OffsetRecord,
+    };
+    use camus_metadata::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = MetadataNode::open(1, dir.path(), "127.0.0.1:1")
+        .await
+        .unwrap();
+    node.initialize(voters(&[1])).await.unwrap();
+    assert!(wait_until(|| async { node.write("ready", "1").await.is_ok() }).await);
+
+    let save =
+        |empty_since_ms: i64, members: Vec<MemberRecord>, generation: i32| Command::SaveGroup {
+            group: "readers".into(),
+            record: GroupRecord {
+                generation,
+                protocol_type: Some("consumer".into()),
+                members,
+                empty_since_ms,
+                ..GroupRecord::default()
+            },
+        };
+    let expire = |now_ms: i64| Command::ExpireOffsets {
+        group: "readers".into(),
+        now_ms,
+        retention_ms: 1_000,
+    };
+    let member = MemberRecord {
+        member_id: "m".into(),
+        ..MemberRecord::default()
+    };
+    assert_eq!(
+        node.group_write(save(-1, vec![member], 1)).await.unwrap(),
+        0
+    );
+    let commit = Command::CommitOffsets {
+        group: "readers".into(),
+        generation: 1,
+        member_id: "m".into(),
+        offsets: vec![OffsetCommit {
+            topic_id: "topic-1".into(),
+            partition: 0,
+            record: OffsetRecord {
+                offset: 5,
+                leader_epoch: -1,
+                metadata: None,
+                commit_timestamp: 1_000,
+            },
+        }],
+    };
+    assert_eq!(node.group_write(commit).await.unwrap(), 0);
+    let offset = offset_key("readers", "topic-1", 0);
+
+    node.group_write(expire(10_000_000)).await.unwrap();
+    assert!(
+        node.read_local(&offset).unwrap().is_some(),
+        "members keep offsets"
+    );
+
+    node.group_write(save(2_000, Vec::new(), 2)).await.unwrap();
+    node.group_write(save(2_800, Vec::new(), 2)).await.unwrap();
+    node.group_write(expire(2_900)).await.unwrap();
+    assert!(
+        node.read_local(&offset).unwrap().is_some(),
+        "a re-save while empty does not restart the clock, and 900 ms is not enough"
+    );
+    node.group_write(expire(3_000)).await.unwrap();
+    assert!(node.read_local(&offset).unwrap().is_none());
+    assert!(node.read_local(&group_key("readers")).unwrap().is_none());
+    node.shutdown().await.unwrap();
+}
