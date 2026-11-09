@@ -65,7 +65,8 @@ this change, is on shard 0.
 
 The broker's single `WalSlot` becomes a set of shards keyed by id. Shard 0
 stays in `wal_dir`, where the single-shard build keeps it, so an upgraded
-broker moves nothing; shard `n > 0` lives in `<data-dir>/wal-shards/<n>`. A
+broker moves nothing; shard `n > 0` lives next to it, in
+`<wal_dir>-shards/<n>`, so a WAL on its own disk keeps every shard there. A
 broker opens every shard in `wal/shards` as soon as it sees the layout; a
 shard it is not a voter of stays empty and receives no RPC.
 

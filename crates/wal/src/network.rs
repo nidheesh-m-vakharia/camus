@@ -108,12 +108,31 @@ impl Conn {
 
 /// HTTP RPC factory. `BasicNode.addr` is the broker HTTP `host:port`; shard
 /// RPC lives under `/wal/` so it does not collide with the metadata group.
+/// Shard 0 uses `/wal/raft-*`, as before shards had ids; shard `n` uses
+/// `/wal/<n>/raft-*` (ADR 0014).
 #[derive(Clone, Default)]
-pub struct HttpFactory;
+pub struct HttpFactory {
+    /// Path under the broker's HTTP root: `wal` or `wal/<n>`.
+    pub prefix: String,
+}
+
+impl HttpFactory {
+    /// The factory for shard `shard`.
+    pub fn for_shard(shard: u32) -> Self {
+        Self {
+            prefix: if shard == 0 {
+                "wal".into()
+            } else {
+                format!("wal/{shard}")
+            },
+        }
+    }
+}
 
 pub struct HttpConn {
     target: NodeId,
     addr: String,
+    prefix: String,
     client: reqwest::Client,
 }
 
@@ -124,6 +143,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpFactory {
         HttpConn {
             target,
             addr: node.addr.clone(),
+            prefix: self.prefix.clone(),
             client: reqwest::Client::new(),
         }
     }
@@ -182,7 +202,7 @@ impl HttpConn {
         Resp: DeserializeOwned,
         E: std::error::Error + DeserializeOwned,
     {
-        let url = format!("http://{}/wal/{path}", self.addr);
+        let url = format!("http://{}/{}/{path}", self.addr, self.prefix);
         let body = camus_raft::codec::encode(&req)
             .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
         let response = self

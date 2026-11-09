@@ -34,6 +34,10 @@ curl -sf -X POST http://127.0.0.1:18080/admin/init \
   -d '[{"id":1,"addr":"127.0.0.1:18080"}]'
 ```
 
+`/admin/init` creates one WAL shard per broker marked `"wal"` (the default),
+each with up to three voters, so each broker leads one shard. To choose the
+count, send `{"peers": [...], "shards": N}` instead of the bare list.
+
 `--dev-plaintext` is refused on a non-loopback address unless you also pass
 `--allow-non-loopback`. SASL_SSL needs `--tls-cert`, `--tls-key`,
 `CAMUS_SASL_USER`, and `CAMUS_SASL_PASSWORD`.
@@ -91,7 +95,7 @@ A few Kafka behaviors are different on purpose:
 | `acks=1` | Same barrier as `acks=all` |
 | `acks=0` | No wait, and the batch may be lost |
 | No ACL on a resource | Denied with SASL or mTLS, allowed on the dev PLAINTEXT listener; `CAMUS_ACL_ALLOW_IF_NO_ACL` overrides |
-| Partition leaders | One WAL shard leads every `wal` partition; no reassignment |
+| Partition leaders | Leadership belongs to WAL shards (one per broker by default), each leading the partitions placed on it; no reassignment, and no rebalancing yet after a failover (ADR 0014) |
 | Broker configs | Set at startup, read-only; no client quotas |
 
 The full list is in [docs/compatibility.md](docs/compatibility.md).

@@ -2471,7 +2471,14 @@ impl Kafka {
         let size = append.raw.len() as u64;
         let hold_start = Instant::now();
         loop {
-            let unsealed = wal.unsealed_bytes();
+            // `wal.disk.limit` bounds the broker's disk, so it counts every
+            // shard this broker holds, not just this one (ADR 0014).
+            let unsealed: u64 = self
+                .wal
+                .all()
+                .iter()
+                .map(|(_, shard)| shard.unsealed_bytes())
+                .sum();
             if unsealed == 0 || unsealed + size <= self.wal_limit {
                 break;
             }

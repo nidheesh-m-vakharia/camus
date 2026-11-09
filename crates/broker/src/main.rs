@@ -79,6 +79,20 @@ struct Args {
 /// Largest Raft RPC body the HTTP routes accept.
 const RAFT_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
+/// `/admin/init` body: the peers, as before shards had ids, or the peers and
+/// a shard count (ADR 0014). Without a count there is one shard per WAL
+/// voter.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InitBody {
+    Peers(Vec<Peer>),
+    Layout {
+        peers: Vec<Peer>,
+        #[serde(default)]
+        shards: Option<u32>,
+    },
+}
+
 #[derive(Deserialize)]
 struct Peer {
     id: NodeId,
@@ -136,6 +150,12 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| args.data_dir.join("wal"));
     let wal = Arc::new(WalSlot::new(Shard::open(args.node_id, &wal_dir).await?));
+    tokio::spawn(open_shards(
+        Arc::clone(&node),
+        Arc::clone(&wal),
+        args.node_id,
+        wal_dir.clone(),
+    ));
     let admin = Arc::new(Admin {
         node: Arc::clone(&node),
         wal: Arc::clone(&wal),
@@ -171,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/wal/raft-vote", post(wal_vote))
                 .route("/wal/raft-append", post(wal_append))
                 .route("/wal/raft-snapshot", post(wal_snapshot))
+                .route("/wal/{shard}/init", post(shard_init))
                 .route("/wal/{shard}/raft-vote", post(shard_vote))
                 .route("/wal/{shard}/raft-append", post(shard_append))
                 .route("/wal/{shard}/raft-snapshot", post(shard_snapshot))
@@ -276,44 +297,163 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "sweep_objects_deleted": camus_compactor::STATS.objects_deleted.load(std::sync::atomic::Ordering::Relaxed),
         "sweep_bytes_deleted": camus_compactor::STATS.bytes_deleted.load(std::sync::atomic::Ordering::Relaxed),
         "produce_hold_ms": kafka::PRODUCE_HOLD_MS.load(std::sync::atomic::Ordering::Relaxed),
+        "wal_shards": admin
+            .wal
+            .all()
+            .into_iter()
+            .map(|(id, shard)| serde_json::json!({
+                "id": id,
+                "leader": shard.leader(),
+                "voters": shard.voters(),
+                "unsealed_bytes": shard.unsealed_bytes(),
+            }))
+            .collect::<Vec<_>>(),
     }))
 }
 
 /// Create the metadata group from every peer and the WAL shard from the
 /// peers marked `wal`. Each `addr` is that broker's HTTP address; both
 /// groups' RPC goes there. The shard is initialized on its first voter.
+/// Where shard `shard` keeps its log: shard 0 in `wal_dir`, as before shards
+/// had ids, and shard `n` beside it in `<wal_dir>-shards/<n>` (ADR 0014).
+fn shard_dir(wal_dir: &std::path::Path, shard: u32) -> PathBuf {
+    if shard == 0 {
+        return wal_dir.to_path_buf();
+    }
+    let name = wal_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wal".into());
+    wal_dir
+        .with_file_name(format!("{name}-shards"))
+        .join(shard.to_string())
+}
+
+/// Open every shard in the stored layout that this broker has not opened
+/// yet. A shard this broker is not a voter of stays empty.
+async fn open_shards(
+    node: Arc<MetadataNode>,
+    wal: Arc<WalSlot>,
+    node_id: NodeId,
+    wal_dir: PathBuf,
+) {
+    loop {
+        let count = node
+            .read_local(camus_metadata::SHARDS)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|layout| layout["count"].as_u64())
+            .unwrap_or(1);
+        for shard in 1..u32::try_from(count).unwrap_or(1) {
+            if wal.shard(shard).is_some() {
+                continue;
+            }
+            let dir = shard_dir(&wal_dir, shard);
+            match Shard::open_shard(node_id, &dir, shard).await {
+                Ok(opened) => {
+                    wal.replace(shard, opened);
+                    tracing::info!(shard, "opened wal shard");
+                }
+                Err(err) => tracing::warn!(shard, %err, "opening wal shard"),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Each shard's voters: every WAL voter for a one-shard cluster, as before
+/// shards had ids; otherwise `min(3, voters)` of them, starting at a
+/// different voter for each shard so each is the first, preferred, voter of
+/// some shard (ADR 0014).
+fn shard_voters(voters: &[NodeId], shards: u32) -> Vec<Vec<NodeId>> {
+    if shards <= 1 {
+        return vec![voters.to_vec()];
+    }
+    let each = voters.len().min(3);
+    (0..shards as usize)
+        .map(|shard| {
+            (0..each)
+                .map(|offset| voters[(shard + offset) % voters.len()])
+                .collect()
+        })
+        .collect()
+}
+
 async fn init(
     State(admin): State<Arc<Admin>>,
-    Json(peers): Json<Vec<Peer>>,
+    Json(body): Json<InitBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let (peers, shards) = match body {
+        InitBody::Peers(peers) => (peers, None),
+        InitBody::Layout { peers, shards } => (peers, shards),
+    };
     let mut nodes = BTreeMap::new();
-    let mut shard = BTreeMap::new();
+    let mut voters = Vec::new();
     for peer in peers {
         let node = BasicNode { addr: peer.addr };
         if peer.wal {
-            shard.insert(peer.id, node.clone());
+            voters.push(peer.id);
         }
         nodes.insert(peer.id, node);
     }
-    let Some(first) = shard.values().next().cloned() else {
+    if voters.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no wal voter".into()));
-    };
+    }
+    voters.sort_unstable();
+    let count = shards.unwrap_or(voters.len() as u32).max(1);
+    let layout = shard_voters(&voters, count);
     admin
         .node
-        .initialize(nodes)
+        .initialize(nodes.clone())
         .await
         .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
-    let response = admin
-        .http
-        .post(format!("http://{}/wal/init", first.addr))
-        .json(&shard)
-        .send()
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    if !response.status().is_success() {
-        let status =
-            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return Err((status, response.text().await.unwrap_or_default()));
+    if count > 1 {
+        let raw = serde_json::json!({ "count": count, "voters": layout }).to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Err(err) = metadata_write(&admin, camus_metadata::SHARDS, &raw).await {
+            if std::time::Instant::now() > deadline {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, err.to_string()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    // Initialize each shard on its first voter, which then usually leads it.
+    // A broker opens a new shard once it sees the layout, so retry until it
+    // has.
+    for (shard, members) in layout.iter().enumerate() {
+        let map: BTreeMap<NodeId, BasicNode> =
+            members.iter().map(|id| (*id, nodes[id].clone())).collect();
+        let first = &nodes[&members[0]];
+        let path = if shard == 0 {
+            "wal/init".to_string()
+        } else {
+            format!("wal/{shard}/init")
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let sent = admin
+                .http
+                .post(format!("http://{}/{path}", first.addr))
+                .json(&map)
+                .send()
+                .await;
+            match sent {
+                Ok(response) if response.status().is_success() => break,
+                Ok(response)
+                    if response.status() != StatusCode::NOT_FOUND
+                        || std::time::Instant::now() > deadline =>
+                {
+                    let status = StatusCode::from_u16(response.status().as_u16())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    return Err((status, response.text().await.unwrap_or_default()));
+                }
+                Err(err) if std::time::Instant::now() > deadline => {
+                    return Err((StatusCode::BAD_GATEWAY, err.to_string()));
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
     }
     Ok(StatusCode::OK)
 }
@@ -322,7 +462,26 @@ async fn wal_init(
     State(wal): State<Arc<WalSlot>>,
     Json(nodes): Json<BTreeMap<NodeId, BasicNode>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    wal.get()
+    initialize_shard(&wal, 0, nodes).await
+}
+
+async fn shard_init(
+    State(wal): State<Arc<WalSlot>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(nodes): Json<BTreeMap<NodeId, BasicNode>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    initialize_shard(&wal, shard, nodes).await
+}
+
+async fn initialize_shard(
+    wal: &WalSlot,
+    shard: u32,
+    nodes: BTreeMap<NodeId, BasicNode>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(opened) = wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard} yet")));
+    };
+    opened
         .initialize(nodes)
         .await
         .map(|_| StatusCode::OK)
@@ -405,7 +564,7 @@ async fn truncate_to_sealed(
     .await
     .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
     let _ = old.raft.shutdown().await;
-    let dir = admin.wal_dir.clone();
+    let dir = shard_dir(&admin.wal_dir, body.shard);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
@@ -416,7 +575,9 @@ async fn truncate_to_sealed(
         .unwrap_or_else(|| "wal".into());
     let aside = dir.with_file_name(format!("{name}.truncated-{stamp}"));
     std::fs::rename(&dir, &aside).map_err(|err| internal(err.into()))?;
-    let fresh = Shard::open(me, &dir).await.map_err(internal)?;
+    let fresh = Shard::open_shard(me, &dir, body.shard)
+        .await
+        .map_err(internal)?;
     fresh
         .initialize(BTreeMap::from([(me, BasicNode { addr })]))
         .await

@@ -34,3 +34,38 @@ fn a_single_shard_cluster_places_partitions_on_shard_0_and_routes_by_id() {
     );
     assert_eq!(post("/wal/7/raft-vote"), 404, "no such shard");
 }
+
+#[test]
+fn init_with_a_shard_count_opens_every_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = support::Node::with(1, dir.path(), Opts::default());
+    let init = reqwest::blocking::Client::new()
+        .post(format!("http://{}/admin/init", node.http))
+        .json(&serde_json::json!({
+            "peers": [{"id": 1, "addr": node.http, "wal": true}],
+            "shards": 2,
+        }))
+        .send()
+        .unwrap();
+    assert!(init.status().is_success(), "{}", init.text().unwrap());
+    support::wait_settled(&[&node]);
+    let addr = support::kafka_addr(&node);
+    support::create_topic_with(&addr, "wal", 2);
+    let layout: serde_json::Value =
+        serde_json::from_str(&read_key(&node.http, "wal/shards").unwrap()).unwrap();
+    assert_eq!(layout["count"].as_u64(), Some(2));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let shards = support::admin(&node.http).unwrap()["wal_shards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|shard| shard["leader"].as_u64() == Some(1))
+            .count();
+        if shards == 2 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "shard 1 never led");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
