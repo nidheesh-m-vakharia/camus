@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Railway Infrastructure as Code for the Camus broker.",
+  "dependencies": {
+    "railway": "^3.12.0"
+  }
+}

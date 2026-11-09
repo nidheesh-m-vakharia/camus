@@ -1,5 +1,6 @@
 name = "camus"
 compatibility_date = "2026-11-07"
+previews = { }
 
 [assets]
 directory = "./site"
