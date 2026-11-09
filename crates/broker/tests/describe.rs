@@ -3,6 +3,8 @@
 
 mod support;
 
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use camus_protocol::messages::consumer_group_describe_response::ConsumerGroupDescribeResponse;
@@ -244,4 +246,58 @@ fn describe_producers_lists_a_sealed_idempotent_producer() {
         assert!(Instant::now() < deadline, "the producer never appeared");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// `kafka-clients` 4.4.0 joins with `group.protocol=consumer` and
+/// `Admin.describeConsumerGroups` reads the member back.
+#[test]
+fn java_admin_describes_a_consumer_protocol_group() {
+    let jars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-jars");
+    if !jars.join("kafka-clients-4.4.0.jar").is_file() {
+        eprintln!("skipping java describe; missing {}", jars.display());
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let classes = root.path().join("classes");
+    std::fs::create_dir_all(&classes).unwrap();
+    let mut classpath = vec![classes.display().to_string()];
+    for entry in std::fs::read_dir(&jars).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+            classpath.push(path.display().to_string());
+        }
+    }
+    let classpath = classpath.join(":");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/java/DescribeConsumerGroup.java");
+    let compiled = Command::new("javac")
+        .args(["--release", "17", "-cp", &classpath, "-d"])
+        .arg(&classes)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "javac\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let node = single(root.path(), Opts::default());
+    let ran = Command::new("java")
+        .args([
+            "-cp",
+            &classpath,
+            "DescribeConsumerGroup",
+            &kafka_addr(&node),
+        ])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        ran.status.success() && text.contains("consumer group describe ok"),
+        "{text}"
+    );
 }
