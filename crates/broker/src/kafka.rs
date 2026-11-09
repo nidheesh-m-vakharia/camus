@@ -2640,6 +2640,10 @@ impl Kafka {
         let mut puts = tokio::task::JoinSet::new();
         for (slot, chunk) in chunks.into_iter().enumerate() {
             let bucket = self.bucket.clone();
+            let mut chunk = chunk;
+            // Each partition's batches sit together in the object, so they
+            // publish as one extent.
+            chunk.sort_by_key(|batch| (batch.topic_id, batch.partition, batch.start));
             puts.spawn(async move {
                 let mut heads = Vec::with_capacity(chunk.len());
                 let mut notes = Vec::new();
@@ -2719,7 +2723,7 @@ impl Kafka {
                 });
             }
         }
-        (parts, producers, seals, all_put)
+        (coalesce(parts), producers, seals, all_put)
     }
 
     /// One upload pass: at most `upload.flush.bytes` (8 MiB, ADR 0006) of
@@ -3005,7 +3009,17 @@ impl Kafka {
         }
         let mut parts = Vec::new();
         if !pieces.is_empty() {
-            let (index, body) = camus_uploader::encode(&pieces);
+            // Encode each partition's batches together, so they publish as one
+            // extent, and map the offsets back to `pieces` order.
+            let mut order: Vec<usize> = (0..pieces.len()).collect();
+            order.sort_by_key(|&at| (pieces[at].topic_id, pieces[at].partition, pieces[at].start));
+            let sorted: Vec<Piece> = order.iter().map(|&at| pieces[at].clone()).collect();
+            let (sorted_index, body) = camus_uploader::encode(&sorted);
+            drop(sorted);
+            let mut index = vec![(0, 0); pieces.len()];
+            for (at, located) in order.into_iter().zip(sorted_index) {
+                index[at] = located;
+            }
             let object_key = camus_uploader::object_key();
             if self.bucket.put_new(&object_key, body).await.is_err() {
                 return fail(items, STORAGE);
@@ -3035,7 +3049,7 @@ impl Kafka {
                     max_timestamp: item.max_timestamp,
                 });
             }
-            let published = self.node.publish(parts, notes).await;
+            let published = self.node.publish(coalesce(parts), notes).await;
             let code = match published {
                 Ok(response) if response.error_code == 0 => None,
                 Ok(response) => Some(response.error_code),
@@ -3639,6 +3653,34 @@ struct ConfigView {
 
 /// `NoteTxn` applies the abort and reports the Kafka code in `value` when the
 /// batch cannot join the transaction. A normal success leaves `value` empty.
+/// Merge parts that continue one another in the same object into one, so a
+/// partition gets one extent per object rather than one per batch. Each
+/// partition's parts stay in offset order.
+fn coalesce(mut parts: Vec<PublishPart>) -> Vec<PublishPart> {
+    parts.sort_by(|a, b| (&a.topic, a.partition).cmp(&(&b.topic, b.partition)));
+    let mut out: Vec<PublishPart> = Vec::with_capacity(parts.len());
+    for part in parts {
+        if let Some(last) = out.last_mut() {
+            if last.topic == part.topic
+                && last.partition == part.partition
+                && last.epoch == part.epoch
+                && last.object_key == part.object_key
+                && last.end == part.start
+                && last.file_offset + u64::from(last.length) == part.file_offset
+            {
+                if let Some(length) = last.length.checked_add(part.length) {
+                    last.end = part.end;
+                    last.length = length;
+                    last.max_timestamp = last.max_timestamp.max(part.max_timestamp);
+                    continue;
+                }
+            }
+        }
+        out.push(part);
+    }
+    out
+}
+
 fn noted_error(applied: &anyhow::Result<camus_metadata::Response>) -> Option<i16> {
     match applied {
         Ok(response) if response.error_code != 0 => Some(response.error_code),
