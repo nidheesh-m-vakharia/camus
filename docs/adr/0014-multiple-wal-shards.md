@@ -139,6 +139,10 @@ in Kafka.
   campaign can end in an election someone else wins. A handover therefore
   campaigns again, past the lease, until the preferred voter leads (up to
   about three seconds); `ElectLeaders` answers `0` only once it has.
+- A cluster written before shard ids has no `wal/shards` row and no `shard`
+  field on its partitions. Both mean shard 0, whose log is still the
+  original `wal` directory, so a restart on this build reads that log
+  where the old build left it.
 
 ## Delivery
 

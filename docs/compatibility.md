@@ -305,7 +305,7 @@ acceptance test. `-` means not run.
 | ExpireDelegationToken | 40 | | not planned | unimplemented | - | - | - |
 | DescribeDelegationToken | 41 | | not planned | unimplemented | - | - | - |
 | DeleteGroups | 42 | 3 | 0-3 | implemented | pass | pass | pass |
-| ElectLeaders | 43 | | 0-2 (`PREFERRED`; `UNCLEAN` answers 83) | implemented | - | - | - |
+| ElectLeaders | 43 | | 0-2 (`PREFERRED`; `UNCLEAN` answers 83) | implemented | pass | - | - |
 | IncrementalAlterConfigs | 44 | 4 | 0-1 | implemented | pass | pass | pass |
 | AlterPartitionReassignments | 45 | | not planned | unimplemented | - | - | - |
 | ListPartitionReassignments | 46 | | not planned | unimplemented | - | - | - |
@@ -347,7 +347,7 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 | Go | `franz-go` v1.22.0, SASL_SSL, passed | 1 |
 | kcat | CLI against the dev listener | 1, smoke |
 | KafkaJS 2 | round trip with a consumer group, in the ecosystem harness | passed |
-| Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, API versions | passed |
+| Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, preferred leader election, API versions | passed |
 | Kafka Connect 4.4.0, distributed | FileStream source and sink, compacted internal topics, resume after restart | passed |
 | Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | passed |
 | MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | passed |
