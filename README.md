@@ -208,10 +208,11 @@ longer published. Tests that need a bucket skip unless `CAMUS_MINIO=1`.
 
 `CAMUS_ECOSYSTEM=1 cargo test -p camus-broker --test ecosystem -- --test-threads=1`
 runs the Apache Kafka 4.4.0 CLI tools, Kafka Connect, Kafka Streams with
-`exactly_once_v2`, MirrorMaker 2 from a real Kafka broker, and KafkaJS
-against Camus. It downloads the Kafka distribution into `target/` and needs
-a JDK and `npm`. Schema Registry runs in Docker and needs the broker on a
-non-loopback address, so it also needs `CAMUS_ECOSYSTEM_DOCKER=1`.
+`exactly_once_v2`, MirrorMaker 2 from a real Kafka broker, KafkaJS,
+confluent-kafka-go, and confluent-kafka-dotnet against Camus. It downloads
+the Kafka distribution into `target/` and needs a JDK, `npm`, Go with
+librdkafka, and the .NET SDK. Schema Registry runs in Docker and needs the
+broker on a non-loopback address, so it also needs `CAMUS_ECOSYSTEM_DOCKER=1`.
 
 `--advertised-addr host:port` is what Metadata hands out, as Kafka's
 `advertised.listeners`; use it behind NAT or for clients in containers.
