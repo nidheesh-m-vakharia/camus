@@ -62,6 +62,8 @@ pub struct RedbMachine {
     current_snapshot: RwLock<Option<StoredSnapshot>>,
     /// When an apply last committed with fsync.
     last_durable: std::sync::Mutex<std::time::Instant>,
+    /// Bumped after each commit that may change the stored ACLs.
+    acl_version: AtomicU64,
 }
 
 impl RedbMachine {
@@ -83,7 +85,13 @@ impl RedbMachine {
             snapshot_idx: AtomicU64::new(snapshot_idx),
             current_snapshot: RwLock::new(current),
             last_durable: std::sync::Mutex::new(std::time::Instant::now()),
+            acl_version: AtomicU64::new(0),
         })
+    }
+
+    /// See [`crate::MetadataNode::acl_version`].
+    pub fn acl_version(&self) -> u64 {
+        self.acl_version.load(Ordering::Acquire)
     }
 
     /// Up to `limit` applied keys in `[from, to)`, in key order.
@@ -209,6 +217,14 @@ fn read_applied(
         None => StoredMembership::default(),
     };
     Ok((last_applied, membership))
+}
+
+fn may_change_acls(command: &Command) -> bool {
+    match command {
+        Command::CreateAcls { .. } | Command::DeleteAcls { .. } => true,
+        Command::Put { key, .. } | Command::Delete { key } => key == acl::KEY,
+        _ => false,
+    }
 }
 
 fn apply_command(
@@ -741,6 +757,10 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
     {
         let entries: Vec<_> = entries.into_iter().collect();
         let mut responses = Vec::with_capacity(entries.len());
+        let acls_change = entries.iter().any(|entry| match &entry.payload {
+            EntryPayload::Normal(command) => may_change_acls(command),
+            _ => false,
+        });
         let durable = entries
             .iter()
             .any(|entry| matches!(entry.payload, EntryPayload::Membership(_)))
@@ -787,6 +807,10 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
             .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
         if durable {
             *self.last_durable.lock().expect("last durable") = std::time::Instant::now();
+        }
+        // After the commit, so whoever sees the new version reads the new ACLs.
+        if acls_change {
+            self.acl_version.fetch_add(1, Ordering::Release);
         }
         Ok(responses)
     }
@@ -854,6 +878,7 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
         }
         txn.commit()
             .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+        self.acl_version.fetch_add(1, Ordering::Release);
         *self.current_snapshot.write().await = Some(StoredSnapshot {
             meta: meta.clone(),
             data: bytes,
