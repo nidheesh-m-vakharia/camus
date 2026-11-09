@@ -711,3 +711,120 @@ fn a_transaction_past_its_timeout_is_aborted_and_its_producer_fenced() {
     assert_eq!(recovered.producer_id.0, producer);
     assert_eq!(recovered.producer_epoch, epoch + 2);
 }
+
+fn add_partition(stream: &mut TcpStream, correlation: i32, producer: i64, epoch: i16) {
+    send(
+        stream,
+        ApiKey::AddPartitionsToTxn,
+        3,
+        correlation,
+        &AddPartitionsToTxnRequest::default()
+            .with_v3_and_below_transactional_id(TransactionalId(StrBytes::from_static_str(
+                "checkout",
+            )))
+            .with_v3_and_below_producer_id(producer.into())
+            .with_v3_and_below_producer_epoch(epoch)
+            .with_v3_and_below_topics(vec![AddPartitionsToTxnTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("orders")))
+                .with_partitions(vec![0])]),
+    );
+    let added = recv::<AddPartitionsToTxnResponse>(stream, 3);
+    assert_eq!(
+        added.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code, 0,
+        "{added:?}"
+    );
+}
+
+fn end(stream: &mut TcpStream, correlation: i32, producer: i64, epoch: i16, commit: bool) {
+    send(
+        stream,
+        ApiKey::EndTxn,
+        3,
+        correlation,
+        &EndTxnRequest::default()
+            .with_transactional_id(TransactionalId(StrBytes::from_static_str("checkout")))
+            .with_producer_id(producer.into())
+            .with_producer_epoch(epoch)
+            .with_committed(commit),
+    );
+    assert_eq!(recv::<EndTxnResponse>(stream, 3).error_code, 0);
+}
+
+/// Offsets and values a fetch from `offset` returns.
+fn read_from(stream: &mut TcpStream, isolation: i8, offset: i64) -> Vec<(i64, String)> {
+    let mut part = FetchPartition::default();
+    part.partition = 0;
+    part.fetch_offset = offset;
+    part.partition_max_bytes = 1024 * 1024;
+    let mut topic = FetchTopic::default();
+    topic.topic = TopicName(StrBytes::from_static_str("orders"));
+    topic.partitions = vec![part];
+    send(
+        stream,
+        ApiKey::Fetch,
+        11,
+        30,
+        &FetchRequest::default()
+            .with_max_wait_ms(50)
+            .with_isolation_level(isolation)
+            .with_topics(vec![topic]),
+    );
+    let data = recv::<FetchResponse>(stream, 11)
+        .responses
+        .remove(0)
+        .partitions
+        .remove(0);
+    let Some(mut bytes) = data.records else {
+        return Vec::new();
+    };
+    camus_protocol::records::RecordBatchDecoder::decode_all(&mut bytes)
+        .unwrap()
+        .into_iter()
+        .flat_map(|set| set.records)
+        .filter(|record| record.offset >= offset)
+        .map(|record| {
+            (
+                record.offset,
+                String::from_utf8(record.value.unwrap().to_vec()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Camus writes no control records, so a `read_committed` consumer that
+/// seeks into or past an aborted range must still get the committed records
+/// at their own offsets, as with Kafka.
+#[test]
+fn a_read_committed_seek_skips_an_aborted_range_and_keeps_offsets() {
+    let root = tempfile::tempdir().unwrap();
+    let (node, mut stream) = start(root.path(), &[]);
+    let started = init_producer(&mut stream, 1, 60_000, None);
+    assert_eq!(started.error_code, 0);
+    let (producer, epoch) = (started.producer_id.0, started.producer_epoch);
+    for (round, (value, commit)) in [("a", true), ("b", false), ("c", true)]
+        .into_iter()
+        .enumerate()
+    {
+        let base = 10 * (round as i32 + 1);
+        add_partition(&mut stream, base, producer, epoch);
+        produce(
+            &mut stream,
+            base + 1,
+            batch(value.as_bytes(), producer, epoch, round as i32),
+            producer,
+        );
+        end(&mut stream, base + 2, producer, epoch, commit);
+    }
+    let committed = |offset| {
+        let mut stream = TcpStream::connect(&node.kafka).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        read_from(&mut stream, 1, offset)
+    };
+    assert_eq!(committed(0), vec![(0, "a".into()), (2, "c".into())]);
+    assert_eq!(committed(1), vec![(2, "c".into())], "seek into the abort");
+    assert_eq!(committed(2), vec![(2, "c".into())]);
+    // read_uncommitted sees the aborted record too, as in Kafka.
+    assert_eq!(read_from(&mut stream, 0, 0).len(), 3);
+}

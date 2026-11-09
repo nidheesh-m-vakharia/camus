@@ -75,7 +75,9 @@ Metadata voters default to 3. WAL shard replication factor defaults to 3.
 Both are config. A 5-voter metadata group is allowed and is not the default.
 `durability.mode` defaults to `wal`.
 
-## What Phase 0 will contain
+## What Phase 0 contained
+
+This section is the original Phase 0 scope, kept as a record. Phase 0 is done.
 
 Phase 0 is foundations only. No Produce or Fetch handler that accepts data.
 
