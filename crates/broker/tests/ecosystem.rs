@@ -1,12 +1,14 @@
 //! The Kafka ecosystem against Camus: the Apache Kafka 4.4.0 CLI tools, Kafka
 //! Connect, Kafka Streams with `exactly_once_v2`, MirrorMaker 2 from a real
-//! Apache Kafka broker, KafkaJS, and Schema Registry.
+//! Apache Kafka broker, KafkaJS, confluent-kafka-go, confluent-kafka-dotnet,
+//! and Schema Registry.
 //!
 //! Opt-in with `CAMUS_ECOSYSTEM=1`; the first run downloads the Kafka
 //! distribution into `target/kafka-dist`. A JDK is required (`JAVA_HOME`, or
-//! Homebrew's `openjdk@21`), and `node`/`npm` for KafkaJS. Schema Registry runs
-//! in Docker and needs the broker on a non-loopback address, so it is a
-//! further opt-in: `CAMUS_ECOSYSTEM_DOCKER=1`.
+//! Homebrew's `openjdk@21`), `node`/`npm` for KafkaJS, Go and librdkafka for
+//! confluent-kafka-go, and the .NET SDK for confluent-kafka-dotnet. Schema
+//! Registry runs in Docker and needs the broker on a non-loopback address, so
+//! it is a further opt-in: `CAMUS_ECOSYSTEM_DOCKER=1`.
 
 mod support;
 
@@ -775,6 +777,95 @@ fn kafkajs_round_trips() {
     );
     assert!(
         ran.status.success() && text.contains("kafkajs ok"),
+        "{text}"
+    );
+}
+
+fn program(name: &str, fallbacks: &[&str]) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            let candidate = PathBuf::from(dir).join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    fallbacks.iter().map(PathBuf::from).find(|path| path.is_file())
+}
+
+#[test]
+fn confluent_kafka_go_round_trips() {
+    if !enabled() {
+        return;
+    }
+    let Some(go) = program("go", &["/opt/homebrew/bin/go"]) else {
+        eprintln!("skipping confluent-kafka-go; go is not installed");
+        return;
+    };
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/ecosystem/confluent_kafka_go");
+    let pkg = Command::new("pkg-config")
+        .args(["--variable=pcfiledir", "rdkafka"])
+        .output();
+    let mut command = Command::new(go);
+    command
+        .args(["run", "-tags", "dynamic", "."])
+        .current_dir(&source)
+        .env("CGO_ENABLED", "1");
+    if let Ok(output) = pkg {
+        if output.status.success() {
+            let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !dir.is_empty() {
+                let joined = match std::env::var("PKG_CONFIG_PATH") {
+                    Ok(existing) if !existing.is_empty() => format!("{dir}:{existing}"),
+                    _ => dir,
+                };
+                command.env("PKG_CONFIG_PATH", joined);
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, bootstrap) = broker(dir.path());
+    let ran = command.arg(&bootstrap).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        ran.status.success() && text.contains("confluent-kafka-go ok"),
+        "{text}"
+    );
+}
+
+#[test]
+fn confluent_kafka_dotnet_round_trips() {
+    if !enabled() {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let fallback = format!("{home}/.dotnet/dotnet");
+    let Some(dotnet) = program("dotnet", &["/opt/homebrew/bin/dotnet", &fallback]) else {
+        eprintln!("skipping confluent-kafka-dotnet; dotnet is not installed");
+        return;
+    };
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/ecosystem/confluent_kafka_dotnet");
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, bootstrap) = broker(dir.path());
+    let ran = Command::new(dotnet)
+        .args(["run", "--project"])
+        .arg(&source)
+        .arg("--")
+        .arg(&bootstrap)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        ran.status.success() && text.contains("confluent-kafka-dotnet ok"),
         "{text}"
     );
 }
