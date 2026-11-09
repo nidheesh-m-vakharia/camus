@@ -113,6 +113,16 @@ a metadata write, kills the leader, and checks that a new write commits.
 MinIO is built from `deploy/minio` because current community images are no
 longer published. Tests that need a bucket skip unless `CAMUS_MINIO=1`.
 
+`CAMUS_ECOSYSTEM=1 cargo test -p camus-broker --test ecosystem -- --test-threads=1`
+runs the Apache Kafka 4.4.0 CLI tools, Kafka Connect, Kafka Streams with
+`exactly_once_v2`, MirrorMaker 2 from a real Kafka broker, and KafkaJS
+against Camus. It downloads the Kafka distribution into `target/` and needs
+a JDK and `npm`. Schema Registry runs in Docker and needs the broker on a
+non-loopback address, so it also needs `CAMUS_ECOSYSTEM_DOCKER=1`.
+
+`--advertised-addr host:port` is what Metadata hands out, as Kafka's
+`advertised.listeners`; use it behind NAT or for clients in containers.
+
 GitHub Actions runs `cargo test --workspace --locked` on pull requests and
 on `main`.
 

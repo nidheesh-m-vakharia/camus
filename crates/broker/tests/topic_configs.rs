@@ -454,3 +454,41 @@ fn auto_create_can_be_turned_off() {
     let addr = kafka_addr(&node);
     assert_eq!(metadata_for(&addr, "fresh", true), (3, 0));
 }
+
+#[test]
+fn describe_configs_reports_the_broker() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = single(dir.path(), Opts::default());
+    let addr = kafka_addr(&node);
+    let mut stream = connect(&addr);
+    let resource = |name: &'static str| {
+        let mut resource = DescribeConfigsResource::default();
+        resource.resource_type = 4;
+        resource.resource_name = StrBytes::from_static_str(name);
+        resource
+    };
+    send(
+        &mut stream,
+        ApiKey::DescribeConfigs,
+        4,
+        &DescribeConfigsRequest::default().with_resources(vec![resource("1"), resource("2")]),
+    );
+    let response = recv::<DescribeConfigsResponse>(&mut stream, 4);
+    let mine = &response.results[0];
+    assert_eq!(mine.error_code, 0);
+    let max = mine
+        .configs
+        .iter()
+        .find(|row| row.name.as_str() == "message.max.bytes")
+        .expect("message.max.bytes");
+    assert_eq!(
+        max.value.as_ref().map(|v| v.to_string()).as_deref(),
+        Some("1048588")
+    );
+    assert!(max.read_only);
+    assert!(mine
+        .configs
+        .iter()
+        .any(|row| row.name.as_str() == "auto.create.topics.enable"));
+    assert_eq!(response.results[1].error_code, 42, "another broker's id");
+}
