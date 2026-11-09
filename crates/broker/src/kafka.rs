@@ -55,6 +55,7 @@ mod admin;
 mod describe;
 mod epochs;
 mod groups;
+mod scram;
 mod txn;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -137,6 +138,56 @@ impl Socket {
             Self::Tls(socket) => socket.write_all(buf).await,
         }
     }
+    /// `User:<subject>` from the client's TLS certificate, formatted as
+    /// Kafka's default principal builder does (RFC 2253, most specific
+    /// first). `None` without a client certificate.
+    fn certificate_principal(&self) -> Option<String> {
+        let Self::Tls(stream) = self else {
+            return None;
+        };
+        let der = stream.get_ref().1.peer_certificates()?.first()?;
+        let (_, certificate) = x509_parser::parse_x509_certificate(der.as_ref()).ok()?;
+        Some(format!("User:{}", rfc2253(certificate.subject())))
+    }
+}
+
+/// A distinguished name as Java's `X500Principal.getName()` prints it.
+fn rfc2253(name: &x509_parser::x509::X509Name<'_>) -> String {
+    let rdns: Vec<String> = name
+        .iter_rdn()
+        .map(|rdn| {
+            rdn.iter()
+                .map(|attribute| {
+                    let oid = attribute.attr_type().to_id_string();
+                    let key = match oid.as_str() {
+                        "2.5.4.3" => "CN".to_string(),
+                        "2.5.4.6" => "C".to_string(),
+                        "2.5.4.7" => "L".to_string(),
+                        "2.5.4.8" => "ST".to_string(),
+                        "2.5.4.9" => "STREET".to_string(),
+                        "2.5.4.10" => "O".to_string(),
+                        "2.5.4.11" => "OU".to_string(),
+                        "0.9.2342.19200300.100.1.25" => "DC".to_string(),
+                        "0.9.2342.19200300.100.1.1" => "UID".to_string(),
+                        other => other.to_string(),
+                    };
+                    let value = attribute.as_str().unwrap_or_default();
+                    let mut escaped = String::new();
+                    for (at, c) in value.chars().enumerate() {
+                        let edge = at == 0 && (c == '#' || c == ' ')
+                            || at + 1 == value.chars().count() && c == ' ';
+                        if edge || matches!(c, ',' | '+' | '"' | '\\' | '<' | '>' | ';') {
+                            escaped.push('\\');
+                        }
+                        escaped.push(c);
+                    }
+                    format!("{key}={escaped}")
+                })
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect();
+    rdns.into_iter().rev().collect::<Vec<_>>().join(",")
 }
 
 /// Metadata key for shard 0's leader and voters. Phase 2 runs one shard.
@@ -274,12 +325,13 @@ impl Kafka {
         if require_sasl && !sasl_user.is_empty() {
             super_users.insert(format!("User:{sasl_user}"));
         }
-        // Without SASL every client is `User:ANONYMOUS`, as on a Kafka
-        // listener with no authorizer, so a resource no ACL names stays open.
+        // On the dev PLAINTEXT listener every client is `User:ANONYMOUS`, as
+        // on a Kafka listener with no authorizer, so a resource no ACL names
+        // stays open. An authenticated listener (SASL or mTLS) denies it.
         let allow_if_no_acl = match std::env::var("CAMUS_ACL_ALLOW_IF_NO_ACL").ok().as_deref() {
             Some("true") => true,
             Some("false") => false,
-            _ => !require_sasl,
+            _ => !require_sasl && tls.is_none(),
         };
         let txn_max_timeout_ms = env_ms("CAMUS_TXN_MAX_TIMEOUT_MS", 900_000) as i64;
         let txn_abort_interval_ms = env_ms("CAMUS_TXN_ABORT_INTERVAL_MS", 10_000);
@@ -1177,9 +1229,15 @@ impl Kafka {
     }
 
     async fn connection(&self, mut socket: Socket, host: String) -> anyhow::Result<()> {
+        // A client certificate is the principal on an mTLS listener, as on
+        // Kafka's SSL listener, unless SASL is also required.
+        let certified = socket.certificate_principal();
         let mut session = Session {
             authed: !self.require_sasl,
             host,
+            principal: if self.require_sasl { None } else { certified },
+            mechanism: "PLAIN".into(),
+            scram: None,
         };
         loop {
             let mut size_buf = [0u8; 4];
@@ -1234,7 +1292,10 @@ impl Kafka {
             return unsupported(key, version, header.correlation_id);
         }
         let caller = Caller {
-            principal: self.principal(session.authed),
+            principal: session
+                .principal
+                .clone()
+                .unwrap_or_else(|| "User:ANONYMOUS".into()),
             host: session.host.clone(),
         };
         match key {
@@ -1246,10 +1307,8 @@ impl Kafka {
             ApiKey::Produce => self.produce(&header, &mut buf, &caller).await,
             ApiKey::Fetch => self.fetch(&header, &mut buf, &caller).await,
             ApiKey::ListOffsets => self.list_offsets(&header, &mut buf, &caller).await,
-            ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf),
-            ApiKey::SaslAuthenticate => {
-                self.sasl_authenticate(&header, &mut buf, &mut session.authed)
-            }
+            ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf, session),
+            ApiKey::SaslAuthenticate => self.sasl_authenticate(&header, &mut buf, session),
             ApiKey::FindCoordinator => self.find_coordinator(&header, &mut buf, &caller).await,
             ApiKey::JoinGroup => self.join_group(&header, &mut buf, &caller).await,
             ApiKey::SyncGroup => self.sync_group(&header, &mut buf, &caller).await,
@@ -1293,6 +1352,14 @@ impl Kafka {
             }
             ApiKey::DescribeProducers => self.describe_producers(&header, &mut buf, &caller).await,
             ApiKey::DescribeLogDirs => self.describe_log_dirs(&header, &mut buf, &caller).await,
+            ApiKey::DescribeUserScramCredentials => {
+                self.describe_user_scram_credentials(&header, &mut buf, &caller)
+                    .await
+            }
+            ApiKey::AlterUserScramCredentials => {
+                self.alter_user_scram_credentials(&header, &mut buf, &caller)
+                    .await
+            }
             ApiKey::OffsetForLeaderEpoch => {
                 self.offset_for_leader_epoch(&header, &mut buf, &caller)
                     .await
@@ -1496,14 +1563,6 @@ impl Kafka {
             topic.partitions.push(partition);
         }
         topic
-    }
-
-    fn principal(&self, authed: bool) -> String {
-        if authed && self.require_sasl && !self.sasl_user.is_empty() {
-            format!("User:{}", self.sasl_user)
-        } else {
-            "User:ANONYMOUS".into()
-        }
     }
 
     /// Kafka's authorizer: super users may do anything; otherwise the ACLs
@@ -3052,13 +3111,25 @@ impl Kafka {
         row
     }
 
-    fn sasl_handshake(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    fn sasl_handshake(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        session: &mut Session,
+    ) -> Reply {
         let Ok(request) = SaslHandshakeRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let mut response = SaslHandshakeResponse::default();
-        response.mechanisms = vec![StrBytes::from_static_str("PLAIN")];
-        if request.mechanism.as_str() != "PLAIN" {
+        response.mechanisms = ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"]
+            .into_iter()
+            .map(StrBytes::from_static_str)
+            .collect();
+        let mechanism = request.mechanism.to_string();
+        if mechanism == "PLAIN" || scram::Mechanism::from_name(&mechanism).is_some() {
+            session.mechanism = mechanism;
+            session.scram = None;
+        } else {
             response.error_code = SASL_MECHANISM;
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
@@ -3068,13 +3139,41 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        authed: &mut bool,
+        session: &mut Session,
     ) -> Reply {
         let Ok(request) = SaslAuthenticateRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let mut response = SaslAuthenticateResponse::default();
         let bytes = request.auth_bytes.as_ref();
+        let fail = |response: &mut SaslAuthenticateResponse| {
+            response.error_code = SASL_AUTH_FAILED;
+            response.error_message = Some(StrBytes::from_static_str("authentication failed"));
+        };
+        if let Some(mechanism) = scram::Mechanism::from_name(&session.mechanism) {
+            match session.scram.take() {
+                None => {
+                    match scram::Exchange::start(mechanism, bytes, |user| {
+                        self.scram_credential(mechanism, user)
+                    }) {
+                        Some((exchange, reply)) => {
+                            session.scram = Some(exchange);
+                            response.auth_bytes = Bytes::from(reply);
+                        }
+                        None => fail(&mut response),
+                    }
+                }
+                Some(exchange) => match exchange.finish(bytes) {
+                    Some((user, reply)) => {
+                        session.authed = true;
+                        session.principal = Some(format!("User:{user}"));
+                        response.auth_bytes = Bytes::from(reply);
+                    }
+                    None => fail(&mut response),
+                },
+            }
+            return frame_of(header.request_api_version, header.correlation_id, &response);
+        }
         let mut parts = bytes.split(|byte| *byte == 0);
         let _authzid = parts.next();
         let user = parts.next().unwrap_or_default();
@@ -3083,10 +3182,10 @@ impl Kafka {
             && constant_eq(pass, self.sasl_pass.as_bytes())
             && !self.sasl_user.is_empty()
         {
-            *authed = true;
+            session.authed = true;
+            session.principal = Some(format!("User:{}", self.sasl_user));
         } else {
-            response.error_code = SASL_AUTH_FAILED;
-            response.error_message = Some(StrBytes::from_static_str("authentication failed"));
+            fail(&mut response);
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
@@ -3127,6 +3226,13 @@ pub(crate) struct Caller {
 struct Session {
     authed: bool,
     host: String,
+    /// Who the client is once authenticated: from SASL, or from its TLS
+    /// certificate. `None` is `User:ANONYMOUS`.
+    principal: Option<String>,
+    /// The SASL mechanism from SaslHandshake.
+    mechanism: String,
+    /// A SCRAM exchange waiting for the client-final message.
+    scram: Option<scram::Exchange>,
 }
 
 /// How an upload pass ended.
@@ -3318,4 +3424,33 @@ fn constant_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod principal_tests {
+    use super::rfc2253;
+
+    #[test]
+    fn a_subject_prints_in_reverse_encoded_order_as_java_does() {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "example");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "alice, the admin");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).unwrap();
+        // rcgen encodes CN before O. Java's `X500Principal.getName()` prints
+        // the encoded RDNs last to first, so the same certificate is
+        // `O=...,CN=...` there too.
+        let encoded: Vec<String> = parsed
+            .subject()
+            .iter_rdn()
+            .map(|rdn| rdn.iter().next().unwrap().attr_type().to_id_string())
+            .collect();
+        assert_eq!(encoded, vec!["2.5.4.3", "2.5.4.10"]);
+        assert_eq!(rfc2253(parsed.subject()), "O=example,CN=alice\\, the admin");
+    }
 }

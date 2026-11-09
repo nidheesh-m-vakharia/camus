@@ -59,6 +59,8 @@ openraft::declare_raft_types!(
 pub enum Command {
     /// Insert or replace one key.
     Put { key: String, value: String },
+    /// Remove one key. Missing keys are not an error.
+    Delete { key: String },
     /// Create a topic and its partitions at offset 0.
     CreateTopic {
         /// Topic name.

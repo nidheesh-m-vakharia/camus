@@ -52,6 +52,12 @@ struct Args {
     /// PEM private key for the SASL_SSL listener.
     #[arg(long)]
     tls_key: Option<PathBuf>,
+    /// PEM CA bundle for client certificates. With it the TLS listener
+    /// requires a certificate from that CA and, as Kafka's SSL listener, takes
+    /// the principal from its subject; SASL is then off unless
+    /// `--require-sasl` is set.
+    #[arg(long)]
+    tls_client_ca: Option<PathBuf>,
     /// Allow a PLAINTEXT Kafka listener. Refused for a non-loopback bind unless
     /// `--allow-non-loopback` is also set.
     #[arg(long, default_value_t = false)]
@@ -59,7 +65,7 @@ struct Args {
     /// Allow the PLAINTEXT listener to bind outside the loopback interface.
     #[arg(long, default_value_t = false)]
     allow_non_loopback: bool,
-    /// Require SASL/PLAIN before any API other than ApiVersions and the SASL pair.
+    /// Require SASL (PLAIN or SCRAM) before any API other than ApiVersions and the SASL pair.
     #[arg(long, default_value_t = false)]
     require_sasl: bool,
 }
@@ -585,7 +591,7 @@ async fn start_kafka(
     args: &Args,
 ) -> anyhow::Result<()> {
     let tls = match (&args.tls_cert, &args.tls_key) {
-        (Some(cert), Some(key)) => Some(load_tls(cert, key)?),
+        (Some(cert), Some(key)) => Some(load_tls(cert, key, args.tls_client_ca.as_deref())?),
         (None, None) => None,
         _ => anyhow::bail!("--tls-cert and --tls-key are set together"),
     };
@@ -635,7 +641,9 @@ async fn start_kafka(
     })?;
     let user = std::env::var("CAMUS_SASL_USER").unwrap_or_default();
     let password = std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default();
-    let require_sasl = args.require_sasl || tls.is_some();
+    // TLS alone means SASL_SSL. With a client CA it is Kafka's SSL listener,
+    // where the certificate is the identity.
+    let require_sasl = args.require_sasl || (tls.is_some() && args.tls_client_ca.is_none());
     if require_sasl && (user.is_empty() || password.is_empty()) {
         anyhow::bail!("SASL requires CAMUS_SASL_USER and CAMUS_SASL_PASSWORD");
     }
@@ -659,6 +667,7 @@ async fn start_kafka(
 fn load_tls(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
+    client_ca: Option<&std::path::Path>,
 ) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cert_file = std::fs::File::open(cert_path)?;
@@ -668,8 +677,23 @@ fn load_tls(
     let mut key_reader = std::io::BufReader::new(key_file);
     let key = rustls_pemfile::private_key(&mut key_reader)?
         .ok_or_else(|| anyhow::anyhow!("no private key in {key_path:?}"))?;
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+    let builder = rustls::ServerConfig::builder();
+    let config = match client_ca {
+        None => builder.with_no_client_auth().with_single_cert(certs, key)?,
+        Some(path) => {
+            let mut roots = rustls::RootCertStore::empty();
+            let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+            for cert in rustls_pemfile::certs(&mut reader) {
+                roots.add(cert?)?;
+            }
+            anyhow::ensure!(!roots.is_empty(), "no CA certificate in {path:?}");
+            let verifier =
+                rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
+                    .build()?;
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)?
+        }
+    };
     Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
 }
