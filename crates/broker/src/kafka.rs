@@ -193,7 +193,10 @@ fn rfc2253(name: &x509_parser::x509::X509Name<'_>) -> String {
 }
 
 /// Metadata key for shard 0's leader and voters. Phase 2 runs one shard.
-const SHARD_KEY: &str = "wal/0";
+/// Metadata key of a WAL shard's view, which its leader announces.
+fn shard_key(shard: u32) -> String {
+    format!("wal/{shard}")
+}
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
 struct ShardView {
@@ -205,10 +208,12 @@ struct ShardView {
     epoch: i32,
 }
 
-/// Metadata key of the amount added to the WAL shard's Raft term to get the
+/// Metadata key of the amount added to a WAL shard's Raft term to get its
 /// leader epoch. `truncate-to-sealed` starts a fresh shard at term 1 and
 /// raises this, so epochs never go backwards.
-pub const SHARD_EPOCH_BASE: &str = "wal/0/epoch-base";
+pub fn epoch_base_key(shard: u32) -> String {
+    format!("wal/{shard}/epoch-base")
+}
 
 /// One broker's Kafka endpoint.
 pub struct Kafka {
@@ -423,10 +428,6 @@ impl Kafka {
     }
 
     /// The shard serving requests now.
-    fn wal(&self) -> Arc<Shard> {
-        self.wal.get()
-    }
-
     fn gone_long_enough(&self, id: [u8; 16]) -> bool {
         let mut unknown = self.unknown.lock().expect("unknown topics");
         let since = *unknown.entry(id).or_insert_with(Instant::now);
@@ -509,37 +510,70 @@ impl Kafka {
         Ok(response.json().await?)
     }
 
+    /// The WAL shard a partition lives on (ADR 0014).
+    fn partition_shard(&self, topic: &Topic, partition: i32) -> u32 {
+        self.partition_state(topic, partition)
+            .map(|state| state.shard)
+            .unwrap_or(0)
+    }
+
+    /// The open WAL shard holding a partition, if this broker has it.
+    fn wal_of(&self, topic: &Topic, partition: i32) -> Option<Arc<Shard>> {
+        self.wal.shard(self.partition_shard(topic, partition))
+    }
+
+    /// This broker leads the WAL shard holding a partition.
+    fn leads_wal(&self, topic: &Topic, partition: i32) -> bool {
+        self.wal_of(topic, partition)
+            .is_some_and(|shard| shard.is_leader())
+    }
+
+    /// A partition's WAL end, or 0 when this broker does not have its shard.
+    fn wal_end(&self, topic: &Topic, partition: i32) -> i64 {
+        self.wal_of(topic, partition)
+            .map(|shard| shard.end_offset(&topic_id(topic), partition))
+            .unwrap_or(0)
+    }
+
     /// Shard leader and voters as clients should see them. The shard leader
     /// records itself in metadata so brokers outside the shard can answer
     /// Metadata; until it has, this broker's own view is used.
-    fn shard_view(&self) -> ShardView {
+    fn shard_view(&self, shard: u32) -> ShardView {
         self.node
-            .read_local(SHARD_KEY)
+            .read_local(&shard_key(shard))
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_else(|| self.local_shard_view())
+            .unwrap_or_else(|| self.local_shard_view(shard))
     }
 
-    fn local_shard_view(&self) -> ShardView {
-        let wal = self.wal();
+    fn local_shard_view(&self, shard: u32) -> ShardView {
+        let Some(wal) = self.wal.shard(shard) else {
+            return ShardView {
+                leader: None,
+                voters: Vec::new(),
+                epoch: -1,
+            };
+        };
         ShardView {
             leader: wal.leader(),
             voters: wal.voters(),
-            epoch: self.shard_epoch(),
+            epoch: self.shard_epoch(shard),
         }
     }
 
-    /// This broker's WAL shard epoch: the base from metadata plus the term.
-    fn shard_epoch(&self) -> i32 {
+    /// This broker's epoch for a WAL shard: the base from metadata plus the
+    /// shard's term.
+    fn shard_epoch(&self, shard: u32) -> i32 {
         let base: i64 = self
             .node
-            .read_local(SHARD_EPOCH_BASE)
+            .read_local(&epoch_base_key(shard))
             .ok()
             .flatten()
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(0);
-        i32::try_from(base.saturating_add(self.wal().term() as i64)).unwrap_or(i32::MAX)
+        let term = self.wal.shard(shard).map(|wal| wal.term()).unwrap_or(0);
+        i32::try_from(base.saturating_add(term as i64)).unwrap_or(i32::MAX)
     }
 
     /// The metadata group's term, the epoch of every `r2` partition.
@@ -547,10 +581,11 @@ impl Kafka {
         i32::try_from(self.node.raft.metrics().borrow().current_term).unwrap_or(i32::MAX)
     }
 
-    /// The leader epoch clients should see for `topic`'s partitions.
-    fn partition_epoch(&self, topic: &Topic) -> i32 {
+    /// The leader epoch clients should see for a partition.
+    fn partition_epoch(&self, topic: &Topic, partition: i32) -> i32 {
         if topic.durability == "wal" {
-            self.shard_view().epoch
+            self.shard_view(self.partition_shard(topic, partition))
+                .epoch
         } else {
             self.metadata_epoch()
         }
@@ -559,11 +594,16 @@ impl Kafka {
     /// Kafka's check of a client's `current_leader_epoch`: `-1` skips it, an
     /// older epoch is `FENCED_LEADER_EPOCH`, and a newer one, which this
     /// broker has not seen yet, is `UNKNOWN_LEADER_EPOCH`.
-    fn check_leader_epoch(&self, topic: &Topic, current_leader_epoch: i32) -> Result<(), i16> {
+    fn check_leader_epoch(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        current_leader_epoch: i32,
+    ) -> Result<(), i16> {
         if current_leader_epoch < 0 {
             return Ok(());
         }
-        let mine = self.leading_epoch(topic);
+        let mine = self.leading_epoch(topic, partition);
         match current_leader_epoch.cmp(&mine) {
             std::cmp::Ordering::Less => Err(FENCED_LEADER_EPOCH),
             std::cmp::Ordering::Greater => Err(UNKNOWN_LEADER_EPOCH),
@@ -571,34 +611,36 @@ impl Kafka {
         }
     }
 
-    /// The epoch this broker leads `topic`'s partitions in, for checking a
-    /// client's `current_leader_epoch`.
-    fn leading_epoch(&self, topic: &Topic) -> i32 {
+    /// The epoch this broker leads a partition in, for checking a client's
+    /// `current_leader_epoch`.
+    fn leading_epoch(&self, topic: &Topic, partition: i32) -> i32 {
         if topic.durability == "wal" {
-            self.shard_epoch()
+            self.shard_epoch(self.partition_shard(topic, partition))
         } else {
             self.metadata_epoch()
         }
     }
 
-    /// Record this broker as shard leader in metadata when it leads and the
-    /// stored view differs.
+    /// Record this broker as leader in metadata for each shard it leads, when
+    /// the stored view differs.
     async fn announce_shard(&self) {
-        if !self.wal().leads_quorum(Duration::from_millis(500)) {
-            return;
-        }
-        let mine = self.local_shard_view();
-        let stored: Option<ShardView> = self
-            .node
-            .read_local(SHARD_KEY)
-            .ok()
-            .flatten()
-            .and_then(|raw| serde_json::from_str(&raw).ok());
-        if stored.as_ref() == Some(&mine) {
-            return;
-        }
-        if let Ok(raw) = serde_json::to_string(&mine) {
-            let _ = self.meta_write(SHARD_KEY.to_string(), raw).await;
+        for (id, wal) in self.wal.all() {
+            if !wal.leads_quorum(Duration::from_millis(500)) {
+                continue;
+            }
+            let mine = self.local_shard_view(id);
+            let stored: Option<ShardView> = self
+                .node
+                .read_local(&shard_key(id))
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str(&raw).ok());
+            if stored.as_ref() == Some(&mine) {
+                continue;
+            }
+            if let Ok(raw) = serde_json::to_string(&mine) {
+                let _ = self.meta_write(shard_key(id), raw).await;
+            }
         }
     }
 
@@ -769,7 +811,7 @@ impl Kafka {
     fn high_watermark(&self, topic: &Topic, partition: i32) -> Option<i64> {
         let sealed = self.partition_state(topic, partition)?.next_offset;
         if topic.durability == "wal" {
-            Some(sealed.max(self.wal().end_offset(&topic_id(topic), partition)))
+            Some(sealed.max(self.wal_end(topic, partition)))
         } else {
             Some(sealed)
         }
@@ -1631,31 +1673,29 @@ impl Kafka {
             return topic;
         };
         topic.topic_id = Uuid::parse_str(&stored.id).unwrap_or_else(|_| Uuid::nil());
-        // A `wal` partition is led by its shard leader (ADR 0006), not by the
-        // metadata leader.
-        let (leader, replicas) = if stored.durability == "wal" {
-            let view = self.shard_view();
-            let replicas: Vec<BrokerId> = view
-                .voters
-                .into_iter()
-                .filter_map(|id| i32::try_from(id).ok().map(BrokerId))
-                .collect();
-            (view.leader.map(|id| id as i32), replicas)
-        } else {
-            (leader, leader.map(BrokerId).into_iter().collect())
-        };
-        let leader_id = leader.unwrap_or(-1);
-        let error = if leader.is_some() {
-            0
-        } else {
-            LEADER_NOT_AVAILABLE
-        };
         for index in 0..stored.partitions {
+            // A `wal` partition is led by the leader of its shard (ADR 0006,
+            // ADR 0014), not by the metadata leader.
+            let (leader, replicas) = if stored.durability == "wal" {
+                let view = self.shard_view(self.partition_shard(&stored, index));
+                let replicas: Vec<BrokerId> = view
+                    .voters
+                    .into_iter()
+                    .filter_map(|id| i32::try_from(id).ok().map(BrokerId))
+                    .collect();
+                (view.leader.map(|id| id as i32), replicas)
+            } else {
+                (leader, leader.map(BrokerId).into_iter().collect())
+            };
             let mut partition = MetadataResponsePartition::default();
             partition.partition_index = index;
-            partition.error_code = error;
-            partition.leader_id = BrokerId(leader_id);
-            partition.leader_epoch = self.partition_epoch(&stored);
+            partition.error_code = if leader.is_some() {
+                0
+            } else {
+                LEADER_NOT_AVAILABLE
+            };
+            partition.leader_id = BrokerId(leader.unwrap_or(-1));
+            partition.leader_epoch = self.partition_epoch(&stored, index);
             if leader.is_some() {
                 partition.replica_nodes = replicas.clone();
                 partition.isr_nodes = replicas.clone();
@@ -1891,7 +1931,7 @@ impl Kafka {
     /// The replica count Metadata reports for a topic of this durability.
     fn replication_factor(&self, durability: &str) -> i16 {
         if durability == "wal" {
-            i16::try_from(self.shard_view().voters.len().max(1)).unwrap_or(i16::MAX)
+            i16::try_from(self.shard_view(0).voters.len().max(1)).unwrap_or(i16::MAX)
         } else {
             1
         }
@@ -2371,7 +2411,10 @@ impl Kafka {
         txn_id: Option<&str>,
         held: &mut Duration,
     ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
-        let wal = self.wal();
+        let shard = self.partition_shard(topic, partition);
+        let Some(wal) = self.wal.shard(shard) else {
+            return Err(NOT_LEADER);
+        };
         if wal.storage_failed() {
             return Err(STORAGE);
         }
@@ -2406,7 +2449,7 @@ impl Kafka {
             topic: name.to_string(),
             partition,
             topic_id: topic_id(topic),
-            epoch: self.shard_epoch(),
+            epoch: self.shard_epoch(shard),
             raw: raw.clone(),
             records: info.iter().map(|batch| batch.records).sum(),
             base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
@@ -2590,9 +2633,21 @@ impl Kafka {
     /// One upload pass: at most `upload.flush.bytes` (8 MiB, ADR 0006) of
     /// the oldest unsealed batches go into one object.
     async fn upload_wal(&self) -> Upload {
-        // One shard for the whole pass, so a truncate mid-upload cannot seal
-        // into the shard that replaced it.
-        let wal = self.wal();
+        let mut outcome = Upload::Done;
+        for (_, wal) in self.wal.all() {
+            match self.upload_shard(wal).await {
+                Upload::Failed => outcome = Upload::Failed,
+                Upload::Full if outcome != Upload::Failed => outcome = Upload::Full,
+                _ => {}
+            }
+        }
+        outcome
+    }
+
+    /// One upload pass for one shard this broker leads. The shard is fixed
+    /// for the whole pass, so a truncate mid-upload cannot seal into the
+    /// shard that replaced it.
+    async fn upload_shard(&self, wal: Arc<Shard>) -> Upload {
         if !wal.is_leader() {
             return Upload::Done;
         }
@@ -3015,11 +3070,11 @@ impl Kafka {
             row.error_code = UNKNOWN_TOPIC;
             return row;
         };
-        if topic.durability == "wal" && !self.wal().is_leader() {
+        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
             row.error_code = NOT_LEADER;
             return row;
         }
-        if let Err(code) = self.check_leader_epoch(topic, current_leader_epoch) {
+        if let Err(code) = self.check_leader_epoch(topic, partition, current_leader_epoch) {
             row.error_code = code;
             return row;
         }
@@ -3033,7 +3088,7 @@ impl Kafka {
                 return row;
             };
             let sealed = state.next_offset;
-            let wal_end = self.wal().end_offset(&topic_id(topic), partition);
+            let wal_end = self.wal_end(topic, partition);
             let high_watermark = sealed.max(wal_end);
             let mut stable = high_watermark;
             row.high_watermark = high_watermark;
@@ -3094,11 +3149,14 @@ impl Kafka {
             }
             if !stopped && offset < stable {
                 let remaining = limit.saturating_sub(out.len());
-                let extra = match self
-                    .wal()
-                    .read(&topic_id(topic), partition, sealed, offset, remaining)
-                    .await
-                {
+                let unsealed = match self.wal_of(topic, partition) {
+                    Some(wal) => {
+                        wal.read(&topic_id(topic), partition, sealed, offset, remaining)
+                            .await
+                    }
+                    None => Ok(Vec::new()),
+                };
+                let extra = match unsealed {
                     Ok(extra) => extra,
                     Err(_) => {
                         row.error_code = STORAGE;
@@ -3193,12 +3251,12 @@ impl Kafka {
             row.offset = -1;
             return row;
         };
-        if topic.durability == "wal" && !self.wal().is_leader() {
+        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
             row.error_code = NOT_LEADER;
             row.offset = -1;
             return row;
         }
-        if let Err(code) = self.check_leader_epoch(topic, current_leader_epoch) {
+        if let Err(code) = self.check_leader_epoch(topic, partition, current_leader_epoch) {
             row.error_code = code;
             row.offset = -1;
             return row;
@@ -3208,15 +3266,13 @@ impl Kafka {
             row.offset = -1;
             return row;
         };
-        row.leader_epoch = self.partition_epoch(topic);
+        row.leader_epoch = self.partition_epoch(topic, partition);
         if timestamp == -2 {
             row.offset = state.log_start;
             return row;
         }
         if timestamp == -1 {
-            row.offset = state
-                .next_offset
-                .max(self.wal().end_offset(&topic_id(topic), partition));
+            row.offset = state.next_offset.max(self.wal_end(topic, partition));
             return row;
         }
         for extent in &state.extents {

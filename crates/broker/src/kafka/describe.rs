@@ -234,7 +234,9 @@ impl Kafka {
                     Some(found) if partition < 0 || partition >= found.partitions => {
                         row.error_code = UNKNOWN_TOPIC;
                     }
-                    Some(found) if !self.leads_topic(found) => row.error_code = NOT_LEADER,
+                    Some(found) if !self.leads_partition(found, partition) => {
+                        row.error_code = NOT_LEADER;
+                    }
                     Some(found) => row.active_producers = self.active_producers(found, partition),
                 }
                 out.partitions.push(row);
@@ -319,10 +321,11 @@ impl Kafka {
             let Some(topic) = self.topic(&name) else {
                 continue;
             };
-            if !self.leads_topic(&topic) {
-                continue;
-            }
-            let indexes = partitions.unwrap_or_else(|| (0..topic.partitions).collect());
+            let indexes: Vec<i32> = partitions
+                .unwrap_or_else(|| (0..topic.partitions).collect())
+                .into_iter()
+                .filter(|partition| self.leads_partition(&topic, *partition))
+                .collect();
             let mut out = DescribeLogDirsTopic::default();
             out.name = TopicName(text(&name));
             for partition in indexes {

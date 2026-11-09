@@ -133,6 +133,7 @@ pub fn create_partitions(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     topics: &[PartitionIncrease],
 ) -> Result<Done, String> {
+    let mut placer = catalog::Placer::load(get)?;
     let mut put = Vec::new();
     let mut items = Vec::new();
     for topic in topics {
@@ -173,6 +174,7 @@ pub fn create_partitions(
                 txn_committed: Vec::new(),
                 txn_aborted: Vec::new(),
                 epochs: Vec::new(),
+                shard: placer.next(),
             };
             put.push((
                 catalog::partition_storage_key(&stored.id, partition),
@@ -186,6 +188,7 @@ pub fn create_partitions(
         ));
         items.push(Item { code: 0, low: 0 });
     }
+    put.extend(placer.put());
     Ok(Done {
         put,
         del: Vec::new(),

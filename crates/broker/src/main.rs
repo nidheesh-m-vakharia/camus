@@ -97,6 +97,9 @@ fn yes() -> bool {
 struct Truncate {
     #[serde(default)]
     i_accept_data_loss: bool,
+    /// The WAL shard to truncate. Shard 0, the only one, when absent.
+    #[serde(default)]
+    shard: u32,
 }
 
 /// State for routes that touch both groups.
@@ -168,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
                 .route("/wal/raft-vote", post(wal_vote))
                 .route("/wal/raft-append", post(wal_append))
                 .route("/wal/raft-snapshot", post(wal_snapshot))
+                .route("/wal/{shard}/raft-vote", post(shard_vote))
+                .route("/wal/{shard}/raft-append", post(shard_append))
+                .route("/wal/{shard}/raft-snapshot", post(shard_snapshot))
                 .with_state(Arc::clone(&wal)),
         );
 
@@ -345,7 +351,12 @@ async fn truncate_to_sealed(
     }
     let _one = admin.truncating.lock().await;
     let me = admin.node_id;
-    let old = admin.wal.get();
+    let Some(old) = admin.wal.shard(body.shard) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("node {me} has no wal shard {}", body.shard),
+        ));
+    };
     if !old.voters().contains(&me) {
         return Err((
             StatusCode::CONFLICT,
@@ -380,15 +391,19 @@ async fn truncate_to_sealed(
     // and OffsetForLeaderEpoch can tell them where their history ended.
     let base: i64 = admin
         .node
-        .read_local(kafka::SHARD_EPOCH_BASE)
+        .read_local(&kafka::epoch_base_key(body.shard))
         .ok()
         .flatten()
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(0);
     let raised = base.saturating_add(old.term() as i64);
-    metadata_write(&admin, kafka::SHARD_EPOCH_BASE, &raised.to_string())
-        .await
-        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    metadata_write(
+        &admin,
+        &kafka::epoch_base_key(body.shard),
+        &raised.to_string(),
+    )
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
     let _ = old.raft.shutdown().await;
     let dir = admin.wal_dir.clone();
     let stamp = std::time::SystemTime::now()
@@ -406,7 +421,7 @@ async fn truncate_to_sealed(
         .initialize(BTreeMap::from([(me, BasicNode { addr })]))
         .await
         .map_err(internal)?;
-    admin.wal.replace(fresh);
+    admin.wal.replace(body.shard, fresh);
     tracing::warn!(node_id = me, aside = %aside.display(), "wal shard truncated to sealed");
     Ok(Json(serde_json::json!({
         "voters": [me],
@@ -550,43 +565,100 @@ async fn snapshot(
     rpc_reply(&node.raft.install_snapshot(req).await)
 }
 
-async fn wal_vote(
-    State(wal): State<Arc<WalSlot>>,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    let req: VoteRequest<NodeId> = match rpc_body(&body) {
+/// Shard `id`, or a 404 when this broker does not have it open.
+fn open_shard(wal: &WalSlot, id: u32) -> Result<Arc<Shard>, axum::response::Response> {
+    use axum::response::IntoResponse;
+    wal.shard(id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no wal shard {id}")).into_response())
+}
+
+async fn vote_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
+    let shard = match open_shard(wal, id) {
+        Ok(shard) => shard,
+        Err(reply) => return reply,
+    };
+    let req: VoteRequest<NodeId> = match rpc_body(body) {
         Ok(req) => req,
         Err(reply) => return reply,
     };
-    rpc_reply(&wal.get().raft.vote(req).await)
+    rpc_reply(&shard.raft.vote(req).await)
 }
 
-async fn wal_append(
-    State(wal): State<Arc<WalSlot>>,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    let req: AppendEntriesRequest<camus_wal::TypeConfig> = match rpc_body(&body) {
+async fn append_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
+    let shard = match open_shard(wal, id) {
+        Ok(shard) => shard,
+        Err(reply) => return reply,
+    };
+    let req: AppendEntriesRequest<camus_wal::TypeConfig> = match rpc_body(body) {
         Ok(req) => req,
         Err(reply) => return reply,
     };
     let carries = !req.entries.is_empty();
     let started = std::time::Instant::now();
-    let result = wal.get().raft.append_entries(req).await;
+    let result = shard.raft.append_entries(req).await;
     if carries {
         camus_wal::RPC_TIMES.handled(started.elapsed());
     }
     rpc_reply(&result)
 }
 
+async fn snapshot_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
+    let shard = match open_shard(wal, id) {
+        Ok(shard) => shard,
+        Err(reply) => return reply,
+    };
+    let req: InstallSnapshotRequest<camus_wal::TypeConfig> = match rpc_body(body) {
+        Ok(req) => req,
+        Err(reply) => return reply,
+    };
+    rpc_reply(&shard.raft.install_snapshot(req).await)
+}
+
+/// Shard 0's routes from before shards had ids. They stay so brokers of
+/// both versions can replicate during a rolling upgrade (ADR 0014).
+async fn wal_vote(
+    State(wal): State<Arc<WalSlot>>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    vote_on(&wal, 0, &body).await
+}
+
+async fn wal_append(
+    State(wal): State<Arc<WalSlot>>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    append_on(&wal, 0, &body).await
+}
+
 async fn wal_snapshot(
     State(wal): State<Arc<WalSlot>>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    let req: InstallSnapshotRequest<camus_wal::TypeConfig> = match rpc_body(&body) {
-        Ok(req) => req,
-        Err(reply) => return reply,
-    };
-    rpc_reply(&wal.get().raft.install_snapshot(req).await)
+    snapshot_on(&wal, 0, &body).await
+}
+
+async fn shard_vote(
+    State(wal): State<Arc<WalSlot>>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    vote_on(&wal, id, &body).await
+}
+
+async fn shard_append(
+    State(wal): State<Arc<WalSlot>>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    append_on(&wal, id, &body).await
+}
+
+async fn shard_snapshot(
+    State(wal): State<Arc<WalSlot>>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    snapshot_on(&wal, id, &body).await
 }
 
 async fn start_kafka(
