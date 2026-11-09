@@ -6,11 +6,11 @@
 //! in the Raft log entry they arrived in, and reads take them from there. A
 //! batch is written to disk once.
 //!
-//! openraft may purge log entries once a snapshot covers them. Before a
-//! snapshot is handed out, every unsealed batch is copied into the `DETACHED`
-//! table, so its bytes outlive the purge; the snapshot carries them too, for
-//! a follower that installs it. Batches are normally sealed within the upload
-//! interval, long before a snapshot, so this copy is the exception.
+//! The log is purged only below its oldest entry that still holds an
+//! unsealed batch ([`Machine::purge_floor`]), so this node's unsealed bytes
+//! are always in its log. A snapshot carries those bytes too, for a follower
+//! that installs it; that follower keeps them in the `DETACHED` table, since
+//! its log will not hold their entries.
 //!
 //! Apply is on the produce ack path, so it changes only memory. The Raft
 //! log, fsynced on a quorum, is what makes a batch durable. What apply
@@ -498,9 +498,24 @@ impl Machine {
         Ok(out)
     }
 
-    /// Copy every unsealed batch's bytes into `DETACHED`, durably, so a log
-    /// purge cannot take them. Returns the snapshot's bytes section.
-    async fn detach_all(&self) -> Result<Vec<(u64, serde_bytes::ByteBuf)>, StorageError<NodeId>> {
+    /// Highest log index a purge may remove: below the oldest entry that
+    /// still holds an unsealed batch, and no further than what is applied.
+    /// `None` before anything is applied.
+    pub fn purge_floor(&self) -> Option<u64> {
+        let state = self.state.lock().expect("wal state");
+        let applied = state.last_applied?.index;
+        match state.heads.by_key.keys().next() {
+            Some(oldest) => (oldest >> 12)
+                .checked_sub(1)
+                .map(|index| index.min(applied)),
+            None => Some(applied),
+        }
+    }
+
+    /// Every unsealed batch's bytes, for a snapshot's bytes section.
+    async fn snapshot_bytes(
+        &self,
+    ) -> Result<Vec<(u64, serde_bytes::ByteBuf)>, StorageError<NodeId>> {
         let heads: Vec<Head> = self
             .state
             .lock()
@@ -509,26 +524,13 @@ impl Machine {
             .in_commit_order()
             .cloned()
             .collect();
-        let batches = self.materialize(heads.clone()).await?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-        let mut out = Vec::with_capacity(heads.len());
-        {
-            let mut table = txn
-                .open_table(DETACHED)
-                .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-            for (head, batch) in heads.iter().zip(batches) {
-                table
-                    .insert(head.key(), batch.bytes.as_slice())
-                    .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-                out.push((head.key(), serde_bytes::ByteBuf::from(batch.bytes)));
-            }
-        }
-        txn.commit()
-            .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-        Ok(out)
+        let keys: Vec<u64> = heads.iter().map(Head::key).collect();
+        let batches = self.materialize(heads).await?;
+        Ok(keys
+            .into_iter()
+            .zip(batches)
+            .map(|(key, batch)| (key, serde_bytes::ByteBuf::from(batch.bytes)))
+            .collect())
     }
 }
 
@@ -811,11 +813,11 @@ fn io(subject: ErrorSubject<NodeId>, err: &dyn std::error::Error) -> StorageErro
 
 impl RaftSnapshotBuilder<TypeConfig> for Arc<Machine> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        // openraft may purge the log up to this snapshot. The applied state
-        // has to be on disk, and every unsealed batch's bytes have to live
-        // somewhere other than the log, first.
+        // The log may be purged up to this snapshot, so the applied state
+        // has to be on disk first. Unsealed bytes stay in the log
+        // (`purge_floor`); the snapshot carries a copy for a follower.
         self.flush()?;
-        let bytes = self.detach_all().await?;
+        let bytes = self.snapshot_bytes().await?;
         let (body, last_applied, membership) = {
             let state = self.state.lock().expect("wal state");
             (
