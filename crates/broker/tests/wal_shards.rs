@@ -300,7 +300,10 @@ fn bounce(nodes: &mut [Node], meta_leader: i32, controller: &str) -> i32 {
         if led {
             break;
         }
-        assert!(Instant::now() < deadline, "shard {moved} never moved off {victim}: {alive:?}");
+        assert!(
+            Instant::now() < deadline,
+            "shard {moved} never moved off {victim}: {alive:?}"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     nodes[(victim - 1) as usize].restart();
@@ -318,7 +321,10 @@ fn a_returning_broker_takes_its_shard_back() {
     let victim = bounce(&mut nodes, meta_leader, &controller);
     let deadline = Instant::now() + Duration::from_secs(30);
     while leaders(&controller, None)[(victim - 1) as usize].0 != victim {
-        assert!(Instant::now() < deadline, "broker {victim} never took its shard back");
+        assert!(
+            Instant::now() < deadline,
+            "broker {victim} never took its shard back"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     write_and_read_everywhere(&controller, None, "balanced");
@@ -378,7 +384,11 @@ fn elect_leaders_moves_a_shard_back_to_its_preferred_broker() {
         if handed.status().is_success() {
             break;
         }
-        assert!(Instant::now() < deadline, "hand-over refused: {}", handed.status());
+        assert!(
+            Instant::now() < deadline,
+            "hand-over refused: {}",
+            handed.status()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -387,7 +397,11 @@ fn elect_leaders_moves_a_shard_back_to_its_preferred_broker() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    assert_eq!(elect(&controller, 1), vec![83; PARTITIONS as usize], "UNCLEAN");
+    assert_eq!(
+        elect(&controller, 1),
+        vec![83; PARTITIONS as usize],
+        "UNCLEAN"
+    );
     // Shard 0 may still be settling, so its partition can answer 0 in the
     // same call that moves shard 1. 80 means the preferred broker is not
     // caught up yet; 84 means it already leads.
@@ -397,7 +411,9 @@ fn elect_leaders_moves_a_shard_back_to_its_preferred_broker() {
         let codes = elect(&controller, 0);
         assert!(
             codes.len() == PARTITIONS as usize
-                && codes.iter().all(|code| *code == 0 || *code == 80 || *code == 84),
+                && codes
+                    .iter()
+                    .all(|code| *code == 0 || *code == 80 || *code == 84),
             "PREFERRED answered {codes:?}"
         );
         moved |= codes[1] == 0;

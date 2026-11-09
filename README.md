@@ -125,7 +125,7 @@ A few Kafka behaviors are different on purpose:
 | `acks=1` | Same barrier as `acks=all` |
 | `acks=0` | No wait, and the batch may be lost |
 | No ACL on a resource | Denied with SASL or mTLS, allowed on the dev PLAINTEXT listener; `CAMUS_ACL_ALLOW_IF_NO_ACL` overrides |
-| Partition leaders | Leadership belongs to WAL shards (one per broker by default); a shard's partitions move together when it rebalances or on `ElectLeaders`; no reassignment (ADR 0014) |
+| Partition leaders | Leadership belongs to WAL shards (one per core by default, shared evenly across brokers); a shard's partitions move together when it rebalances or on `ElectLeaders`; no reassignment (ADR 0014) |
 | Broker configs | Set at startup, read-only; no client quotas |
 
 The full list is in [docs/compatibility.md](docs/compatibility.md).

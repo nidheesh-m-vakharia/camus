@@ -176,6 +176,7 @@ fn read_committed_hides_an_open_transaction_and_an_abort() {
     std::fs::create_dir_all(dir).unwrap();
     let log = std::fs::File::create(dir.join("broker.log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",
@@ -410,6 +411,7 @@ fn java_transaction_hides_an_open_batch_and_commits_its_offset() {
     let dir = root.path();
     let log = std::fs::File::create(dir.join("broker.log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",
@@ -569,6 +571,7 @@ fn produce(stream: &mut TcpStream, correlation: i32, raw: Bytes, _producer: i64)
 fn start(root: &Path, env: &[(&str, &str)]) -> (Node, TcpStream) {
     let log = std::fs::File::create(root.join("broker.log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",

@@ -33,8 +33,10 @@ how to build them before that work starts.
 
 The cluster has `shard_count` shards, fixed when the cluster is initialized.
 `POST /admin/init` accepts an optional `shards` count. When it is absent,
-the count is the number of brokers in the request, so each broker can be the
-preferred leader of one shard (#47). A shard's voters are
+the count is one shard per core of the broker handling init, rounded up to
+a multiple of the voter count and capped at eight shards per voter, so each
+voter is the preferred leader of the same number of shards. `CAMUS_WAL_SHARDS=voters`
+keeps the earlier one-shard-per-broker count. A shard's voters are
 `min(3, brokers)` brokers, chosen round-robin starting at a different broker
 for each shard, spread across racks when racks are configured (ADR 0006).
 The first voter in the list is the shard's preferred leader.
@@ -184,8 +186,9 @@ Each step lands with its tests and leaves the cluster working.
 
 ## Resolved in review
 
-- Default shard count: one per broker, as above. A multiple of the broker
-  count would spread a lost broker's leadership wider but multiplies Raft
-  groups, heartbeats, and object puts.
+- Default shard count: one shard per core, rounded up to a multiple of the
+  broker count and capped at eight shards per broker. A lost broker's
+  leadership is spread across the shards it led. `CAMUS_WAL_SHARDS=voters`
+  keeps one shard per broker.
 - Bundling: one object per shard per flush, as above, so a slow or
   truncated shard never holds up another's publish.

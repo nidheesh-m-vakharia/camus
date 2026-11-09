@@ -196,12 +196,13 @@ impl From<Failure> for WriteError {
 /// Bytes one packed entry may carry before the committer starts another.
 const GROUP_BYTES: usize = 1024 * 1024;
 
-/// Packed entries that may be committing at once. One: openraft writes the
-/// log one append at a time, so more in flight only split the same traffic
-/// into smaller entries with an fsync each. Measured with
-/// `broker/tests/throughput.rs` at 32 producers: 4 in flight gave 10.4 MiB/s
-/// and 0.18 fsyncs per ack; 1 gave 14.9 MiB/s and 0.07.
-const IN_FLIGHT: usize = 1;
+/// Packed entries that may be committing at once. Two: the next group's disk
+/// flush runs while the previous group waits on its quorum. The group is
+/// packed before a slot is taken, so the extra slot does not flush one batch
+/// at a time. Four slots, taken before the pack, measured 10.4 MiB/s and
+/// 0.18 fsyncs per ack against 14.9 MiB/s and 0.07 with a single slot
+/// (`broker/tests/throughput.rs`, 32 producers).
+const IN_FLIGHT: usize = 2;
 
 /// Group commit (ADR 0006). Batches that arrive while entries are being
 /// committed wait here and go into the next entry together, so concurrent
@@ -214,12 +215,19 @@ async fn commit_loop(
 ) {
     let slots = Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT));
     while let Some(first) = queue.recv().await {
-        // Waiting for a slot is what lets the next group fill up.
+        let mut size = first.0.raw.len();
+        let mut group = vec![first];
+        // Pack before taking a slot. With two commits allowed, the queue
+        // still fills to `GROUP_BYTES` while both slots are busy, and a free
+        // slot then flushes that whole pack instead of the next single batch.
+        while size < GROUP_BYTES && group.len() < machine::MAX_PACKED {
+            let Ok(next) = queue.try_recv() else { break };
+            size += next.0.raw.len();
+            group.push(next);
+        }
         let Ok(slot) = slots.clone().acquire_owned().await else {
             return;
         };
-        let mut size = first.0.raw.len();
-        let mut group = vec![first];
         while size < GROUP_BYTES && group.len() < machine::MAX_PACKED {
             let Ok(next) = queue.try_recv() else { break };
             size += next.0.raw.len();
@@ -797,7 +805,11 @@ mod tests {
         assert_eq!(first_ack.base_offset, 0);
         let again = first.append(batch.clone()).await.unwrap();
         assert_eq!(again.base_offset, 0);
-        assert_eq!(first.end_offset(&[1; 16], 0), 1, "the retry is not a second record");
+        assert_eq!(
+            first.end_offset(&[1; 16], 0),
+            1,
+            "the retry is not a second record"
+        );
 
         let gone = shards[(leader - 1) as usize].take().unwrap();
         gone.raft.shutdown().await.unwrap();
@@ -808,7 +820,10 @@ mod tests {
         let survivor = live.iter().find(|shard| shard.node_id == next).unwrap();
         let after = survivor.append(batch).await.unwrap();
         assert_eq!(after.error_code, 0);
-        assert_eq!(after.base_offset, 0, "the new leader still has the sequence");
+        assert_eq!(
+            after.base_offset, 0,
+            "the new leader still has the sequence"
+        );
         assert_eq!(survivor.end_offset(&[1; 16], 0), 1);
         let followed = survivor.append(idempotent(b"next", 7, 0, 1)).await.unwrap();
         assert_eq!(followed.base_offset, 1);

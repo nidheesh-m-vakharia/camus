@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Binary encoding for Raft log entries and Raft RPC bodies.
 //!
 //! postcard, not JSON: a produce batch's bytes are written as one

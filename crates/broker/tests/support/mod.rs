@@ -402,6 +402,7 @@ impl Node {
             .open(dir.join("broker.log"))
             .unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_camus-broker"));
+        command.env("CAMUS_WAL_SHARDS", "voters");
         command
             .args([
                 "--node-id",

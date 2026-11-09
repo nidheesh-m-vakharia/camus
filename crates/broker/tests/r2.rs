@@ -47,6 +47,7 @@ impl Node {
         let log = std::fs::File::create(dir.join("broker.log")).unwrap();
         let bin = env!("CARGO_BIN_EXE_camus-broker");
         let child = Command::new(bin)
+            .env("CAMUS_WAL_SHARDS", "voters")
             .args([
                 "--node-id",
                 "1",

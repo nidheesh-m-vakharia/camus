@@ -41,7 +41,10 @@ impl Kafka {
             .flatten()
             .enumerate()
             .filter_map(|(shard, voters)| {
-                Some((u32::try_from(shard).ok()?, voters.as_array()?.first()?.as_u64()?))
+                Some((
+                    u32::try_from(shard).ok()?,
+                    voters.as_array()?.first()?.as_u64()?,
+                ))
             })
             .collect()
     }
@@ -70,7 +73,11 @@ impl Kafka {
             let Some(addr) = wal.voter_addr(preferred) else {
                 continue;
             };
-            tracing::info!(shard, preferred, "handing shard back to its preferred leader");
+            tracing::info!(
+                shard,
+                preferred,
+                "handing shard back to its preferred leader"
+            );
             let _ = self
                 .http
                 .post(format!("http://{addr}/wal/{shard}/campaign"))
@@ -125,9 +132,7 @@ impl Kafka {
                     _ if !allowed => auth::CLUSTER_FAILED,
                     _ if !preferred_only => ELIGIBLE_LEADERS_NOT_AVAILABLE,
                     None => UNKNOWN_TOPIC,
-                    Some(topic) if partition < 0 || partition >= topic.partitions => {
-                        UNKNOWN_TOPIC
-                    }
+                    Some(topic) if partition < 0 || partition >= topic.partitions => UNKNOWN_TOPIC,
                     // An `r2` partition is led by the metadata leader, and a
                     // one-shard cluster has no preferred leader.
                     Some(topic) if topic.durability != "wal" => ELECTION_NOT_NEEDED,

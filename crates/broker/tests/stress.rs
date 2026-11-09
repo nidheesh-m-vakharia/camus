@@ -50,6 +50,7 @@ fn spawn(dir: &Path) -> Node {
     let dir = dir.to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",

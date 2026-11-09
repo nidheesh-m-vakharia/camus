@@ -63,9 +63,30 @@ The format:
   last index is below the new start. A partial first segment is rewritten
   once, or left in place and skipped. No in-place punch is required for
   correctness.
-- `std::fs` only. No `mmap`, no `O_DIRECT`, no `unsafe` in the first cut.
-  If a later change needs `unsafe`, the block must say why safe Rust cannot
-  express it, and a test must fail when the invariant breaks.
+- No `mmap`. On Linux, a segment append whose offset and length are multiples
+  of 4096 is one direct write with force-unit-access (`O_DIRECT` and
+  `RWF_DSYNC`). The completion of that write is the ack. The bytes are padded
+  with a record whose index is `u64::MAX`, which open skips. A drive or
+  filesystem that rejects the direct write, and every other operating
+  system, uses a buffered write linked to one `fsync`. The active segment is
+  a registered file, updated when the segment rotates, and the write uses a
+  1 MiB buffer pinned once for the life of the ring. The `io_uring` crate's
+  queue and buffer-registration APIs are `unsafe` because the kernel reads
+  that memory and uses the descriptor while the submission is in flight;
+  safe Rust cannot name that lifetime. Those blocks stay in
+  `crates/raft/src/submit.rs`. The buffer is not reallocated after
+  registration, and the ring is dropped before the buffer.
+  `append_reopen_and_torn_tail` fails if a synced prefix disappears or a
+  torn tail is served.
+- These `io_uring` features are not used. `IORING_SETUP_SQPOLL` would keep a
+  kernel thread polling for a syscall that is noise next to the fsync.
+  `IORING_SETUP_IOPOLL` is not used. The kernel accepts that flag on a disk
+  whose `queue/io_poll` is 0, and the direct write then does not complete.
+  The same ring also has to `fsync` when the direct write is refused, and an
+  `fsync` is not a polled opcode.
+  `IORING_OP_SEND_ZC` and multishot accept or receive would replace the
+  tokio socket loop. `IORING_OP_URING_CMD` would bypass the filesystem the
+  torn-tail recovery depends on, and it only exists on NVMe.
 
 Phase 0 still records a benchmark of this format against `redb` and `fjall`
 on the same machine (workload below). The numbers go at the bottom of this

@@ -21,6 +21,7 @@ fn spawn(compact: bool) -> Node {
     let dir = tempfile::tempdir().unwrap().keep();
     let log = std::fs::File::create(dir.join("broker.log")).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_camus-broker"));
+    command.env("CAMUS_WAL_SHARDS", "voters");
     command
         .args([
             "--node-id",
