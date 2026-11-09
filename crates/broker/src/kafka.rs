@@ -3016,15 +3016,21 @@ impl Kafka {
                     topic_response.partitions.push(row);
                     continue;
                 }
-                topic_response.partitions.push(
-                    self.list_one(
+                let mut row = self
+                    .list_one(
                         stored.as_ref(),
                         partition.partition_index,
                         partition.current_leader_epoch,
                         partition.timestamp,
                     )
-                    .await,
-                );
+                    .await;
+                // The epoch is in the response from v4. The encoder refuses a
+                // field the version does not have, and that would close the
+                // connection of a client on v1-3, such as KafkaJS.
+                if header.request_api_version < 4 {
+                    row.leader_epoch = -1;
+                }
+                topic_response.partitions.push(row);
             }
             response.topics.push(topic_response);
         }
