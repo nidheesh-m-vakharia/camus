@@ -2,6 +2,15 @@
 //!
 //! Applies are one write transaction: the key, the last applied log id, and
 //! the membership commit together or not at all.
+//!
+//! Apply is on every metadata write's path, so most applies commit without
+//! fsync: the Raft log, fsynced on a quorum, is what makes a write durable.
+//! After a crash redb rolls back to its last durable commit and openraft
+//! re-applies the log from there. An apply is durable when it carries a
+//! membership change or when [`DURABLE_EVERY`] has passed since the last
+//! durable one, which bounds that replay. Storing a snapshot is a durable
+//! commit too, so the state is on disk before openraft purges the log under
+//! the snapshot.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -31,6 +40,9 @@ const LAST_APPLIED: &str = "last_applied";
 const MEMBERSHIP: &str = "membership";
 const SNAPSHOT: &str = "snapshot";
 
+/// Longest time between durable applies.
+const DURABLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Serialize, Deserialize, Default)]
 struct SnapshotBody {
     data: BTreeMap<String, String>,
@@ -48,6 +60,8 @@ pub struct RedbMachine {
     snapshot_idx: AtomicU64,
     /// Latest snapshot, also stored in `redb` under [`SNAPSHOT`].
     current_snapshot: RwLock<Option<StoredSnapshot>>,
+    /// When an apply last committed with fsync.
+    last_durable: std::sync::Mutex<std::time::Instant>,
 }
 
 impl RedbMachine {
@@ -68,6 +82,7 @@ impl RedbMachine {
             db,
             snapshot_idx: AtomicU64::new(snapshot_idx),
             current_snapshot: RwLock::new(current),
+            last_durable: std::sync::Mutex::new(std::time::Instant::now()),
         })
     }
 
@@ -726,10 +741,20 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
     {
         let entries: Vec<_> = entries.into_iter().collect();
         let mut responses = Vec::with_capacity(entries.len());
-        let txn = self
+        let durable = entries
+            .iter()
+            .any(|entry| matches!(entry.payload, EntryPayload::Membership(_)))
+            || self.last_durable.lock().expect("last durable").elapsed() >= DURABLE_EVERY;
+        let mut txn = self
             .db
             .begin_write()
             .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+        txn.set_durability(if durable {
+            redb::Durability::Immediate
+        } else {
+            redb::Durability::None
+        })
+        .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
         {
             let mut kv = txn
                 .open_table(KV)
@@ -760,6 +785,9 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
         }
         txn.commit()
             .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+        if durable {
+            *self.last_durable.lock().expect("last durable") = std::time::Instant::now();
+        }
         Ok(responses)
     }
 

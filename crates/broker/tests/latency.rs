@@ -9,6 +9,10 @@
 //! ```
 //!
 //! `CAMUS_BENCH_WAL` and `CAMUS_BENCH_R2` set the sample counts.
+//! `CAMUS_BENCH_PARTITIONS` sends one batch to each of that many partitions
+//! in every request, as a client batching for one broker does. Every
+//! partition must be led by the broker the producer dials, so use it with
+//! `CAMUS_BENCH_BROKERS=1`.
 
 mod support;
 
@@ -28,12 +32,16 @@ fn count(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn produce_on(stream: &mut TcpStream, value: &str) -> i16 {
+fn produce_on(stream: &mut TcpStream, value: &str, partitions: i32) -> i16 {
     let mut topic = TopicProduceData::default();
     topic.name = TopicName(StrBytes::from_static_str(TOPIC));
-    topic.partition_data = vec![PartitionProduceData::default()
-        .with_index(0)
-        .with_records(Some(batch(value)))];
+    topic.partition_data = (0..partitions)
+        .map(|index| {
+            PartitionProduceData::default()
+                .with_index(index)
+                .with_records(Some(batch(value)))
+        })
+        .collect();
     send(
         stream,
         ApiKey::Produce,
@@ -43,7 +51,12 @@ fn produce_on(stream: &mut TcpStream, value: &str) -> i16 {
             .with_timeout_ms(30_000)
             .with_topic_data(vec![topic]),
     );
-    recv::<ProduceResponse>(stream, 9).responses[0].partition_responses[0].error_code
+    recv::<ProduceResponse>(stream, 9).responses[0]
+        .partition_responses
+        .iter()
+        .map(|part| part.error_code)
+        .find(|code| *code != 0)
+        .unwrap_or(0)
 }
 
 fn run(
@@ -60,7 +73,8 @@ fn run(
     init(&nodes, &(1..=brokers).collect::<Vec<_>>());
     let meta_leader = wait_settled(&nodes.iter().collect::<Vec<_>>());
     let controller = nodes.iter().find(|node| node.id == meta_leader).unwrap();
-    create_topic(&kafka_addr(controller), mode);
+    let partitions = count("CAMUS_BENCH_PARTITIONS", 1) as i32;
+    create_topic_with(&kafka_addr(controller), mode, partitions);
     let (leader_id, leader) = partition_leader(&kafka_addr(&nodes[0]), None);
     let pids: Vec<u32> = nodes.iter().map(|node| node.child.id()).collect();
     // Empty: the cluster and topic exist, nothing has been produced.
@@ -70,12 +84,12 @@ fn run(
     stream.set_nodelay(true).unwrap();
     let value = "x".repeat(1024);
     for _ in 0..warmup {
-        assert_eq!(produce_on(&mut stream, &value), 0);
+        assert_eq!(produce_on(&mut stream, &value, partitions), 0);
     }
     let mut out = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
-        assert_eq!(produce_on(&mut stream, &value), 0);
+        assert_eq!(produce_on(&mut stream, &value, partitions), 0);
         out.push(started.elapsed());
     }
     let peak = sampler.finish();

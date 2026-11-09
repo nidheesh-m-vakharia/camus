@@ -756,9 +756,19 @@ pub fn create_topic(controller: &str, durability_mode: &'static str) {
 
 /// Create `TOPIC` with `partitions` partitions.
 pub fn create_topic_with(controller: &str, durability_mode: &'static str, partitions: i32) {
+    create_topic_named(controller, TOPIC, durability_mode, partitions);
+}
+
+/// Create the topic `name` with `partitions` partitions.
+pub fn create_topic_named(
+    controller: &str,
+    name: &'static str,
+    durability_mode: &'static str,
+    partitions: i32,
+) {
     let mut stream = connect(controller);
     let mut created = CreatableTopic::default();
-    created.name = TopicName(StrBytes::from_static_str(TOPIC));
+    created.name = TopicName(StrBytes::from_static_str(name));
     created.num_partitions = partitions;
     created.replication_factor = -1;
     let mut durability = CreatableTopicConfig::default();
@@ -787,15 +797,30 @@ pub fn single(dir: &Path, opts: Opts) -> Node {
 }
 
 pub fn init(nodes: &[Node], wal: &[i32]) {
-    let peers: Vec<_> = nodes
+    post_init(nodes, &serde_json::json!(peers(nodes, wal)));
+}
+
+/// [`init`] with exactly `shards` WAL shards.
+pub fn init_shards(nodes: &[Node], wal: &[i32], shards: u32) {
+    post_init(
+        nodes,
+        &serde_json::json!({"peers": peers(nodes, wal), "shards": shards}),
+    );
+}
+
+fn peers(nodes: &[Node], wal: &[i32]) -> Vec<serde_json::Value> {
+    nodes
         .iter()
         .map(|node| {
             serde_json::json!({"id": node.id, "addr": node.http, "wal": wal.contains(&node.id)})
         })
-        .collect();
+        .collect()
+}
+
+fn post_init(nodes: &[Node], body: &serde_json::Value) {
     let init = reqwest::blocking::Client::new()
         .post(format!("http://{}/admin/init", nodes[0].http))
-        .json(&peers)
+        .json(body)
         .send()
         .unwrap();
     assert!(init.status().is_success(), "{}", init.text().unwrap());

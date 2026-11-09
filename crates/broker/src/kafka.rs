@@ -2343,12 +2343,12 @@ impl Kafka {
                     )
                     .await
                 {
-                    Ok(Some(rx)) => {
+                    Ok(Some(queued)) => {
                         let partition_index = topic_response.partition_responses.len();
                         topic_response
                             .partition_responses
                             .push(partition_error(partition.index, 0));
-                        waiters.push((topic_index, partition_index, rx));
+                        waiters.push((topic_index, partition_index, queued));
                     }
                     Ok(None) => {
                         if request.acks != 0 {
@@ -2370,11 +2370,21 @@ impl Kafka {
                 response.responses.push(topic_response);
             }
         }
+        let mut submitted = self.submit_wal(&mut waiters);
         if request.acks == 0 {
             return Reply::Silent;
         }
-        for (topic_index, partition_index, rx) in waiters {
-            let settled = rx.await.unwrap_or(Err(NOT_LEADER));
+        for ((topic_index, partition_index, queued), submitted) in
+            waiters.into_iter().zip(submitted.drain(..))
+        {
+            let settled = match (queued, submitted) {
+                (Queued::R2(rx), _) => rx.await.unwrap_or(Err(NOT_LEADER)),
+                (Queued::Wal(produce), Some(Ok(pending))) => {
+                    self.settle_wal(produce, pending).await
+                }
+                (Queued::Wal(_), Some(Err(code))) => Err(code),
+                (Queued::Wal(_), None) => Err(NOT_LEADER),
+            };
             let row = &mut response.responses[topic_index].partition_responses[partition_index];
             match settled {
                 Ok(offset) => row.base_offset = offset,
@@ -2393,6 +2403,90 @@ impl Kafka {
         );
         response.throttle_time_ms = 0;
         frame_of(header.request_api_version, header.correlation_id, &response)
+    }
+
+    /// Queue every WAL batch in `waiters`, one submission per shard in
+    /// request order, so a request's partitions on one shard share a group
+    /// commit instead of committing one after another. Returns one entry per
+    /// waiter: `None` for r2, else the pending commit or its error code.
+    fn submit_wal(
+        &self,
+        waiters: &mut [(usize, usize, Queued)],
+    ) -> Vec<Option<Result<camus_wal::Pending, i16>>> {
+        let mut shards: Vec<(u32, Arc<Shard>, Vec<usize>)> = Vec::new();
+        for (index, (_, _, queued)) in waiters.iter().enumerate() {
+            let Queued::Wal(produce) = queued else {
+                continue;
+            };
+            match shards.iter_mut().find(|(id, _, _)| *id == produce.shard_id) {
+                Some((_, _, indexes)) => indexes.push(index),
+                None => shards.push((produce.shard_id, produce.shard.clone(), vec![index])),
+            }
+        }
+        let mut submitted: Vec<_> = waiters.iter().map(|_| None).collect();
+        for (_, shard, indexes) in shards {
+            let appends = indexes
+                .iter()
+                .map(|&index| match &mut waiters[index].2 {
+                    Queued::Wal(produce) => produce.append.take().expect("unsubmitted append"),
+                    Queued::R2(_) => unreachable!("indexes hold wal waiters"),
+                })
+                .collect();
+            match shard.submit(appends) {
+                Ok(pending) => {
+                    for (index, pending) in indexes.into_iter().zip(pending) {
+                        submitted[index] = Some(Ok(pending));
+                    }
+                }
+                Err(err) => {
+                    let code = wal_error_code(&shard, err);
+                    for index in indexes {
+                        submitted[index] = Some(Err(code));
+                    }
+                }
+            }
+        }
+        submitted
+    }
+
+    /// Wait for one submitted WAL batch, until the produce deadline, and
+    /// record its transaction span once it commits.
+    async fn settle_wal(
+        &self,
+        produce: WalProduce,
+        pending: camus_wal::Pending,
+    ) -> Result<i64, i16> {
+        // Without a quorum the commit never comes. Kafka answers a produce
+        // that outlives `timeout_ms` with REQUEST_TIMED_OUT; the entry may
+        // still commit later, as in Kafka.
+        let wait = produce.deadline.saturating_duration_since(Instant::now());
+        let response = match tokio::time::timeout(wait, pending.wait()).await {
+            Err(_) => return Err(REQUEST_TIMED_OUT),
+            Ok(Err(err)) => return Err(wal_error_code(&produce.shard, err)),
+            Ok(Ok(response)) => response,
+        };
+        if response.error_code != 0 {
+            return Err(response.error_code);
+        }
+        if let Some((id, producer, epoch)) = produce.txn {
+            let noted = self
+                .meta_apply(Command::NoteTxn {
+                    transactional_id: id,
+                    producer_id: producer,
+                    producer_epoch: epoch,
+                    span: TxnSpan {
+                        topic: produce.topic,
+                        partition: produce.partition,
+                        start: response.base_offset,
+                        end: response.base_offset + i64::from(produce.records),
+                    },
+                })
+                .await;
+            if let Some(code) = noted_error(&noted) {
+                return Err(code);
+            }
+        }
+        Ok(response.base_offset)
     }
 
     fn produce_all_error(
@@ -2426,7 +2520,7 @@ impl Kafka {
         timeout_ms: i32,
         txn_id: Option<&str>,
         held: &mut Duration,
-    ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
+    ) -> Result<Option<Queued>, i16> {
         let Some(topic) = topic else {
             return Err(UNKNOWN_TOPIC);
         };
@@ -2481,7 +2575,7 @@ impl Kafka {
         if acks == 0 {
             Ok(None)
         } else {
-            Ok(Some(rx))
+            Ok(Some(Queued::R2(rx)))
         }
     }
 
@@ -2495,7 +2589,7 @@ impl Kafka {
         timeout_ms: i32,
         txn_id: Option<&str>,
         held: &mut Duration,
-    ) -> Result<Option<oneshot::Receiver<Result<i64, i16>>>, i16> {
+    ) -> Result<Option<Queued>, i16> {
         let shard = self.partition_shard(topic, partition);
         let Some(wal) = self.wal.shard(shard) else {
             return Err(NOT_LEADER);
@@ -2541,18 +2635,25 @@ impl Kafka {
             max_timestamp: info.last().map(|batch| batch.max_timestamp).unwrap_or(-1),
             floor: state.next_offset,
         };
+        let mut produce = WalProduce {
+            shard_id: shard,
+            shard: wal,
+            append: None,
+            txn,
+            topic: name.to_string(),
+            partition,
+            records: append.records,
+            deadline: Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64),
+        };
         if acks == 0 {
-            tokio::spawn(async move {
-                let _ = wal.append(append).await;
-            });
-            return Ok(None);
+            produce.append = Some(append);
+            return Ok(Some(Queued::Wal(produce)));
         }
         // ADR 0005 backpressure: past the disk limit, hold the produce until
         // an upload seals enough, and report the hold as throttle time. The
         // batch is not appended while held, so a timeout loses nothing that
         // was acknowledged.
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
-        let records = append.records;
+        let deadline = produce.deadline;
         let size = append.raw.len() as u64;
         let hold_start = Instant::now();
         loop {
@@ -2574,47 +2675,8 @@ impl Kafka {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         *held = (*held).max(hold_start.elapsed());
-        // Without a quorum the commit never comes. Kafka answers a produce
-        // that outlives `timeout_ms` with REQUEST_TIMED_OUT; the entry may
-        // still commit later, as in Kafka.
-        let wait = deadline.saturating_duration_since(Instant::now());
-        let response = match tokio::time::timeout(wait, wal.append(append)).await {
-            Err(_) => return Err(REQUEST_TIMED_OUT),
-            Ok(Err(WriteError::NotLeader)) => return Err(NOT_LEADER),
-            Ok(Err(WriteError::Storage)) => return Err(STORAGE),
-            Ok(Err(_)) if wal.storage_failed() => return Err(STORAGE),
-            Ok(Err(WriteError::Other(_))) if !wal.is_leader() => return Err(NOT_LEADER),
-            Ok(Err(WriteError::Other(_))) => return Err(STORAGE),
-            Ok(Ok(response)) => response,
-        };
-        if let Some((id, producer, epoch)) = txn {
-            if response.error_code == 0 {
-                let noted = self
-                    .meta_apply(Command::NoteTxn {
-                        transactional_id: id,
-                        producer_id: producer,
-                        producer_epoch: epoch,
-                        span: TxnSpan {
-                            topic: name.to_string(),
-                            partition,
-                            start: response.base_offset,
-                            end: response.base_offset + i64::from(records),
-                        },
-                    })
-                    .await;
-                if let Some(code) = noted_error(&noted) {
-                    return Err(code);
-                }
-            }
-        }
-        let (tx, rx) = oneshot::channel();
-        let settled = if response.error_code == 0 {
-            Ok(response.base_offset)
-        } else {
-            Err(response.error_code)
-        };
-        let _ = tx.send(settled);
-        Ok(Some(rx))
+        produce.append = Some(append);
+        Ok(Some(Queued::Wal(produce)))
     }
 
     /// Split `upload` (commit order) into objects of at most `FLUSH_BYTES`,
@@ -3282,6 +3344,17 @@ impl Kafka {
                         return row;
                     }
                 };
+                // The WAL and metadata are separate Raft groups. This broker
+                // can apply a seal, which drops batches from the WAL, before
+                // it applies the publish that puts them in `sealed`. Then the
+                // first unsealed batch starts past the sealed end, and
+                // serving it would skip the batches in between. Serve nothing
+                // from the WAL until metadata catches up; the fetch retries.
+                let extra = if first_base(&extra).is_some_and(|base| base > sealed.max(offset)) {
+                    Vec::new()
+                } else {
+                    extra
+                };
                 let extra = if isolation == 1 {
                     filter_txn(&extra, &state, &mut stable)
                 } else {
@@ -3649,6 +3722,42 @@ struct ConfigView {
     spec: &'static camus_metadata::config::Spec,
     value: String,
     source: i8,
+}
+
+/// Base offset of the first batch in `records`, if there is one.
+fn first_base(records: &[u8]) -> Option<i64> {
+    Some(i64::from_be_bytes(records.get(..8)?.try_into().ok()?))
+}
+
+/// The produce error code for a WAL write that did not commit.
+fn wal_error_code(shard: &Shard, err: WriteError) -> i16 {
+    match err {
+        WriteError::NotLeader => NOT_LEADER,
+        WriteError::Storage => STORAGE,
+        WriteError::Other(_) if shard.storage_failed() => STORAGE,
+        WriteError::Other(_) if !shard.is_leader() => NOT_LEADER,
+        WriteError::Other(_) => STORAGE,
+    }
+}
+
+/// One validated partition of a produce request, waiting to be committed.
+enum Queued {
+    /// Buffered for the next R2 flush.
+    R2(oneshot::Receiver<Result<i64, i16>>),
+    /// Accepted for a WAL shard; [`Kafka::submit_wal`] queues it.
+    Wal(WalProduce),
+}
+
+struct WalProduce {
+    shard_id: u32,
+    shard: Arc<Shard>,
+    /// Taken when the batch is submitted.
+    append: Option<Append>,
+    txn: Option<(String, i64, i16)>,
+    topic: String,
+    partition: i32,
+    records: i32,
+    deadline: Instant,
 }
 
 /// `NoteTxn` applies the abort and reports the Kafka code in `value` when the
