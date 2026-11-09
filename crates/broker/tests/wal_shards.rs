@@ -295,12 +295,16 @@ fn elect_leaders_moves_a_shard_back_to_its_preferred_broker() {
         root.path(),
         Opts::default().env("CAMUS_AUTO_LEADER_REBALANCE", "false"),
     );
-    // Partition 1 is on shard 1, preferred by broker 2. Wait for broker 2
-    // to lead it, then hand it to broker 3 through the leader.
+    // Partition 1 is on shard 1, preferred by broker 2. Rebalance is off, so
+    // a lost first election is not retried; campaign the preferred voter
+    // until it leads, then hand the shard to broker 3.
     let deadline = Instant::now() + Duration::from_secs(30);
     while leaders(&controller, None)[1].0 != 2 {
+        let _ = reqwest::blocking::Client::new()
+            .post(format!("http://{}/wal/1/campaign", nodes[1].http))
+            .send();
         assert!(Instant::now() < deadline, "broker 2 never led shard 1");
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(200));
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -322,24 +326,27 @@ fn elect_leaders_moves_a_shard_back_to_its_preferred_broker() {
     }
 
     assert_eq!(elect(&controller, 1), vec![83; PARTITIONS as usize], "UNCLEAN");
-    // Just after a move the new leader may not yet see broker 2 caught up,
-    // and answers PREFERRED_LEADER_NOT_AVAILABLE (80) until it does.
+    // Shard 0 may still be settling, so its partition can answer 0 in the
+    // same call that moves shard 1. 80 means the preferred broker is not
+    // caught up yet; 84 means it already leads.
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut moved = false;
     loop {
         let codes = elect(&controller, 0);
-        if codes == vec![84, 0, 84] {
+        assert!(
+            codes.len() == PARTITIONS as usize
+                && codes.iter().all(|code| *code == 0 || *code == 80 || *code == 84),
+            "PREFERRED answered {codes:?}"
+        );
+        moved |= codes[1] == 0;
+        if moved && leaders(&controller, None)[1].0 == 2 {
             break;
         }
         assert!(
-            codes == vec![84, 80, 84] && Instant::now() < deadline,
-            "PREFERRED answered {codes:?}"
+            Instant::now() < deadline,
+            "shard 1 never came back by election: {codes:?}"
         );
         std::thread::sleep(Duration::from_millis(300));
-    }
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while leaders(&controller, None)[1].0 != 2 {
-        assert!(Instant::now() < deadline, "the election did not move shard 1 back");
-        std::thread::sleep(Duration::from_millis(100));
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     while elect(&controller, 0) != vec![84; PARTITIONS as usize] {
