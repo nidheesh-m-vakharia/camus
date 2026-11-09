@@ -268,16 +268,35 @@ pub fn sealed_end(http: &str) -> i64 {
     part["next_offset"].as_i64().unwrap()
 }
 
-/// Partition 0's extents as `(start, end)` from `http`'s metadata replica.
+/// Every key under `prefix` and its value, from `http`'s metadata replica.
+pub fn scan_keys(http: &str, prefix: &str) -> Vec<(String, String)> {
+    reqwest::blocking::Client::new()
+        .get(format!("http://{http}/admin/scan"))
+        .query(&[("prefix", prefix)])
+        .send()
+        .unwrap()
+        .json()
+        .unwrap()
+}
+
+/// Partition 0's extents as `(start, end)` from `http`'s metadata replica:
+/// from the partition row if it predates extent keys, else from the keys.
 pub fn extents(http: &str) -> Vec<(i64, i64)> {
     let topic: serde_json::Value =
         serde_json::from_str(&read_key(http, &format!("topic/{TOPIC}")).unwrap()).unwrap();
     let id = topic["id"].as_str().unwrap();
     let part: serde_json::Value =
         serde_json::from_str(&read_key(http, &format!("part/{id}/0")).unwrap()).unwrap();
-    part["extents"]
-        .as_array()
-        .unwrap()
+    let legacy = part["extents"].as_array().cloned().unwrap_or_default();
+    let stored: Vec<serde_json::Value> = if legacy.is_empty() {
+        scan_keys(http, &format!("ext/{id}/{:010}/", 0))
+            .into_iter()
+            .map(|(_, raw)| serde_json::from_str(&raw).unwrap())
+            .collect()
+    } else {
+        legacy
+    };
+    stored
         .iter()
         .map(|extent| {
             (
@@ -778,15 +797,30 @@ pub fn single(dir: &Path, opts: Opts) -> Node {
 }
 
 pub fn init(nodes: &[Node], wal: &[i32]) {
-    let peers: Vec<_> = nodes
+    post_init(nodes, &serde_json::json!(peers(nodes, wal)));
+}
+
+/// [`init`] with exactly `shards` WAL shards.
+pub fn init_shards(nodes: &[Node], wal: &[i32], shards: u32) {
+    post_init(
+        nodes,
+        &serde_json::json!({"peers": peers(nodes, wal), "shards": shards}),
+    );
+}
+
+fn peers(nodes: &[Node], wal: &[i32]) -> Vec<serde_json::Value> {
+    nodes
         .iter()
         .map(|node| {
             serde_json::json!({"id": node.id, "addr": node.http, "wal": wal.contains(&node.id)})
         })
-        .collect();
+        .collect()
+}
+
+fn post_init(nodes: &[Node], body: &serde_json::Value) {
     let init = reqwest::blocking::Client::new()
         .post(format!("http://{}/admin/init", nodes[0].http))
-        .json(&peers)
+        .json(body)
         .send()
         .unwrap();
     assert!(init.status().is_success(), "{}", init.text().unwrap());

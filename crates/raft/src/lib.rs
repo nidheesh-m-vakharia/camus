@@ -11,5 +11,5 @@ mod segment;
 mod store;
 mod submit;
 
-pub use segment::{SegmentLog, DEFAULT_SEGMENT_BYTES};
+pub use segment::{Payload, SegmentLog, DEFAULT_SEGMENT_BYTES, DEFAULT_TAIL_BYTES};
 pub use store::{AppendStats, SegmentLogStore};

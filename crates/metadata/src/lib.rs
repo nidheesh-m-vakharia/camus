@@ -22,8 +22,9 @@ pub use acl::{
 };
 pub use admin::{ConfigChange, ConfigEdit, Item, OffsetDrop, PartitionIncrease, RecordCut};
 pub use catalog::{
-    parse_partition, parse_topic, partition_storage_key, topic_index_key, topic_storage_key,
-    EpochStart, Extent, Partition, PublishPart, Span, Topic, SHARDS,
+    extent_key, extent_range, extents_after, parse_partition, parse_topic, partition_storage_key,
+    topic_extent_prefix, topic_index_key, topic_storage_key, EpochStart, Extent, Partition,
+    PublishPart, Scan, Span, Topic, SHARDS,
 };
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{
@@ -501,6 +502,17 @@ impl MetadataNode {
     /// its own; call [`MetadataNode::linearizable`] first when it must be.
     pub fn scan_local(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
         Ok(self.machine.scan(prefix)?)
+    }
+
+    /// Up to `limit` locally applied keys in `[from, to)`, in key order. Not
+    /// linearizable.
+    pub fn scan_range_local(
+        &self,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(self.machine.scan_range(from, to, limit)?)
     }
 
     /// Read the latest applied value on this node. This is not a linearizable read.
