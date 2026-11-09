@@ -290,6 +290,24 @@ fn cli_tools_manage_topics_groups_configs_and_records() {
         consumed.contains("v1") && consumed.contains("v2"),
         "{consumed}"
     );
+    let producers = tool(
+        "kafka-transactions.sh",
+        &[
+            "--bootstrap-server",
+            b,
+            "describe-producers",
+            "--topic",
+            "cli",
+            "--partition",
+            "0",
+        ],
+        None,
+        false,
+    );
+    assert!(
+        producers.contains("ProducerId") || producers.contains("producer"),
+        "{producers}"
+    );
     let groups = tool(
         "kafka-consumer-groups.sh",
         &[
