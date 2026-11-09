@@ -318,7 +318,7 @@ acceptance test. `-` means not run.
 | UpdateFeatures | 57 | | not planned | unimplemented | - | - | - |
 | Envelope | 58 | | not planned | unimplemented | - | - | - |
 | DescribeCluster | 60 | 4 | 0-2 | implemented | pass | pass | - |
-| DescribeProducers | 61 | | 0 | implemented | - | - | - |
+| DescribeProducers | 61 | | 0 | implemented | pass | - | - |
 | UnregisterBroker | 64 | | not planned | unimplemented | - | - | - |
 | DescribeTransactions | 65 | 5 | 0 | implemented | pass | - | pass |
 | ListTransactions | 66 | 5 | 0-2 | implemented | pass | - | pass |
@@ -328,7 +328,7 @@ acceptance test. `-` means not run.
 | GetTelemetrySubscriptions | 71 | | not planned | unimplemented | - | - | - |
 | PushTelemetry | 72 | | not planned | unimplemented | - | - | - |
 | ListClientMetricsResources | 74 | | not planned | unimplemented | - | - | - |
-| DescribeTopicPartitions | 75 | | 0 | implemented | - | - | - |
+| DescribeTopicPartitions | 75 | | 0 | implemented | pass | - | - |
 
 Version numbers are filled in when the handler lands, from the generated
 4.4.0 schema, capped at what the handler implements. "TBD" means the range
@@ -347,7 +347,7 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 | Go | `franz-go` v1.22.0, SASL_SSL, passed | 1 |
 | kcat | CLI against the dev listener | 1, smoke |
 | KafkaJS 2 | round trip with a consumer group, in the ecosystem harness | passed |
-| Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, preferred leader election, API versions | passed |
+| Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, describe-producers, preferred leader election, API versions | passed |
 | Kafka Connect 4.4.0, distributed | FileStream source and sink, compacted internal topics, resume after restart | passed |
 | Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | passed |
 | MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | passed |
