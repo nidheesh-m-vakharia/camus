@@ -558,6 +558,25 @@ async fn start_kafka(
     } else {
         bound.ip().to_string()
     };
+    // The MinIO fallbacks are for development. A broker serving TLS must be
+    // told where its log lives instead of silently using a local stand-in.
+    if !args.dev_plaintext {
+        let missing: Vec<&str> = [
+            "CAMUS_S3_ENDPOINT",
+            "CAMUS_S3_BUCKET",
+            "CAMUS_S3_ACCESS_KEY",
+            "CAMUS_S3_SECRET_KEY",
+        ]
+        .into_iter()
+        .filter(|name| std::env::var(name).map_or(true, |value| value.is_empty()))
+        .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "object storage is not configured; set {} (the MinIO defaults apply only with --dev-plaintext)",
+                missing.join(", ")
+            );
+        }
+    }
     let bucket = Bucket::connect(&BucketConfig {
         endpoint: std::env::var("CAMUS_S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),

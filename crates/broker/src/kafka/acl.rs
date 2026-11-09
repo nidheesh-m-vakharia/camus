@@ -16,7 +16,7 @@ use camus_protocol::messages::{
 };
 use camus_protocol::protocol::{Decodable, StrBytes};
 
-use super::{frame_of, Kafka, Reply};
+use super::{frame_of, Caller, Kafka, Reply};
 
 const NOT_LEADER: i16 = 6;
 const CLUSTER_AUTH: i16 = 31;
@@ -29,13 +29,13 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        principal: &str,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = CreateAclsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let mut response = CreateAclsResponse::default();
-        if !self.allows(principal, CLUSTER, "kafka-cluster", ALTER) {
+        if !self.allows(caller, CLUSTER, "kafka-cluster", ALTER) {
             response.results = request
                 .creations
                 .iter()
@@ -78,13 +78,13 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        principal: &str,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = DescribeAclsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let mut response = DescribeAclsResponse::default();
-        if !self.allows(principal, CLUSTER, "kafka-cluster", DESCRIBE) {
+        if !self.allows(caller, CLUSTER, "kafka-cluster", DESCRIBE) {
             response.error_code = CLUSTER_AUTH;
             return frame_of(header.request_api_version, header.correlation_id, &response);
         }
@@ -126,13 +126,13 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
-        principal: &str,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = DeleteAclsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let mut response = DeleteAclsResponse::default();
-        if !self.allows(principal, CLUSTER, "kafka-cluster", ALTER) {
+        if !self.allows(caller, CLUSTER, "kafka-cluster", ALTER) {
             response.filter_results = request
                 .filters
                 .iter()

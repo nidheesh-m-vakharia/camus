@@ -44,7 +44,7 @@ use camus_protocol::messages::{
 use camus_protocol::protocol::{Decodable, StrBytes};
 use uuid::Uuid;
 
-use super::{frame_of, topic_name, Kafka, Reply};
+use super::{auth, frame_of, topic_name, Caller, Kafka, Reply};
 
 const INVALID_REQUEST: i16 = 42;
 const UNKNOWN_TOPIC: i16 = 3;
@@ -148,7 +148,12 @@ impl Kafka {
         }
     }
 
-    pub(super) async fn find_coordinator(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn find_coordinator(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = FindCoordinatorRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -180,6 +185,14 @@ impl Kafka {
             }
             if key.is_empty() {
                 return (codes::INVALID_GROUP_ID, None, -1, String::new(), -1);
+            }
+            let (resource, denied) = if request.key_type == 0 {
+                (auth::GROUP, auth::GROUP_FAILED)
+            } else {
+                (auth::TXN_ID, auth::TXN_ID_FAILED)
+            };
+            if !self.allows(caller, resource, key, auth::DESCRIBE) {
+                return (denied, None, -1, String::new(), -1);
             }
             match &address {
                 Some((id, host, port)) => (0, None, *id, host.clone(), *port),
@@ -216,13 +229,20 @@ impl Kafka {
         frame_of(version, header.correlation_id, &response)
     }
 
-    pub(super) async fn join_group(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn join_group(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = JoinGroupRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let version = header.request_api_version;
         let group = request.group_id.0.to_string();
+        let allowed = self.allows(caller, auth::GROUP, &group, auth::READ);
         let answer = match self.coordinating().await {
+            _ if !allowed => JoinResponse::error(auth::GROUP_FAILED, request.member_id.as_str()),
             Err(code) => JoinResponse::error(code, request.member_id.as_str()),
             Ok(()) => {
                 let join = JoinRequest {
@@ -234,7 +254,7 @@ impl Kafka {
                         .as_ref()
                         .map(|id| id.to_string())
                         .unwrap_or_default(),
-                    client_host: String::from("/unknown"),
+                    client_host: format!("/{}", caller.host),
                     protocol_type: request.protocol_type.to_string(),
                     protocols: request
                         .protocols
@@ -280,12 +300,19 @@ impl Kafka {
         frame_of(version, header.correlation_id, &response)
     }
 
-    pub(super) async fn sync_group(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn sync_group(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = SyncGroupRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let version = header.request_api_version;
+        let allowed = self.allows(caller, auth::GROUP, request.group_id.0.as_str(), auth::READ);
         let answer = match self.coordinating().await {
+            _ if !allowed => SyncResponse::error(auth::GROUP_FAILED),
             Err(code) => SyncResponse::error(code),
             Ok(()) => {
                 let assignments = request
@@ -316,11 +343,18 @@ impl Kafka {
         frame_of(version, header.correlation_id, &response)
     }
 
-    pub(super) async fn heartbeat(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn heartbeat(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = HeartbeatRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
+        let allowed = self.allows(caller, auth::GROUP, request.group_id.0.as_str(), auth::READ);
         let code = match self.coordinating().await {
+            _ if !allowed => auth::GROUP_FAILED,
             Err(code) => code,
             Ok(()) => self.coordinator.heartbeat(
                 request.group_id.0.as_str(),
@@ -335,7 +369,12 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    pub(super) async fn leave_group(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn leave_group(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = LeaveGroupRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -357,7 +396,9 @@ impl Kafka {
             }]
         };
         let mut response = LeaveGroupResponse::default();
+        let allowed = self.allows(caller, auth::GROUP, &group, auth::READ);
         let answered = match self.coordinating().await {
+            _ if !allowed => Err(auth::GROUP_FAILED),
             Err(code) => Err(code),
             Ok(()) => self.coordinator.leave(&group, &leaving, Instant::now()),
         };
@@ -380,7 +421,12 @@ impl Kafka {
         frame_of(version, header.correlation_id, &response)
     }
 
-    pub(super) async fn offset_commit(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn offset_commit(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = OffsetCommitRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -388,7 +434,9 @@ impl Kafka {
         let group = request.group_id.0.to_string();
         let generation = request.generation_id_or_member_epoch;
         let member_id = request.member_id.to_string();
+        let allowed = self.allows(caller, auth::GROUP, &group, auth::READ);
         let gate = match self.coordinating().await {
+            _ if !allowed => auth::GROUP_FAILED,
             Err(code) => code,
             Ok(()) => self.coordinator.check_commit(
                 &group,
@@ -414,11 +462,15 @@ impl Kafka {
             out.name = topic.name.clone();
             out.topic_id = topic.topic_id;
             let topic_index = response.topics.len();
+            let readable = stored
+                .as_ref()
+                .is_none_or(|found| self.allows(caller, auth::TOPIC, &found.name, auth::READ));
             for partition in &topic.partitions {
                 let mut row = OffsetCommitResponsePartition::default();
                 row.partition_index = partition.partition_index;
                 match &stored {
                     _ if gate != 0 => row.error_code = gate,
+                    _ if !readable => row.error_code = auth::TOPIC_FAILED,
                     Some(found)
                         if partition.partition_index >= 0
                             && partition.partition_index < found.partitions =>
@@ -482,7 +534,12 @@ impl Kafka {
             .collect()
     }
 
-    pub(super) async fn offset_fetch(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn offset_fetch(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = OffsetFetchRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -548,14 +605,24 @@ impl Kafka {
 
         // One answer per group: rows of (name, id, partition, record).
         let mut answers = Vec::new();
+        let mut denied_topics = std::collections::BTreeSet::new();
         for (group, member_code, topics) in wanted {
-            let group_error = if gate != 0 { gate } else { member_code };
+            let group_error = if gate != 0 {
+                gate
+            } else if !self.allows(caller, auth::GROUP, &group, auth::DESCRIBE) {
+                auth::GROUP_FAILED
+            } else {
+                member_code
+            };
             let mut rows: Vec<(String, Uuid, i32, Option<OffsetRecord>)> = Vec::new();
             if group_error == 0 {
                 let stored = self.stored_offsets(&group);
                 match topics {
                     Some(topics) => {
                         for (name, id, partitions) in topics {
+                            if !self.allows(caller, auth::TOPIC, &name, auth::DESCRIBE) {
+                                denied_topics.insert(name.clone());
+                            }
                             let topic = self.topic(&name);
                             let topic_id = topic
                                 .as_ref()
@@ -579,10 +646,15 @@ impl Kafka {
                             let Ok(id) = Uuid::parse_str(&topic_id) else {
                                 continue;
                             };
-                            // Offsets of a deleted topic are not reported.
+                            // Offsets of a deleted topic are not reported, and
+                            // neither are those of a topic the caller may not
+                            // describe.
                             let Some(name) = self.topic_name_by_id(&id) else {
                                 continue;
                             };
+                            if !self.allows(caller, auth::TOPIC, &name, auth::DESCRIBE) {
+                                continue;
+                            }
                             rows.push((name, id, partition, Some(record)));
                         }
                     }
@@ -616,12 +688,20 @@ impl Kafka {
                             topics.len() - 1
                         }
                     };
-                    let (offset, epoch, metadata) = row_parts(&record);
+                    let denied = denied_topics.contains(&name);
+                    let (offset, epoch, metadata) = if denied {
+                        row_parts(&None)
+                    } else {
+                        row_parts(&record)
+                    };
                     let mut part = OffsetFetchResponsePartitions::default();
                     part.partition_index = partition;
                     part.committed_offset = offset;
                     part.committed_leader_epoch = epoch;
                     part.metadata = metadata.map(|value| text(&value));
+                    if denied {
+                        part.error_code = auth::TOPIC_FAILED;
+                    }
                     topics[at].partitions.push(part);
                 }
                 out.topics = topics;
@@ -643,7 +723,12 @@ impl Kafka {
                         topics.len() - 1
                     }
                 };
-                let (offset, epoch, metadata) = row_parts(&record);
+                let denied = denied_topics.contains(&name);
+                let (offset, epoch, metadata) = if denied {
+                    row_parts(&None)
+                } else {
+                    row_parts(&record)
+                };
                 let mut part = OffsetFetchResponsePartition::default();
                 part.partition_index = partition;
                 part.committed_offset = offset;
@@ -653,6 +738,9 @@ impl Kafka {
                 if version < 2 {
                     part.error_code = gate;
                 }
+                if denied {
+                    part.error_code = auth::TOPIC_FAILED;
+                }
                 topics[at].partitions.push(part);
             }
             response.topics = topics;
@@ -660,15 +748,24 @@ impl Kafka {
         frame_of(version, header.correlation_id, &response)
     }
 
-    pub(super) async fn list_groups(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn list_groups(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = ListGroupsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
         let mut response = ListGroupsResponse::default();
         // A broker that does not coordinate has no groups to list; the admin
         // client asks every broker and merges.
+        let every = self.allows(caller, auth::CLUSTER, auth::CLUSTER_NAME, auth::DESCRIBE);
         if self.coordinating().await.is_ok() {
             for group in self.coordinator.list() {
+                if !every && !self.allows(caller, auth::GROUP, &group.id, auth::DESCRIBE) {
+                    continue;
+                }
                 let state_ok = request.states_filter.is_empty()
                     || request
                         .states_filter
@@ -693,7 +790,12 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    pub(super) async fn describe_groups(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn describe_groups(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = DescribeGroupsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -703,6 +805,11 @@ impl Kafka {
             let mut out = DescribedGroup::default();
             out.group_id = group.clone();
             out.authorized_operations = i32::MIN;
+            if !self.allows(caller, auth::GROUP, group.0.as_str(), auth::DESCRIBE) {
+                out.error_code = auth::GROUP_FAILED;
+                response.groups.push(out);
+                continue;
+            }
             if gate != 0 {
                 out.error_code = gate;
                 response.groups.push(out);
@@ -735,7 +842,12 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
-    pub(super) async fn delete_groups(&self, header: &RequestHeader, buf: &mut Bytes) -> Reply {
+    pub(super) async fn delete_groups(
+        &self,
+        header: &RequestHeader,
+        buf: &mut Bytes,
+        caller: &Caller,
+    ) -> Reply {
         let Ok(request) = DeleteGroupsRequest::decode(buf, header.request_api_version) else {
             return Reply::Close;
         };
@@ -743,7 +855,9 @@ impl Kafka {
         let mut response = DeleteGroupsResponse::default();
         for group in &request.groups_names {
             let id = group.0.to_string();
-            let code = if gate != 0 {
+            let code = if !self.allows(caller, auth::GROUP, &id, auth::DELETE) {
+                auth::GROUP_FAILED
+            } else if gate != 0 {
                 gate
             } else if !self.coordinator.deletable(&id) {
                 groups::codes::NON_EMPTY_GROUP
@@ -772,6 +886,7 @@ impl Kafka {
         &self,
         header: &RequestHeader,
         buf: &mut Bytes,
+        caller: &Caller,
     ) -> Reply {
         let Ok(request) = ConsumerGroupHeartbeatRequest::decode(buf, header.request_api_version)
         else {
@@ -805,8 +920,24 @@ impl Kafka {
                 .unwrap_or_default(),
             version,
         };
-        let topics = self.group_topics();
-        let answer = match self.coordinating().await {
+        // Kafka needs READ on the group and DESCRIBE on each named topic; a
+        // regex only matches topics the caller may describe.
+        let denied_name = heartbeat.subscribed_topics.as_ref().and_then(|names| {
+            names
+                .iter()
+                .find(|name| !self.allows(caller, auth::TOPIC, name, auth::DESCRIBE))
+                .cloned()
+        });
+        let gate = if !self.allows(caller, auth::GROUP, &heartbeat.group, auth::READ) {
+            Err(auth::GROUP_FAILED)
+        } else if denied_name.is_some() {
+            Err(auth::TOPIC_FAILED)
+        } else {
+            self.coordinating().await
+        };
+        let mut topics = self.group_topics();
+        topics.retain(|topic| self.allows(caller, auth::TOPIC, &topic.name, auth::DESCRIBE));
+        let answer = match gate {
             Err(code) => camus_coordinator::ConsumerHeartbeatResponse {
                 error: code,
                 message: None,
