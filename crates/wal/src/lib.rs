@@ -763,11 +763,7 @@ mod tests {
         assert_eq!(first_ack.base_offset, 0);
         let again = first.append(batch.clone()).await.unwrap();
         assert_eq!(again.base_offset, 0);
-        assert_eq!(
-            first.end_offset(&[1; 16], 0),
-            1,
-            "the retry is not a second record"
-        );
+        assert_eq!(first.end_offset(&[1; 16], 0), 1, "the retry is not a second record");
 
         let gone = shards[(leader - 1) as usize].take().unwrap();
         gone.raft.shutdown().await.unwrap();
@@ -778,10 +774,7 @@ mod tests {
         let survivor = live.iter().find(|shard| shard.node_id == next).unwrap();
         let after = survivor.append(batch).await.unwrap();
         assert_eq!(after.error_code, 0);
-        assert_eq!(
-            after.base_offset, 0,
-            "the new leader still has the sequence"
-        );
+        assert_eq!(after.base_offset, 0, "the new leader still has the sequence");
         assert_eq!(survivor.end_offset(&[1; 16], 0), 1);
         let followed = survivor.append(idempotent(b"next", 7, 0, 1)).await.unwrap();
         assert_eq!(followed.base_offset, 1);
