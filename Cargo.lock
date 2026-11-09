@@ -355,6 +355,7 @@ dependencies = [
  "clap",
  "openraft",
  "rcgen",
+ "redb",
  "regex",
  "reqwest",
  "ring",

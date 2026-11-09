@@ -43,6 +43,7 @@ camus-raft = { version = "0.1.0", path = "../raft" }
 bytes = "1"
 camus-protocol = { path = "../protocol" }
 rcgen = "0.14"
+redb = "4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "blocking", "query"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde_json = "1"
