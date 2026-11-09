@@ -878,9 +878,72 @@ fn confluent_kafka_dotnet_round_trips() {
     );
 }
 
+struct Container(String);
+
+impl Drop for Container {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// A fresh Schema Registry process. It stores nothing of its own: a restart
+/// has to read `_schemas` back from the broker.
+fn start_schema_registry(broker_port: u16) -> (Container, String) {
+    let registry = free_port();
+    let name = format!("camus-sr-{registry}");
+    let started = Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &name,
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "-p",
+        ])
+        .arg(format!("{registry}:8081"))
+        .args([
+            "-e",
+            "SCHEMA_REGISTRY_HOST_NAME=localhost",
+            "-e",
+            "SCHEMA_REGISTRY_LISTENERS=http://0.0.0.0:8081",
+            "-e",
+        ])
+        .arg(format!(
+            "SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=PLAINTEXT://host.docker.internal:{broker_port}"
+        ))
+        .args([
+            "-e",
+            "SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR=1",
+            "confluentinc/cp-schema-registry:latest",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "docker run schema-registry failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    (Container(name), format!("http://127.0.0.1:{registry}"))
+}
+
+fn schema_registry_ready(http: &reqwest::blocking::Client, base: &str) {
+    wait_for("Schema Registry", Duration::from_secs(120), || {
+        http.get(format!("{base}/subjects"))
+            .send()
+            .is_ok_and(|response| response.status().is_success())
+    });
+}
+
 /// Schema Registry in Docker. The container reaches the broker through
 /// `host.docker.internal`, so the broker listens on every interface and
-/// advertises that name. Opt-in: `CAMUS_ECOSYSTEM_DOCKER=1`.
+/// advertises that name. The registry is then thrown away and a new one must
+/// load the same schema id from `_schemas`. Opt-in: `CAMUS_ECOSYSTEM_DOCKER=1`.
 #[test]
 fn schema_registry_stores_a_schema() {
     if !enabled() || std::env::var("CAMUS_ECOSYSTEM_DOCKER").ok().as_deref() != Some("1") {
@@ -891,58 +954,43 @@ fn schema_registry_stores_a_schema() {
     let port = free_port();
     let http_port = free_port();
     let _broker = Background::broker(dir.path(), port, http_port);
-    let init = reqwest::blocking::Client::new()
+    let http = reqwest::blocking::Client::new();
+    let init = http
         .post(format!("http://127.0.0.1:{http_port}/admin/init"))
         .json(&serde_json::json!([{"id": 1, "addr": format!("127.0.0.1:{http_port}")}]))
         .send()
         .unwrap();
-    assert!(init.status().is_success());
-    let registry = free_port();
-    let name = format!("camus-sr-{registry}");
-    let started = Command::new("docker")
-        .args(["run", "-d", "--rm", "--name", &name, "-p"])
-        .arg(format!("{registry}:8081"))
-        .args([
-            "-e",
-            "SCHEMA_REGISTRY_HOST_NAME=localhost",
-            "-e",
-            "SCHEMA_REGISTRY_LISTENERS=http://0.0.0.0:8081",
-            "-e",
-        ])
-        .arg(format!(
-            "SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=PLAINTEXT://host.docker.internal:{port}"
-        ))
-        .args([
-            "-e",
-            "SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR=1",
-            "confluentinc/cp-schema-registry:latest",
-        ])
-        .status()
-        .unwrap();
-    assert!(started.success());
-    struct Container(String);
-    impl Drop for Container {
-        fn drop(&mut self) {
-            let _ = Command::new("docker").args(["rm", "-f", &self.0]).status();
-        }
-    }
-    let _container = Container(name);
-    let http = reqwest::blocking::Client::new();
-    let base = format!("http://127.0.0.1:{registry}");
-    wait_for("Schema Registry", Duration::from_secs(120), || {
-        http.get(format!("{base}/subjects"))
-            .send()
-            .is_ok_and(|response| response.status().is_success())
-    });
+    let init_status = init.status();
+    assert!(init_status.is_success(), "{}", init.text().unwrap());
+
+    let (container, base) = start_schema_registry(port);
+    schema_registry_ready(&http, &base);
     let registered = http
         .post(format!("{base}/subjects/orders-value/versions"))
         .header("Content-Type", "application/vnd.schemaregistry.v1+json")
         .body(r#"{"schema":"{\"type\":\"string\"}"}"#)
         .send()
         .unwrap();
-    assert!(
-        registered.status().is_success(),
-        "{}",
-        registered.text().unwrap()
-    );
+    let registered_status = registered.status();
+    let registered_body = registered.text().unwrap();
+    assert!(registered_status.is_success(), "{registered_body}");
+    let schema_id = serde_json::from_str::<serde_json::Value>(&registered_body).unwrap()["id"]
+        .as_i64()
+        .expect("schema id");
+    drop(container);
+
+    let (_restarted, base) = start_schema_registry(port);
+    schema_registry_ready(&http, &base);
+    let loaded = http
+        .get(format!("{base}/subjects/orders-value/versions/latest"))
+        .send()
+        .unwrap();
+    let loaded_status = loaded.status();
+    let loaded_body = loaded.text().unwrap();
+    assert!(loaded_status.is_success(), "{loaded_body}");
+    let loaded: serde_json::Value = serde_json::from_str(&loaded_body).unwrap();
+    assert_eq!(loaded["id"].as_i64(), Some(schema_id), "{loaded}");
+    // Schema Registry stores the canonical Avro form, not the object we posted.
+    assert_eq!(loaded["schema"].as_str(), Some("\"string\""), "{loaded}");
+    assert_eq!(loaded["schemaType"].as_str(), Some("AVRO"), "{loaded}");
 }
