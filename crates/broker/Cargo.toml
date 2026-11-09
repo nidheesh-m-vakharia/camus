@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+base64 = "0.23"
 bytes = "1"
 camus-metadata = { path = "../metadata" }
 camus-protocol = { path = "../protocol" }
@@ -24,6 +25,7 @@ camus-compactor = { path = "../compactor" }
 clap = { version = "4", features = ["derive"] }
 openraft = { version = "=0.9.25", features = ["serde"] }
 regex = "1"
+ring = "0.17"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,6 +34,7 @@ rustls-pemfile = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "io-util", "sync", "time"] }
 tokio-rustls = "0.26"
 uuid = "1"
+x509-parser = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 camus-raft = { version = "0.1.0", path = "../raft" }

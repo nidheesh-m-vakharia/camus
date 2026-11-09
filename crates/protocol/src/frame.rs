@@ -50,6 +50,16 @@ const IMPLEMENTED: &[ImplementedApi] = &[
         max: 11,
     },
     ImplementedApi {
+        key: ApiKey::DescribeUserScramCredentials,
+        min: 0,
+        max: 0,
+    },
+    ImplementedApi {
+        key: ApiKey::AlterUserScramCredentials,
+        min: 0,
+        max: 0,
+    },
+    ImplementedApi {
         key: ApiKey::ConsumerGroupDescribe,
         min: 0,
         max: 1,

@@ -230,14 +230,15 @@ fn sasl_ssl_rejects_bad_credentials_and_accepts_plain() {
         ApiKey::SaslHandshake,
         1,
         2,
-        &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("SCRAM-SHA-256")),
+        &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("GSSAPI")),
     );
     let handshake = recv::<SaslHandshakeResponse>(&mut stream, 1);
     assert_eq!(
         handshake.error_code,
         ResponseError::UnsupportedSaslMechanism.code()
     );
-    assert_eq!(handshake.mechanisms[0].as_str(), "PLAIN");
+    let offered: Vec<&str> = handshake.mechanisms.iter().map(|m| m.as_str()).collect();
+    assert_eq!(offered, vec!["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"]);
 
     send(
         &mut stream,

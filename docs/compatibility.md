@@ -141,7 +141,15 @@ defaults to `false` when SASL is required and `true` on the dev PLAINTEXT
 listener, where every client is `User:ANONYMOUS`. `CAMUS_SUPER_USERS` is
 Kafka's `super.users`, a `;`-separated principal list; the SASL user from
 `CAMUS_SASL_USER` is always a super user, so a new cluster can create its
-first ACLs. A broker serving TLS refuses to start unless `CAMUS_S3_ENDPOINT`,
+first ACLs. SASL/SCRAM-SHA-256 and SCRAM-SHA-512 users are created and
+removed with `AlterUserScramCredentials` and listed with
+`DescribeUserScramCredentials` (cluster `ALTER` and `DESCRIBE`); metadata keeps
+the salt, iterations (4096–16384), `StoredKey`, and `ServerKey`, never the
+password. With `--tls-client-ca`, the TLS listener requires a client
+certificate from that CA and, as Kafka's SSL listener, takes the principal
+from its subject, `User:<RFC 2253 DN>` in the order Java prints it; SASL is then
+off unless `--require-sasl` is set. Authenticated listeners deny a resource no
+ACL names by default. A broker serving TLS refuses to start unless `CAMUS_S3_ENDPOINT`,
 `CAMUS_S3_BUCKET`, `CAMUS_S3_ACCESS_KEY`, and `CAMUS_S3_SECRET_KEY` are set;
 the MinIO defaults apply only with `--dev-plaintext`.
 
@@ -225,7 +233,7 @@ acceptance test. `-` means not run.
 | SyncGroup | 14 | 3 | 0-5 | implemented | pass | pass | pass |
 | DescribeGroups | 15 | 3 | 0-6 | implemented | pass | pass | pass |
 | ListGroups | 16 | 3 | 0-5 | implemented | pass | pass | pass |
-| SaslHandshake | 17 | 1 | 0-1 | implemented (PLAIN) | pass | pass | pass |
+| SaslHandshake | 17 | 1 | 0-1 | implemented (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512) | pass | pass | pass |
 | ApiVersions | 18 | 1 | 0-5 | implemented | pass | pass | pass |
 | CreateTopics | 19 | 1 | 2-7 | implemented | pass | pass | pass |
 | DeleteTopics | 20 | 1 | 1-6 | implemented | pass | pass | pass |
@@ -244,7 +252,7 @@ acceptance test. `-` means not run.
 | AlterConfigs | 33 | 4 | 0-2 | implemented | - | pass | pass |
 | AlterReplicaLogDirs | 34 | | not planned | unimplemented | - | - | - |
 | DescribeLogDirs | 35 | | 1-4 | implemented | - | - | - |
-| SaslAuthenticate | 36 | 1 | 0-2 | implemented (PLAIN) | pass | pass | pass |
+| SaslAuthenticate | 36 | 1 | 0-2 | implemented (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512) | pass | pass | pass |
 | CreatePartitions | 37 | 4 | 0-3 | implemented | pass | pass | pass |
 | CreateDelegationToken | 38 | | not planned | unimplemented | - | - | - |
 | RenewDelegationToken | 39 | | not planned | unimplemented | - | - | - |
@@ -258,8 +266,8 @@ acceptance test. `-` means not run.
 | OffsetDelete | 47 | 4 | 0 | implemented | pass | - | pass |
 | DescribeClientQuotas | 48 | | throttle is internal; API not planned for 0–5 | unimplemented | - | - | - |
 | AlterClientQuotas | 49 | | not planned | unimplemented | - | - | - |
-| DescribeUserScramCredentials | 50 | | SCRAM not planned | unimplemented | - | - | - |
-| AlterUserScramCredentials | 51 | | not planned | unimplemented | - | - | - |
+| DescribeUserScramCredentials | 50 | | 0 | implemented | - | - | - |
+| AlterUserScramCredentials | 51 | | 0 | implemented | - | - | - |
 | DescribeQuorum | 55 | | not planned (KRaft-specific) | unimplemented | - | - | - |
 | UpdateFeatures | 57 | | not planned | unimplemented | - | - | - |
 | Envelope | 58 | | not planned | unimplemented | - | - | - |

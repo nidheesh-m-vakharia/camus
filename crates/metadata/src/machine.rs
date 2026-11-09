@@ -203,6 +203,13 @@ fn apply_command(
             .map(|old| old.value().to_owned());
         return Ok(Response::ok(previous));
     }
+    if let Command::Delete { key } = command {
+        let previous = kv
+            .remove(key.as_str())
+            .map_err(|err| io(ErrorSubject::StateMachine, &err))?
+            .map(|old| old.value().to_owned());
+        return Ok(Response::ok(previous));
+    }
     let outcome = {
         let read = |key: &str| -> Result<Option<String>, String> {
             match kv.get(key) {
@@ -212,7 +219,7 @@ fn apply_command(
             }
         };
         match command {
-            Command::Put { .. } => unreachable!("handled above"),
+            Command::Put { .. } | Command::Delete { .. } => unreachable!("handled above"),
             Command::CreateTopic {
                 name,
                 id,
