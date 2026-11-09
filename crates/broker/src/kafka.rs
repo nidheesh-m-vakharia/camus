@@ -75,6 +75,10 @@ const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 /// `FLUSH_BYTES`, put in parallel, then one publish and one seal for all.
 const UPLOAD_PASS_BYTES: usize = 4 * FLUSH_BYTES;
 const BUFFER_LIMIT: usize = 256 * 1024 * 1024;
+/// Longest wait for a WAL seal or a metadata publish to commit. Past it the
+/// pass fails and is retried, so a shard or metadata group without quorum
+/// cannot stall uploads, or hold r2 produces, indefinitely.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 const WAL_DISK_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 
 const CORRUPT: i16 = 2;
@@ -292,6 +296,16 @@ pub struct Kafka {
     /// Topic ids seen in the WAL with no topic in metadata, and since when.
     unknown: std::sync::Mutex<BTreeMap<[u8; 16], Instant>>,
     buf: Mutex<Vec<Item>>,
+    /// Bytes in `buf`.
+    buffered: std::sync::atomic::AtomicUsize,
+    /// Woken when a flush takes items out of `buf`.
+    drained: tokio::sync::Notify,
+    /// Asks the flush task for a flush before its timer.
+    flush_now: tokio::sync::Notify,
+    /// Fetches waiting for data, by partition. Each holds one entry per
+    /// partition it waits on, removed when it returns, so this holds only
+    /// fetches in flight.
+    arrivals: std::sync::Mutex<Arrivals>,
     flush_lock: Mutex<()>,
 }
 
@@ -433,6 +447,10 @@ impl Kafka {
             coordinator: camus_coordinator::Coordinator::new(store, groups::coordinator_config()),
             coordinator_term: Mutex::new(None),
             buf: Mutex::new(Vec::new()),
+            buffered: std::sync::atomic::AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
+            flush_now: tokio::sync::Notify::new(),
+            arrivals: std::sync::Mutex::new(Arrivals::new()),
             flush_lock: Mutex::new(()),
         }
     }
@@ -1262,26 +1280,34 @@ impl Kafka {
                 }
             }
         }
-        let Some(kept) = camus_protocol::compact::plan_expiring(&records, tombstones_before) else {
+        // Planning and rebuilding run on the blocking pool, off the threads
+        // that serve requests.
+        let rebuilt = tokio::task::spawn_blocking(move || {
+            let kept = camus_protocol::compact::plan_expiring(&records, tombstones_before)?;
+            if kept.is_empty() {
+                return Some(None);
+            }
+            camus_protocol::compact::rebuild(&kept).ok().map(Some)
+        })
+        .await;
+        let Ok(Some(rebuilt)) = rebuilt else {
             return;
         };
         // When nothing survives, the prefix becomes an extent with no
         // object and no bytes. The log start stays where it is, as Kafka's
         // cleaner leaves it, and a fetch there moves on to the next record.
-        let (object_key, length) = if kept.is_empty() {
-            (String::new(), 0)
-        } else {
-            let Ok(body) = camus_protocol::compact::rebuild(&kept) else {
-                return;
-            };
-            let Ok(length) = u32::try_from(body.len()) else {
-                return;
-            };
-            let object_key = camus_uploader::object_key();
-            if self.bucket.put_new(&object_key, body).await.is_err() {
-                return;
+        let (object_key, length) = match rebuilt {
+            None => (String::new(), 0),
+            Some(body) => {
+                let Ok(length) = u32::try_from(body.len()) else {
+                    return;
+                };
+                let object_key = camus_uploader::object_key();
+                if self.bucket.put_new(&object_key, body).await.is_err() {
+                    return;
+                }
+                (object_key, length)
             }
-            (object_key, length)
         };
         if base_timestamp == i64::MAX {
             base_timestamp = 0;
@@ -1307,8 +1333,14 @@ impl Kafka {
         let flush = Arc::clone(&self);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(flush.flush_ms)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(flush.flush_ms)) => {}
+                    _ = flush.flush_now.notified() => {}
+                }
                 flush.flush().await;
+                while flush.buffered.load(std::sync::atomic::Ordering::Relaxed) >= FLUSH_BYTES {
+                    flush.flush().await;
+                }
             }
         });
         if self.compact_ms > 0 {
@@ -1386,32 +1418,18 @@ impl Kafka {
                 }
             });
         }
+        // One upload loop per shard, started as shards open, so a shard
+        // that is slow or without quorum delays and backs off only itself.
         let upload = Arc::clone(&self);
         tokio::spawn(async move {
-            let mut failures = 0u32;
-            let mut backlog = false;
+            let mut started = std::collections::BTreeSet::new();
             loop {
-                // A pass that filled its object leaves more behind; start the
-                // next one at once so a backlog drains at R2's pace.
-                let delay = if failures > 0 {
-                    retry_delay(failures)
-                } else if backlog {
-                    Duration::ZERO
-                } else {
-                    Duration::from_millis(upload.flush_ms)
-                };
-                tokio::time::sleep(delay).await;
-                match upload.upload_wal().await {
-                    Upload::Failed => {
-                        failures = failures.saturating_add(1);
-                        backlog = false;
-                        tracing::warn!(failures, "wal upload failed; retrying");
-                    }
-                    pass => {
-                        failures = 0;
-                        backlog = pass == Upload::Full;
+                for (id, _) in upload.wal.all() {
+                    if started.insert(id) {
+                        tokio::spawn(Arc::clone(&upload).upload_loop(id));
                     }
                 }
+                tokio::time::sleep(Duration::from_millis(upload.flush_ms)).await;
             }
         });
         tokio::spawn(groups::tick(
@@ -2307,6 +2325,7 @@ impl Kafka {
         let mut response = ProduceResponse::default();
         let mut waiters = Vec::new();
         let mut held = Duration::ZERO;
+        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms.max(0) as u64);
         for topic in request.topic_data {
             let name = self.resolve_topic(
                 topic.name.0.as_str(),
@@ -2370,7 +2389,7 @@ impl Kafka {
                 response.responses.push(topic_response);
             }
         }
-        let mut submitted = self.submit_wal(&mut waiters);
+        let mut submitted = self.submit_wal(&mut waiters).await;
         if request.acks == 0 {
             return Reply::Silent;
         }
@@ -2378,7 +2397,13 @@ impl Kafka {
             waiters.into_iter().zip(submitted.drain(..))
         {
             let settled = match (queued, submitted) {
-                (Queued::R2(rx), _) => rx.await.unwrap_or(Err(NOT_LEADER)),
+                (Queued::R2(rx), _) => {
+                    let wait = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(wait, rx).await {
+                        Ok(settled) => settled.unwrap_or(Err(NOT_LEADER)),
+                        Err(_) => Err(REQUEST_TIMED_OUT),
+                    }
+                }
                 (Queued::Wal(produce), Some(Ok(pending))) => {
                     self.settle_wal(produce, pending).await
                 }
@@ -2409,7 +2434,7 @@ impl Kafka {
     /// request order, so a request's partitions on one shard share a group
     /// commit instead of committing one after another. Returns one entry per
     /// waiter: `None` for r2, else the pending commit or its error code.
-    fn submit_wal(
+    async fn submit_wal(
         &self,
         waiters: &mut [(usize, usize, Queued)],
     ) -> Vec<Option<Result<camus_wal::Pending, i16>>> {
@@ -2432,7 +2457,7 @@ impl Kafka {
                     Queued::R2(_) => unreachable!("indexes hold wal waiters"),
                 })
                 .collect();
-            match shard.submit(appends) {
+            match shard.submit(appends).await {
                 Ok(pending) => {
                     for (index, pending) in indexes.into_iter().zip(pending) {
                         submitted[index] = Some(Ok(pending));
@@ -2468,6 +2493,7 @@ impl Kafka {
         if response.error_code != 0 {
             return Err(response.error_code);
         }
+        self.arrived(&produce.topic, produce.partition);
         if let Some((id, producer, epoch)) = produce.txn {
             let noted = self
                 .meta_apply(Command::NoteTxn {
@@ -2556,21 +2582,32 @@ impl Kafka {
         self.reject_null_key(topic, raw)?;
         let txn = self.accept_txn(txn_id, &info, &identities, name, partition)?;
         let (tx, rx) = oneshot::channel();
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
         let waited = self
-            .enqueue(Item {
-                topic: name.to_string(),
-                partition,
-                raw: raw.clone(),
-                records: info.iter().map(|batch| batch.records).sum(),
-                base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
-                max_timestamp: info.last().map(|batch| batch.max_timestamp).unwrap_or(-1),
-                ack: if acks == 0 { None } else { Some(tx) },
-                txn_id: txn.as_ref().map(|(id, _, _)| id.clone()),
-                producer_id: txn.as_ref().map(|(_, id, _)| *id).unwrap_or(-1),
-                producer_epoch: txn.as_ref().map(|(_, _, epoch)| *epoch).unwrap_or(-1),
-            })
+            .enqueue(
+                deadline,
+                Item {
+                    topic: name.to_string(),
+                    partition,
+                    raw: raw.clone(),
+                    records: info.iter().map(|batch| batch.records).sum(),
+                    base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
+                    max_timestamp: info.last().map(|batch| batch.max_timestamp).unwrap_or(-1),
+                    ack: if acks == 0 { None } else { Some(tx) },
+                    txn_id: txn.as_ref().map(|(id, _, _)| id.clone()),
+                    producer_id: txn.as_ref().map(|(_, id, _)| *id).unwrap_or(-1),
+                    producer_epoch: txn.as_ref().map(|(_, _, epoch)| *epoch).unwrap_or(-1),
+                },
+            )
             .await;
         // A full `r2.buffer.limit` holds the produce in `enqueue`; report it.
+        let waited = match waited {
+            Ok(waited) => waited,
+            Err(held_for) => {
+                *held = (*held).max(held_for);
+                return Err(REQUEST_TIMED_OUT);
+            }
+        };
         *held = (*held).max(waited);
         if acks == 0 {
             Ok(None)
@@ -2645,10 +2682,6 @@ impl Kafka {
             records: append.records,
             deadline: Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64),
         };
-        if acks == 0 {
-            produce.append = Some(append);
-            return Ok(Some(Queued::Wal(produce)));
-        }
         // ADR 0005 backpressure: past the disk limit, hold the produce until
         // an upload seals enough, and report the hold as throttle time. The
         // batch is not appended while held, so a timeout loses nothing that
@@ -2656,7 +2689,11 @@ impl Kafka {
         let deadline = produce.deadline;
         let size = append.raw.len() as u64;
         let hold_start = Instant::now();
+        // `acks=0` is held too: it is appended all the same.
         loop {
+            let sealed = camus_wal::sealed();
+            tokio::pin!(sealed);
+            sealed.as_mut().enable();
             // `wal.disk.limit` bounds the broker's disk, so it counts every
             // shard this broker holds, not just this one (ADR 0014).
             let unsealed: u64 = self
@@ -2672,7 +2709,11 @@ impl Kafka {
                 *held = (*held).max(hold_start.elapsed());
                 return Err(REQUEST_TIMED_OUT);
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            // A seal is what frees room; wait for one, not a timer.
+            tokio::select! {
+                _ = sealed => {}
+                _ = tokio::time::sleep_until(deadline.into()) => {}
+            }
         }
         *held = (*held).max(hold_start.elapsed());
         produce.append = Some(append);
@@ -2788,18 +2829,39 @@ impl Kafka {
         (coalesce(parts), producers, seals, all_put)
     }
 
-    /// One upload pass: at most `upload.flush.bytes` (8 MiB, ADR 0006) of
-    /// the oldest unsealed batches go into one object.
-    async fn upload_wal(&self) -> Upload {
-        let mut outcome = Upload::Done;
-        for (_, wal) in self.wal.all() {
+    /// Upload shard `id` for as long as the broker runs: a pass every upload
+    /// interval, at once after a pass that filled its object, and with
+    /// backoff after a failure. The shard is looked up each pass, since a
+    /// truncate may replace it.
+    async fn upload_loop(self: Arc<Self>, id: u32) {
+        let mut failures = 0u32;
+        let mut backlog = false;
+        loop {
+            // A pass that filled its object leaves more behind; start the
+            // next one at once so a backlog drains at R2's pace.
+            let delay = if failures > 0 {
+                retry_delay(failures)
+            } else if backlog {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(self.flush_ms)
+            };
+            tokio::time::sleep(delay).await;
+            let Some(wal) = self.wal.shard(id) else {
+                continue;
+            };
             match self.upload_shard(wal).await {
-                Upload::Failed => outcome = Upload::Failed,
-                Upload::Full if outcome != Upload::Failed => outcome = Upload::Full,
-                _ => {}
+                Upload::Failed => {
+                    failures = failures.saturating_add(1);
+                    backlog = false;
+                    tracing::warn!(shard = id, failures, "wal upload failed; retrying");
+                }
+                pass => {
+                    failures = 0;
+                    backlog = pass == Upload::Full;
+                }
             }
         }
-        outcome
     }
 
     /// One upload pass for one shard this broker leads. The shard is fixed
@@ -2896,45 +2958,65 @@ impl Kafka {
         if drops.is_empty() {
             return done;
         }
-        if let Ok(index) = wal.seal(drops).await {
+        if let Ok(Ok(index)) = tokio::time::timeout(COMMIT_TIMEOUT, wal.seal(drops)).await {
             let _ = wal.purge(index).await;
         }
         done
     }
 
     /// Buffer one `r2` batch. Returns how long it waited for buffer space.
-    async fn enqueue(&self, item: Item) -> Duration {
+    /// Buffer `item` for the next flush. Past `r2.buffer.limit`, wait for a
+    /// flush to drain the buffer, until `deadline`. Returns how long it
+    /// waited, or, past the deadline, `Err` with that time and nothing
+    /// buffered.
+    async fn enqueue(&self, deadline: Instant, item: Item) -> Result<Duration, Duration> {
+        use std::sync::atomic::Ordering::Relaxed;
         let started = Instant::now();
+        let size = item.raw.len();
         loop {
-            let held = self
-                .buf
-                .lock()
-                .await
-                .iter()
-                .map(|queued| queued.raw.len())
-                .sum::<usize>();
-            if held == 0 || held + item.raw.len() <= BUFFER_LIMIT {
+            let drained = self.drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            let held = self.buffered.load(Relaxed);
+            if held == 0 || held + size <= BUFFER_LIMIT {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::select! {
+                _ = drained => {}
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    return Err(started.elapsed());
+                }
+            }
         }
         let waited = started.elapsed();
-        let mut buf = self.buf.lock().await;
-        let size = buf.iter().map(|queued| queued.raw.len()).sum::<usize>() + item.raw.len();
-        buf.push(item);
-        drop(buf);
-        if size >= FLUSH_BYTES {
-            self.flush().await;
+        self.buf.lock().await.push(item);
+        // A full object goes up now, from the flush task, not this producer.
+        if self.buffered.fetch_add(size, Relaxed) + size >= FLUSH_BYTES {
+            self.flush_now.notify_one();
         }
-        waited
+        Ok(waited)
     }
 
     async fn flush(&self) {
         let _gate = self.flush_lock.lock().await;
-        let items = {
+        // At most `FLUSH_BYTES` (at least one item) per object, so a full
+        // buffer becomes several bounded puts, not one huge one.
+        let items: Vec<Item> = {
             let mut buf = self.buf.lock().await;
-            std::mem::take(&mut *buf)
+            let mut size = 0;
+            let mut taken = 0;
+            for item in buf.iter() {
+                if taken > 0 && size + item.raw.len() > FLUSH_BYTES {
+                    break;
+                }
+                size += item.raw.len();
+                taken += 1;
+            }
+            self.buffered
+                .fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+            buf.drain(..taken).collect()
         };
+        self.drained.notify_waiters();
         if items.is_empty() {
             return;
         }
@@ -3111,14 +3193,20 @@ impl Kafka {
                     max_timestamp: item.max_timestamp,
                 });
             }
-            let published = self.node.publish(coalesce(parts), notes).await;
+            let published =
+                tokio::time::timeout(COMMIT_TIMEOUT, self.node.publish(coalesce(parts), notes))
+                    .await;
             let code = match published {
-                Ok(response) if response.error_code == 0 => None,
-                Ok(response) => Some(response.error_code),
-                Err(_) => Some(NOT_LEADER),
+                Ok(Ok(response)) if response.error_code == 0 => None,
+                Ok(Ok(response)) => Some(response.error_code),
+                Ok(Err(_)) => Some(NOT_LEADER),
+                Err(_) => Some(REQUEST_TIMED_OUT),
             };
             if let Some(code) = code {
                 return fail(items, code);
+            }
+            for item in &items {
+                self.arrived(&item.topic, item.partition);
             }
         }
         let mut noted = pieces.iter();
@@ -3173,9 +3261,12 @@ impl Kafka {
         };
         let mut response = FetchResponse::default();
         let deadline = Instant::now() + Duration::from_millis(request.max_wait_ms.max(0) as u64);
+        let min_bytes = usize::try_from(request.min_bytes.max(1)).unwrap_or(1);
+        // Woken when a batch commits on one of these partitions here.
+        let mut watching = Watching::new(self);
         loop {
             response.responses.clear();
-            let mut any = false;
+            let mut bytes = 0usize;
             for topic in &request.topics {
                 let name = self.resolve_topic(
                     topic.topic.0.as_str(),
@@ -3198,6 +3289,7 @@ impl Kafka {
                     continue;
                 }
                 for partition in &topic.partitions {
+                    watching.add((name.clone(), partition.partition));
                     let row = self
                         .fetch_partition(
                             stored.as_ref(),
@@ -3208,18 +3300,24 @@ impl Kafka {
                             request.isolation_level,
                         )
                         .await;
-                    if row.records.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
-                        any = true;
-                    }
+                    bytes += row.records.as_ref().map_or(0, |records| records.len());
                     topic_response.partitions.push(row);
                 }
                 response.responses.push(topic_response);
             }
-            if any || Instant::now() >= deadline {
+            let now = Instant::now();
+            if bytes >= min_bytes || now >= deadline {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            // A commit here wakes this at once. Data that arrives some other
+            // way (published by another broker) is found by the fallback.
+            let wait = deadline.saturating_duration_since(now).min(FETCH_RECHECK);
+            tokio::select! {
+                _ = watching.wake.notified() => {}
+                _ = tokio::time::sleep(wait) => {}
+            }
         }
+        drop(watching);
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
@@ -3762,6 +3860,75 @@ struct WalProduce {
 
 /// `NoteTxn` applies the abort and reports the Kafka code in `value` when the
 /// batch cannot join the transaction. A normal success leaves `value` empty.
+/// Fetches waiting on each partition.
+type Arrivals = std::collections::HashMap<(String, i32), Vec<Arc<tokio::sync::Notify>>>;
+
+/// Most partitions one fetch registers to be woken by. A fetch for more still
+/// sees their data, at the next recheck.
+const MAX_WATCHED: usize = 1024;
+
+/// How long a waiting fetch goes without looking again, for data no local
+/// commit announces.
+const FETCH_RECHECK: Duration = Duration::from_millis(100);
+
+/// One fetch's registrations, removed when it is dropped: when the fetch
+/// returns, or when its connection closes mid-wait.
+struct Watching<'a> {
+    kafka: &'a Kafka,
+    wake: Arc<tokio::sync::Notify>,
+    keys: Vec<(String, i32)>,
+}
+
+impl<'a> Watching<'a> {
+    fn new(kafka: &'a Kafka) -> Self {
+        Self {
+            kafka,
+            wake: Arc::new(tokio::sync::Notify::new()),
+            keys: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, key: (String, i32)) {
+        if self.keys.len() >= MAX_WATCHED || self.keys.contains(&key) {
+            return;
+        }
+        let mut arrivals = self.kafka.arrivals.lock().expect("arrivals");
+        arrivals
+            .entry(key.clone())
+            .or_default()
+            .push(Arc::clone(&self.wake));
+        self.keys.push(key);
+    }
+}
+
+impl Drop for Watching<'_> {
+    fn drop(&mut self) {
+        let Ok(mut arrivals) = self.kafka.arrivals.lock() else {
+            return;
+        };
+        for key in &self.keys {
+            if let Some(waiting) = arrivals.get_mut(key) {
+                waiting.retain(|other| !Arc::ptr_eq(other, &self.wake));
+                if waiting.is_empty() {
+                    arrivals.remove(key);
+                }
+            }
+        }
+    }
+}
+
+impl Kafka {
+    /// Wake every fetch waiting on this partition.
+    fn arrived(&self, topic: &str, partition: i32) {
+        let arrivals = self.arrivals.lock().expect("arrivals");
+        if let Some(waiting) = arrivals.get(&(topic.to_string(), partition)) {
+            for wake in waiting {
+                wake.notify_one();
+            }
+        }
+    }
+}
+
 /// Merge parts that continue one another in the same object into one, so a
 /// partition gets one extent per object rather than one per batch. Each
 /// partition's parts stay in offset order.
