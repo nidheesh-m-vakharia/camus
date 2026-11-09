@@ -91,6 +91,8 @@ const INVALID_REPLICA_ASSIGNMENT: i16 = 39;
 const CONFIG_SOURCE_TOPIC: i8 = 1;
 const CONFIG_SOURCE_BROKER: i8 = 4;
 const CONFIG_SOURCE_DEFAULT: i8 = 5;
+/// `DescribeConfigs` resource type of a broker.
+const BROKER_RESOURCE: i8 = 4;
 const SASL_MECHANISM: i16 = 33;
 const ILLEGAL_SASL: i16 = 34;
 const INVALID_CONFIG: i16 = 40;
@@ -655,6 +657,104 @@ impl Kafka {
             first.producer_id,
             first.producer_epoch,
         )))
+    }
+
+    /// Broker settings DescribeConfigs reports for this broker, under Kafka's
+    /// names: `(name, value, Kafka 4.4.0 default, ConfigType)`. They are set
+    /// at startup, so all are read-only.
+    fn broker_configs(&self) -> Vec<(&'static str, String, &'static str, i8)> {
+        const BOOLEAN: i8 = 1;
+        const STRING: i8 = 2;
+        const INT: i8 = 3;
+        const LONG: i8 = 5;
+        let super_users: Vec<&str> = self.super_users.iter().map(String::as_str).collect();
+        vec![
+            ("broker.id", self.node_id.to_string(), "-1", INT),
+            (
+                "auto.create.topics.enable",
+                self.auto_create_topics.to_string(),
+                "true",
+                BOOLEAN,
+            ),
+            (
+                "num.partitions",
+                self.default_partitions.to_string(),
+                "1",
+                INT,
+            ),
+            (
+                "message.max.bytes",
+                self.message_max_bytes.to_string(),
+                "1048588",
+                INT,
+            ),
+            ("compression.type", "producer".into(), "producer", STRING),
+            ("delete.topic.enable", "true".into(), "true", BOOLEAN),
+            (
+                "unclean.leader.election.enable",
+                "false".into(),
+                "false",
+                BOOLEAN,
+            ),
+            ("log.cleanup.policy", "delete".into(), "delete", STRING),
+            ("log.retention.ms", "604800000".into(), "604800000", LONG),
+            ("log.retention.bytes", "-1".into(), "-1", LONG),
+            (
+                "log.retention.check.interval.ms",
+                self.retention_check_ms.to_string(),
+                "300000",
+                LONG,
+            ),
+            (
+                "log.cleaner.enable",
+                (self.compact_ms > 0).to_string(),
+                "true",
+                BOOLEAN,
+            ),
+            (
+                "file.delete.delay.ms",
+                self.sweep_delay_ms.to_string(),
+                "60000",
+                LONG,
+            ),
+            (
+                "offsets.retention.minutes",
+                (self.offsets_retention_ms / 60_000).to_string(),
+                "10080",
+                INT,
+            ),
+            (
+                "offsets.retention.check.interval.ms",
+                self.offsets_check_ms.to_string(),
+                "600000",
+                LONG,
+            ),
+            (
+                "transaction.max.timeout.ms",
+                self.txn_max_timeout_ms.to_string(),
+                "900000",
+                INT,
+            ),
+            (
+                "transactional.id.expiration.ms",
+                self.txn_id_expiration_ms.to_string(),
+                "604800000",
+                INT,
+            ),
+            (
+                "producer.id.expiration.ms",
+                self.producer_id_expiration_ms.to_string(),
+                "86400000",
+                INT,
+            ),
+            (
+                "allow.everyone.if.no.acl.found",
+                self.allow_if_no_acl.to_string(),
+                "false",
+                BOOLEAN,
+            ),
+            ("super.users", super_users.join(";"), "", STRING),
+        ]
     }
 
     /// The log directory DescribeLogDirs names: the bucket and key prefix.
@@ -1886,7 +1986,48 @@ impl Kafka {
             let mut result = DescribeConfigsResult::default();
             result.resource_type = resource.resource_type;
             result.resource_name = resource.resource_name.clone();
-            if resource.resource_type != 2 {
+            if resource.resource_type == BROKER_RESOURCE {
+                let name = resource.resource_name.as_str();
+                if !self.allows(
+                    caller,
+                    auth::CLUSTER,
+                    auth::CLUSTER_NAME,
+                    auth::DESCRIBE_CONFIGS,
+                ) {
+                    result.error_code = auth::CLUSTER_FAILED;
+                } else if !name.is_empty() && name != self.node_id.to_string() {
+                    result.error_code = INVALID_REQUEST;
+                    result.error_message = Some(StrBytes::from_string(format!(
+                        "Broker {} answers only for itself, not {name}",
+                        self.node_id
+                    )));
+                } else {
+                    let wanted = resource
+                        .configuration_keys
+                        .as_ref()
+                        .filter(|keys| !keys.is_empty());
+                    result.configs = self
+                        .broker_configs()
+                        .into_iter()
+                        .filter(|(config, ..)| {
+                            wanted.is_none_or(|keys| keys.iter().any(|key| key.as_str() == *config))
+                        })
+                        .map(|(config, value, kafka_default, config_type)| {
+                            let mut out = DescribeConfigsResourceResult::default();
+                            out.name = StrBytes::from_static_str(config);
+                            out.config_source = if value == kafka_default {
+                                CONFIG_SOURCE_DEFAULT
+                            } else {
+                                CONFIG_SOURCE_BROKER
+                            };
+                            out.value = Some(StrBytes::from_string(value));
+                            out.read_only = true;
+                            out.config_type = config_type;
+                            out
+                        })
+                        .collect();
+                }
+            } else if resource.resource_type != 2 {
                 result.error_code = INVALID_REQUEST;
             } else if !self.allows(
                 caller,

@@ -300,7 +300,20 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 | Python / librdkafka | `confluent-kafka` 2.16.1, SASL_SSL, passed | 1 |
 | Go | `franz-go` v1.22.0, SASL_SSL, passed | 1 |
 | kcat | CLI against the dev listener | 1, smoke |
-| KafkaJS, kafka-python, confluent-kafka-go, confluent-kafka-dotnet | tracked, not in the first harness | 1 if time, else follow-up |
+| KafkaJS 2 | round trip with a consumer group, in the ecosystem harness | passed |
+| Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, API versions | passed |
+| Kafka Connect 4.4.0, distributed | FileStream source and sink, compacted internal topics, resume after restart | passed |
+| Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | passed |
+| MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | passed |
+| Schema Registry | in the harness behind `CAMUS_ECOSYSTEM_DOCKER=1` | not run here |
+| kafka-python, confluent-kafka-go, confluent-kafka-dotnet | tracked; toolchains not in the harness | - |
+
+The ecosystem harness (`crates/broker/tests/ecosystem.rs`) found and fixed
+two gaps: DescribeConfigs did not answer for the broker resource, and a
+ListOffsets v1-3 response carried a leader epoch those versions cannot
+encode, closing the connection. DescribeConfigs for a broker returns that
+broker's settings under Kafka's names, read-only; dynamic broker configs
+are not supported. `--advertised-addr` sets what Metadata hands out.
 
 ## Compression
 

@@ -46,6 +46,12 @@ struct Args {
     /// `--tls-cert` and `--tls-key`.
     #[arg(long)]
     kafka_addr: Option<String>,
+    /// `host:port` clients should connect to, as Kafka's
+    /// `advertised.listeners`. Defaults to the bound address, or 127.0.0.1
+    /// when bound to every interface. Needed behind NAT, in containers, and
+    /// whenever clients reach the broker by another name.
+    #[arg(long)]
+    advertised_addr: Option<String>,
     /// PEM certificate for the SASL_SSL listener.
     #[arg(long)]
     tls_cert: Option<PathBuf>,
@@ -605,10 +611,15 @@ async fn start_kafka(
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let bound = listener.local_addr()?;
     std::fs::write(args.data_dir.join("kafka-addr"), bound.to_string())?;
-    let host = if bind.ip().is_unspecified() {
-        "127.0.0.1".to_string()
-    } else {
-        bound.ip().to_string()
+    let (host, port) = match &args.advertised_addr {
+        Some(advertised) => {
+            let (host, port) = advertised
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow::anyhow!("--advertised-addr must be host:port"))?;
+            (host.to_string(), port.parse::<u16>()?)
+        }
+        None if bind.ip().is_unspecified() => ("127.0.0.1".to_string(), bound.port()),
+        None => (bound.ip().to_string(), bound.port()),
     };
     // The MinIO fallbacks are for development. A broker serving TLS must be
     // told where its log lives instead of silently using a local stand-in.
@@ -652,7 +663,7 @@ async fn start_kafka(
         bucket,
         i32::try_from(node_id)?,
         host,
-        bound.port() as i32,
+        i32::from(port),
         require_sasl,
         user,
         password,
