@@ -444,6 +444,11 @@ impl Shard {
     }
 
     /// Whether this process is the shard leader.
+    /// The shard's current Raft term.
+    pub fn term(&self) -> u64 {
+        self.raft.metrics().borrow().current_term
+    }
+
     pub fn is_leader(&self) -> bool {
         self.raft.metrics().borrow().current_leader == Some(self.node_id)
     }

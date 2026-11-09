@@ -23,7 +23,7 @@ pub use acl::{
 pub use admin::{ConfigChange, ConfigEdit, Item, OffsetDrop, PartitionIncrease, RecordCut};
 pub use catalog::{
     parse_partition, parse_topic, partition_storage_key, topic_index_key, topic_storage_key,
-    Extent, Partition, PublishPart, Span, Topic,
+    EpochStart, Extent, Partition, PublishPart, Span, Topic,
 };
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{

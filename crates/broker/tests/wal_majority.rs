@@ -56,6 +56,11 @@ fn majority_loss_needs_truncate_to_sealed() {
 
     // Lose the shard leader and one more voter: no quorum left.
     let (leader, _) = partition_leader(&outsider, None);
+    let before = partition_epoch(&outsider);
+    assert!(
+        before >= 1,
+        "wal partitions report the shard term as their epoch"
+    );
     let other = [1, 2, 3].into_iter().find(|id| *id != leader).unwrap();
     let survivor = [1, 2, 3]
         .into_iter()
@@ -94,6 +99,18 @@ fn majority_loss_needs_truncate_to_sealed() {
         1,
         "OFFSET_OUT_OF_RANGE past the sealed end"
     );
+    // The truncation is a new leader epoch. A consumer that read offsets 2
+    // and 3 in the old one learns its epoch ended at 2 and resets.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while partition_epoch(&outsider) <= before {
+        assert!(
+            Instant::now() < deadline,
+            "the epoch never moved past {before}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let after = partition_epoch(&outsider);
+    assert_eq!(epoch_end(&now_addr, after, before).2, 2);
     let (_, offset) = produce_retrying(&outsider, "v4");
     assert_eq!(offset, 2, "the next produce appends at the sealed end");
     assert_eq!(read_all(&now_addr, 3), vec!["v0", "v1", "v4"]);

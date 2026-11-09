@@ -363,6 +363,20 @@ async fn truncate_to_sealed(
         .map(|node| node.addr.clone())
         .ok_or_else(|| (StatusCode::CONFLICT, format!("node {me} has no address")))?;
     let internal = |err: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    // The fresh shard starts at term 1. Raise the epoch base past every epoch
+    // the old shard used first, so clients see the truncation as a new epoch
+    // and OffsetForLeaderEpoch can tell them where their history ended.
+    let base: i64 = admin
+        .node
+        .read_local(kafka::SHARD_EPOCH_BASE)
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0);
+    let raised = base.saturating_add(old.term() as i64);
+    metadata_write(&admin, kafka::SHARD_EPOCH_BASE, &raised.to_string())
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
     let _ = old.raft.shutdown().await;
     let dir = admin.wal_dir.clone();
     let stamp = std::time::SystemTime::now()
@@ -386,6 +400,33 @@ async fn truncate_to_sealed(
         "voters": [me],
         "moved_aside": aside.display().to_string(),
     })))
+}
+
+/// Write one metadata key here when this node leads the group, otherwise
+/// through the leader's `/admin/write`.
+async fn metadata_write(admin: &Admin, key: &str, value: &str) -> anyhow::Result<()> {
+    let metrics = admin.node.raft.metrics().borrow().clone();
+    let leader = metrics
+        .current_leader
+        .ok_or_else(|| anyhow::anyhow!("no metadata leader"))?;
+    if leader == metrics.id {
+        admin.node.write(key, value).await?;
+        return Ok(());
+    }
+    let addr = metrics
+        .membership_config
+        .membership()
+        .get_node(&leader)
+        .map(|node| node.addr.clone())
+        .ok_or_else(|| anyhow::anyhow!("metadata leader has no address"))?;
+    let response = admin
+        .http
+        .post(format!("http://{addr}/admin/write"))
+        .json(&serde_json::json!({ "key": key, "value": value }))
+        .send()
+        .await?;
+    anyhow::ensure!(response.status().is_success(), "metadata write failed");
+    Ok(())
 }
 
 async fn write(

@@ -106,6 +106,19 @@ impl Topic {
     }
 }
 
+fn no_epoch() -> i32 {
+    -1
+}
+
+/// Where a leader epoch's records begin in a partition.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EpochStart {
+    /// Leader epoch.
+    pub epoch: i32,
+    /// First offset written in it.
+    pub start: i64,
+}
+
 fn default_retention_ms() -> i64 {
     604_800_000
 }
@@ -155,6 +168,10 @@ pub struct Partition {
     /// `read_committed`.
     #[serde(default)]
     pub txn_aborted: Vec<Span>,
+    /// Leader epochs in order, each with the first offset sealed in it.
+    /// `OffsetForLeaderEpoch` answers from this.
+    #[serde(default)]
+    pub epochs: Vec<EpochStart>,
 }
 
 /// An offset range, inclusive start, exclusive end.
@@ -169,6 +186,9 @@ pub struct Span {
 /// One partition slice inside a publish command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PublishPart {
+    /// Leader epoch the part's batches were sealed with, or `-1`.
+    #[serde(default = "no_epoch")]
+    pub epoch: i32,
     /// Topic name.
     pub topic: String,
     /// Partition index.
@@ -287,6 +307,7 @@ pub fn create_topic(
             extents: Vec::new(),
             txn_committed: Vec::new(),
             txn_aborted: Vec::new(),
+            epochs: Vec::new(),
         };
         put.push((
             part_key(&id, partition),
@@ -376,6 +397,17 @@ pub fn publish(
             max_timestamp: part.max_timestamp,
         });
         state.next_offset = part.end;
+        if part.epoch >= 0
+            && state
+                .epochs
+                .last()
+                .is_none_or(|last| part.epoch > last.epoch)
+        {
+            state.epochs.push(EpochStart {
+                epoch: part.epoch,
+                start: part.start,
+            });
+        }
         // `DeleteRecords` may have moved the log start past records that were
         // still in the WAL. Their extent is not kept; the sweep removes the
         // object once nothing else points into it.
@@ -516,6 +548,7 @@ mod tests {
         }
         let get = |key: &str| Ok(map.get(key).cloned());
         let part = PublishPart {
+            epoch: -1,
             topic: "events".into(),
             partition: 0,
             start: 1,
@@ -552,6 +585,7 @@ mod tests {
             publish(
                 &get,
                 &[PublishPart {
+                    epoch: -1,
                     topic: "events".into(),
                     partition: 0,
                     start: 0,
@@ -584,5 +618,48 @@ mod tests {
         assert_eq!(state.extents.len(), 1);
         assert_eq!(state.extents[0].key, "bundle/new.seg");
         assert_eq!(state.extents[0].end, 3);
+    }
+
+    #[test]
+    fn publish_records_where_each_epoch_starts() {
+        let mut map = HashMap::new();
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let Outcome::Change { put, .. } =
+            create_topic(&get, "events", "topic-1", 1, "wal", &[]).unwrap()
+        else {
+            panic!("create");
+        };
+        for (key, value) in put {
+            map.insert(key, value);
+        }
+        let part = |start: i64, end: i64, epoch: i32| PublishPart {
+            epoch,
+            topic: "events".into(),
+            partition: 0,
+            start,
+            end,
+            object_key: "bundle/a".into(),
+            file_offset: 0,
+            length: 1,
+            base_timestamp: 0,
+            max_timestamp: 0,
+        };
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let Outcome::Change { put, .. } = publish(
+            &get,
+            &[part(0, 2, 1), part(2, 4, 1), part(4, 6, 3), part(6, 7, -1)],
+            &[],
+        )
+        .unwrap() else {
+            panic!("publish");
+        };
+        let state: Partition = serde_json::from_str(&put[0].1).unwrap();
+        assert_eq!(
+            state.epochs,
+            vec![
+                EpochStart { epoch: 1, start: 0 },
+                EpochStart { epoch: 3, start: 4 }
+            ]
+        );
     }
 }

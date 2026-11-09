@@ -50,6 +50,11 @@ const IMPLEMENTED: &[ImplementedApi] = &[
         max: 11,
     },
     ImplementedApi {
+        key: ApiKey::OffsetForLeaderEpoch,
+        min: 3,
+        max: 4,
+    },
+    ImplementedApi {
         key: ApiKey::Metadata,
         min: 0,
         max: 13,

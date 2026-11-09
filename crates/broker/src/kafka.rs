@@ -52,6 +52,7 @@ use crate::slot::WalSlot;
 
 mod acl;
 mod admin;
+mod epochs;
 mod groups;
 mod txn;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -79,6 +80,8 @@ const TOO_LARGE: i16 = 10;
 const INVALID_RECORD: i16 = 87;
 const INVALID_PARTITIONS: i16 = 37;
 const INVALID_TOPIC: i16 = 17;
+const FENCED_LEADER_EPOCH: i16 = 74;
+const UNKNOWN_LEADER_EPOCH: i16 = 76;
 const INVALID_TRANSACTION_TIMEOUT: i16 = 50;
 const INVALID_REPLICATION_FACTOR: i16 = 38;
 const INVALID_REPLICA_ASSIGNMENT: i16 = 39;
@@ -142,7 +145,16 @@ const SHARD_KEY: &str = "wal/0";
 struct ShardView {
     leader: Option<NodeId>,
     voters: Vec<NodeId>,
+    /// The leader's epoch for every `wal` partition: the shard term plus
+    /// the base kept across `truncate-to-sealed`.
+    #[serde(default)]
+    epoch: i32,
 }
+
+/// Metadata key of the amount added to the WAL shard's Raft term to get the
+/// leader epoch. `truncate-to-sealed` starts a fresh shard at term 1 and
+/// raises this, so epochs never go backwards.
+pub const SHARD_EPOCH_BASE: &str = "wal/0/epoch-base";
 
 /// One broker's Kafka endpoint.
 pub struct Kafka {
@@ -459,6 +471,58 @@ impl Kafka {
         ShardView {
             leader: wal.leader(),
             voters: wal.voters(),
+            epoch: self.shard_epoch(),
+        }
+    }
+
+    /// This broker's WAL shard epoch: the base from metadata plus the term.
+    fn shard_epoch(&self) -> i32 {
+        let base: i64 = self
+            .node
+            .read_local(SHARD_EPOCH_BASE)
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(0);
+        i32::try_from(base.saturating_add(self.wal().term() as i64)).unwrap_or(i32::MAX)
+    }
+
+    /// The metadata group's term, the epoch of every `r2` partition.
+    fn metadata_epoch(&self) -> i32 {
+        i32::try_from(self.node.raft.metrics().borrow().current_term).unwrap_or(i32::MAX)
+    }
+
+    /// The leader epoch clients should see for `topic`'s partitions.
+    fn partition_epoch(&self, topic: &Topic) -> i32 {
+        if topic.durability == "wal" {
+            self.shard_view().epoch
+        } else {
+            self.metadata_epoch()
+        }
+    }
+
+    /// Kafka's check of a client's `current_leader_epoch`: `-1` skips it, an
+    /// older epoch is `FENCED_LEADER_EPOCH`, and a newer one, which this
+    /// broker has not seen yet, is `UNKNOWN_LEADER_EPOCH`.
+    fn check_leader_epoch(&self, topic: &Topic, current_leader_epoch: i32) -> Result<(), i16> {
+        if current_leader_epoch < 0 {
+            return Ok(());
+        }
+        let mine = self.leading_epoch(topic);
+        match current_leader_epoch.cmp(&mine) {
+            std::cmp::Ordering::Less => Err(FENCED_LEADER_EPOCH),
+            std::cmp::Ordering::Greater => Err(UNKNOWN_LEADER_EPOCH),
+            std::cmp::Ordering::Equal => Ok(()),
+        }
+    }
+
+    /// The epoch this broker leads `topic`'s partitions in, for checking a
+    /// client's `current_leader_epoch`.
+    fn leading_epoch(&self, topic: &Topic) -> i32 {
+        if topic.durability == "wal" {
+            self.shard_epoch()
+        } else {
+            self.metadata_epoch()
         }
     }
 
@@ -1211,6 +1275,10 @@ impl Kafka {
             ApiKey::DescribeAcls => self.describe_acls(&header, &mut buf, &caller).await,
             ApiKey::CreateAcls => self.create_acls(&header, &mut buf, &caller).await,
             ApiKey::DeleteAcls => self.delete_acls(&header, &mut buf, &caller).await,
+            ApiKey::OffsetForLeaderEpoch => {
+                self.offset_for_leader_epoch(&header, &mut buf, &caller)
+                    .await
+            }
             ApiKey::ConsumerGroupHeartbeat => {
                 self.consumer_group_heartbeat(&header, &mut buf, &caller)
                     .await
@@ -1402,7 +1470,7 @@ impl Kafka {
             partition.partition_index = index;
             partition.error_code = error;
             partition.leader_id = BrokerId(leader_id);
-            partition.leader_epoch = stored.leader_epoch;
+            partition.leader_epoch = self.partition_epoch(&stored);
             if leader.is_some() {
                 partition.replica_nodes = replicas.clone();
                 partition.isr_nodes = replicas.clone();
@@ -2120,7 +2188,7 @@ impl Kafka {
             topic: name.to_string(),
             partition,
             topic_id: topic_id(topic),
-            epoch: topic.leader_epoch,
+            epoch: self.shard_epoch(),
             raw: raw.clone(),
             records: info.iter().map(|batch| batch.records).sum(),
             base_timestamp: info.first().map(|batch| batch.base_timestamp).unwrap_or(-1),
@@ -2237,6 +2305,7 @@ impl Kafka {
                         batch.end,
                         batch.base_timestamp,
                         batch.max_timestamp,
+                        batch::leader_epoch(&batch.bytes),
                     ));
                     pieces.push(Piece {
                         topic_id: batch.topic_id,
@@ -2272,10 +2341,13 @@ impl Kafka {
                 continue;
             }
             producers.extend(notes);
-            for ((topic, topic_id, partition, start, end, base, max), (file_offset, length)) in
-                heads.into_iter().zip(index)
+            for (
+                (topic, topic_id, partition, start, end, base, max, epoch),
+                (file_offset, length),
+            ) in heads.into_iter().zip(index)
             {
                 parts.push(PublishPart {
+                    epoch,
                     topic: topic.clone(),
                     partition,
                     start,
@@ -2460,7 +2532,7 @@ impl Kafka {
                 return fail(items, UNKNOWN_TOPIC);
             };
             next.insert(key.clone(), state.next_offset);
-            epochs.insert(key, state.leader_epoch);
+            epochs.insert(key, self.metadata_epoch());
             let id = Uuid::parse_str(&topic.id).unwrap_or_else(|_| Uuid::nil());
             ids.insert(item.topic.clone(), *id.as_bytes());
         }
@@ -2583,6 +2655,10 @@ impl Kafka {
             for (item, (file_offset, length)) in appended.zip(index) {
                 let start = pieces[parts.len()].start;
                 parts.push(PublishPart {
+                    epoch: epochs
+                        .get(&(item.topic.clone(), item.partition))
+                        .copied()
+                        .unwrap_or(-1),
                     topic: item.topic.clone(),
                     partition: item.partition,
                     start,
@@ -2685,6 +2761,7 @@ impl Kafka {
                         .fetch_partition(
                             stored.as_ref(),
                             partition.partition,
+                            partition.current_leader_epoch,
                             partition.fetch_offset,
                             partition.partition_max_bytes,
                             request.isolation_level,
@@ -2709,6 +2786,7 @@ impl Kafka {
         &self,
         topic: Option<&Topic>,
         partition: i32,
+        current_leader_epoch: i32,
         offset: i64,
         max_bytes: i32,
         isolation: i8,
@@ -2721,6 +2799,10 @@ impl Kafka {
         };
         if topic.durability == "wal" && !self.wal().is_leader() {
             row.error_code = NOT_LEADER;
+            return row;
+        }
+        if let Err(code) = self.check_leader_epoch(topic, current_leader_epoch) {
+            row.error_code = code;
             return row;
         }
         let limit = max_bytes.max(0) as usize;
@@ -2857,14 +2939,21 @@ impl Kafka {
                     topic_response.partitions.push(row);
                     continue;
                 }
-                topic_response.partitions.push(
-                    self.list_one(
+                let mut row = self
+                    .list_one(
                         stored.as_ref(),
                         partition.partition_index,
+                        partition.current_leader_epoch,
                         partition.timestamp,
                     )
-                    .await,
-                );
+                    .await;
+                // The epoch is in the response from v4. The encoder refuses a
+                // field the version does not have, and that would close the
+                // connection of a client on v1-3, such as KafkaJS.
+                if header.request_api_version < 4 {
+                    row.leader_epoch = -1;
+                }
+                topic_response.partitions.push(row);
             }
             response.topics.push(topic_response);
         }
@@ -2875,6 +2964,7 @@ impl Kafka {
         &self,
         topic: Option<&Topic>,
         partition: i32,
+        current_leader_epoch: i32,
         timestamp: i64,
     ) -> ListOffsetsPartitionResponse {
         let mut row = ListOffsetsPartitionResponse::default();
@@ -2890,12 +2980,17 @@ impl Kafka {
             row.offset = -1;
             return row;
         }
+        if let Err(code) = self.check_leader_epoch(topic, current_leader_epoch) {
+            row.error_code = code;
+            row.offset = -1;
+            return row;
+        }
         let Some(state) = self.partition_state(topic, partition) else {
             row.error_code = UNKNOWN_TOPIC;
             row.offset = -1;
             return row;
         };
-        row.leader_epoch = state.leader_epoch;
+        row.leader_epoch = self.partition_epoch(topic);
         if timestamp == -2 {
             row.offset = state.log_start;
             return row;

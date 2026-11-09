@@ -780,3 +780,65 @@ pub fn init(nodes: &[Node], wal: &[i32]) {
         .unwrap();
     assert!(init.status().is_success(), "{}", init.text().unwrap());
 }
+
+/// Partition 0's leader epoch as Metadata through `via` reports it.
+pub fn partition_epoch(via: &str) -> i32 {
+    let mut stream = connect(via);
+    let mut topic = MetadataRequestTopic::default();
+    topic.name = Some(TopicName(StrBytes::from_static_str(TOPIC)));
+    send(
+        &mut stream,
+        ApiKey::Metadata,
+        12,
+        &MetadataRequest::default().with_topics(Some(vec![topic])),
+    );
+    let metadata = recv::<MetadataResponse>(&mut stream, 12);
+    metadata.topics[0].partitions[0].leader_epoch
+}
+
+/// `OffsetForLeaderEpoch` for partition 0: `(error, epoch, end_offset)`.
+pub fn epoch_end(addr: &str, current_leader_epoch: i32, leader_epoch: i32) -> (i16, i32, i64) {
+    use camus_protocol::messages::offset_for_leader_epoch_request::{
+        OffsetForLeaderPartition, OffsetForLeaderTopic,
+    };
+    use camus_protocol::messages::offset_for_leader_epoch_response::OffsetForLeaderEpochResponse;
+    let mut stream = connect(addr);
+    send(
+        &mut stream,
+        ApiKey::OffsetForLeaderEpoch,
+        4,
+        &camus_protocol::messages::OffsetForLeaderEpochRequest::default()
+            .with_replica_id(camus_protocol::messages::BrokerId(-1))
+            .with_topics(vec![OffsetForLeaderTopic::default()
+                .with_topic(TopicName(StrBytes::from_static_str(TOPIC)))
+                .with_partitions(vec![OffsetForLeaderPartition::default()
+                    .with_partition(0)
+                    .with_current_leader_epoch(current_leader_epoch)
+                    .with_leader_epoch(leader_epoch)])]),
+    );
+    let response = recv::<OffsetForLeaderEpochResponse>(&mut stream, 4);
+    let row = &response.topics[0].partitions[0];
+    (row.error_code, row.leader_epoch, row.end_offset)
+}
+
+/// Fetch partition 0 at `offset` naming `current_leader_epoch`; the error.
+pub fn fetch_in_epoch(addr: &str, current_leader_epoch: i32, offset: i64) -> i16 {
+    let mut stream = connect(addr);
+    let mut part = FetchPartition::default();
+    part.partition = 0;
+    part.fetch_offset = offset;
+    part.current_leader_epoch = current_leader_epoch;
+    part.partition_max_bytes = 1024 * 1024;
+    let mut topic = FetchTopic::default();
+    topic.topic = TopicName(StrBytes::from_static_str(TOPIC));
+    topic.partitions = vec![part];
+    send(
+        &mut stream,
+        ApiKey::Fetch,
+        11,
+        &FetchRequest::default()
+            .with_max_wait_ms(0)
+            .with_topics(vec![topic]),
+    );
+    recv::<FetchResponse>(&mut stream, 11).responses[0].partitions[0].error_code
+}
