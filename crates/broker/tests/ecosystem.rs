@@ -367,6 +367,19 @@ fn cli_tools_manage_topics_groups_configs_and_records() {
         None,
         false,
     );
+    let elected = tool(
+        "kafka-leader-election.sh",
+        &[
+            "--bootstrap-server",
+            b,
+            "--election-type",
+            "PREFERRED",
+            "--all-topic-partitions",
+        ],
+        None,
+        false,
+    );
+    assert!(elected.contains("Valid replica already elected"), "{elected}");
     let versions = tool(
         "kafka-broker-api-versions.sh",
         &["--bootstrap-server", b],
