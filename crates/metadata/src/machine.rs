@@ -36,22 +36,96 @@ use crate::{Command, NodeId, Response, TypeConfig};
 const KV: TableDefinition<&str, &str> = TableDefinition::new("kv");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
+/// The latest snapshot's body, as built or installed.
+const SNAPSHOT_DATA: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot_data");
+
 const LAST_APPLIED: &str = "last_applied";
 const MEMBERSHIP: &str = "membership";
-const SNAPSHOT: &str = "snapshot";
+/// The latest snapshot's meta, JSON, in `META`; its body is in `SNAPSHOT_DATA`.
+const SNAPSHOT_META: &str = "snapshot_meta";
+const CURRENT: &str = "current";
+/// The latest snapshot before `SNAPSHOT_DATA`: meta and body together, as
+/// JSON, the body a JSON array of byte values. Read, never written.
+const LEGACY_SNAPSHOT: &str = "snapshot";
+
+/// First bytes of a snapshot body: the key-value rows follow, encoded as a
+/// postcard `Vec<(String, String)>`. A body without them is the JSON
+/// `SnapshotBody` written before.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"CAMUSKV2";
 
 /// Longest time between durable applies.
 const DURABLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Snapshot body before [`SNAPSHOT_MAGIC`].
 #[derive(Serialize, Deserialize, Default)]
 struct SnapshotBody {
     data: BTreeMap<String, String>,
+}
+
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Encode every row of `kv` as a snapshot body, straight from the table:
+/// the magic, then what postcard writes for a `Vec<(String, String)>`.
+fn encode_rows(kv: &impl ReadableTable<&'static str, &'static str>) -> Result<Vec<u8>, String> {
+    let count = kv.len().map_err(|err| err.to_string())?;
+    let mut out = Vec::new();
+    out.extend_from_slice(SNAPSHOT_MAGIC);
+    push_varint(&mut out, count);
+    let mut written = 0u64;
+    for row in kv.iter().map_err(|err| err.to_string())? {
+        let (key, value) = row.map_err(|err| err.to_string())?;
+        for text in [key.value(), value.value()] {
+            push_varint(&mut out, text.len() as u64);
+            out.extend_from_slice(text.as_bytes());
+        }
+        written += 1;
+    }
+    if written != count {
+        return Err(format!("snapshot read {written} rows of {count}"));
+    }
+    Ok(out)
+}
+
+/// The rows of a snapshot body in either format.
+fn decode_rows(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    match bytes.strip_prefix(SNAPSHOT_MAGIC) {
+        Some(rows) => camus_raft::codec::decode(rows).map_err(|err| err.to_string()),
+        None => serde_json::from_slice::<SnapshotBody>(bytes)
+            .map(|body| body.data.into_iter().collect())
+            .map_err(|err| err.to_string()),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, openraft::BasicNode>,
     data: Vec<u8>,
+}
+
+/// Store `stored` as the latest snapshot, in `txn`, and drop any legacy copy.
+fn put_snapshot(txn: &redb::WriteTransaction, stored: &StoredSnapshot) -> Result<(), String> {
+    let mut meta = txn.open_table(META).map_err(|err| err.to_string())?;
+    let json = serde_json::to_string(&stored.meta).map_err(|err| err.to_string())?;
+    meta.insert(SNAPSHOT_META, json.as_str())
+        .map_err(|err| err.to_string())?;
+    meta.remove(LEGACY_SNAPSHOT)
+        .map_err(|err| err.to_string())?;
+    let mut data = txn
+        .open_table(SNAPSHOT_DATA)
+        .map_err(|err| err.to_string())?;
+    data.insert(CURRENT, stored.data.as_slice())
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 /// On-disk metadata state machine.
@@ -159,14 +233,22 @@ fn load_snapshot(db: &Database) -> Result<Option<StoredSnapshot>, StorageError<N
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
         Err(err) => return Err(io(ErrorSubject::StateMachine, &err)),
     };
-    let Some(raw) = table
-        .get(SNAPSHOT)
-        .map_err(|err| io(ErrorSubject::StateMachine, &err))?
-    else {
+    let fail = |err: &dyn std::error::Error| io(ErrorSubject::StateMachine, err);
+    if let Some(raw) = table.get(SNAPSHOT_META).map_err(|e| fail(&e))? {
+        let meta = serde_json::from_str(raw.value()).map_err(|e| fail(&e))?;
+        let data = txn
+            .open_table(SNAPSHOT_DATA)
+            .map_err(|e| fail(&e))?
+            .get(CURRENT)
+            .map_err(|e| fail(&e))?
+            .map(|raw| raw.value().to_vec())
+            .unwrap_or_default();
+        return Ok(Some(StoredSnapshot { meta, data }));
+    }
+    let Some(raw) = table.get(LEGACY_SNAPSHOT).map_err(|e| fail(&e))? else {
         return Ok(None);
     };
-    let stored =
-        serde_json::from_str(raw.value()).map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+    let stored = serde_json::from_str(raw.value()).map_err(|e| fail(&e))?;
     Ok(Some(stored))
 }
 
@@ -668,18 +750,17 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<RedbMachine> {
             .db
             .begin_read()
             .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-        let mut data = BTreeMap::new();
-        if let Ok(table) = txn.open_table(KV) {
-            for entry in table
-                .iter()
-                .map_err(|err| io(ErrorSubject::StateMachine, &err))?
-            {
-                let (key, value) = entry.map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-                data.insert(key.value().to_owned(), value.value().to_owned());
+        let bytes = match txn.open_table(KV) {
+            Ok(table) => encode_rows(&table),
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                let mut empty = SNAPSHOT_MAGIC.to_vec();
+                push_varint(&mut empty, 0);
+                Ok(empty)
             }
+            Err(err) => Err(err.to_string()),
         }
-        let bytes = serde_json::to_vec(&SnapshotBody { data })
-            .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+        .map_err(|err| io(ErrorSubject::StateMachine, &std::io::Error::other(err)))?;
+        drop(txn);
         let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot_id = match last_applied {
             Some(last) => format!("{}-{}-{snapshot_idx}", last.leader_id, last.index),
@@ -699,16 +780,8 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<RedbMachine> {
                 .db
                 .begin_write()
                 .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-            {
-                let mut table = txn
-                    .open_table(META)
-                    .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-                let json = serde_json::to_string(&stored)
-                    .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-                table
-                    .insert(SNAPSHOT, json.as_str())
-                    .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-            }
+            put_snapshot(&txn, &stored)
+                .map_err(|err| io(ErrorSubject::StateMachine, &std::io::Error::other(err)))?;
             txn.commit()
                 .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
         }
@@ -803,8 +876,12 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
-        let body: SnapshotBody = serde_json::from_slice(&bytes)
-            .map_err(|err| io(ErrorSubject::Snapshot(Some(meta.signature())), &err))?;
+        let rows = decode_rows(&bytes).map_err(|err| {
+            io(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                &std::io::Error::other(err),
+            )
+        })?;
         let txn = self
             .db
             .begin_write()
@@ -823,7 +900,7 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
                 kv.remove(key.as_str())
                     .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
             }
-            for (key, value) in &body.data {
+            for (key, value) in &rows {
                 kv.insert(key.as_str(), value.as_str())
                     .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
             }
@@ -842,22 +919,16 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
             meta_table
                 .insert(MEMBERSHIP, membership.as_str())
                 .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-            let stored = StoredSnapshot {
-                meta: meta.clone(),
-                data: bytes.clone(),
-            };
-            let json = serde_json::to_string(&stored)
-                .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-            meta_table
-                .insert(SNAPSHOT, json.as_str())
-                .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
         }
-        txn.commit()
-            .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
-        *self.current_snapshot.write().await = Some(StoredSnapshot {
+        let stored = StoredSnapshot {
             meta: meta.clone(),
             data: bytes,
-        });
+        };
+        put_snapshot(&txn, &stored)
+            .map_err(|err| io(ErrorSubject::StateMachine, &std::io::Error::other(err)))?;
+        txn.commit()
+            .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+        *self.current_snapshot.write().await = Some(stored);
         Ok(())
     }
 
@@ -877,5 +948,103 @@ impl RaftStateMachine<TypeConfig> for Arc<RedbMachine> {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filled(dir: &Path, rows: &[(&str, &str)]) -> Arc<RedbMachine> {
+        let machine = Arc::new(RedbMachine::open(&dir.join("state.redb")).unwrap());
+        let txn = machine.db.begin_write().unwrap();
+        {
+            let mut kv = txn.open_table(KV).unwrap();
+            for (key, value) in rows {
+                kv.insert(*key, *value).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        machine
+    }
+
+    #[test]
+    fn the_body_is_what_postcard_writes_for_the_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "x".repeat(300);
+        let rows = [("a", "1"), ("b/longer", long.as_str()), ("c", "")];
+        let machine = filled(dir.path(), &rows);
+        let txn = machine.db.begin_read().unwrap();
+        let body = encode_rows(&txn.open_table(KV).unwrap()).unwrap();
+        let expected: Vec<(String, String)> = rows
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        assert_eq!(
+            &body[SNAPSHOT_MAGIC.len()..],
+            camus_raft::codec::encode(&expected).unwrap().as_slice()
+        );
+        assert_eq!(decode_rows(&body).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_snapshot_from_before_the_magic_still_installs() {
+        let legacy = serde_json::to_vec(&SnapshotBody {
+            data: [("k".to_string(), "v".to_string())].into_iter().collect(),
+        })
+        .unwrap();
+        assert_eq!(
+            decode_rows(&legacy).unwrap(),
+            vec![("k".to_string(), "v".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_built_snapshot_installs_and_reloads_at_about_its_data_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = "v".repeat(1_000);
+        let rows: Vec<(String, String)> = (0..200)
+            .map(|at| (format!("part/topic/{at}"), value.clone()))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let mut source = filled(dir.path(), &borrowed);
+        let snapshot = source.build_snapshot().await.unwrap();
+        let body = snapshot.snapshot.into_inner();
+        let data_size: usize = rows
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum();
+        assert!(
+            body.len() < data_size + data_size / 10,
+            "{} bytes for {data_size} bytes of rows",
+            body.len()
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let mut target = Arc::new(RedbMachine::open(&other.path().join("state.redb")).unwrap());
+        target
+            .install_snapshot(&snapshot.meta, Box::new(Cursor::new(body.clone())))
+            .await
+            .unwrap();
+        let mut expected = rows.clone();
+        expected.sort();
+        assert_eq!(target.scan("part/").unwrap(), expected);
+        drop(target);
+        let mut reopened = Arc::new(RedbMachine::open(&other.path().join("state.redb")).unwrap());
+        let current = reopened.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(current.meta.snapshot_id, snapshot.meta.snapshot_id);
+        assert_eq!(current.snapshot.into_inner(), body);
+        let txn = reopened.db.begin_read().unwrap();
+        assert!(
+            txn.open_table(META)
+                .unwrap()
+                .get(LEGACY_SNAPSHOT)
+                .unwrap()
+                .is_none(),
+            "no JSON copy is written"
+        );
     }
 }
