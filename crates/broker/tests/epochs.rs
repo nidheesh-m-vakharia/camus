@@ -71,4 +71,3 @@ fn list_offsets_answers_versions_without_an_epoch() {
         }
     }
 }
-

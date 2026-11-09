@@ -127,9 +127,11 @@ Steps, in order:
 1. **Throughput benchmark.** Done. `broker/tests/throughput.rs`, with fsync
    and byte counters on the shard log (`wal_log_*` in `/admin/metrics`).
 2. **Group commit.** Done. A committer task packs batches that arrive
-   while an entry commits into the next entry (up to 1 MiB). One entry in
-   flight: more split groups and cost throughput (measured, see
-   `IN_FLIGHT` in `crates/wal`). The 32-producer failure was not load: the
+   while an entry commits into the next entry (up to 1 MiB). Two entries
+   may be in flight. The group is packed before a slot is taken, so the
+   second slot overlaps the next disk flush with the previous quorum
+   (`IN_FLIGHT` in `crates/wal`). Four slots, taken before the pack, split
+   groups and cost throughput (measured). The 32-producer failure was not load: the
    follower's HTTP route refused bodies over axum's 2 MB default, which one
    1 MiB client batch already exceeded once JSON-encoded. The Raft routes
    now take 64 MB and an AppendEntries carries at most 8 entries.

@@ -98,6 +98,7 @@ fn admin_apis_change_the_topic_and_refuse_a_past_the_end_delete() {
     let dir = tempfile::tempdir().unwrap();
     let log = std::fs::File::create(dir.path().join("broker.log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",

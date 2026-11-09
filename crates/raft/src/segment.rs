@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Append-only Raft log segments.
 //!
 //! Each record is `index u64`, `len u32`, payload, `crc32c u32`, all
@@ -17,6 +19,10 @@ use serde::{Deserialize, Serialize};
 const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 const HEADER: usize = 12;
 const CRC_LEN: usize = 4;
+/// A record with this index is alignment padding for a direct write. It is
+/// not a Raft entry. Open skips it. `u64::MAX` is not a Raft log index this
+/// store assigns.
+const PAD_INDEX: u64 = u64::MAX;
 /// Larger than this, a length field is a torn write rather than a record.
 const MAX_PAYLOAD: u32 = 32 * 1024 * 1024;
 
@@ -46,7 +52,11 @@ pub struct SegmentLog {
     active_segment: u64,
     active: File,
     active_len: u64,
+    /// Bumped each time `active` is a different file. Registered `io_uring`
+    /// descriptors follow this, not the raw number, which the kernel reuses.
+    active_gen: u64,
     skip_through: Option<u64>,
+    submit: crate::submit::Submitter,
 }
 
 impl SegmentLog {
@@ -70,7 +80,9 @@ impl SegmentLog {
                 active_segment: 0,
                 active,
                 active_len: 0,
+                active_gen: 1,
                 skip_through,
+                submit: crate::submit::Submitter::new(),
             });
         }
 
@@ -104,7 +116,9 @@ impl SegmentLog {
                 active_segment: 0,
                 active,
                 active_len: 0,
+                active_gen: 1,
                 skip_through,
+                submit: crate::submit::Submitter::new(),
             });
         }
 
@@ -128,7 +142,9 @@ impl SegmentLog {
             active_segment,
             active,
             active_len,
+            active_gen: 1,
             skip_through,
+            submit: crate::submit::Submitter::new(),
         })
     }
 
@@ -137,7 +153,8 @@ impl SegmentLog {
         self.locs.keys().next_back().copied()
     }
 
-    /// Write records and `fsync` once. Readers see them only after the sync.
+    /// Write records and fsync once per segment. Readers see them only after
+    /// that sync. On Linux the write and the fsync are one `io_uring` submission.
     pub fn append_batch(&mut self, records: &[(u64, &[u8])]) -> io::Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -145,38 +162,48 @@ impl SegmentLog {
         let mark = self.active_len;
         let mark_segment = self.active_segment;
         let mut added: Vec<(u64, Loc)> = Vec::with_capacity(records.len());
+        let mut chunk: Vec<u8> = Vec::new();
+        let mut chunk_at = self.active_len;
         for &(index, payload) in records {
             if payload.len() > MAX_PAYLOAD as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "payload exceeds 32MiB",
-                ));
+                return self.fail_append(
+                    mark_segment,
+                    mark,
+                    chunk_at,
+                    io::Error::new(io::ErrorKind::InvalidInput, "payload exceeds 32MiB"),
+                );
             }
             let last_stored = self.locs.keys().next_back().copied();
             let last_batch = added.last().map(|(index, _)| *index);
             if let Some(last) = last_stored.max(last_batch) {
                 if index <= last {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("index {index} is not after {last}"),
-                    ));
+                    return self.fail_append(
+                        mark_segment,
+                        mark,
+                        chunk_at,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("index {index} is not after {last}"),
+                        ),
+                    );
                 }
             }
-            if self.active_len > 0
-                && self.active_len + record_len(payload.len()) > self.segment_bytes
-            {
-                self.active.sync_all()?;
+            let need = record_len(payload.len());
+            if self.active_len > 0 && self.active_len + need > self.segment_bytes {
+                if let Err(err) = self.flush_chunk(chunk_at, &mut chunk) {
+                    return self.fail_append(mark_segment, mark, chunk_at, err);
+                }
+                chunk.clear();
                 let next = index;
                 self.active = create_segment(&self.dir, next)?;
                 self.active_segment = next;
                 self.active_len = 0;
+                self.active_gen = self.active_gen.wrapping_add(1);
+                chunk_at = 0;
             }
             let header = self.active_len;
-            // Truncate and reopen both leave the cursor somewhere other than
-            // the logical tail. Pin it so the bytes land at `header`.
-            self.active.seek(SeekFrom::Start(header))?;
-            write_record(&mut self.active, index, payload)?;
-            self.active_len += record_len(payload.len());
+            push_record(&mut chunk, index, payload);
+            self.active_len += need;
             added.push((
                 index,
                 Loc {
@@ -186,20 +213,51 @@ impl SegmentLog {
                 },
             ));
         }
-        if let Err(err) = self.active.sync_all() {
-            // The new bytes did not hit disk. Roll the active file back when
-            // we did not rotate; a rotated empty segment is removed.
-            if self.active_segment == mark_segment {
-                let _ = self.active.set_len(mark);
-                let _ = self.active.sync_all();
-                self.active_len = mark;
-            }
-            return Err(err);
+        if let Err(err) = self.flush_chunk(chunk_at, &mut chunk) {
+            return self.fail_append(mark_segment, mark, chunk_at, err);
         }
         for (index, loc) in added {
             self.locs.insert(index, loc);
         }
         Ok(())
+    }
+
+    fn flush_chunk(&mut self, offset: u64, bytes: &mut Vec<u8>) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let before = bytes.len();
+        let align = self.submit.io_align();
+        if align > 1 {
+            // The file end lands on a block boundary so the next append can
+            // be one direct force-unit-access write.
+            push_pad(bytes, offset, align);
+        }
+        let gen = self.active_gen;
+        self.submit
+            .write_at_sync(&mut self.active, gen, offset, bytes)?;
+        self.active_len += (bytes.len() - before) as u64;
+        Ok(())
+    }
+
+    /// The bytes did not hit disk. Roll the active file back when this batch
+    /// did not rotate it.
+    fn fail_append(
+        &mut self,
+        mark_segment: u64,
+        mark: u64,
+        chunk_at: u64,
+        err: io::Error,
+    ) -> io::Result<()> {
+        let rewind = if self.active_segment == mark_segment {
+            mark
+        } else {
+            chunk_at
+        };
+        let _ = self.active.set_len(rewind);
+        let _ = self.active.sync_all();
+        self.active_len = rewind;
+        Err(err)
     }
 
     /// Payload at `index`, if it is still in the log.
@@ -248,6 +306,7 @@ impl SegmentLog {
             self.active = create_segment(&self.dir, 0)?;
             self.active_segment = 0;
             self.active_len = 0;
+            self.active_gen = self.active_gen.wrapping_add(1);
             return Ok(());
         }
         let active_segment = survivors.last().copied().unwrap_or(0);
@@ -257,6 +316,7 @@ impl SegmentLog {
                 .write(true)
                 .open(segment_path(&self.dir, active_segment))?;
             self.active_segment = active_segment;
+            self.active_gen = self.active_gen.wrapping_add(1);
         }
         let last = self
             .locs
@@ -347,18 +407,35 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-fn write_record(file: &mut File, index: u64, payload: &[u8]) -> io::Result<()> {
-    let mut header = [0u8; HEADER];
-    header[..8].copy_from_slice(&index.to_le_bytes());
-    header[8..12].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+/// Extend `buf` so `offset + buf.len()` is a multiple of `align`, using one
+/// padding record. `align` of 0 or 1 leaves the buffer alone.
+fn push_pad(buf: &mut Vec<u8>, offset: u64, align: usize) {
+    if align <= 1 {
+        return;
+    }
+    let end = offset.saturating_add(buf.len() as u64);
+    let mis = (end % align as u64) as usize;
+    if mis == 0 {
+        return;
+    }
+    let need = align - mis;
+    let overhead = HEADER + CRC_LEN;
+    let payload = if need >= overhead {
+        need - overhead
+    } else {
+        need + align - overhead
+    };
+    push_record(buf, PAD_INDEX, &vec![0u8; payload]);
+}
+
+fn push_record(buf: &mut Vec<u8>, index: u64, payload: &[u8]) {
+    let start = buf.len();
+    buf.extend_from_slice(&index.to_le_bytes());
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(payload);
     let mut digest = CRC32C.digest();
-    digest.update(&header);
-    digest.update(payload);
-    let crc = digest.finalize().to_le_bytes();
-    file.write_all(&header)?;
-    file.write_all(payload)?;
-    file.write_all(&crc)?;
-    Ok(())
+    digest.update(&buf[start..]);
+    buf.extend_from_slice(&digest.finalize().to_le_bytes());
 }
 
 fn meta_path(dir: &Path) -> PathBuf {
@@ -430,6 +507,10 @@ fn scan_segment(
         digest.update(&payload);
         if digest.finalize() != u32::from_le_bytes(crc_bytes) {
             return Ok(offset);
+        }
+        if index == PAD_INDEX {
+            offset += total;
+            continue;
         }
         if skip_through.is_some_and(|skip| index <= skip) {
             offset += total;
@@ -504,5 +585,27 @@ mod tests {
         assert_eq!(log.get(3).unwrap().unwrap(), b"eee");
         assert!(log.get(1).unwrap().is_none());
         assert_eq!(log.last_index(), Some(3));
+    }
+
+    #[test]
+    fn padding_record_is_skipped_and_lands_on_a_block() {
+        let mut buf = Vec::new();
+        push_record(&mut buf, 1, b"one");
+        push_pad(&mut buf, 0, 4096);
+        assert_eq!(buf.len() % 4096, 0);
+        assert!(buf.len() > 16);
+
+        let mut unaligned = Vec::new();
+        push_record(&mut unaligned, 7, b"x");
+        push_pad(&mut unaligned, 10, 4096);
+        assert_eq!((10 + unaligned.len()) % 4096, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = segment_path(dir.path(), 0);
+        std::fs::write(&path, &buf).unwrap();
+        let log = SegmentLog::open(dir.path()).unwrap();
+        assert_eq!(log.get(1).unwrap().unwrap(), b"one");
+        assert_eq!(log.last_index(), Some(1));
+        assert!(log.get(u64::MAX).unwrap().is_none());
     }
 }

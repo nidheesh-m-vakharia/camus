@@ -131,6 +131,7 @@ fn spawn(dir: &Path, pki: &Pki, client_ca: bool, env: &[(&str, &str)]) -> Node {
     let ca = dir.join("ca.pem");
     std::fs::write(&ca, &pki.ca_pem).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_camus-broker"));
+    command.env("CAMUS_WAL_SHARDS", "voters");
     command
         .args([
             "--node-id",

@@ -42,6 +42,7 @@ impl Drop for Node {
 fn spawn() -> Node {
     let dir = tempfile::tempdir().unwrap().keep();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",

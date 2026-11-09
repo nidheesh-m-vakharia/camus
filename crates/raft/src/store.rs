@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! [`RaftLogStorage`] backed by [`SegmentLog`].
 //!
 //! Append serializes entries, writes them, and `fsync`s once for the whole

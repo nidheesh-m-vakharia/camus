@@ -352,13 +352,12 @@ impl Kafka {
         let producer_id_expiration_ms =
             env_ms("CAMUS_PRODUCER_ID_EXPIRATION_MS", 86_400_000) as i64;
         let producer_id_check_ms = env_ms("CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS", 600_000);
-        let leader_balance_ms = if std::env::var("CAMUS_AUTO_LEADER_REBALANCE").as_deref()
-            == Ok("false")
-        {
-            0
-        } else {
-            env_ms("CAMUS_LEADER_IMBALANCE_CHECK_MS", 300_000)
-        };
+        let leader_balance_ms =
+            if std::env::var("CAMUS_AUTO_LEADER_REBALANCE").as_deref() == Ok("false") {
+                0
+            } else {
+                env_ms("CAMUS_LEADER_IMBALANCE_CHECK_MS", 300_000)
+            };
         // Kafka's setting is in minutes; `CAMUS_OFFSETS_RETENTION_MS`
         // overrides it for tests that cannot wait a minute.
         let offsets_retention_ms = std::env::var("CAMUS_OFFSETS_RETENTION_MS")

@@ -134,6 +134,7 @@ impl Background {
     fn broker(dir: &Path, port: u16, http_port: u16) -> Self {
         let log = std::fs::File::create(dir.join("broker.log")).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+            .env("CAMUS_WAL_SHARDS", "voters")
             .args(["--node-id", "1", "--http-addr"])
             .arg(format!("127.0.0.1:{http_port}"))
             .arg("--kafka-addr")
@@ -399,7 +400,10 @@ fn cli_tools_manage_topics_groups_configs_and_records() {
         None,
         false,
     );
-    assert!(elected.contains("Valid replica already elected"), "{elected}");
+    assert!(
+        elected.contains("Valid replica already elected"),
+        "{elected}"
+    );
     let versions = tool(
         "kafka-broker-api-versions.sh",
         &["--bootstrap-server", b],
@@ -790,7 +794,10 @@ fn program(name: &str, fallbacks: &[&str]) -> Option<PathBuf> {
             }
         }
     }
-    fallbacks.iter().map(PathBuf::from).find(|path| path.is_file())
+    fallbacks
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
 }
 
 #[test]
@@ -802,7 +809,8 @@ fn confluent_kafka_go_round_trips() {
         eprintln!("skipping confluent-kafka-go; go is not installed");
         return;
     };
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/ecosystem/confluent_kafka_go");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/ecosystem/confluent_kafka_go");
     let pkg = Command::new("pkg-config")
         .args(["--variable=pcfiledir", "rdkafka"])
         .output();

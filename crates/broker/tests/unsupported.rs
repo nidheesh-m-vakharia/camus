@@ -80,6 +80,7 @@ fn an_unimplemented_api_returns_unsupported_version_and_the_connection_stays_up(
     let dir = tempfile::tempdir().unwrap();
     let log = std::fs::File::create(dir.path().join("broker.log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",

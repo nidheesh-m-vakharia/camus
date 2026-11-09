@@ -46,6 +46,7 @@ fn spawn(compact_ms: &str) -> Node {
     std::fs::create_dir_all(&path).unwrap();
     let log = std::fs::File::create(path.join("broker.log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",

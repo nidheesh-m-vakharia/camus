@@ -60,6 +60,7 @@ fn wait_file(path: &Path) -> String {
 fn spawn(dir: &Path, cert: &Path, key: &Path) -> Node {
     let log = std::fs::File::create(dir.join("broker.log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",
@@ -598,6 +599,7 @@ fn a_tls_broker_without_object_storage_settings_refuses_to_start() {
     std::fs::write(&cert, signed.pem()).unwrap();
     std::fs::write(&key, key_pair.serialize_pem()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_camus-broker"))
+        .env("CAMUS_WAL_SHARDS", "voters")
         .args([
             "--node-id",
             "1",

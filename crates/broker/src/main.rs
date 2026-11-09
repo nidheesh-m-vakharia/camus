@@ -80,8 +80,10 @@ struct Args {
 const RAFT_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 /// `/admin/init` body: the peers, as before shards had ids, or the peers and
-/// a shard count (ADR 0014). Without a count there is one shard per WAL
-/// voter.
+/// a shard count (ADR 0014). Without a count the count follows the cores of
+/// this process, rounded up so each voter leads the same number of shards.
+/// `CAMUS_WAL_SHARDS=voters` keeps one shard per voter. A positive integer
+/// in that variable is the count.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum InitBody {
@@ -145,11 +147,10 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir)?;
     let node = Arc::new(MetadataNode::open(args.node_id, &args.data_dir, &args.http_addr).await?);
-    let wal_dir = args
-        .wal_dir
-        .clone()
-        .unwrap_or_else(|| args.data_dir.join("wal"));
+    let wal_dir = resolve_wal_dir(args.wal_dir.clone(), &args.data_dir);
+    std::fs::create_dir_all(&wal_dir)?;
     let wal = Arc::new(WalSlot::new(Shard::open(args.node_id, &wal_dir).await?));
+    warn_if_rotating_wal(&wal_dir);
     tokio::spawn(open_shards(
         Arc::clone(&node),
         Arc::clone(&wal),
@@ -313,9 +314,150 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
     }))
 }
 
-/// Create the metadata group from every peer and the WAL shard from the
-/// peers marked `wal`. Each `addr` is that broker's HTTP address; both
-/// groups' RPC goes there. The shard is initialized on its first voter.
+/// Shard count when init omits one. One shard per core of this process,
+/// rounded up to a multiple of the voter count so each voter is the preferred
+/// leader of the same number of shards, and capped at eight shards per voter.
+fn default_shard_count(voters: usize) -> u32 {
+    if let Ok(raw) = std::env::var("CAMUS_WAL_SHARDS") {
+        if raw == "voters" {
+            return u32::try_from(voters).unwrap_or(1).max(1);
+        }
+        if let Ok(count) = raw.parse::<u32>() {
+            if count >= 1 {
+                return count;
+            }
+        }
+    }
+    shard_count_for(
+        voters,
+        std::thread::available_parallelism()
+            .map(|cores| u32::try_from(cores.get()).unwrap_or(1))
+            .unwrap_or(1),
+    )
+}
+
+/// [`default_shard_count`] without reading the environment.
+fn shard_count_for(voters: usize, cores: u32) -> u32 {
+    let voters = u32::try_from(voters).unwrap_or(1).max(1);
+    let rounded = cores.max(voters).div_ceil(voters) * voters;
+    rounded.min(voters.saturating_mul(8)).max(1)
+}
+
+/// `{data_dir}/wal`, or a directory on local NVMe when that path is a
+/// rotating disk and an NVMe filesystem is mounted. An explicit `--wal-dir`
+/// is used as given.
+fn resolve_wal_dir(explicit: Option<PathBuf>, data_dir: &std::path::Path) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir;
+    }
+    let fallback = data_dir.join("wal");
+    #[cfg(target_os = "linux")]
+    if device_rotates(data_dir) == Some(true) {
+        if let Some(mount) = largest_nvme_mount() {
+            let dir = mount.join("camus-wal");
+            tracing::info!(
+                path = %dir.display(),
+                mount = %mount.display(),
+                "WAL directory is on local NVMe"
+            );
+            return dir;
+        }
+    }
+    fallback
+}
+
+/// Log when the WAL directory sits on a rotating disk. The produce ack waits
+/// for that disk.
+fn warn_if_rotating_wal(path: &std::path::Path) {
+    if device_rotates(path) == Some(true) {
+        tracing::warn!(
+            path = %path.display(),
+            "WAL directory is on a rotating disk; put it on local NVMe"
+        );
+    }
+}
+
+/// `Some(true)` when `path` (or the nearest existing parent) is on a rotating
+/// disk. `None` when the device cannot be read, including off Linux.
+fn device_rotates(path: &std::path::Path) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cursor = path.to_path_buf();
+        let meta = loop {
+            if let Ok(meta) = std::fs::metadata(&cursor) {
+                break meta;
+            }
+            if !cursor.pop() {
+                return None;
+            }
+        };
+        use std::os::unix::fs::MetadataExt;
+        let dev = meta.dev();
+        // glibc's encoding of a device id. Partitions expose `queue` on the
+        // parent disk, so both paths are tried.
+        let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+        let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+        let queue = format!("/sys/dev/block/{major}:{minor}/queue/rotational");
+        let parent = format!("/sys/dev/block/{major}:{minor}/../queue/rotational");
+        let text = std::fs::read_to_string(&queue).or_else(|_| std::fs::read_to_string(&parent));
+        return text.ok().map(|text| text.trim() == "1");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Mount point of the largest non-rotating NVMe filesystem, skipping the
+/// root and boot filesystems.
+#[cfg(target_os = "linux")]
+fn largest_nvme_mount() -> Option<PathBuf> {
+    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for line in table.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(spec) = fields.next() else { continue };
+        let Some(mount) = fields.next() else { continue };
+        let mount = mount.replace("\\040", " ");
+        let fstype = fields.next().unwrap_or("");
+        if !spec.starts_with("/dev/nvme") {
+            continue;
+        }
+        if matches!(
+            fstype,
+            "tmpfs" | "devtmpfs" | "overlay" | "squashfs" | "autofs"
+        ) {
+            continue;
+        }
+        if mount == "/" || mount.starts_with("/boot") || mount.starts_with("/snap") {
+            continue;
+        }
+        let path = PathBuf::from(&mount);
+        if device_rotates(&path) != Some(false) {
+            continue;
+        }
+        let bytes = nvme_disk_bytes(spec);
+        if best.as_ref().is_none_or(|(have, _)| bytes > *have) {
+            best = Some((bytes, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Whole-disk size in bytes for `/dev/nvme0n1` or `/dev/nvme0n1p2`.
+#[cfg(target_os = "linux")]
+fn nvme_disk_bytes(spec: &str) -> u64 {
+    let name = spec.trim_start_matches("/dev/");
+    let disk = name.split('p').next().unwrap_or(name);
+    let sectors = std::fs::read_to_string(format!("/sys/block/{disk}/size")).unwrap_or_default();
+    sectors
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0)
+        .saturating_mul(512)
+}
+
 /// Where shard `shard` keeps its log: shard 0 in `wal_dir`, as before shards
 /// had ids, and shard `n` beside it in `<wal_dir>-shards/<n>` (ADR 0014).
 fn shard_dir(wal_dir: &std::path::Path, shard: u32) -> PathBuf {
@@ -382,6 +524,9 @@ fn shard_voters(voters: &[NodeId], shards: u32) -> Vec<Vec<NodeId>> {
         .collect()
 }
 
+/// Create the metadata group from every peer and the WAL shards from the
+/// peers marked `wal`. Each `addr` is that broker's HTTP address; both
+/// groups' RPC goes there. Each shard is initialized on its first voter.
 async fn init(
     State(admin): State<Arc<Admin>>,
     Json(body): Json<InitBody>,
@@ -403,7 +548,7 @@ async fn init(
         return Err((StatusCode::BAD_REQUEST, "no wal voter".into()));
     }
     voters.sort_unstable();
-    let count = shards.unwrap_or(voters.len() as u32).max(1);
+    let count = shards.unwrap_or_else(|| default_shard_count(voters.len()));
     let layout = shard_voters(&voters, count);
     admin
         .node
@@ -426,10 +571,8 @@ async fn init(
     // until it has; a voter that is already initialized answers 409. Then
     // the first voter campaigns, so it usually leads the shard.
     for (shard, members) in layout.iter().enumerate() {
-        let map: BTreeMap<NodeId, BasicNode> = members
-            .iter()
-            .map(|id| (*id, nodes[id].clone()))
-            .collect();
+        let map: BTreeMap<NodeId, BasicNode> =
+            members.iter().map(|id| (*id, nodes[id].clone())).collect();
         let path = if shard == 0 {
             "wal/init".to_string()
         } else {
@@ -1130,7 +1273,15 @@ fn load_tls(
 mod tests {
     use std::net::SocketAddr;
 
-    use super::advertised_endpoint;
+    use super::{advertised_endpoint, shard_count_for};
+
+    #[test]
+    fn shard_count_follows_cores_and_shares_them_across_voters() {
+        assert_eq!(shard_count_for(3, 8), 9);
+        assert_eq!(shard_count_for(3, 1), 3);
+        assert_eq!(shard_count_for(1, 10), 8);
+        assert_eq!(shard_count_for(3, 100), 24);
+    }
 
     #[test]
     fn unspecified_bind_advertises_loopback() {
