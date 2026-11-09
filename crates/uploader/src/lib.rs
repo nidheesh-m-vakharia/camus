@@ -14,6 +14,7 @@ const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 const MAGIC: &[u8] = b"CAMUSFTR";
 
 /// One partition's batches inside a bundle.
+#[derive(Clone)]
 pub struct Piece {
     /// Topic id, 16 bytes.
     pub topic_id: [u8; 16],

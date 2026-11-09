@@ -66,6 +66,9 @@ use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 const MAX_FRAME: usize = 100 * 1024 * 1024;
+/// Sealed extents read from metadata at a time. Each read is one bounded
+/// range of keys, so a request's cost does not grow with the partition's age.
+const EXTENT_PAGE: usize = 256;
 const MAX_BATCH: usize = batch::MAX_BATCH_CEILING;
 const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 /// Most unsealed bytes one upload pass takes: up to four objects of
@@ -663,6 +666,47 @@ impl Kafka {
         camus_metadata::parse_topic(&raw).ok()
     }
 
+    /// Up to `limit` sealed extents of `partition` that end after `after`, in
+    /// offset order.
+    fn extents_after(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        state: &camus_metadata::Partition,
+        after: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<camus_metadata::Extent>> {
+        let scan = |from: &str, to: &str, limit: usize| {
+            self.node
+                .scan_range_local(from, to, limit)
+                .map_err(|err| err.to_string())
+        };
+        camus_metadata::extents_after(&scan, &topic.id, partition, state, after, limit)
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Every sealed extent of `partition`, read a page at a time. For
+    /// background passes over the whole partition, not request paths.
+    fn all_extents(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        state: &camus_metadata::Partition,
+    ) -> anyhow::Result<Vec<camus_metadata::Extent>> {
+        let mut all = Vec::new();
+        loop {
+            let after = all
+                .last()
+                .map_or(-1, |extent: &camus_metadata::Extent| extent.end);
+            let page = self.extents_after(topic, partition, state, after, EXTENT_PAGE)?;
+            let full = page.len() == EXTENT_PAGE;
+            all.extend(page);
+            if !full {
+                return Ok(all);
+            }
+        }
+    }
+
     fn partition_state(&self, topic: &Topic, partition: i32) -> Option<camus_metadata::Partition> {
         let raw = self
             .node
@@ -880,8 +924,11 @@ impl Kafka {
                 let Some(state) = self.partition_state(&topic, partition) else {
                     continue;
                 };
+                let Ok(extents) = self.all_extents(&topic, partition, &state) else {
+                    continue;
+                };
                 if let Some(offset) = camus_compactor::retention::cut(
-                    &state.extents,
+                    &extents,
                     state.log_start,
                     topic.retention_ms,
                     topic.retention_bytes,
@@ -1065,7 +1112,11 @@ impl Kafka {
                     .read_local(&camus_metadata::partition_storage_key(&topic.id, partition))?
                     .ok_or_else(|| anyhow::anyhow!("{name}-{partition} has no partition row"))?;
                 let state = camus_metadata::parse_partition(&raw).map_err(anyhow::Error::msg)?;
-                keys.extend(state.extents.into_iter().map(|extent| extent.key));
+                keys.extend(
+                    self.all_extents(&topic, partition, &state)?
+                        .into_iter()
+                        .map(|extent| extent.key),
+                );
             }
         }
         Ok(keys)
@@ -1147,11 +1198,23 @@ impl Kafka {
         // record is at least that old are compacted.
         let now = txn::now_ms();
         let lag = topic.config_i64("min.compaction.lag.ms");
-        let eligible: Vec<&camus_metadata::Extent> = state
-            .extents
-            .iter()
-            .take_while(|extent| now.saturating_sub(extent.max_timestamp) >= lag)
-            .collect();
+        let mut eligible: Vec<camus_metadata::Extent> = Vec::new();
+        'scan: loop {
+            let after = eligible.last().map_or(-1, |extent| extent.end);
+            let Ok(page) = self.extents_after(topic, partition, &state, after, EXTENT_PAGE) else {
+                return;
+            };
+            let full = page.len() == EXTENT_PAGE;
+            for extent in page {
+                if now.saturating_sub(extent.max_timestamp) < lag {
+                    break 'scan;
+                }
+                eligible.push(extent);
+            }
+            if !full {
+                break;
+            }
+        }
         let Some(last) = eligible.last() else {
             return;
         };
@@ -1160,7 +1223,7 @@ impl Kafka {
         let mut records = Vec::new();
         let mut base_timestamp = i64::MAX;
         let mut max_timestamp = i64::MIN;
-        for extent in eligible {
+        for extent in &eligible {
             if extent.length == 0 {
                 continue;
             }
@@ -2639,6 +2702,10 @@ impl Kafka {
         let mut puts = tokio::task::JoinSet::new();
         for (slot, chunk) in chunks.into_iter().enumerate() {
             let bucket = self.bucket.clone();
+            let mut chunk = chunk;
+            // Each partition's batches sit together in the object, so they
+            // publish as one extent.
+            chunk.sort_by_key(|batch| (batch.topic_id, batch.partition, batch.start));
             puts.spawn(async move {
                 let mut heads = Vec::with_capacity(chunk.len());
                 let mut notes = Vec::new();
@@ -2718,7 +2785,7 @@ impl Kafka {
                 });
             }
         }
-        (parts, producers, seals, all_put)
+        (coalesce(parts), producers, seals, all_put)
     }
 
     /// One upload pass: at most `upload.flush.bytes` (8 MiB, ADR 0006) of
@@ -3004,7 +3071,17 @@ impl Kafka {
         }
         let mut parts = Vec::new();
         if !pieces.is_empty() {
-            let (index, body) = camus_uploader::encode(&pieces);
+            // Encode each partition's batches together, so they publish as one
+            // extent, and map the offsets back to `pieces` order.
+            let mut order: Vec<usize> = (0..pieces.len()).collect();
+            order.sort_by_key(|&at| (pieces[at].topic_id, pieces[at].partition, pieces[at].start));
+            let sorted: Vec<Piece> = order.iter().map(|&at| pieces[at].clone()).collect();
+            let (sorted_index, body) = camus_uploader::encode(&sorted);
+            drop(sorted);
+            let mut index = vec![(0, 0); pieces.len()];
+            for (at, located) in order.into_iter().zip(sorted_index) {
+                index[at] = located;
+            }
             let object_key = camus_uploader::object_key();
             if self.bucket.put_new(&object_key, body).await.is_err() {
                 return fail(items, STORAGE);
@@ -3034,7 +3111,7 @@ impl Kafka {
                     max_timestamp: item.max_timestamp,
                 });
             }
-            let published = self.node.publish(parts, notes).await;
+            let published = self.node.publish(coalesce(parts), notes).await;
             let code = match published {
                 Ok(response) if response.error_code == 0 => None,
                 Ok(response) => Some(response.error_code),
@@ -3193,49 +3270,62 @@ impl Kafka {
             }
             let mut out = BytesMut::new();
             let mut stopped = false;
-            'extents: for extent in &state.extents {
-                // A compacted range whose records all expired has no bytes.
-                if extent.end <= offset || extent.length == 0 {
-                    continue;
-                }
-                let end = extent.file_offset + u64::from(extent.length);
-                let Ok(bytes) = self
-                    .bucket
-                    .get_range(&extent.key, extent.file_offset..end)
-                    .await
+            let mut after = offset;
+            'extents: loop {
+                let Ok(page) = self.extents_after(topic, partition, &state, after, EXTENT_PAGE)
                 else {
                     row.error_code = STORAGE;
                     return row;
                 };
-                let Ok(info) = batch::inspect(&bytes, MAX_FRAME) else {
-                    row.error_code = CORRUPT;
-                    return row;
-                };
-                let mut cursor = 0;
-                for batch in info {
-                    let next = batch.last_offset + 1;
-                    if isolation == 1 {
-                        match txn_batch(batch.base_offset, batch.transactional, &state) {
-                            TxnView::Stop => {
-                                stable = stable.min(batch.base_offset);
+                let full = page.len() == EXTENT_PAGE;
+                for extent in &page {
+                    after = extent.end;
+                    // A compacted range whose records all expired has no bytes.
+                    if extent.end <= offset || extent.length == 0 {
+                        continue;
+                    }
+                    let end = extent.file_offset + u64::from(extent.length);
+                    let Ok(bytes) = self
+                        .bucket
+                        .get_range(&extent.key, extent.file_offset..end)
+                        .await
+                    else {
+                        row.error_code = STORAGE;
+                        return row;
+                    };
+                    let Ok(info) = batch::inspect(&bytes, MAX_FRAME) else {
+                        row.error_code = CORRUPT;
+                        return row;
+                    };
+                    let mut cursor = 0;
+                    for batch in info {
+                        let next = batch.last_offset + 1;
+                        if isolation == 1 {
+                            match txn_batch(batch.base_offset, batch.transactional, &state) {
+                                TxnView::Stop => {
+                                    stable = stable.min(batch.base_offset);
+                                    stopped = true;
+                                    break 'extents;
+                                }
+                                TxnView::Skip => {
+                                    cursor += batch.len;
+                                    continue;
+                                }
+                                TxnView::Take => {}
+                            }
+                        }
+                        if next > offset && batch.base_offset < stable {
+                            if !out.is_empty() && out.len() + batch.len > limit {
                                 stopped = true;
                                 break 'extents;
                             }
-                            TxnView::Skip => {
-                                cursor += batch.len;
-                                continue;
-                            }
-                            TxnView::Take => {}
+                            out.extend_from_slice(&bytes[cursor..cursor + batch.len]);
                         }
+                        cursor += batch.len;
                     }
-                    if next > offset && batch.base_offset < stable {
-                        if !out.is_empty() && out.len() + batch.len > limit {
-                            stopped = true;
-                            break 'extents;
-                        }
-                        out.extend_from_slice(&bytes[cursor..cursor + batch.len]);
-                    }
-                    cursor += batch.len;
+                }
+                if !full {
+                    break;
                 }
             }
             if !stopped && offset < stable {
@@ -3377,33 +3467,46 @@ impl Kafka {
             row.offset = state.next_offset.max(self.wal_end(topic, partition));
             return row;
         }
-        for extent in &state.extents {
-            if extent.max_timestamp < timestamp || extent.length == 0 {
-                continue;
-            }
-            let end = extent.file_offset + u64::from(extent.length);
-            let Ok(bytes) = self
-                .bucket
-                .get_range(&extent.key, extent.file_offset..end)
-                .await
-            else {
+        let mut after = -1;
+        loop {
+            let Ok(page) = self.extents_after(topic, partition, &state, after, EXTENT_PAGE) else {
                 row.error_code = STORAGE;
                 row.offset = -1;
                 return row;
             };
-            let Ok(info) = batch::inspect(&bytes, MAX_FRAME) else {
-                row.error_code = CORRUPT;
-                row.offset = -1;
-                return row;
-            };
-            let mut batch_offset = extent.start;
-            for batch in info {
-                if batch.max_timestamp >= timestamp {
-                    row.offset = batch_offset;
-                    row.timestamp = batch.max_timestamp;
-                    return row;
+            let full = page.len() == EXTENT_PAGE;
+            for extent in &page {
+                after = extent.end;
+                if extent.max_timestamp < timestamp || extent.length == 0 {
+                    continue;
                 }
-                batch_offset += i64::from(batch.records);
+                let end = extent.file_offset + u64::from(extent.length);
+                let Ok(bytes) = self
+                    .bucket
+                    .get_range(&extent.key, extent.file_offset..end)
+                    .await
+                else {
+                    row.error_code = STORAGE;
+                    row.offset = -1;
+                    return row;
+                };
+                let Ok(info) = batch::inspect(&bytes, MAX_FRAME) else {
+                    row.error_code = CORRUPT;
+                    row.offset = -1;
+                    return row;
+                };
+                let mut batch_offset = extent.start;
+                for batch in info {
+                    if batch.max_timestamp >= timestamp {
+                        row.offset = batch_offset;
+                        row.timestamp = batch.max_timestamp;
+                        return row;
+                    }
+                    batch_offset += i64::from(batch.records);
+                }
+            }
+            if !full {
+                break;
             }
         }
         row.offset = -1;
@@ -3659,6 +3762,34 @@ struct WalProduce {
 
 /// `NoteTxn` applies the abort and reports the Kafka code in `value` when the
 /// batch cannot join the transaction. A normal success leaves `value` empty.
+/// Merge parts that continue one another in the same object into one, so a
+/// partition gets one extent per object rather than one per batch. Each
+/// partition's parts stay in offset order.
+fn coalesce(mut parts: Vec<PublishPart>) -> Vec<PublishPart> {
+    parts.sort_by(|a, b| (&a.topic, a.partition).cmp(&(&b.topic, b.partition)));
+    let mut out: Vec<PublishPart> = Vec::with_capacity(parts.len());
+    for part in parts {
+        if let Some(last) = out.last_mut() {
+            if last.topic == part.topic
+                && last.partition == part.partition
+                && last.epoch == part.epoch
+                && last.object_key == part.object_key
+                && last.end == part.start
+                && last.file_offset + u64::from(last.length) == part.file_offset
+            {
+                if let Some(length) = last.length.checked_add(part.length) {
+                    last.end = part.end;
+                    last.length = length;
+                    last.max_timestamp = last.max_timestamp.max(part.max_timestamp);
+                    continue;
+                }
+            }
+        }
+        out.push(part);
+    }
+    out
+}
+
 fn noted_error(applied: &anyhow::Result<camus_metadata::Response>) -> Option<i16> {
     match applied {
         Ok(response) if response.error_code != 0 => Some(response.error_code),

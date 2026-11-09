@@ -139,6 +139,11 @@ struct ReadQuery {
     key: String,
 }
 
+#[derive(Deserialize)]
+struct ScanQuery {
+    prefix: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -175,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/publish", post(publish))
         .route("/admin/apply", post(apply_command))
         .route("/admin/read", get(read))
+        .route("/admin/scan", get(scan))
         .route("/raft-vote", post(vote))
         .route("/raft-append", post(append))
         .route("/raft-snapshot", post(snapshot))
@@ -945,6 +951,17 @@ async fn read(
         .read_local(&query.key)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(Json(serde_json::json!({ "value": value })))
+}
+
+/// Every locally applied key under `prefix`, as `[[key, value], ...]`.
+async fn scan(
+    State(node): State<Arc<MetadataNode>>,
+    Query(query): Query<ScanQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let rows = node
+        .scan_local(&query.prefix)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(serde_json::json!(rows)))
 }
 
 /// Decode a postcard Raft RPC body, or answer 400.
