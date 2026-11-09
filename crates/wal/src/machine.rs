@@ -12,10 +12,14 @@
 //! a follower that installs it. Batches are normally sealed within the upload
 //! interval, long before a snapshot, so this copy is the exception.
 //!
-//! Apply is on the produce ack path, so it writes only what changed in a redb
-//! commit that does not fsync. After a crash redb rolls back to its last
-//! durable commit and openraft re-applies the log from there.
-//! [`Machine::flush`] makes the state durable before the log under it can go.
+//! Apply is on the produce ack path, so it changes only memory. The Raft
+//! log, fsynced on a quorum, is what makes a batch durable. What apply
+//! changed is recorded and [`Machine::flush`] writes just that, in one
+//! durable redb commit: about once a second from the shard, before a
+//! snapshot, and when the membership changes. After a crash openraft
+//! re-applies the log from the last flush. Building a snapshot flushes, and
+//! the log is purged only up to a snapshot, so the entries a restart needs
+//! are still there.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -35,6 +39,10 @@ use tokio::sync::RwLock;
 use crate::{Command, NodeId, Response, TypeConfig};
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+/// Next offset per partition key.
+const NEXT: TableDefinition<&str, i64> = TableDefinition::new("next");
+/// Producer sequences per `{partition key}/{producer id}`, postcard.
+const PRODUCERS: TableDefinition<&str, &[u8]> = TableDefinition::new("producers");
 /// Unsealed batch headers by storage key, postcard.
 const HEADS: TableDefinition<u64, &[u8]> = TableDefinition::new("heads");
 /// Bytes of unsealed batches whose log entry a snapshot may purge.
@@ -91,19 +99,145 @@ impl Head {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+/// Unsealed heads, indexed for how they are read: by partition and offset
+/// for fetch and seal, by storage key (commit order) for the uploader.
+#[derive(Default, Clone)]
+struct Heads {
+    by_part: BTreeMap<([u8; 16], i32), BTreeMap<i64, Head>>,
+    by_key: BTreeMap<u64, ([u8; 16], i32, i64)>,
+    /// Sum of every head's `len`.
+    bytes: u64,
+}
+
+impl Heads {
+    fn insert(&mut self, head: Head) {
+        self.bytes += head.len;
+        self.by_key
+            .insert(head.key(), (head.topic_id, head.partition, head.start));
+        self.by_part
+            .entry((head.topic_id, head.partition))
+            .or_default()
+            .insert(head.start, head);
+    }
+
+    fn remove(&mut self, topic_id: [u8; 16], partition: i32, start: i64) -> Option<Head> {
+        let part = self.by_part.get_mut(&(topic_id, partition))?;
+        let head = part.remove(&start)?;
+        if part.is_empty() {
+            self.by_part.remove(&(topic_id, partition));
+        }
+        self.by_key.remove(&head.key());
+        self.bytes -= head.len;
+        Some(head)
+    }
+
+    /// Every head, in commit order.
+    fn in_commit_order(&self) -> impl Iterator<Item = &Head> {
+        self.by_key
+            .values()
+            .filter_map(|(topic_id, partition, start)| {
+                self.by_part.get(&(*topic_id, *partition))?.get(start)
+            })
+    }
+
+    /// One partition's heads at or after `sealed_end` that end after
+    /// `offset`, in offset order.
+    fn of_partition(
+        &self,
+        topic_id: [u8; 16],
+        partition: i32,
+        sealed_end: i64,
+        offset: i64,
+    ) -> impl Iterator<Item = &Head> {
+        let part = self.by_part.get(&(topic_id, partition));
+        // Start at the head holding `offset`, if one does.
+        let holding = part
+            .and_then(|part| part.range(..=offset).next_back())
+            .filter(|(_, head)| head.end > offset)
+            .map(|(start, _)| *start)
+            .unwrap_or(offset);
+        part.into_iter()
+            .flat_map(move |part| part.range(holding.max(sealed_end)..))
+            .map(|(_, head)| head)
+    }
+}
+
+impl FromIterator<Head> for Heads {
+    fn from_iter<I: IntoIterator<Item = Head>>(iter: I) -> Self {
+        let mut heads = Heads::default();
+        for head in iter {
+            heads.insert(head);
+        }
+        heads
+    }
+}
+
+/// What apply changed since the last flush.
+#[derive(Default)]
+struct Dirty {
+    added: BTreeMap<u64, Head>,
+    removed: BTreeSet<u64>,
+    next: BTreeSet<String>,
+    producers: BTreeSet<String>,
+    /// `last_applied` or the membership moved.
+    meta: bool,
+}
+
+impl Dirty {
+    fn is_empty(&self) -> bool {
+        !self.meta
+            && self.added.is_empty()
+            && self.removed.is_empty()
+            && self.next.is_empty()
+            && self.producers.is_empty()
+    }
+
+    fn add(&mut self, head: Head) {
+        self.added.insert(head.key(), head);
+    }
+
+    fn remove(&mut self, key: u64) {
+        // A head added and removed between flushes never reaches the tables.
+        if self.added.remove(&key).is_none() {
+            self.removed.insert(key);
+        }
+    }
+
+    /// Put back what a failed flush took, under anything applied since.
+    fn restore(&mut self, older: Dirty) {
+        for (key, head) in older.added {
+            if !self.removed.remove(&key) {
+                self.added.entry(key).or_insert(head);
+            }
+        }
+        for key in older.removed {
+            if !self.added.contains_key(&key) {
+                self.removed.insert(key);
+            }
+        }
+        self.next.extend(older.next);
+        self.producers.extend(older.producers);
+        self.meta |= older.meta;
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
 struct State {
     last_applied: Option<LogId<NodeId>>,
     #[serde(default)]
     membership: Option<StoredMembership<NodeId, openraft::BasicNode>>,
-    #[serde(default)]
+    /// In the `NEXT` table. Read here only from state written before it.
+    #[serde(default, skip_serializing)]
     next: BTreeMap<String, i64>,
     /// Producer sequences, keyed by `{topic id hex}/{partition}/{producer id}`.
     /// A leader change reads this with the log, so a retry is not appended twice.
-    #[serde(default)]
+    /// In the `PRODUCERS` table; read here only from state written before it.
+    #[serde(default, skip_serializing)]
     producers: BTreeMap<String, camus_protocol::idempotence::ProducerSeq>,
     #[serde(skip)]
-    heads: Vec<Head>,
+    heads: Heads,
+    #[serde(skip)]
+    dirty: Dirty,
 }
 
 /// What a snapshot carries besides openraft's meta.
@@ -139,13 +273,6 @@ fn decode_snapshot(data: &[u8]) -> Result<SnapshotData, &'static str> {
     })
 }
 
-/// What changed in one apply call.
-#[derive(Default)]
-struct Delta {
-    added: Vec<Head>,
-    removed: Vec<u64>,
-}
-
 #[derive(Serialize, Deserialize)]
 struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, openraft::BasicNode>,
@@ -157,6 +284,9 @@ pub struct Machine {
     db: Database,
     log: camus_raft::SegmentLogStore<TypeConfig>,
     state: std::sync::Mutex<State>,
+    /// Held across a flush or a snapshot install, so their writes do not
+    /// interleave.
+    flushing: std::sync::Mutex<()>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
 }
@@ -182,6 +312,7 @@ impl Machine {
             db,
             log,
             state: std::sync::Mutex::new(state),
+            flushing: std::sync::Mutex::new(()),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: RwLock::new(current),
         })
@@ -196,33 +327,68 @@ impl Machine {
             .unwrap_or(0)
     }
 
-    /// Make every applied change durable. Call before purging the log.
+    /// Make every applied change durable, writing only what changed since
+    /// the last flush. Blocks on disk: call it off the async runtime.
     pub fn flush(&self) -> Result<(), StorageError<NodeId>> {
-        let state = self.state.lock().expect("wal state");
-        persist(&self.db, &state, &Delta::default(), true)
+        let _gate = self.flushing.lock().expect("wal flush");
+        let (meta, next, producers, dirty) = {
+            let mut state = self.state.lock().expect("wal state");
+            if state.dirty.is_empty() {
+                return Ok(());
+            }
+            let dirty = std::mem::take(&mut state.dirty);
+            let meta = serde_json::to_string(&*state)
+                .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+            let next: Vec<(String, Option<i64>)> = dirty
+                .next
+                .iter()
+                .map(|key| (key.clone(), state.next.get(key).copied()))
+                .collect();
+            let producers = dirty
+                .producers
+                .iter()
+                .map(|key| {
+                    let raw = state
+                        .producers
+                        .get(key)
+                        .map(|seq| {
+                            camus_raft::codec::encode(seq)
+                                .map_err(|err| io(ErrorSubject::StateMachine, &err))
+                        })
+                        .transpose()?;
+                    Ok((key.clone(), raw))
+                })
+                .collect::<Result<Vec<_>, StorageError<NodeId>>>()?;
+            (meta, next, producers, dirty)
+        };
+        let written = write_changes(&self.db, &meta, &next, &producers, &dirty);
+        if written.is_err() {
+            self.state.lock().expect("wal state").dirty.restore(dirty);
+        }
+        written
     }
 
     pub fn unsealed_bytes(&self) -> u64 {
-        let state = self.state.lock().expect("wal state");
-        state.heads.iter().map(|head| head.len).sum()
+        self.state.lock().expect("wal state").heads.bytes
     }
 
     /// The oldest unsealed batches in commit order, with their bytes, up to
     /// `limit` bytes (at least one batch). Commit order keeps each
     /// partition's batches in offset order and lets no partition starve.
     pub async fn pending(&self, limit: u64) -> Result<Vec<Batch>, StorageError<NodeId>> {
-        let mut heads = self.state.lock().expect("wal state").heads.clone();
-        heads.sort_by_key(Head::key);
-        let mut size = 0u64;
-        let mut taken = 0;
-        for head in &heads {
-            if taken > 0 && size + head.len > limit {
-                break;
+        let heads: Vec<Head> = {
+            let state = self.state.lock().expect("wal state");
+            let mut size = 0u64;
+            let mut taken = Vec::new();
+            for head in state.heads.in_commit_order() {
+                if !taken.is_empty() && size + head.len > limit {
+                    break;
+                }
+                size += head.len;
+                taken.push(head.clone());
             }
-            size += head.len;
-            taken += 1;
-        }
-        heads.truncate(taken);
+            taken
+        };
         self.materialize(heads).await
     }
 
@@ -237,31 +403,22 @@ impl Machine {
         offset: i64,
         limit: usize,
     ) -> Result<Vec<u8>, StorageError<NodeId>> {
-        let mut heads: Vec<Head> = {
+        let (heads, size) = {
             let state = self.state.lock().expect("wal state");
-            state
+            let mut size = 0u64;
+            let mut kept = Vec::new();
+            for head in state
                 .heads
-                .iter()
-                .filter(|head| {
-                    &head.topic_id == topic_id
-                        && head.partition == partition
-                        && head.start >= sealed_end
-                        && head.end > offset
-                })
-                .cloned()
-                .collect()
-        };
-        heads.sort_by_key(|head| head.start);
-        let mut size = 0u64;
-        let mut kept = Vec::new();
-        for head in heads {
-            if size != 0 && size + head.len > limit as u64 {
-                break;
+                .of_partition(*topic_id, partition, sealed_end, offset)
+            {
+                if size != 0 && size + head.len > limit as u64 {
+                    break;
+                }
+                size += head.len;
+                kept.push(head.clone());
             }
-            size += head.len;
-            kept.push(head);
-        }
-        let heads = kept;
+            (kept, size)
+        };
         let mut out = Vec::with_capacity(size as usize);
         for batch in self.materialize(heads).await? {
             out.extend_from_slice(&batch.bytes);
@@ -299,12 +456,11 @@ impl Machine {
             .map(|head| head.log_index)
             .collect();
         let mut entries: BTreeMap<u64, Command> = BTreeMap::new();
-        if let (Some(first), Some(last)) = (wanted.first(), wanted.last()) {
-            let mut log = self.log.clone();
-            for entry in log.try_get_log_entries(*first..=*last).await? {
-                if !wanted.contains(&entry.log_id.index) {
-                    continue;
-                }
+        // Read only the entries these heads are in, one range per run of
+        // consecutive indexes, not everything between the first and last.
+        let mut log = self.log.clone();
+        for (first, last) in runs(&wanted) {
+            for entry in log.try_get_log_entries(first..=last).await? {
                 if let EntryPayload::Normal(command) = entry.payload {
                     entries.insert(entry.log_id.index, command);
                 }
@@ -345,7 +501,14 @@ impl Machine {
     /// Copy every unsealed batch's bytes into `DETACHED`, durably, so a log
     /// purge cannot take them. Returns the snapshot's bytes section.
     async fn detach_all(&self) -> Result<Vec<(u64, serde_bytes::ByteBuf)>, StorageError<NodeId>> {
-        let heads = self.state.lock().expect("wal state").heads.clone();
+        let heads: Vec<Head> = self
+            .state
+            .lock()
+            .expect("wal state")
+            .heads
+            .in_commit_order()
+            .cloned()
+            .collect();
         let batches = self.materialize(heads.clone()).await?;
         let txn = self
             .db
@@ -367,6 +530,18 @@ impl Machine {
             .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
         Ok(out)
     }
+}
+
+/// Runs of consecutive indexes as inclusive `(first, last)` pairs.
+fn runs(indexes: &BTreeSet<u64>) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &index in indexes {
+        match out.last_mut() {
+            Some((_, last)) if *last + 1 == index => *last = index,
+            _ => out.push((index, index)),
+        }
+    }
+    out
 }
 
 fn missing(head: &Head) -> StorageError<NodeId> {
@@ -397,6 +572,36 @@ fn load_state(db: &Database) -> Result<State, StorageError<NodeId>> {
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(State::default()),
         Err(e) => return Err(err(&e)),
     };
+    // State written before the per-key tables kept offsets and producer
+    // sequences in the JSON above. Without the tables, those stay as read and
+    // the next flush writes them out.
+    match txn.open_table(NEXT) {
+        Ok(table) => {
+            state.next.clear();
+            for row in table.iter().map_err(|e| err(&e))? {
+                let (key, next) = row.map_err(|e| err(&e))?;
+                state.next.insert(key.value().to_string(), next.value());
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            state.dirty.next = state.next.keys().cloned().collect();
+        }
+        Err(e) => return Err(err(&e)),
+    }
+    match txn.open_table(PRODUCERS) {
+        Ok(table) => {
+            state.producers.clear();
+            for row in table.iter().map_err(|e| err(&e))? {
+                let (key, raw) = row.map_err(|e| err(&e))?;
+                let seq = camus_raft::codec::decode(raw.value()).map_err(|e| err(&e))?;
+                state.producers.insert(key.value().to_string(), seq);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            state.dirty.producers = state.producers.keys().cloned().collect();
+        }
+        Err(e) => return Err(err(&e)),
+    }
     let heads = match txn.open_table(HEADS) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(state),
@@ -405,7 +610,7 @@ fn load_state(db: &Database) -> Result<State, StorageError<NodeId>> {
     for row in heads.iter().map_err(|e| err(&e))? {
         let (_, head) = row.map_err(|e| err(&e))?;
         let head: Head = camus_raft::codec::decode(head.value()).map_err(|e| err(&e))?;
-        state.heads.push(head);
+        state.heads.insert(head);
     }
     Ok(state)
 }
@@ -426,62 +631,62 @@ fn load_snapshot(db: &Database) -> Result<Option<StoredSnapshot>, StorageError<N
     ))
 }
 
-/// Write one apply's changes. `durable` decides whether this commit fsyncs.
-fn persist(
+/// Write what changed since the last flush, in one durable commit.
+fn write_changes(
     db: &Database,
-    state: &State,
-    delta: &Delta,
-    durable: bool,
+    meta: &str,
+    next: &[(String, Option<i64>)],
+    producers: &[(String, Option<Vec<u8>>)],
+    dirty: &Dirty,
 ) -> Result<(), StorageError<NodeId>> {
     let err = |err: &dyn std::error::Error| io(ErrorSubject::StateMachine, err);
-    let meta = serde_json::to_string(state).map_err(|e| err(&e))?;
-    let mut txn = db.begin_write().map_err(|e| err(&e))?;
-    txn.set_durability(if durable {
-        redb::Durability::Immediate
-    } else {
-        redb::Durability::None
-    })
-    .map_err(|e| err(&e))?;
+    let txn = db.begin_write().map_err(|e| err(&e))?;
     {
         let mut table = txn.open_table(META).map_err(|e| err(&e))?;
-        table.insert(STATE, meta.as_str()).map_err(|e| err(&e))?;
+        table.insert(STATE, meta).map_err(|e| err(&e))?;
+        let mut offsets = txn.open_table(NEXT).map_err(|e| err(&e))?;
+        for (key, value) in next {
+            match value {
+                Some(value) => offsets.insert(key.as_str(), *value).map(|_| ()),
+                None => offsets.remove(key.as_str()).map(|_| ()),
+            }
+            .map_err(|e| err(&e))?;
+        }
+        let mut sequences = txn.open_table(PRODUCERS).map_err(|e| err(&e))?;
+        for (key, raw) in producers {
+            match raw {
+                Some(raw) => sequences.insert(key.as_str(), raw.as_slice()).map(|_| ()),
+                None => sequences.remove(key.as_str()).map(|_| ()),
+            }
+            .map_err(|e| err(&e))?;
+        }
         let mut heads = txn.open_table(HEADS).map_err(|e| err(&e))?;
         let mut detached = txn.open_table(DETACHED).map_err(|e| err(&e))?;
-        for key in &delta.removed {
+        for key in &dirty.removed {
             heads.remove(*key).map_err(|e| err(&e))?;
             detached.remove(*key).map_err(|e| err(&e))?;
         }
-        for head in &delta.added {
+        for (key, head) in &dirty.added {
             let raw = camus_raft::codec::encode(head).map_err(|e| err(&e))?;
-            heads
-                .insert(head.key(), raw.as_slice())
-                .map_err(|e| err(&e))?;
+            heads.insert(*key, raw.as_slice()).map_err(|e| err(&e))?;
         }
     }
     txn.commit().map_err(|e| err(&e))?;
     Ok(())
 }
 
-fn apply_one(state: &mut State, command: Command, log_index: u64, delta: &mut Delta) -> Response {
-    apply_at(state, command, log_index, 0, delta)
+fn apply_one(state: &mut State, command: Command, log_index: u64) -> Response {
+    apply_at(state, command, log_index, 0)
 }
 
-fn apply_at(
-    state: &mut State,
-    command: Command,
-    log_index: u64,
-    pos: u32,
-    delta: &mut Delta,
-) -> Response {
+fn apply_at(state: &mut State, command: Command, log_index: u64, pos: u32) -> Response {
     match command {
         Command::Appends(batches) => {
             let each = batches
                 .into_iter()
                 .take(MAX_PACKED)
                 .enumerate()
-                .map(|(pos, batch)| {
-                    apply_at(state, Command::Append(batch), log_index, pos as u32, delta)
-                })
+                .map(|(pos, batch)| apply_at(state, Command::Append(batch), log_index, pos as u32))
                 .collect();
             Response {
                 base_offset: -1,
@@ -543,6 +748,7 @@ fn apply_at(
                 for identity in &identities {
                     if identity.producer_id >= 0 {
                         let seq_key = format!("{key}/{}", identity.producer_id);
+                        state.dirty.producers.insert(seq_key.clone());
                         let seq = state.producers.entry(seq_key).or_default();
                         camus_protocol::idempotence::record(
                             seq,
@@ -556,6 +762,7 @@ fn apply_at(
                 }
             }
             let end = start + i64::from(batch.records);
+            state.dirty.next.insert(key.clone());
             state.next.insert(key, end);
             let head = Head {
                 topic: batch.topic,
@@ -570,8 +777,8 @@ fn apply_at(
                 epoch: batch.epoch,
                 len: batch.raw.len() as u64,
             };
-            delta.added.push(head.clone());
-            state.heads.push(head);
+            state.dirty.add(head.clone());
+            state.heads.insert(head);
             Response {
                 base_offset: start,
                 error_code: 0,
@@ -579,22 +786,14 @@ fn apply_at(
             }
         }
         Command::Seal { drops } => {
-            state.heads.retain(|head| {
-                let sealed = drops.iter().any(|drop| {
-                    drop.topic_id == head.topic_id
-                        && drop.partition == head.partition
-                        && drop.start == head.start
-                });
-                if sealed {
-                    delta.removed.push(head.key());
+            for drop in drops {
+                if let Some(head) = state
+                    .heads
+                    .remove(drop.topic_id, drop.partition, drop.start)
+                {
+                    state.dirty.remove(head.key());
                 }
-                !sealed
-            });
-            // A batch added and sealed in the same apply call never reaches
-            // the tables.
-            delta
-                .added
-                .retain(|head| !delta.removed.contains(&head.key()));
+            }
             Response {
                 base_offset: -1,
                 error_code: 0,
@@ -617,22 +816,29 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<Machine> {
         // somewhere other than the log, first.
         self.flush()?;
         let bytes = self.detach_all().await?;
-        let state = self.state.lock().expect("wal state").clone();
-        let data = camus_raft::codec::encode(&SnapshotData {
-            next: state.next.clone(),
-            heads: state.heads.clone(),
-            bytes,
-            producers: state.producers.clone(),
-        })
-        .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
+        let (body, last_applied, membership) = {
+            let state = self.state.lock().expect("wal state");
+            (
+                SnapshotData {
+                    next: state.next.clone(),
+                    heads: state.heads.in_commit_order().cloned().collect(),
+                    bytes,
+                    producers: state.producers.clone(),
+                },
+                state.last_applied,
+                state.membership.clone().unwrap_or_default(),
+            )
+        };
+        let data =
+            camus_raft::codec::encode(&body).map_err(|err| io(ErrorSubject::StateMachine, &err))?;
         let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot_id = match &state.last_applied {
+        let snapshot_id = match &last_applied {
             Some(last) => format!("{}-{}-{snapshot_idx}", last.leader_id, last.index),
             None => format!("--{snapshot_idx}"),
         };
         let meta = SnapshotMeta {
-            last_log_id: state.last_applied,
-            last_membership: state.membership.clone().unwrap_or_default(),
+            last_log_id: last_applied,
+            last_membership: membership,
             snapshot_id,
         };
         let stored = StoredSnapshot {
@@ -687,19 +893,17 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
     {
         let mut state = self.state.lock().expect("wal state");
         let mut responses = Vec::new();
-        let mut delta = Delta::default();
         let mut membership_changed = false;
         for entry in entries {
             state.last_applied = Some(entry.log_id);
+            state.dirty.meta = true;
             let response = match entry.payload {
                 EntryPayload::Blank => Response {
                     base_offset: -1,
                     error_code: 0,
                     each: Vec::new(),
                 },
-                EntryPayload::Normal(command) => {
-                    apply_one(&mut state, command, entry.log_id.index, &mut delta)
-                }
+                EntryPayload::Normal(command) => apply_one(&mut state, command, entry.log_id.index),
                 EntryPayload::Membership(membership) => {
                     membership_changed = true;
                     state.membership = Some(StoredMembership::new(Some(entry.log_id), membership));
@@ -712,7 +916,11 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
             };
             responses.push(response);
         }
-        persist(&self.db, &state, &delta, membership_changed)?;
+        drop(state);
+        // Rare, and the shard's voters should not depend on a replay.
+        if membership_changed {
+            self.flush()?;
+        }
         Ok(responses)
     }
 
@@ -736,16 +944,40 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
             membership: Some(meta.last_membership.clone()),
             next: parsed.next,
             producers: parsed.producers,
-            heads: parsed.heads,
+            heads: parsed.heads.into_iter().collect(),
+            dirty: Dirty::default(),
         };
-        // Replace every stored head; the snapshot's bytes become detached,
-        // since this node's log will not hold their entries.
+        // Replace every table in one durable commit. The snapshot's bytes
+        // become detached, since this node's log will not hold their entries.
         let err = |err: &dyn std::error::Error| io(ErrorSubject::StateMachine, err);
         {
+            let _gate = self.flushing.lock().expect("wal flush");
             let txn = self.db.begin_write().map_err(|e| err(&e))?;
             {
+                let mut table = txn.open_table(META).map_err(|e| err(&e))?;
+                let json = serde_json::to_string(&state).map_err(|e| err(&e))?;
+                table.insert(STATE, json.as_str()).map_err(|e| err(&e))?;
+                let mut offsets = txn.open_table(NEXT).map_err(|e| err(&e))?;
+                offsets.retain(|_, _| false).map_err(|e| err(&e))?;
+                for (key, next) in &state.next {
+                    offsets.insert(key.as_str(), *next).map_err(|e| err(&e))?;
+                }
+                let mut sequences = txn.open_table(PRODUCERS).map_err(|e| err(&e))?;
+                sequences.retain(|_, _| false).map_err(|e| err(&e))?;
+                for (key, seq) in &state.producers {
+                    let raw = camus_raft::codec::encode(seq).map_err(|e| err(&e))?;
+                    sequences
+                        .insert(key.as_str(), raw.as_slice())
+                        .map_err(|e| err(&e))?;
+                }
                 let mut heads = txn.open_table(HEADS).map_err(|e| err(&e))?;
                 heads.retain(|_, _| false).map_err(|e| err(&e))?;
+                for head in state.heads.in_commit_order() {
+                    let raw = camus_raft::codec::encode(head).map_err(|e| err(&e))?;
+                    heads
+                        .insert(head.key(), raw.as_slice())
+                        .map_err(|e| err(&e))?;
+                }
                 let mut detached = txn.open_table(DETACHED).map_err(|e| err(&e))?;
                 detached.retain(|_, _| false).map_err(|e| err(&e))?;
                 for (key, bytes) in &parsed.bytes {
@@ -755,13 +987,8 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
                 }
             }
             txn.commit().map_err(|e| err(&e))?;
+            *self.state.lock().expect("wal state") = state;
         }
-        let delta = Delta {
-            added: state.heads.clone(),
-            removed: Vec::new(),
-        };
-        persist(&self.db, &state, &delta, true)?;
-        *self.state.lock().expect("wal state") = state;
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data,
@@ -787,5 +1014,216 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head(partition: i32, start: i64, end: i64, log_index: u64, pos: u32) -> Head {
+        Head {
+            topic: "events".into(),
+            partition,
+            start,
+            end,
+            log_index,
+            pos,
+            topic_id: [7; 16],
+            base_timestamp: 0,
+            max_timestamp: 0,
+            epoch: 0,
+            len: (end - start) as u64 * 10,
+        }
+    }
+
+    fn open(dir: &Path) -> Machine {
+        let log = camus_raft::SegmentLogStore::open(dir.join("log")).unwrap();
+        Machine::open(&dir.join("state.redb"), log).unwrap()
+    }
+
+    #[test]
+    fn heads_are_found_by_partition_offset_and_commit_order() {
+        let mut heads: Heads = [
+            head(0, 0, 2, 1, 0),
+            head(1, 0, 5, 1, 1),
+            head(0, 2, 4, 2, 0),
+            head(0, 4, 9, 3, 0),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(heads.bytes, 20 + 50 + 20 + 50);
+        let starts = |heads: &Heads, sealed_end, offset| -> Vec<i64> {
+            heads
+                .of_partition([7; 16], 0, sealed_end, offset)
+                .map(|head| head.start)
+                .collect()
+        };
+        assert_eq!(starts(&heads, 0, 0), vec![0, 2, 4]);
+        assert_eq!(
+            starts(&heads, 0, 3),
+            vec![2, 4],
+            "from the head holding offset 3"
+        );
+        assert_eq!(
+            starts(&heads, 4, 0),
+            vec![4],
+            "nothing below the sealed end"
+        );
+        assert_eq!(starts(&heads, 0, 9), Vec::<i64>::new());
+        let order: Vec<(i32, i64)> = heads
+            .in_commit_order()
+            .map(|head| (head.partition, head.start))
+            .collect();
+        assert_eq!(order, vec![(0, 0), (1, 0), (0, 2), (0, 4)]);
+
+        assert!(heads.remove([7; 16], 0, 2).is_some());
+        assert!(heads.remove([7; 16], 0, 2).is_none());
+        assert_eq!(heads.bytes, 20 + 50 + 50);
+        assert_eq!(starts(&heads, 0, 0), vec![0, 4]);
+        heads.remove([7; 16], 1, 0);
+        assert!(
+            !heads.by_part.contains_key(&([7; 16], 1)),
+            "an empty partition goes"
+        );
+    }
+
+    #[test]
+    fn a_head_added_and_sealed_between_flushes_is_never_written() {
+        let mut dirty = Dirty::default();
+        dirty.add(head(0, 0, 1, 1, 0));
+        dirty.remove(head(0, 0, 1, 1, 0).key());
+        assert!(dirty.added.is_empty() && dirty.removed.is_empty());
+        dirty.remove(head(0, 1, 2, 2, 0).key());
+        assert_eq!(
+            dirty.removed.len(),
+            1,
+            "a flushed head's removal is written"
+        );
+    }
+
+    #[test]
+    fn a_failed_flush_gives_back_what_was_not_undone_since() {
+        let mut taken = Dirty::default();
+        taken.add(head(0, 0, 1, 1, 0));
+        taken.add(head(0, 1, 2, 2, 0));
+        taken.remove(head(0, 9, 10, 9, 0).key());
+        taken.next.insert("a".into());
+        let mut since = Dirty::default();
+        // Sealed after the flush took it: it must not be written.
+        since.remove(head(0, 0, 1, 1, 0).key());
+        since.next.insert("b".into());
+        since.restore(taken);
+        assert_eq!(
+            since.added.keys().copied().collect::<Vec<_>>(),
+            vec![head(0, 1, 2, 2, 0).key()]
+        );
+        assert_eq!(
+            since.removed.iter().copied().collect::<Vec<_>>(),
+            vec![head(0, 9, 10, 9, 0).key()]
+        );
+        assert_eq!(since.next.len(), 2);
+    }
+
+    #[test]
+    fn only_a_flush_writes_and_a_reopen_reads_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let machine = open(dir.path());
+            {
+                let mut state = machine.state.lock().unwrap();
+                state.next.insert("p0".into(), 4);
+                state.dirty.next.insert("p0".into());
+                let seq = state.producers.entry("p0/9".into()).or_default();
+                camus_protocol::idempotence::record(seq, 0, 0, 4, 0);
+                state.dirty.producers.insert("p0/9".into());
+                for head in [head(0, 0, 2, 1, 0), head(0, 2, 4, 2, 0)] {
+                    state.dirty.add(head.clone());
+                    state.heads.insert(head);
+                }
+            }
+            drop(machine);
+            let unflushed = open(dir.path());
+            let state = unflushed.state.lock().unwrap();
+            assert!(state.next.is_empty(), "apply's changes stay in memory");
+            assert_eq!(state.heads.bytes, 0);
+        }
+        let machine = open(dir.path());
+        {
+            let mut state = machine.state.lock().unwrap();
+            state.next.insert("p0".into(), 4);
+            state.dirty.next.insert("p0".into());
+            let seq = state.producers.entry("p0/9".into()).or_default();
+            camus_protocol::idempotence::record(seq, 0, 0, 4, 0);
+            state.dirty.producers.insert("p0/9".into());
+            for head in [head(0, 0, 2, 1, 0), head(0, 2, 4, 2, 0)] {
+                state.dirty.add(head.clone());
+                state.heads.insert(head);
+            }
+        }
+        machine.flush().unwrap();
+        {
+            let mut state = machine.state.lock().unwrap();
+            assert!(state.dirty.is_empty());
+            let sealed = state.heads.remove([7; 16], 0, 0).unwrap();
+            state.dirty.remove(sealed.key());
+        }
+        machine.flush().unwrap();
+        drop(machine);
+        let reopened = open(dir.path());
+        let state = reopened.state.lock().unwrap();
+        assert_eq!(state.next.get("p0"), Some(&4));
+        assert!(state.producers.contains_key("p0/9"));
+        assert_eq!(
+            state
+                .heads
+                .in_commit_order()
+                .map(|head| head.start)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the sealed head's row is gone"
+        );
+        assert!(state.dirty.is_empty());
+    }
+
+    #[test]
+    fn state_from_before_the_key_tables_is_read_and_moved_on_the_next_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // The old shape: offsets and producers inside the state JSON.
+            let db = Database::create(dir.path().join("state.redb")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(META).unwrap();
+                let legacy = serde_json::json!({
+                    "last_applied": null,
+                    "membership": null,
+                    "next": {"p0": 7},
+                    "producers": {"p0/3": {"epoch": 0, "batches": []}},
+                });
+                table.insert(STATE, legacy.to_string().as_str()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let machine = open(dir.path());
+        {
+            let state = machine.state.lock().unwrap();
+            assert_eq!(state.next.get("p0"), Some(&7));
+            assert!(state.producers.contains_key("p0/3"));
+            assert!(
+                state.dirty.next.contains("p0"),
+                "queued to move to its table"
+            );
+        }
+        machine.flush().unwrap();
+        drop(machine);
+        let machine = open(dir.path());
+        let state = machine.state.lock().unwrap();
+        assert_eq!(state.next.get("p0"), Some(&7));
+        assert!(state.producers.contains_key("p0/3"));
+        assert!(state.dirty.is_empty(), "read from the tables now");
+        let txn = machine.db.begin_read().unwrap();
+        let json = txn.open_table(META).unwrap().get(STATE).unwrap().unwrap();
+        assert!(!json.value().contains("\"next\""), "{}", json.value());
     }
 }

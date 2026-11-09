@@ -313,6 +313,29 @@ async fn commit_loop(
     }
 }
 
+/// How often the shard writes what apply changed. Apply itself touches only
+/// memory; this bounds how much of the log a restart re-applies.
+const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Flush the state machine every [`FLUSH_EVERY`], off the async runtime,
+/// until the shard is dropped. A failed flush keeps its changes for the
+/// next one.
+async fn flush_loop(machine: std::sync::Weak<Machine>) {
+    let mut tick = tokio::time::interval(FLUSH_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(machine) = machine.upgrade() else {
+            return;
+        };
+        match tokio::task::spawn_blocking(move || machine.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(%err, "wal state flush failed; retrying"),
+            Err(_) => return,
+        }
+    }
+}
+
 /// Move batches from `ready`, then from the queue, into `group` until it
 /// reaches `GROUP_BYTES` or `MAX_PACKED`.
 fn pack(
@@ -414,6 +437,7 @@ impl Shard {
         let log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
         let log_stats = log.stats();
         let machine = Arc::new(Machine::open(&dir.join("state.redb"), log.clone())?);
+        tokio::spawn(flush_loop(Arc::downgrade(&machine)));
         let raft = Raft::new(node_id, config, network, log, machine.clone()).await?;
         let storage_failed = Arc::new(AtomicBool::new(false));
         let (queue, waiting) = tokio::sync::mpsc::unbounded_channel();
