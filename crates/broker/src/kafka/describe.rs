@@ -334,11 +334,10 @@ impl Kafka {
                 };
                 let mut row = DescribeLogDirsPartition::default();
                 row.partition_index = partition;
-                row.partition_size = state
-                    .extents
-                    .iter()
-                    .map(|extent| i64::from(extent.length))
-                    .sum();
+                row.partition_size = self
+                    .all_extents(&topic, partition, &state)
+                    .map(|extents| extents.iter().map(|extent| i64::from(extent.length)).sum())
+                    .unwrap_or(0);
                 out.partitions.push(row);
             }
             if !out.partitions.is_empty() {

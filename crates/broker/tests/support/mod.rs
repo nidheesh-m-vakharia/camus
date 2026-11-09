@@ -268,16 +268,35 @@ pub fn sealed_end(http: &str) -> i64 {
     part["next_offset"].as_i64().unwrap()
 }
 
-/// Partition 0's extents as `(start, end)` from `http`'s metadata replica.
+/// Every key under `prefix` and its value, from `http`'s metadata replica.
+pub fn scan_keys(http: &str, prefix: &str) -> Vec<(String, String)> {
+    reqwest::blocking::Client::new()
+        .get(format!("http://{http}/admin/scan"))
+        .query(&[("prefix", prefix)])
+        .send()
+        .unwrap()
+        .json()
+        .unwrap()
+}
+
+/// Partition 0's extents as `(start, end)` from `http`'s metadata replica:
+/// from the partition row if it predates extent keys, else from the keys.
 pub fn extents(http: &str) -> Vec<(i64, i64)> {
     let topic: serde_json::Value =
         serde_json::from_str(&read_key(http, &format!("topic/{TOPIC}")).unwrap()).unwrap();
     let id = topic["id"].as_str().unwrap();
     let part: serde_json::Value =
         serde_json::from_str(&read_key(http, &format!("part/{id}/0")).unwrap()).unwrap();
-    part["extents"]
-        .as_array()
-        .unwrap()
+    let legacy = part["extents"].as_array().cloned().unwrap_or_default();
+    let stored: Vec<serde_json::Value> = if legacy.is_empty() {
+        scan_keys(http, &format!("ext/{id}/{:010}/", 0))
+            .into_iter()
+            .map(|(_, raw)| serde_json::from_str(&raw).unwrap())
+            .collect()
+    } else {
+        legacy
+    };
+    stored
         .iter()
         .map(|extent| {
             (
