@@ -4,7 +4,9 @@
 
 mod support;
 
-use support::{kafka_addr, produce, read_all, read_key, single, wait_settled, Opts, TOPIC};
+use support::{
+    create_topic_named, kafka_addr, produce, read_all, read_key, single, wait_settled, Opts, TOPIC,
+};
 
 #[test]
 fn a_single_shard_cluster_places_partitions_on_shard_0_and_routes_by_id() {
@@ -80,6 +82,12 @@ fn a_pre_shard_cluster_restarts_with_its_data_on_shard_0() {
     let mut node = single(dir.path(), Opts::default());
     let (code, offset) = produce(&kafka_addr(&node), "kept");
     assert_eq!(code, 0, "produce");
+    // Metadata applies fsync at most once a second; the rest come back by
+    // replaying the log. This test edits the redb file directly, so make the
+    // rows durable first: a write a second after the last one commits with
+    // fsync, and takes every earlier apply with it.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    create_topic_named(&kafka_addr(&node), "durable", "wal", 1);
     let _ = node.child.kill();
     let _ = node.child.wait();
     drop_shard_fields(dir.path());

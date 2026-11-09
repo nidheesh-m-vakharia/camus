@@ -127,6 +127,9 @@ pub struct HttpFactory;
 pub struct HttpConn {
     target: NodeId,
     addr: String,
+    /// Kept for the connection's life, so RPCs reuse pooled keep-alive
+    /// connections instead of a new TCP handshake each.
+    client: reqwest::Client,
 }
 
 impl RaftNetworkFactory<TypeConfig> for HttpFactory {
@@ -136,6 +139,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpFactory {
         HttpConn {
             target,
             addr: node.addr.clone(),
+            client: reqwest::Client::new(),
         }
     }
 }
@@ -144,25 +148,25 @@ impl RaftNetwork<TypeConfig> for HttpConn {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RpcError> {
-        send(self.target, &self.addr, "raft-append", rpc).await
+        self.send("raft-append", rpc, option).await
     }
 
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<InstallSnapshotResponse<NodeId>, RpcError<InstallSnapshotError>> {
-        send(self.target, &self.addr, "raft-snapshot", rpc).await
+        self.send("raft-snapshot", rpc, option).await
     }
 
     async fn vote(
         &mut self,
         rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RpcError> {
-        send(self.target, &self.addr, "raft-vote", rpc).await
+        self.send("raft-vote", rpc, option).await
     }
     /// Retry an unreachable peer every 100ms. openraft's default is 500ms,
     /// which leaves a restarted broker's replica stale for up to a second.
@@ -171,49 +175,52 @@ impl RaftNetwork<TypeConfig> for HttpConn {
     }
 }
 
-async fn send<Req, Resp, E>(
-    target: NodeId,
-    addr: &str,
-    path: &str,
-    req: Req,
-) -> Result<Resp, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>
-where
-    Req: Serialize,
-    Resp: DeserializeOwned,
-    E: std::error::Error + DeserializeOwned,
-{
-    let url = format!("http://{addr}/{path}");
-    let client = reqwest::Client::new();
-    let body = camus_raft::codec::encode(&req)
-        .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
-    let response = client
-        .post(&url)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            camus_raft::codec::CONTENT_TYPE,
-        )
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| {
-            if err.is_connect() {
-                RPCError::Unreachable(Unreachable::new(&err))
-            } else {
-                RPCError::Network(NetworkError::new(&err))
-            }
-        })?;
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
-    if !status.is_success() {
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        return Err(RPCError::Network(NetworkError::new(
-            &std::io::Error::other(format!("{status}: {text}")),
-        )));
+impl HttpConn {
+    async fn send<Req, Resp, E>(
+        &self,
+        path: &str,
+        req: Req,
+        option: RPCOption,
+    ) -> Result<Resp, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+        E: std::error::Error + DeserializeOwned,
+    {
+        let url = format!("http://{}/{path}", self.addr);
+        let body = camus_raft::codec::encode(&req)
+            .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
+        let response = self
+            .client
+            .post(&url)
+            .timeout(option.hard_ttl())
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                camus_raft::codec::CONTENT_TYPE,
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| {
+                if err.is_connect() {
+                    RPCError::Unreachable(Unreachable::new(&err))
+                } else {
+                    RPCError::Network(NetworkError::new(&err))
+                }
+            })?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
+        if !status.is_success() {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            return Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other(format!("{status}: {text}")),
+            )));
+        }
+        let body: Result<Resp, RaftError<NodeId, E>> = camus_raft::codec::decode(&bytes)
+            .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
+        body.map_err(|err| RPCError::RemoteError(RemoteError::new(self.target, err)))
     }
-    let body: Result<Resp, RaftError<NodeId, E>> = camus_raft::codec::decode(&bytes)
-        .map_err(|err| RPCError::Network(NetworkError::new(&err)))?;
-    body.map_err(|err| RPCError::RemoteError(RemoteError::new(target, err)))
 }

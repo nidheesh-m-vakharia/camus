@@ -737,9 +737,19 @@ pub fn create_topic(controller: &str, durability_mode: &'static str) {
 
 /// Create `TOPIC` with `partitions` partitions.
 pub fn create_topic_with(controller: &str, durability_mode: &'static str, partitions: i32) {
+    create_topic_named(controller, TOPIC, durability_mode, partitions);
+}
+
+/// Create the topic `name` with `partitions` partitions.
+pub fn create_topic_named(
+    controller: &str,
+    name: &'static str,
+    durability_mode: &'static str,
+    partitions: i32,
+) {
     let mut stream = connect(controller);
     let mut created = CreatableTopic::default();
-    created.name = TopicName(StrBytes::from_static_str(TOPIC));
+    created.name = TopicName(StrBytes::from_static_str(name));
     created.num_partitions = partitions;
     created.replication_factor = -1;
     let mut durability = CreatableTopicConfig::default();

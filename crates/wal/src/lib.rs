@@ -166,14 +166,29 @@ pub struct Shard {
     node_id: NodeId,
     storage_failed: Arc<AtomicBool>,
     log_stats: Arc<camus_raft::AppendStats>,
-    queue: tokio::sync::mpsc::UnboundedSender<Queued>,
+    queue: tokio::sync::mpsc::UnboundedSender<Vec<Queued>>,
 }
 
-/// One produce batch waiting for the committer.
+/// One produce batch waiting for the committer. A request's batches for one
+/// shard are sent together, so the committer sees all of them at once.
 type Queued = (
     Append,
     tokio::sync::oneshot::Sender<Result<Response, Failure>>,
 );
+
+/// A batch queued by [`Shard::submit`].
+pub struct Pending(tokio::sync::oneshot::Receiver<Result<Response, Failure>>);
+
+impl Pending {
+    /// Wait until the batch commits on a majority and is applied here.
+    pub async fn wait(self) -> Result<Response, WriteError> {
+        match self.0.await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(failure)) => Err(failure.into()),
+            Err(_) => Err(WriteError::Other(anyhow::anyhow!("wal committer stopped"))),
+        }
+    }
+}
 
 /// A [`WriteError`] that can be handed to every batch in a failed group.
 #[derive(Clone, Debug)]
@@ -211,28 +226,30 @@ const IN_FLIGHT: usize = 2;
 async fn commit_loop(
     raft: Raft<TypeConfig>,
     storage_failed: Arc<AtomicBool>,
-    mut queue: tokio::sync::mpsc::UnboundedReceiver<Queued>,
+    mut queue: tokio::sync::mpsc::UnboundedReceiver<Vec<Queued>>,
 ) {
     let slots = Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT));
-    while let Some(first) = queue.recv().await {
-        let mut size = first.0.raw.len();
-        let mut group = vec![first];
+    // Batches received but not yet packed, in arrival order. A request's
+    // batches arrive as one chunk; a chunk larger than a group spills into
+    // the next one.
+    let mut ready = std::collections::VecDeque::new();
+    loop {
+        if ready.is_empty() {
+            let Some(chunk) = queue.recv().await else {
+                return;
+            };
+            ready.extend(chunk);
+        }
+        let mut size = 0;
+        let mut group = Vec::new();
         // Pack before taking a slot. With two commits allowed, the queue
         // still fills to `GROUP_BYTES` while both slots are busy, and a free
         // slot then flushes that whole pack instead of the next single batch.
-        while size < GROUP_BYTES && group.len() < machine::MAX_PACKED {
-            let Ok(next) = queue.try_recv() else { break };
-            size += next.0.raw.len();
-            group.push(next);
-        }
+        pack(&mut queue, &mut ready, &mut group, &mut size);
         let Ok(slot) = slots.clone().acquire_owned().await else {
             return;
         };
-        while size < GROUP_BYTES && group.len() < machine::MAX_PACKED {
-            let Ok(next) = queue.try_recv() else { break };
-            size += next.0.raw.len();
-            group.push(next);
-        }
+        pack(&mut queue, &mut ready, &mut group, &mut size);
         let (appends, waiters): (Vec<_>, Vec<_>) = group.into_iter().unzip();
         let command = if appends.len() == 1 {
             Command::Append(appends.into_iter().next().expect("one append"))
@@ -293,6 +310,26 @@ async fn commit_loop(
                 let _ = waiter.send(result);
             }
         });
+    }
+}
+
+/// Move batches from `ready`, then from the queue, into `group` until it
+/// reaches `GROUP_BYTES` or `MAX_PACKED`.
+fn pack(
+    queue: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<Queued>>,
+    ready: &mut std::collections::VecDeque<Queued>,
+    group: &mut Vec<Queued>,
+    size: &mut usize,
+) {
+    while *size < GROUP_BYTES && group.len() < machine::MAX_PACKED {
+        if ready.is_empty() {
+            let Ok(chunk) = queue.try_recv() else { break };
+            ready.extend(chunk);
+            continue;
+        }
+        let next = ready.pop_front().expect("ready batch");
+        *size += next.0.raw.len();
+        group.push(next);
     }
 }
 
@@ -504,18 +541,29 @@ impl Shard {
     /// leader has applied it. Concurrent calls share one entry and one
     /// quorum fsync.
     pub async fn append(&self, batch: Append) -> Result<Response, WriteError> {
+        let mut pending = self.submit(vec![batch])?;
+        pending.pop().expect("one pending").wait().await
+    }
+
+    /// Queue these batches, in order, without waiting for them to commit.
+    /// They reach the committer together, so batches that fit in one group
+    /// share one entry and one quorum fsync. Each [`Pending`] resolves like
+    /// [`Shard::append`]; dropping one does not withdraw its batch.
+    pub fn submit(&self, batches: Vec<Append>) -> Result<Vec<Pending>, WriteError> {
         if !self.is_leader() {
             return Err(WriteError::NotLeader);
         }
-        let (done, wait) = tokio::sync::oneshot::channel();
+        let (chunk, pending): (Vec<_>, Vec<_>) = batches
+            .into_iter()
+            .map(|batch| {
+                let (done, wait) = tokio::sync::oneshot::channel();
+                ((batch, done), Pending(wait))
+            })
+            .unzip();
         self.queue
-            .send((batch, done))
+            .send(chunk)
             .map_err(|_| WriteError::Other(anyhow::anyhow!("wal committer stopped")))?;
-        match wait.await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(failure)) => Err(failure.into()),
-            Err(_) => Err(WriteError::Other(anyhow::anyhow!("wal committer stopped"))),
-        }
+        Ok(pending)
     }
 
     /// Whether a log or state-machine write has failed on this shard.
