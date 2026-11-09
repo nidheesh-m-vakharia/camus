@@ -255,6 +255,12 @@ and usable bytes are unknown (-1). DescribeProducers lists producers whose
 sequence state is sealed in metadata, with `last_timestamp` and
 `coordinator_epoch` of -1. ConsumerGroupDescribe answers for KIP-848 groups;
 a classic or unknown group is `GROUP_ID_NOT_FOUND` (69).
+AlterPartitionReassignments, ListPartitionReassignments, and
+AlterReplicaLogDirs stay unimplemented: a partition's replicas are the voters
+of its WAL shard, not a placement that can be moved on its own. Client quotas
+stay unimplemented; throttling is internal and there is no byte-rate quota
+API. Delegation tokens, client telemetry, and UpdateFeatures stay
+unimplemented.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
 `UNSUPPORTED_VERSION` (35), and the connection stays open. A version the
@@ -324,7 +330,7 @@ acceptance test. `-` means not run.
 | ListTransactions | 66 | 5 | 0-2 | implemented | pass | - | pass |
 | AllocateProducerIds | 67 | | broker-internal | unimplemented | - | - | - |
 | ConsumerGroupHeartbeat | 68 | 3 | 0-1 | implemented | pass | - | - |
-| ConsumerGroupDescribe | 69 | 3 | 0-1 | implemented | - | - | - |
+| ConsumerGroupDescribe | 69 | 3 | 0-1 | implemented | pass | - | - |
 | GetTelemetrySubscriptions | 71 | | not planned | unimplemented | - | - | - |
 | PushTelemetry | 72 | | not planned | unimplemented | - | - | - |
 | ListClientMetricsResources | 74 | | not planned | unimplemented | - | - | - |

@@ -43,10 +43,21 @@ async fn single_node_write_survives_restart() {
     assert_eq!(node.read_local("topic").unwrap().as_deref(), Some("events"));
     node.shutdown().await.unwrap();
     drop(node);
-
-    let node = MetadataNode::open(1, dir.path(), "127.0.0.1:1")
-        .await
-        .unwrap();
+    // Raft's tasks can still hold the database for a moment after shutdown.
+    let mut node = None;
+    for _ in 0..50 {
+        match MetadataNode::open(1, dir.path(), "127.0.0.1:1").await {
+            Ok(opened) => {
+                node = Some(opened);
+                break;
+            }
+            Err(err) if err.to_string().contains("already open") => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
+    let node = node.expect("the database stayed locked after shutdown");
     assert_eq!(node.read_local("topic").unwrap().as_deref(), Some("events"));
     node.shutdown().await.unwrap();
 }
