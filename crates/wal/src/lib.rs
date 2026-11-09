@@ -167,6 +167,8 @@ pub struct Shard {
     storage_failed: Arc<AtomicBool>,
     log_stats: Arc<camus_raft::AppendStats>,
     queue: tokio::sync::mpsc::UnboundedSender<Vec<Queued>>,
+    /// [`QUEUE_BYTES`] of permits, one per byte.
+    budget: Arc<tokio::sync::Semaphore>,
     /// The shard's background loop stops once this is dropped.
     _alive: Arc<()>,
 }
@@ -176,7 +178,26 @@ pub struct Shard {
 type Queued = (
     Append,
     tokio::sync::oneshot::Sender<Result<Response, Failure>>,
+    Budget,
 );
+
+/// A share of a shard's queue budget, released when every batch it covers
+/// has its result.
+type Budget = Arc<tokio::sync::OwnedSemaphorePermit>;
+
+/// Bytes of batches a shard holds between `submit` and their result: queued,
+/// packed or committing. `submit` waits for room, in arrival order, so a
+/// producer that does not wait for acks cannot grow memory without bound.
+const QUEUE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Woken whenever any shard applies a seal, which frees unsealed bytes.
+static SEALED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// A future that completes at the next seal applied on any shard. Enable it
+/// before checking the condition it waits for, so no seal is missed.
+pub fn sealed() -> tokio::sync::futures::Notified<'static> {
+    SEALED.notified()
+}
 
 /// A batch queued by [`Shard::submit`].
 pub struct Pending(tokio::sync::oneshot::Receiver<Result<Response, Failure>>);
@@ -252,7 +273,14 @@ async fn commit_loop(
             return;
         };
         pack(&mut queue, &mut ready, &mut group, &mut size);
-        let (appends, waiters): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+        let mut appends = Vec::with_capacity(group.len());
+        let mut waiters = Vec::with_capacity(group.len());
+        let mut budgets = Vec::with_capacity(group.len());
+        for (append, waiter, budget) in group {
+            appends.push(append);
+            waiters.push(waiter);
+            budgets.push(budget);
+        }
         let command = if appends.len() == 1 {
             Command::Append(appends.into_iter().next().expect("one append"))
         } else {
@@ -263,6 +291,8 @@ async fn commit_loop(
         let flag = storage_failed.clone();
         tokio::spawn(async move {
             let _slot = slot;
+            // Dropped once this task has sent every result.
+            let _budgets = budgets;
             let failure = |failure: Failure, waiters: Vec<_>| {
                 for waiter in waiters {
                     let _: Result<(), _> =
@@ -494,6 +524,7 @@ impl Shard {
             storage_failed,
             log_stats,
             queue,
+            budget: Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTES)),
             _alive: alive,
         })
     }
@@ -611,23 +642,34 @@ impl Shard {
     /// leader has applied it. Concurrent calls share one entry and one
     /// quorum fsync.
     pub async fn append(&self, batch: Append) -> Result<Response, WriteError> {
-        let mut pending = self.submit(vec![batch])?;
+        let mut pending = self.submit(vec![batch]).await?;
         pending.pop().expect("one pending").wait().await
     }
 
     /// Queue these batches, in order, without waiting for them to commit.
     /// They reach the committer together, so batches that fit in one group
     /// share one entry and one quorum fsync. Each [`Pending`] resolves like
-    /// [`Shard::append`]; dropping one does not withdraw its batch.
-    pub fn submit(&self, batches: Vec<Append>) -> Result<Vec<Pending>, WriteError> {
+    /// [`Shard::append`]; dropping one does not withdraw its batch. Waits
+    /// first while the shard holds [`QUEUE_BYTES`] of batches.
+    pub async fn submit(&self, batches: Vec<Append>) -> Result<Vec<Pending>, WriteError> {
         if !self.is_leader() {
             return Err(WriteError::NotLeader);
         }
+        let bytes: usize = batches.iter().map(|batch| batch.raw.len()).sum();
+        // One batch larger than the budget takes all of it.
+        let permits = u32::try_from(bytes.min(QUEUE_BYTES)).unwrap_or(u32::MAX);
+        let budget: Budget = Arc::new(
+            self.budget
+                .clone()
+                .acquire_many_owned(permits)
+                .await
+                .map_err(|_| WriteError::Other(anyhow::anyhow!("wal committer stopped")))?,
+        );
         let (chunk, pending): (Vec<_>, Vec<_>) = batches
             .into_iter()
             .map(|batch| {
                 let (done, wait) = tokio::sync::oneshot::channel();
-                ((batch, done), Pending(wait))
+                ((batch, done, budget.clone()), Pending(wait))
             })
             .unzip();
         self.queue

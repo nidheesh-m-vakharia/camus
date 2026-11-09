@@ -796,6 +796,7 @@ fn apply_at(state: &mut State, command: Command, log_index: u64, pos: u32) -> Re
                     state.dirty.remove(head.key());
                 }
             }
+            crate::SEALED.notify_waiters();
             Response {
                 base_offset: -1,
                 error_code: 0,
