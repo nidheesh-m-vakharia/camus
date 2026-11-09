@@ -35,6 +35,8 @@ fn wal_shard_survives_losing_the_leader_then_a_follower() {
         6,
         "a follower answers NOT_LEADER_OR_FOLLOWER"
     );
+    // And until the leader has, or its first produce finds no topic.
+    partition_leader(&leader_addr, None);
     let mut acked = Vec::new();
     for index in 0..5 {
         let value = format!("v{index}");

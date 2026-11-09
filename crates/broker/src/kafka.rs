@@ -3254,6 +3254,17 @@ impl Kafka {
                         return row;
                     }
                 };
+                // The WAL and metadata are separate Raft groups. This broker
+                // can apply a seal, which drops batches from the WAL, before
+                // it applies the publish that puts them in `sealed`. Then the
+                // first unsealed batch starts past the sealed end, and
+                // serving it would skip the batches in between. Serve nothing
+                // from the WAL until metadata catches up; the fetch retries.
+                let extra = if first_base(&extra).is_some_and(|base| base > sealed.max(offset)) {
+                    Vec::new()
+                } else {
+                    extra
+                };
                 let extra = if isolation == 1 {
                     filter_txn(&extra, &state, &mut stable)
                 } else {
@@ -3610,8 +3621,11 @@ struct ConfigView {
     source: i8,
 }
 
-/// `NoteTxn` applies the abort and reports the Kafka code in `value` when the
-/// batch cannot join the transaction. A normal success leaves `value` empty.
+/// Base offset of the first batch in `records`, if there is one.
+fn first_base(records: &[u8]) -> Option<i64> {
+    Some(i64::from_be_bytes(records.get(..8)?.try_into().ok()?))
+}
+
 /// The produce error code for a WAL write that did not commit.
 fn wal_error_code(shard: &Shard, err: WriteError) -> i16 {
     match err {
@@ -3643,6 +3657,8 @@ struct WalProduce {
     deadline: Instant,
 }
 
+/// `NoteTxn` applies the abort and reports the Kafka code in `value` when the
+/// batch cannot join the transaction. A normal success leaves `value` empty.
 fn noted_error(applied: &anyhow::Result<camus_metadata::Response>) -> Option<i16> {
     match applied {
         Ok(response) if response.error_code != 0 => Some(response.error_code),
