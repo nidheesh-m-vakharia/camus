@@ -18,6 +18,7 @@ async fn put_range_and_delete() {
         region: "us-east-1".into(),
         access_key: "camus".into(),
         secret_key: "camus-dev-secret".into(),
+        prefix: String::new(),
     })
     .unwrap();
 
@@ -38,4 +39,42 @@ async fn put_range_and_delete() {
 
     bucket.delete(&key).await.unwrap();
     assert!(bucket.is_missing(&key).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_prefix_namespaces_keys_and_list_strips_it() {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        eprintln!("skipping MinIO test; set CAMUS_MINIO=1");
+        return;
+    }
+    let connect = |prefix: String| {
+        Bucket::connect(&BucketConfig {
+            endpoint: std::env::var("CAMUS_S3_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),
+            bucket: "camus".into(),
+            region: "us-east-1".into(),
+            access_key: "camus".into(),
+            secret_key: "camus-dev-secret".into(),
+            prefix,
+        })
+        .unwrap()
+    };
+    let cluster = format!("cluster-{}", std::process::id());
+    let scoped = connect(cluster.clone());
+    let root = connect(String::new());
+    scoped
+        .put_new("bundle/a.seg", Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    let listed = scoped.list("bundle/").await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, "bundle/a.seg");
+    assert_eq!(listed[0].1, 3);
+    assert!(!root
+        .is_missing(&format!("{cluster}/bundle/a.seg"))
+        .await
+        .unwrap());
+    assert!(root.is_missing("bundle/a.seg").await.unwrap());
+    scoped.delete("bundle/a.seg").await.unwrap();
+    assert!(scoped.list("bundle/").await.unwrap().is_empty());
 }

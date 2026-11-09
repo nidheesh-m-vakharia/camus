@@ -343,6 +343,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "camus-compactor",
  "camus-coordinator",
  "camus-metadata",
  "camus-protocol",
@@ -380,6 +381,10 @@ dependencies = [
 [[package]]
 name = "camus-compactor"
 version = "0.1.0"
+dependencies = [
+ "camus-metadata",
+ "ulid",
+]
 
 [[package]]
 name = "camus-coordinator"
@@ -455,6 +460,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures",
  "object_store",
  "tokio",
  "url",
