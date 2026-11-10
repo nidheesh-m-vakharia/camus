@@ -349,6 +349,31 @@ fn shard_count_for(voters: usize, cores: u32) -> u32 {
     rounded.min(voters.saturating_mul(8)).max(1)
 }
 
+/// The local disk tier of the read cache (ADR 0010): at most
+/// `CAMUS_READ_DISK_CACHE_BYTES` (4 GiB) in `CAMUS_READ_DISK_CACHE_ENTRIES`
+/// (65536) files. A size of 0 turns it off, and a cache that cannot be opened
+/// is left off with a warning.
+fn open_disk_cache(dir: &std::path::Path) -> Option<camus_storage::DiskCache> {
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let bytes = env("CAMUS_READ_DISK_CACHE_BYTES").unwrap_or(4 * 1024 * 1024 * 1024);
+    let entries = env("CAMUS_READ_DISK_CACHE_ENTRIES").unwrap_or(65_536);
+    if bytes == 0 || entries == 0 {
+        return None;
+    }
+    let entries = usize::try_from(entries).unwrap_or(usize::MAX);
+    match camus_storage::DiskCache::open(dir, bytes, entries) {
+        Ok(cache) => Some(cache),
+        Err(err) => {
+            tracing::warn!(path = %dir.display(), %err, "read disk cache is off");
+            None
+        }
+    }
+}
+
 /// `{data_dir}/wal`, or a directory on local NVMe when that path is a
 /// rotating disk and an NVMe filesystem is mounted. An explicit `--wal-dir`
 /// is used as given.
@@ -1188,7 +1213,7 @@ async fn start_kafka(
     if require_sasl && (user.is_empty() || password.is_empty()) {
         anyhow::bail!("SASL requires CAMUS_SASL_USER and CAMUS_SASL_PASSWORD");
     }
-    let kafka = Arc::new(kafka::Kafka::new(
+    let kafka = kafka::Kafka::new(
         node,
         bucket,
         i32::try_from(node_id)?,
@@ -1199,7 +1224,11 @@ async fn start_kafka(
         password,
         tls,
         wal,
-    ));
+    );
+    let kafka = Arc::new(match open_disk_cache(&args.data_dir.join("read-cache")) {
+        Some(cache) => kafka.with_disk_cache(cache),
+        None => kafka,
+    });
     info!(%bound, sasl = require_sasl, "kafka listener");
     tokio::spawn(async move { kafka.run(listener).await });
     Ok(())

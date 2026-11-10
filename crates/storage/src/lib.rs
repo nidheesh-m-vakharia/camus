@@ -7,6 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+mod disk_cache;
+
+pub use disk_cache::DiskCache;
+
 use std::ops::Range;
 use std::sync::Arc;
 
