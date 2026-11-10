@@ -94,6 +94,18 @@ fn produce_and_fetch_cost_with_many_extents() {
         fetch_at(&mut stream, built - 1);
         fetched.push(at.elapsed());
     }
+    // A consumer catching up from the start reads every extent.
+    let cold = Instant::now();
+    assert!(read_all(&addr, built).len() >= built as usize);
+    let cold = cold.elapsed();
+    let warm = Instant::now();
+    assert!(read_all(&addr, built).len() >= built as usize);
+    let warm = warm.elapsed();
+    println!(
+        "catch-up read of {built} batches: first {:.0} ms, again {:.0} ms",
+        cold.as_secs_f64() * 1000.0,
+        warm.as_secs_f64() * 1000.0
+    );
     produced.sort();
     fetched.sort();
     println!("| Request | Samples | p50 ms | p99 ms |");

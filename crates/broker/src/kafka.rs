@@ -47,6 +47,7 @@ use camus_protocol::protocol::{decode_request_header_from_buffer, Decodable, Str
 use camus_storage::Bucket;
 use camus_uploader::{self, Piece};
 use camus_wal::{Append, SealDrop, Shard, WriteError};
+use futures::StreamExt;
 
 use crate::slot::WalSlot;
 
@@ -69,6 +70,12 @@ const MAX_FRAME: usize = 100 * 1024 * 1024;
 /// Sealed extents read from metadata at a time. Each read is one bounded
 /// range of keys, so a request's cost does not grow with the partition's age.
 const EXTENT_PAGE: usize = 256;
+/// Sealed ranges one partition's fetch reads from object storage at once.
+const EXTENT_READS: usize = 4;
+/// Partitions one fetch reads at once.
+const FETCH_PARTITIONS: usize = 8;
+/// Default memory for recently read sealed ranges, per broker.
+const READ_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH: usize = batch::MAX_BATCH_CEILING;
 const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 /// Most unsealed bytes one upload pass takes: up to four objects of
@@ -346,6 +353,8 @@ pub struct Kafka {
     /// partition it waits on, removed when it returns, so this holds only
     /// fetches in flight.
     arrivals: std::sync::Mutex<Arrivals>,
+    /// Recently read sealed ranges (`CAMUS_READ_CACHE_BYTES`).
+    read_cache: camus_storage::ReadCache,
     /// Parsed ACLs and the metadata ACL version they were read at.
     acl_cache: std::sync::RwLock<Option<(u64, Arc<camus_metadata::AclSet>)>>,
     flush_lock: Mutex<()>,
@@ -494,6 +503,12 @@ impl Kafka {
             flush_now: tokio::sync::Notify::new(),
             arrivals: std::sync::Mutex::new(Arrivals::new()),
             acl_cache: std::sync::RwLock::new(None),
+            read_cache: camus_storage::ReadCache::new(
+                std::env::var("CAMUS_READ_CACHE_BYTES")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(READ_CACHE_BYTES),
+            ),
             flush_lock: Mutex::new(()),
         }
     }
@@ -725,6 +740,17 @@ impl Kafka {
             .read_local(&camus_metadata::topic_storage_key(name))
             .ok()??;
         camus_metadata::parse_topic(&raw).ok()
+    }
+
+    /// `range` of the sealed object `key`, from the read cache or else from
+    /// object storage, kept for the next reader.
+    async fn sealed_range(&self, key: &str, range: std::ops::Range<u64>) -> anyhow::Result<Bytes> {
+        if let Some(bytes) = self.read_cache.get(key, &range) {
+            return Ok(bytes);
+        }
+        let bytes = self.bucket.get_range(key, range.clone()).await?;
+        self.read_cache.insert(key, &range, bytes.clone());
+        Ok(bytes)
     }
 
     /// Up to `limit` sealed extents of `partition` that end after `after`, in
@@ -3390,8 +3416,13 @@ impl Kafka {
                 }
                 for partition in &topic.partitions {
                     watching.add((name.clone(), partition.partition));
-                    let row = self
-                        .fetch_partition(
+                }
+                // Several partitions at once, answered in request order.
+                let pending: Vec<_> = topic
+                    .partitions
+                    .iter()
+                    .map(|partition| {
+                        self.fetch_partition(
                             stored.as_ref(),
                             partition.partition,
                             partition.current_leader_epoch,
@@ -3399,7 +3430,13 @@ impl Kafka {
                             partition.partition_max_bytes,
                             request.isolation_level,
                         )
-                        .await;
+                    })
+                    .collect();
+                let rows: Vec<PartitionData> = futures::stream::iter(pending)
+                    .buffered(FETCH_PARTITIONS)
+                    .collect()
+                    .await;
+                for row in rows {
                     bytes += row.records.as_ref().map_or(0, |records| records.len());
                     topic_response.partitions.push(row);
                 }
@@ -3476,18 +3513,23 @@ impl Kafka {
                     return row;
                 };
                 let full = page.len() == EXTENT_PAGE;
-                for extent in &page {
-                    after = extent.end;
-                    // A compacted range whose records all expired has no bytes.
-                    if extent.end <= offset || extent.length == 0 {
-                        continue;
-                    }
-                    let end = extent.file_offset + u64::from(extent.length);
-                    let Ok(bytes) = self
-                        .bucket
-                        .get_range(&extent.key, extent.file_offset..end)
-                        .await
-                    else {
+                if let Some(last) = page.last() {
+                    after = last.end;
+                }
+                // Up to `EXTENT_READS` reads ahead, consumed in offset order;
+                // those still in flight when the fetch fills are dropped.
+                // A compacted range whose records all expired has no bytes.
+                let pending: Vec<_> = page
+                    .iter()
+                    .filter(|extent| extent.end > offset && extent.length > 0)
+                    .map(|extent| {
+                        let end = extent.file_offset + u64::from(extent.length);
+                        self.sealed_range(&extent.key, extent.file_offset..end)
+                    })
+                    .collect();
+                let mut reads = futures::stream::iter(pending).buffered(EXTENT_READS);
+                while let Some(read) = reads.next().await {
+                    let Ok(bytes) = read else {
                         row.error_code = STORAGE;
                         return row;
                     };
@@ -3680,8 +3722,7 @@ impl Kafka {
                 }
                 let end = extent.file_offset + u64::from(extent.length);
                 let Ok(bytes) = self
-                    .bucket
-                    .get_range(&extent.key, extent.file_offset..end)
+                    .sealed_range(&extent.key, extent.file_offset..end)
                     .await
                 else {
                     row.error_code = STORAGE;

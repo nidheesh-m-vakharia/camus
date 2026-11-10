@@ -172,6 +172,91 @@ impl Bucket {
     }
 }
 
+/// Recently read byte ranges of sealed objects, up to a fixed number of
+/// bytes, least recently used first out. An object is never rewritten under
+/// its key, so a cached range never goes stale.
+pub struct ReadCache {
+    cap: usize,
+    inner: std::sync::Mutex<CacheInner>,
+}
+
+type RangeKey = (String, u64, u64);
+
+#[derive(Default)]
+struct CacheInner {
+    entries: std::collections::HashMap<RangeKey, (Bytes, u64)>,
+    /// Use stamp to key, oldest first.
+    order: std::collections::BTreeMap<u64, RangeKey>,
+    bytes: usize,
+    next: u64,
+}
+
+impl ReadCache {
+    /// A cache holding at most `cap` bytes. `0` keeps nothing.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            inner: std::sync::Mutex::new(CacheInner::default()),
+        }
+    }
+
+    /// The cache's state. A panic while it was held may have left the maps
+    /// out of step with each other, so a poisoned cache starts again empty.
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            let mut inner = poisoned.into_inner();
+            *inner = CacheInner::default();
+            self.inner.clear_poison();
+            inner
+        })
+    }
+
+    /// The cached bytes of `key` at `range`, if held.
+    pub fn get(&self, key: &str, range: &Range<u64>) -> Option<Bytes> {
+        let mut inner = self.lock();
+        let id = (key.to_string(), range.start, range.end);
+        let stamp = inner.next;
+        let (bytes, used) = inner.entries.get_mut(&id)?;
+        let bytes = bytes.clone();
+        let old = std::mem::replace(used, stamp);
+        inner.next += 1;
+        inner.order.remove(&old);
+        inner.order.insert(stamp, id);
+        Some(bytes)
+    }
+
+    /// Keep `bytes` for `key` at `range`, evicting the least recently used
+    /// ranges to stay within the cap. A range larger than the cap is not kept.
+    pub fn insert(&self, key: &str, range: &Range<u64>, bytes: Bytes) {
+        if bytes.len() > self.cap {
+            return;
+        }
+        let mut inner = self.lock();
+        let id = (key.to_string(), range.start, range.end);
+        if inner.entries.contains_key(&id) {
+            return;
+        }
+        let stamp = inner.next;
+        inner.next += 1;
+        inner.bytes += bytes.len();
+        inner.order.insert(stamp, id.clone());
+        inner.entries.insert(id, (bytes, stamp));
+        while inner.bytes > self.cap {
+            let Some((_, oldest)) = inner.order.pop_first() else {
+                break;
+            };
+            if let Some((evicted, _)) = inner.entries.remove(&oldest) {
+                inner.bytes -= evicted.len();
+            }
+        }
+    }
+
+    /// Bytes held now.
+    pub fn bytes(&self) -> usize {
+        self.lock().bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::virtual_host_endpoint;
@@ -188,5 +273,44 @@ mod tests {
             virtual_host_endpoint("https://camus-abc.t3.storageapi.dev/extra", "camus-abc")
                 .unwrap();
         assert_eq!(endpoint, "https://camus-abc.t3.storageapi.dev");
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn bytes(len: usize) -> Bytes {
+        Bytes::from(vec![7u8; len])
+    }
+
+    #[test]
+    fn the_least_recently_used_range_goes_first_and_the_cap_holds() {
+        let cache = ReadCache::new(30);
+        cache.insert("a", &(0..10), bytes(10));
+        cache.insert("b", &(0..10), bytes(10));
+        cache.insert("c", &(0..10), bytes(10));
+        // Reading `a` makes `b` the oldest.
+        assert!(cache.get("a", &(0..10)).is_some());
+        cache.insert("d", &(0..10), bytes(10));
+        assert!(cache.get("b", &(0..10)).is_none(), "evicted");
+        assert!(cache.get("a", &(0..10)).is_some());
+        assert!(cache.get("c", &(0..10)).is_some());
+        assert!(cache.get("d", &(0..10)).is_some());
+        assert_eq!(cache.bytes(), 30);
+    }
+
+    #[test]
+    fn a_range_is_keyed_by_its_offsets_and_one_over_the_cap_is_not_kept() {
+        let cache = ReadCache::new(16);
+        cache.insert("a", &(0..10), bytes(10));
+        assert!(cache.get("a", &(0..9)).is_none());
+        assert!(cache.get("a", &(10..20)).is_none());
+        cache.insert("big", &(0..17), bytes(17));
+        assert!(cache.get("big", &(0..17)).is_none());
+        assert_eq!(cache.bytes(), 10);
+        let off = ReadCache::new(0);
+        off.insert("a", &(0..1), bytes(1));
+        assert!(off.get("a", &(0..1)).is_none());
     }
 }

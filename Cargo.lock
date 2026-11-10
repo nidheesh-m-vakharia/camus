@@ -353,6 +353,7 @@ dependencies = [
  "camus-uploader",
  "camus-wal",
  "clap",
+ "futures",
  "openraft",
  "rcgen",
  "redb",
