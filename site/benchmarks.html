@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Benchmarks — Camus</title>
+  <meta name="description" content="Preliminary latency, throughput and memory numbers for Camus, from one laptop with MinIO on the same machine.">
+  <link rel="canonical" href="https://camus.nidheesh.dev/benchmarks">
+  <meta name="robots" content="index,follow">
+  <meta property="og:site_name" content="Camus">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Benchmarks — Camus">
+  <meta property="og:description" content="Preliminary latency, throughput and memory numbers for Camus, from one laptop with MinIO on the same machine.">
+  <meta property="og:url" content="https://camus.nidheesh.dev/benchmarks">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Benchmarks — Camus">
+  <meta name="twitter:description" content="Preliminary latency, throughput and memory numbers for Camus, from one laptop with MinIO on the same machine.">
+  <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="fonts/Pollen-variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li>
+          <a href="index.html">Intro</a>
+        </li>
+        <li>
+          <a href="why.html">Why</a>
+        </li>
+        <li>
+          <a href="run.html">Run</a>
+        </li>
+        <li>
+          <a href="clients.html">Clients</a>
+        </li>
+        <li>
+          <a href="durability.html">Durability</a>
+        </li>
+        <li>
+          <a href="benchmarks.html" aria-current="page">Benchmarks</a>
+        </li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <aside class="notice" aria-label="Preliminary results">
+        <p>These benchmarks are preliminary. They were run on one laptop, with the object store on the same machine. Benchmarks over a real network, against real object storage, are coming.</p>
+      </aside>
+      <header class="hero entrance">
+        <h1 style="--n: 0">What one machine measured.</h1>
+      </header>
+
+      <p class="lede">Latency and throughput for a produce, memory per broker, and the costs that changed in the last round of performance work. Each table compares the newest run with an earlier one. The full output is in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/Benchmarks/README.md">Benchmarks README</a>.</p>
+      <h2>Setup</h2>
+      <p>2026-11-10, commit <span class="ports">56f0c3a</span>. Apple M4 Pro, macOS, APFS on the internal SSD. Release build. MinIO in Docker on the same machine. The machine was otherwise idle, and each benchmark ran once.</p>
+      <p>The baseline is 2026-11-05, commit <span class="ports">97cd9f3</span>, on the same machine. All brokers share one SSD, and on macOS <code>fsync</code> is a full device flush. Numbers with three brokers are pessimistic for that reason.</p>
+      <h2>Latency, 3 brokers</h2>
+      <p>One producer sends 1 KiB records with <code>acks=all</code> and waits for each acknowledgement. <code>wal</code> answers after a disk majority has the batch. <code>r2</code> answers after the object is stored. See <a href="durability.html">durability</a>.</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Mode</th><th class="num">Samples</th><th class="num">p50 ms</th><th class="num">p99 ms</th><th class="num">max ms</th><th class="num">Baseline p50 / p99 / max</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>wal</code></td><td class="num">2000</td><td class="num">11.11</td><td class="num">27.07</td><td class="num">42.96</td><td class="num">11.06 / 31.06 / 38.03</td></tr>
+            <tr><td><code>r2</code></td><td class="num">100</td><td class="num">265.82</td><td class="num">280.20</td><td class="num">284.94</td><td class="num">278.40 / 284.75 / 285.28</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h2>Throughput</h2>
+      <p>Each producer sends batches of 16 records of 1 KiB with <code>acks=all</code> for 10 seconds. The 3-broker runs use one WAL shard. fsyncs per ack shows how many acknowledgements share one disk flush. Lower means more sharing.</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th class="num">Brokers</th><th class="num">Producers</th><th class="num">MiB/s</th><th class="num">p50 ms</th><th class="num">p99 ms</th><th class="num">fsyncs/ack</th><th class="num">Baseline MiB/s</th><th class="num">Baseline p50 / p99</th><th class="num">Baseline fsyncs/ack</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="num">3</td><td class="num">1</td><td class="num">1.3</td><td class="num">11.13</td><td class="num">28.96</td><td class="num">1.03</td><td class="num">1.3</td><td class="num">11.06 / 32.21</td><td class="num">1.03</td></tr>
+            <tr><td class="num">3</td><td class="num">8</td><td class="num">4.1</td><td class="num">29.17</td><td class="num">49.03</td><td class="num">0.39</td><td class="num">4.8</td><td class="num">24.06 / 51.47</td><td class="num">0.26</td></tr>
+            <tr><td class="num">3</td><td class="num">32</td><td class="num">15.6</td><td class="num">30.92</td><td class="num">51.96</td><td class="num">0.10</td><td class="num">15.3</td><td class="num">30.05 / 60.23</td><td class="num">0.06</td></tr>
+            <tr><td class="num">1</td><td class="num">1</td><td class="num">3.8</td><td class="num">4.00</td><td class="num">10.08</td><td class="num">1.01</td><td class="num">2.6</td><td class="num">5.65 / 12.53</td><td class="num">1.02</td></tr>
+            <tr><td class="num">1</td><td class="num">8</td><td class="num">9.2</td><td class="num">14.06</td><td class="num">24.06</td><td class="num">0.43</td><td class="num">12.8</td><td class="num">9.07 / 20.84</td><td class="num">0.25</td></tr>
+            <tr><td class="num">1</td><td class="num">32</td><td class="num">27.7</td><td class="num">17.98</td><td class="num">28.23</td><td class="num">0.12</td><td class="num">42.2</td><td class="num">11.09 / 22.60</td><td class="num">0.06</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Three runs are slower than the baseline: 1 broker with 8 and with 32 producers, and 3 brokers with 8 producers. That drop is older than the work measured below. Main just before that work, commit <span class="ports">9687151</span>, measured the same on 1 broker: 8.9 and 9.4 MiB/s with 8 producers, 27.2 and 28.6 MiB/s with 32, with the same fsyncs per ack. The change came in between the baseline and <a href="https://github.com/nidheesh-m-vakharia/camus/pull/93">#93</a>, and it is being bisected.</p>
+      <h2>Memory</h2>
+      <p>Resident memory of the broker serving produce, from <code>ps</code>. Peak is the highest reading, sampled every 20 ms. After is the mean over 2 seconds, starting 3 seconds after the load stopped.</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Run</th><th class="num">Peak MiB</th><th class="num">After MiB</th><th class="num">Baseline peak MiB</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Latency <code>wal</code>, 3 brokers</td><td class="num">29.3</td><td class="num">29.3</td><td class="num">30.8</td></tr>
+            <tr><td>Latency <code>r2</code>, 3 brokers</td><td class="num">22.4</td><td class="num"></td><td class="num">22.6</td></tr>
+            <tr><td>3 brokers, 1 producer</td><td class="num">37.2</td><td class="num"></td><td class="num">29.9</td></tr>
+            <tr><td>3 brokers, 8 producers</td><td class="num">41.6</td><td class="num"></td><td class="num">47.0</td></tr>
+            <tr><td>3 brokers, 32 producers</td><td class="num">177.7</td><td class="num">152.8</td><td class="num">232.1</td></tr>
+            <tr><td>1 broker, 1 producer</td><td class="num">45.2</td><td class="num"></td><td class="num">34.5</td></tr>
+            <tr><td>1 broker, 8 producers</td><td class="num">148.2</td><td class="num">151.5</td><td class="num">202.4</td></tr>
+            <tr><td>1 broker, 32 producers</td><td class="num">273.6</td><td class="num">263.2</td><td class="num">652.0</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Idle was 20.7 MiB in the <code>wal</code> latency run. Followers peaked at 36.7 to 38.4 MiB in the heaviest 3-broker run.</p>
+      <h2>Costs changed in #117 to #128</h2>
+      <p>These benchmarks were added with the changes they measure. Each "before" comes from that pull request's own run, on a different day, so read the comparison as indicative.</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Benchmark</th><th class="num">Now</th><th class="num">Before</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Produce to 8 partitions in one request, 1 broker, p50 / p99</td><td class="num">4.04 / 10.99 ms</td><td class="num">34.26 / 49.95 ms</td></tr>
+            <tr><td>Ack to a waiting consumer, p50 / p90 / p99 / max</td><td class="num">0.18 / 0.31 / 1.56 / 4.00 ms</td><td class="num">11.35 / 19.68 / 22.34 / 22.60 ms</td></tr>
+            <tr><td>One connection, 5 produces in flight</td><td class="num">572 acks/s</td><td class="num">about 225 acks/s</td></tr>
+            <tr><td>Metadata writes, 64 concurrent writers</td><td class="num">5349 writes/s</td><td class="num">about 266 writes/s</td></tr>
+            <tr><td>3000 sealed extents: partition metadata row</td><td class="num">130 bytes</td><td class="num">413 KB</td></tr>
+            <tr><td>3000 sealed extents: fetch the newest, p50 / p99</td><td class="num">0.15 / 0.35 ms</td><td class="num">57.09 / 72.76 ms</td></tr>
+            <tr><td>3000 sealed extents: produce, p50 / p99</td><td class="num">4.98 / 12.38 ms</td><td class="num"></td></tr>
+            <tr><td>3000 sealed extents: read all 3000 batches</td><td class="num">103 ms cold, 2 ms again</td><td class="num">259 ms cold, 261 ms again</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>What each one measures</h3>
+      <ul>
+        <li><strong>8 partitions in one request.</strong> One produce request carries a batch for each of 8 partitions, as a client batching for one broker does. Before is from <a href="https://github.com/nidheesh-m-vakharia/camus/pull/117">#117</a>.</li>
+        <li><strong>Ack to a waiting consumer.</strong> A consumer long-polls at the end of the log while a producer sends one batch every 50 ms. Each of 200 samples is the time from the produce's acknowledgement to the fetch returning that batch. Before is from <a href="https://github.com/nidheesh-m-vakharia/camus/pull/122">#122</a>.</li>
+        <li><strong>5 produces in flight.</strong> One connection keeps five <code>acks=all</code> produces outstanding, as a Kafka client does by default. Before is from <a href="https://github.com/nidheesh-m-vakharia/camus/pull/123">#123</a>.</li>
+        <li><strong>Metadata writes.</strong> 64 writers make 200 writes each to the metadata group, the way consumer groups committing offsets do. Before is from <a href="https://github.com/nidheesh-m-vakharia/camus/pull/127">#127</a>.</li>
+        <li><strong>3000 sealed extents.</strong> Uploads run every millisecond, so each batch becomes its own sealed extent. Then it measures the partition's metadata row, a fetch of the newest extent, a produce, and a consumer reading all 3000 batches from the start, then again from the local cache. Before is from <a href="https://github.com/nidheesh-m-vakharia/camus/pull/119">#119</a> for the row and the fetch, and <a href="https://github.com/nidheesh-m-vakharia/camus/pull/125">#125</a> for the full read.</li>
+      </ul>
+      <h2>Linux</h2>
+      <p>Some of these were also run on Linux, in an OrbStack VM on the same Mac. Those results are in the descriptions of <a href="https://github.com/nidheesh-m-vakharia/camus/pull/118">#118</a> and <a href="https://github.com/nidheesh-m-vakharia/camus/pull/120">#120</a>. They are useful only as before and after comparisons, so they are not in these tables.</p>
+      <h2>Run them yourself</h2>
+      <p>Every benchmark is an ignored test, run in release mode. The ones with <code>CAMUS_MINIO=1</code> need the local bucket from the <a href="minio.html">bucket page</a>.</p>
+      <pre><code>CAMUS_MINIO=1 cargo test --release -p camus-broker --test latency -- --ignored --nocapture
+CAMUS_MINIO=1 cargo test --release -p camus-broker --test throughput -- --ignored --nocapture
+CAMUS_BENCH_BROKERS=1 CAMUS_MINIO=1 cargo test --release -p camus-broker --test throughput -- --ignored --nocapture
+CAMUS_MINIO=1 CAMUS_BENCH_BROKERS=1 CAMUS_BENCH_PARTITIONS=8 cargo test --release -p camus-broker --test latency -- --ignored --nocapture
+CAMUS_MINIO=1 cargo test --release -p camus-broker --test extent_cost -- --ignored --nocapture
+cargo test --release -p camus-broker --test tail_latency -- --ignored --nocapture
+cargo test --release -p camus-broker --test pipelined_throughput -- --ignored --nocapture
+cargo test --release -p camus-metadata --test write_throughput -- --ignored --nocapture</code></pre>
+
+      <footer>
+        <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

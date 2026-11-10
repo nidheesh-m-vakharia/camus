@@ -367,6 +367,37 @@ th {
   font-variant-numeric: tabular-nums;
 }
 
+.table-scroll {
+  max-width: 100%;
+  margin: 0 0 1lh;
+  overflow-x: auto;
+}
+
+.table-scroll table {
+  margin: 0;
+}
+
+th.num,
+td.num {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.notice {
+  max-width: var(--measure);
+  margin: 0 0 2rem;
+  padding: 0.9rem 1.1rem;
+  background: var(--indigo-wash);
+  border: 1px solid color-mix(in srgb, var(--indigo) 35%, transparent);
+  border-radius: 16px;
+  color: var(--text-strong);
+}
+
+.notice p {
+  margin: 0;
+}
+
 footer {
   margin-block-start: 3rem;
   padding-block-start: 1.5rem;
