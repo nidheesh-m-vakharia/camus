@@ -34,7 +34,7 @@ each benchmark run once. Output in `raw/2026-11-10-macos.md`.
 baseline. Main just before #117 (commit `9687151`) measured the same:
 8.9 and 9.4 MiB/s at 8 producers, 27.2 and 28.6 MiB/s at 32, on 1 broker,
 with the same fsyncs/ack. The drop came in between the baseline and #93.
-It is being bisected in its own issue.
+It is being bisected in [#129](https://github.com/nidheesh-m-vakharia/camus/issues/129).
 
 ### Memory, MiB, broker serving produce
 

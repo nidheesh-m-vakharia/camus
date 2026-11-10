@@ -114,7 +114,7 @@
           </tbody>
         </table>
       </div>
-      <p>Three runs are slower than the baseline: 1 broker with 8 and with 32 producers, and 3 brokers with 8 producers. That drop is older than the work measured below. Main just before that work, commit <span class="ports">9687151</span>, measured the same on 1 broker: 8.9 and 9.4 MiB/s with 8 producers, 27.2 and 28.6 MiB/s with 32, with the same fsyncs per ack. The change came in between the baseline and <a href="https://github.com/nidheesh-m-vakharia/camus/pull/93">#93</a>, and it is being bisected.</p>
+      <p>Three runs are slower than the baseline: 1 broker with 8 and with 32 producers, and 3 brokers with 8 producers. That drop is older than the work measured below. Main just before that work, commit <span class="ports">9687151</span>, measured the same on 1 broker: 8.9 and 9.4 MiB/s with 8 producers, 27.2 and 28.6 MiB/s with 32, with the same fsyncs per ack. The change came in between the baseline and <a href="https://github.com/nidheesh-m-vakharia/camus/pull/93">#93</a>, and it is being bisected in <a href="https://github.com/nidheesh-m-vakharia/camus/issues/129">#129</a>.</p>
       <h2>Memory</h2>
       <p>Resident memory of the broker serving produce, from <code>ps</code>. Peak is the highest reading, sampled every 20 ms. After is the mean over 2 seconds, starting 3 seconds after the load stopped.</p>
       <div class="table-scroll">
