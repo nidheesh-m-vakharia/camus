@@ -111,6 +111,29 @@
         </table>
       </div>
       <p>That is why the two modes differ by more than 20 times in the latency table. A <code>wal</code> ack waits for disk flushes on a majority of brokers. An <code>r2</code> ack waits for an object store put and a metadata commit. The fsyncs per ack column in the throughput table shows how many acks share one disk flush. Under load, one flush answers many producers.</p>
+      <figure class="chart">
+        <figcaption>
+          <span class="chart-title">Time to an ack, ms</span>
+          <span class="chart-legend" aria-hidden="true"><span class="key key-now">p50</span><span class="key key-base">p99</span></span>
+        </figcaption>
+        <dl class="bars">
+          <div class="bar-row">
+            <dt><code>wal</code>, a disk majority</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 3.51%"></span><span class="bar-value"><span class="sr-only">p50 </span>11.11</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 8.55%"></span><span class="bar-value"><span class="sr-only">p99 </span>27.07</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt><code>r2</code>, the object stored</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 83.94%"></span><span class="bar-value"><span class="sr-only">p50 </span>265.82</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 88.48%"></span><span class="bar-value"><span class="sr-only">p99 </span>280.20</span></span>
+            </dd>
+          </div>
+        </dl>
+        <p class="chart-note">Three brokers, one producer, 1 KiB records, <code>acks=all</code>.</p>
+      </figure>
       <p>Consumers acknowledge too, in a different sense. A consumer group commits the offset it has processed up to, and that commit is a metadata write. The metadata writes row near the end measures it. The ack to a waiting consumer row measures something else: how soon after a producer's ack a consumer sees the batch.</p>
       <h2>Latency, 3 brokers</h2>
       <p>One producer sends 1 KiB records with <code>acks=all</code> and waits for each acknowledgement before sending the next. <code>wal</code> answers after a disk majority has the batch. <code>r2</code> answers after the object is stored. See <a href="durability.html">durability</a>.</p>
@@ -212,6 +235,70 @@
           </tbody>
         </table>
       </div>
+      <figure class="chart">
+        <figcaption>
+          <span class="chart-title">Peak memory, MiB</span>
+          <span class="chart-legend" aria-hidden="true"><span class="key key-now">2026-11-10</span><span class="key key-base">Baseline, 2026-11-05</span></span>
+        </figcaption>
+        <dl class="bars">
+          <div class="bar-row">
+            <dt>Latency <code>wal</code>, 3 brokers</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 4.04%"></span><span class="bar-value"><span class="sr-only">Now </span>29.3</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 4.25%"></span><span class="bar-value"><span class="sr-only">Baseline </span>30.8</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>Latency <code>r2</code>, 3 brokers</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 3.09%"></span><span class="bar-value"><span class="sr-only">Now </span>22.4</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 3.12%"></span><span class="bar-value"><span class="sr-only">Baseline </span>22.6</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>3 brokers, 1 producer</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 5.13%"></span><span class="bar-value"><span class="sr-only">Now </span>37.2</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 4.13%"></span><span class="bar-value"><span class="sr-only">Baseline </span>29.9</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>3 brokers, 8 producers</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 5.74%"></span><span class="bar-value"><span class="sr-only">Now </span>41.6</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 6.49%"></span><span class="bar-value"><span class="sr-only">Baseline </span>47.0</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>3 brokers, 32 producers</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 24.53%"></span><span class="bar-value"><span class="sr-only">Now </span>177.7</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 32.04%"></span><span class="bar-value"><span class="sr-only">Baseline </span>232.1</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>1 broker, 1 producer</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 6.24%"></span><span class="bar-value"><span class="sr-only">Now </span>45.2</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 4.76%"></span><span class="bar-value"><span class="sr-only">Baseline </span>34.5</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>1 broker, 8 producers</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 20.46%"></span><span class="bar-value"><span class="sr-only">Now </span>148.2</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 27.94%"></span><span class="bar-value"><span class="sr-only">Baseline </span>202.4</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>1 broker, 32 producers</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 37.77%"></span><span class="bar-value"><span class="sr-only">Now </span>273.6</span></span>
+              <span class="bar-line"><span class="bar bar-base" style="--w: 90.00%"></span><span class="bar-value"><span class="sr-only">Baseline </span>652.0</span></span>
+            </dd>
+          </div>
+        </dl>
+      </figure>
       <p>Idle was 20.7 MiB in the <code>wal</code> latency run. Followers peaked at 36.7 to 38.4 MiB in the heaviest 3-broker run.</p>
       <h2>Costs changed in #117 to #128</h2>
       <p>These benchmarks were added with the changes they measure. Each "before" comes from that pull request's own run, on a different day, so read the comparison as indicative.</p>
@@ -232,6 +319,62 @@
           </tbody>
         </table>
       </div>
+      <figure class="chart">
+        <figcaption>
+          <span class="chart-title">How many times better</span>
+        </figcaption>
+        <dl class="bars">
+          <div class="bar-row">
+            <dt>Fetch the newest of 3000 extents, p50</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 64.47%"></span><span class="bar-value"><span class="sr-only"> </span>381×</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>Partition metadata row size</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 87.50%"></span><span class="bar-value"><span class="sr-only"> </span>3,177×</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>Read 3000 batches again, from cache</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 52.86%"></span><span class="bar-value"><span class="sr-only"> </span>130×</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>Ack to a waiting consumer, p50</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 44.97%"></span><span class="bar-value"><span class="sr-only"> </span>63×</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>Metadata writes, 64 writers</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 32.57%"></span><span class="bar-value"><span class="sr-only"> </span>20×</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>Produce to 8 partitions, p50</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 23.20%"></span><span class="bar-value"><span class="sr-only"> </span>8.5×</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>Read 3000 batches cold</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 10.01%"></span><span class="bar-value"><span class="sr-only"> </span>2.5×</span></span>
+            </dd>
+          </div>
+          <div class="bar-row">
+            <dt>5 produces in flight</dt>
+            <dd>
+              <span class="bar-line"><span class="bar bar-now" style="--w: 10.12%"></span><span class="bar-value"><span class="sr-only"> </span>2.5×</span></span>
+            </dd>
+          </div>
+        </dl>
+        <p class="chart-note">Log scale, so the 3,177× row doesn't flatten the rest: equal lengths are equal multiples. For times and sizes the factor is before ÷ now; for rates it is now ÷ before.</p>
+      </figure>
       <h3>What each one measures</h3>
       <ul>
         <li><strong>8 partitions in one request.</strong> One produce request carries a batch for each of 8 partitions, as a client batching for one broker does. Before is from <a href="https://github.com/nidheesh-m-vakharia/camus/pull/117">#117</a>.</li>
