@@ -312,6 +312,11 @@ pub enum Command {
         /// Kafka's `producer.id.expiration.ms`.
         expiration_ms: i64,
     },
+    /// Several commands written as one log entry, applied in order as if each
+    /// were its own entry. The response holds one per command in `each`.
+    /// The metadata group commit writes these; a broker that predates them
+    /// cannot read one.
+    Batch(Vec<Command>),
 }
 
 /// State-machine response for [`Command`].
@@ -323,6 +328,9 @@ pub struct Response {
     /// Kafka error code. `0` means the command was applied.
     #[serde(default)]
     pub error_code: i16,
+    /// For [`Command::Batch`]: one response per command, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub each: Vec<Response>,
 }
 
 impl Response {
@@ -331,6 +339,7 @@ impl Response {
         Self {
             value,
             error_code: 0,
+            each: Vec::new(),
         }
     }
 
@@ -339,6 +348,7 @@ impl Response {
         Self {
             value: None,
             error_code,
+            each: Vec::new(),
         }
     }
 }
@@ -348,6 +358,106 @@ pub struct MetadataNode {
     /// The openraft handle. Routes and tests call this directly.
     pub raft: Raft<TypeConfig>,
     machine: Arc<RedbMachine>,
+    /// Writes waiting for the group commit.
+    writes: tokio::sync::mpsc::Sender<Queued>,
+    /// Reads waiting for a linearizable round.
+    reads: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
+/// A command waiting for the group commit, and where its result goes.
+type Queued = (
+    Command,
+    tokio::sync::oneshot::Sender<Result<Response, String>>,
+);
+
+/// Most commands one metadata log entry carries.
+const GROUP_COMMANDS: usize = 256;
+
+/// Writes allowed to wait for the committer before callers wait to queue.
+const QUEUED_WRITES: usize = 4096;
+
+/// Group commit for the metadata log. Commands that arrive while entries are
+/// committing go into the next entry together, so concurrent writers share
+/// one log append and one quorum fsync instead of one each. Entries are
+/// submitted in arrival order; two may be committing at once.
+async fn write_loop(raft: Raft<TypeConfig>, mut queue: tokio::sync::mpsc::Receiver<Queued>) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(2));
+    while let Some(first) = queue.recv().await {
+        let mut group = vec![first];
+        while group.len() < GROUP_COMMANDS {
+            let Ok(next) = queue.try_recv() else { break };
+            group.push(next);
+        }
+        let Ok(slot) = slots.clone().acquire_owned().await else {
+            return;
+        };
+        // More arrived while both entries were committing; take them too.
+        while group.len() < GROUP_COMMANDS {
+            let Ok(next) = queue.try_recv() else { break };
+            group.push(next);
+        }
+        let (mut commands, waiters): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+        let command = match commands.len() {
+            1 => commands.remove(0),
+            _ => Command::Batch(commands),
+        };
+        let submitted = raft.client_write_ff(command).await;
+        tokio::spawn(async move {
+            let _slot = slot;
+            let fail = |waiters: Vec<tokio::sync::oneshot::Sender<_>>, message: String| {
+                for waiter in waiters {
+                    let _ = waiter.send(Err(message.clone()));
+                }
+            };
+            let received = match submitted {
+                Ok(receiver) => receiver.await,
+                Err(fatal) => return fail(waiters, fatal.to_string()),
+            };
+            let response = match received {
+                Ok(Ok(written)) => written.data,
+                Ok(Err(err)) => return fail(waiters, err.to_string()),
+                Err(_) => return fail(waiters, "metadata raft stopped".into()),
+            };
+            let mut waiters = waiters;
+            if waiters.len() == 1 {
+                if let Some(waiter) = waiters.pop() {
+                    let _ = waiter.send(Ok(response));
+                }
+                return;
+            }
+            let mut each = response.each.into_iter();
+            for waiter in waiters {
+                let _ = waiter.send(
+                    each.next()
+                        .ok_or_else(|| "no response for a batched command".to_string()),
+                );
+            }
+        });
+    }
+}
+
+/// Linearizable reads. Each round confirms leadership once for every read
+/// that was waiting when it started. A read that arrives during a round
+/// waits for the next one, since that round may have begun before writes the
+/// read must see.
+async fn read_loop(
+    raft: Raft<TypeConfig>,
+    mut queue: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) {
+    while let Some(first) = queue.recv().await {
+        let mut waiting = vec![first];
+        while let Ok(next) = queue.try_recv() {
+            waiting.push(next);
+        }
+        let result = raft
+            .ensure_linearizable()
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string());
+        for waiter in waiting {
+            let _ = waiter.send(result.clone());
+        }
+    }
 }
 
 impl MetadataNode {
@@ -388,7 +498,16 @@ impl MetadataNode {
         let log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
         let machine = Arc::new(RedbMachine::open(&dir.join("state.redb"))?);
         let raft = Raft::new(node_id, config, network, log, machine.clone()).await?;
-        Ok(Self { raft, machine })
+        let (writes, queued) = tokio::sync::mpsc::channel(QUEUED_WRITES);
+        tokio::spawn(write_loop(raft.clone(), queued));
+        let (reads, waiting) = tokio::sync::mpsc::channel(QUEUED_WRITES);
+        tokio::spawn(read_loop(raft.clone(), waiting));
+        Ok(Self {
+            raft,
+            machine,
+            writes,
+            reads,
+        })
     }
 
     /// Register this in-process node so peers can reach it.
@@ -409,13 +528,12 @@ impl MetadataNode {
         value: impl Into<String>,
     ) -> anyhow::Result<Response> {
         let response = self
-            .raft
-            .client_write(Command::Put {
+            .submit(Command::Put {
                 key: key.into(),
                 value: value.into(),
             })
             .await?;
-        Ok(response.data)
+        Ok(response)
     }
 
     /// Commit a topic create. `error_code` is a Kafka code when the name is taken or the config is invalid.
@@ -427,8 +545,7 @@ impl MetadataNode {
         configs: Vec<(String, Option<String>)>,
     ) -> anyhow::Result<Response> {
         let response = self
-            .raft
-            .client_write(Command::CreateTopic {
+            .submit(Command::CreateTopic {
                 name: name.into(),
                 id: uuid::Uuid::new_v4().to_string(),
                 partitions,
@@ -436,16 +553,15 @@ impl MetadataNode {
                 configs,
             })
             .await?;
-        Ok(response.data)
+        Ok(response)
     }
 
     /// Commit a topic delete.
     pub async fn delete_topic(&self, name: impl Into<String>) -> anyhow::Result<Response> {
         let response = self
-            .raft
-            .client_write(Command::DeleteTopic { name: name.into() })
+            .submit(Command::DeleteTopic { name: name.into() })
             .await?;
-        Ok(response.data)
+        Ok(response)
     }
 
     /// Commit extent metadata. The object itself is already in the bucket.
@@ -455,16 +571,15 @@ impl MetadataNode {
         producers: Vec<ProducerNote>,
     ) -> anyhow::Result<Response> {
         let response = self
-            .raft
-            .client_write(Command::PublishWithProducers { parts, producers })
+            .submit(Command::PublishWithProducers { parts, producers })
             .await?;
-        Ok(response.data)
+        Ok(response)
     }
 
     /// Commit an admin or group command. `value` is command-specific.
     pub async fn apply(&self, command: Command) -> anyhow::Result<Response> {
-        let response = self.raft.client_write(command).await?;
-        Ok(response.data)
+        let response = self.submit(command).await?;
+        Ok(response)
     }
 
     /// Allocate or bump a producer id. `value` is `"{producer_id},{epoch}"` on success.
@@ -475,28 +590,45 @@ impl MetadataNode {
         producer_epoch: i16,
     ) -> anyhow::Result<Response> {
         let response = self
-            .raft
-            .client_write(Command::InitProducer {
+            .submit(Command::InitProducer {
                 transactional,
                 producer_id,
                 producer_epoch,
             })
             .await?;
-        Ok(response.data)
+        Ok(response)
     }
 
     /// Commit a group command and return its Kafka error code (0 = applied).
     pub async fn group_write(&self, command: Command) -> anyhow::Result<i16> {
-        let response = self.raft.client_write(command).await?;
-        Ok(response.data.error_code)
+        let response = self.submit(command).await?;
+        Ok(response.error_code)
     }
 
     /// Wait until this node, as leader, has applied everything committed
     /// before the call, so a following [`MetadataNode::read_local`] is
     /// linearizable. Fails when this node is not the leader.
     pub async fn linearizable(&self) -> anyhow::Result<()> {
-        self.raft.ensure_linearizable().await?;
-        Ok(())
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.reads
+            .send(done)
+            .await
+            .map_err(|_| anyhow::anyhow!("metadata read loop stopped"))?;
+        wait.await
+            .map_err(|_| anyhow::anyhow!("metadata read loop stopped"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Commit `command` through the group commit, and return its response.
+    async fn submit(&self, command: Command) -> anyhow::Result<Response> {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.writes
+            .send((command, done))
+            .await
+            .map_err(|_| anyhow::anyhow!("metadata committer stopped"))?;
+        wait.await
+            .map_err(|_| anyhow::anyhow!("metadata committer stopped"))?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Applied keys starting with `prefix`, in key order. Not linearizable on
