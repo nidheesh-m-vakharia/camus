@@ -299,6 +299,15 @@ pub fn extents_after(
         .collect()
 }
 
+/// Drop transaction spans that end at or before the log start: no batch
+/// they could match is readable any more, and a `read_committed` fetch scans
+/// these lists for every transactional batch.
+pub(crate) fn prune_spans(state: &mut Partition) {
+    let log_start = state.log_start;
+    state.txn_committed.retain(|span| span.end > log_start);
+    state.txn_aborted.retain(|span| span.end > log_start);
+}
+
 /// Move a row's legacy extents to keys of their own, keeping only those that
 /// end after the log start.
 pub(crate) fn migrate_extents(
