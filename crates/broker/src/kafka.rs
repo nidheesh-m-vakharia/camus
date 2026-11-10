@@ -346,6 +346,8 @@ pub struct Kafka {
     /// partition it waits on, removed when it returns, so this holds only
     /// fetches in flight.
     arrivals: std::sync::Mutex<Arrivals>,
+    /// Parsed ACLs and the metadata ACL version they were read at.
+    acl_cache: std::sync::RwLock<Option<(u64, Arc<camus_metadata::AclSet>)>>,
     flush_lock: Mutex<()>,
 }
 
@@ -491,6 +493,7 @@ impl Kafka {
             drained: tokio::sync::Notify::new(),
             flush_now: tokio::sync::Notify::new(),
             arrivals: std::sync::Mutex::new(Arrivals::new()),
+            acl_cache: std::sync::RwLock::new(None),
             flush_lock: Mutex::new(()),
         }
     }
@@ -1887,9 +1890,7 @@ impl Kafka {
         if self.super_users.contains(&caller.principal) {
             return true;
         }
-        let raw = self.node.read_local("acls").ok().flatten();
-        camus_metadata::acl_allows(
-            raw.as_deref(),
+        self.acls().allows(
             &caller.principal,
             &caller.host,
             resource_type,
@@ -1897,6 +1898,22 @@ impl Kafka {
             operation,
             self.allow_if_no_acl,
         )
+    }
+
+    /// The stored ACLs, parsed once per change rather than once per check.
+    fn acls(&self) -> Arc<camus_metadata::AclSet> {
+        // The version is read before the ACLs, so a change racing this read
+        // leaves an older version cached and is read again next time.
+        let version = self.node.acl_version();
+        if let Some((cached, acls)) = &*self.acl_cache.read().expect("acl cache") {
+            if *cached == version {
+                return Arc::clone(acls);
+            }
+        }
+        let raw = self.node.read_local("acls").ok().flatten();
+        let acls = Arc::new(camus_metadata::AclSet::parse(raw.as_deref()));
+        *self.acl_cache.write().expect("acl cache") = Some((version, Arc::clone(&acls)));
+        acls
     }
 
     async fn create_topics(

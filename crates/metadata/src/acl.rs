@@ -66,7 +66,7 @@ pub struct Filter {
     pub permission: i8,
 }
 
-const KEY: &str = "acls";
+pub(crate) const KEY: &str = "acls";
 
 fn load(raw: Option<String>) -> Result<Vec<Binding>, String> {
     match raw {
@@ -117,6 +117,57 @@ fn host_matches(binding: &Binding, host: &str) -> bool {
     binding.host == "*" || binding.host == host
 }
 
+/// Stored ACLs parsed once, for many checks. Parse again when they change.
+#[derive(Debug)]
+pub struct Compiled {
+    /// `None` when the stored ACLs could not be read: every check denies.
+    bindings: Option<Vec<Binding>>,
+}
+
+impl Compiled {
+    /// Parse the stored JSON array, or `None` when nothing has been written.
+    pub fn parse(raw: Option<&str>) -> Self {
+        Self {
+            bindings: load(raw.map(str::to_string)).ok(),
+        }
+    }
+
+    /// `true` when `principal` may perform `operation` on the resource.
+    /// `host` is the client's IP address as text.
+    pub fn allows(
+        &self,
+        principal: &str,
+        host: &str,
+        resource_type: i8,
+        name: &str,
+        operation: i8,
+        allow_if_none: bool,
+    ) -> bool {
+        let Some(acls) = &self.bindings else {
+            return false;
+        };
+        let named: Vec<_> = acls
+            .iter()
+            .filter(|binding| resource_matches(binding, resource_type, name))
+            .collect();
+        if named.is_empty() {
+            return allow_if_none;
+        }
+        let mine: Vec<_> = named
+            .into_iter()
+            .filter(|binding| principal_matches(binding, principal) && host_matches(binding, host))
+            .collect();
+        if mine.iter().any(|binding| {
+            binding.permission == DENY
+                && (binding.operation == ALL || binding.operation == operation)
+        }) {
+            return false;
+        }
+        mine.iter()
+            .any(|binding| binding.permission == ALLOW && grants(binding.operation, operation))
+    }
+}
+
 /// `true` when `principal` may perform `operation` on the resource.
 ///
 /// `raw` is the stored JSON array, or `None` when nothing has been written.
@@ -130,27 +181,14 @@ pub fn allows(
     operation: i8,
     allow_if_none: bool,
 ) -> bool {
-    let Ok(acls) = load(raw.map(str::to_string)) else {
-        return false;
-    };
-    let named: Vec<_> = acls
-        .iter()
-        .filter(|binding| resource_matches(binding, resource_type, name))
-        .collect();
-    if named.is_empty() {
-        return allow_if_none;
-    }
-    let mine: Vec<_> = named
-        .into_iter()
-        .filter(|binding| principal_matches(binding, principal) && host_matches(binding, host))
-        .collect();
-    if mine.iter().any(|binding| {
-        binding.permission == DENY && (binding.operation == ALL || binding.operation == operation)
-    }) {
-        return false;
-    }
-    mine.iter()
-        .any(|binding| binding.permission == ALLOW && grants(binding.operation, operation))
+    Compiled::parse(raw).allows(
+        principal,
+        host,
+        resource_type,
+        name,
+        operation,
+        allow_if_none,
+    )
 }
 
 fn same(left: &Binding, right: &Binding) -> bool {

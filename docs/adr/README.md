@@ -19,5 +19,6 @@ amendments their files note. 0014 is proposed.
 | [0012](0012-auth.md) | SASL/PLAIN + TLS, and opt-in dev PLAINTEXT |
 | [0013](0013-delivery-phases.md) | Phases 0–5 and their acceptance tests |
 | [0014](0014-multiple-wal-shards.md) | Multiple WAL shards and leadership balance (proposed) |
+| [0015](0015-transaction-spans.md) | Transaction spans without a metadata write per produce (proposed) |
 
 Read [../PLAN.md](../PLAN.md) for the summary.

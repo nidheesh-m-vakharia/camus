@@ -18,7 +18,8 @@ mod producers;
 mod txn;
 
 pub use acl::{
-    allows as acl_allows, describe as acl_describe, Binding as AclBinding, Filter as AclFilter,
+    allows as acl_allows, describe as acl_describe, Binding as AclBinding, Compiled as AclSet,
+    Filter as AclFilter,
 };
 pub use admin::{ConfigChange, ConfigEdit, Item, OffsetDrop, PartitionIncrease, RecordCut};
 pub use catalog::{
@@ -513,6 +514,12 @@ impl MetadataNode {
         limit: usize,
     ) -> anyhow::Result<Vec<(String, String)>> {
         Ok(self.machine.scan_range(from, to, limit)?)
+    }
+
+    /// Moves after every applied change that can alter the stored ACLs, once
+    /// the change is readable. Compare it to know when a parsed copy is stale.
+    pub fn acl_version(&self) -> u64 {
+        self.machine.acl_version()
     }
 
     /// Read the latest applied value on this node. This is not a linearizable read.
