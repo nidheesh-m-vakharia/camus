@@ -469,6 +469,7 @@ dependencies = [
  "bytes",
  "futures",
  "object_store",
+ "tempfile",
  "tokio",
  "url",
 ]

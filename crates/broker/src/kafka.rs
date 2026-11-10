@@ -355,6 +355,8 @@ pub struct Kafka {
     arrivals: std::sync::Mutex<Arrivals>,
     /// Recently read sealed ranges (`CAMUS_READ_CACHE_BYTES`).
     read_cache: camus_storage::ReadCache,
+    /// The tier under `read_cache`, on local disk, when one is configured.
+    disk_cache: Option<camus_storage::DiskCache>,
     /// Parsed ACLs and the metadata ACL version they were read at.
     acl_cache: std::sync::RwLock<Option<(u64, Arc<camus_metadata::AclSet>)>>,
     flush_lock: Mutex<()>,
@@ -509,6 +511,7 @@ impl Kafka {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(READ_CACHE_BYTES),
             ),
+            disk_cache: None,
             flush_lock: Mutex::new(()),
         }
     }
@@ -742,14 +745,30 @@ impl Kafka {
         camus_metadata::parse_topic(&raw).ok()
     }
 
-    /// `range` of the sealed object `key`, from the read cache or else from
-    /// object storage, kept for the next reader.
+    /// Keep recently read sealed ranges on local disk too, under the memory
+    /// cache.
+    pub fn with_disk_cache(mut self, cache: camus_storage::DiskCache) -> Self {
+        self.disk_cache = Some(cache);
+        self
+    }
+
+    /// `range` of the sealed object `key`: from memory, else from local disk,
+    /// else from object storage, kept in each tier it was missing from.
     async fn sealed_range(&self, key: &str, range: std::ops::Range<u64>) -> anyhow::Result<Bytes> {
         if let Some(bytes) = self.read_cache.get(key, &range) {
             return Ok(bytes);
         }
+        if let Some(disk) = &self.disk_cache {
+            if let Some(bytes) = disk.get(key, &range).await {
+                self.read_cache.insert(key, &range, bytes.clone());
+                return Ok(bytes);
+            }
+        }
         let bytes = self.bucket.get_range(key, range.clone()).await?;
         self.read_cache.insert(key, &range, bytes.clone());
+        if let Some(disk) = &self.disk_cache {
+            disk.insert(key, &range, bytes.clone());
+        }
         Ok(bytes)
     }
 
