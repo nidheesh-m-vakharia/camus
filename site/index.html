@@ -36,10 +36,9 @@
     }
   </script>
 </head>
-<body>
+<body class="home">
   <a class="skip" href="#content">Skip to content</a>
-  <div class="shell">
-    <nav class="nav" aria-label="Pages">
+  <header class="site-header">
       <a class="mark" href="index.html">
         <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
           <circle cx="4.6" cy="4.6" r="2.7"/>
@@ -50,46 +49,77 @@
         <span class="mark-name">Camus</span>
         <span class="mark-sub">Kafka protocol, R2 log</span>
       </a>
-      <ul>
-        <li>
-          <a href="index.html" aria-current="page">Intro</a>
-        </li>
-        <li>
-          <a href="why.html">Why</a>
-        </li>
-        <li>
-          <a href="run.html">Run</a>
-        </li>
-        <li>
-          <a href="clients.html">Clients</a>
-        </li>
-        <li>
-          <a href="durability.html">Durability</a>
-        </li>
-        <li>
-          <a href="setup.html">Setup</a>
-          <ul>
-            <li><a href="minio.html">Bucket</a></li>
-            <li><a href="brokers.html">Three brokers</a></li>
-            <li><a href="sasl.html">SASL</a></li>
-            <li><a href="tests.html">Tests</a></li>
-          </ul>
-        </li>
-        <li>
-          <a href="docs.html">Docs</a>
-          <ul>
-            <li><a href="recovery.html">Recovery</a></li>
-          </ul>
-        </li>
-      </ul>
-      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
-    </nav>
-    <main id="content">
-      <header class="hero entrance">
+    <ul>
+      <li><a href="why.html">Why</a></li>
+      <li><a href="run.html">Run</a></li>
+      <li><a href="clients.html">Clients</a></li>
+      <li><a href="durability.html">Durability</a></li>
+      <li><a href="benchmarks.html">Benchmarks</a></li>
+      <li><a href="setup.html">Setup</a></li>
+      <li><a href="docs.html">Docs</a></li>
+    </ul>
+    <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">GitHub</a>
+  </header>
+  <main id="content" class="home-main">
+    <section class="home-hero entrance">
+      <div class="home-hero-text">
         <h1 style="--n: 0">A Kafka broker that keeps the log in object storage.</h1>
-      </header>
-
-      <p class="lede" style="--n: 1">Producers, consumers, and admin clients speak the Kafka wire protocol. The durable log lives in Cloudflare R2, or any S3-compatible bucket. A small set of Rust binaries replicates metadata, and a short write-ahead log, with Raft.</p>
+        <p class="lede" style="--n: 1">Producers, consumers, and admin clients speak the Kafka wire protocol. The durable log lives in Cloudflare R2, or any S3-compatible bucket. A small set of Rust binaries replicates metadata, and a short write-ahead log, with Raft.</p>
+        <p class="home-actions"><a class="button" href="run.html">Run one broker</a><a href="durability.html">How a produce is acknowledged</a></p>
+      </div>
+      <figure class="iso-figure">
+      <svg class="iso" viewBox="0 0 541 340" role="img" aria-labelledby="iso-caption" data-iso='{"ox":180.3,"oy":34.0,"s":20.0}'>
+      <line class="iso-grid" x1="180.3" y1="14.0" x2="14.0" y2="110.0"/>
+      <line class="iso-grid" x1="214.9" y1="34.0" x2="48.7" y2="130.0"/>
+      <line class="iso-grid" x1="249.6" y1="54.0" x2="83.3" y2="150.0"/>
+      <line class="iso-grid" x1="284.2" y1="74.0" x2="117.9" y2="170.0"/>
+      <line class="iso-grid" x1="318.9" y1="94.0" x2="152.6" y2="190.0"/>
+      <line class="iso-grid" x1="353.5" y1="114.0" x2="187.2" y2="210.0"/>
+      <line class="iso-grid" x1="388.1" y1="134.0" x2="221.9" y2="230.0"/>
+      <line class="iso-grid" x1="422.8" y1="154.0" x2="256.5" y2="250.0"/>
+      <line class="iso-grid" x1="457.4" y1="174.0" x2="291.2" y2="270.0"/>
+      <line class="iso-grid" x1="492.1" y1="194.0" x2="325.8" y2="290.0"/>
+      <line class="iso-grid" x1="526.7" y1="214.0" x2="360.4" y2="310.0"/>
+      <line class="iso-grid" x1="180.3" y1="14.0" x2="526.7" y2="214.0"/>
+      <line class="iso-grid" x1="145.7" y1="34.0" x2="492.1" y2="234.0"/>
+      <line class="iso-grid" x1="111.0" y1="54.0" x2="457.4" y2="254.0"/>
+      <line class="iso-grid" x1="76.4" y1="74.0" x2="422.8" y2="274.0"/>
+      <line class="iso-grid" x1="41.7" y1="94.0" x2="388.1" y2="294.0"/>
+      <line class="iso-grid" x1="14.0" y1="110.0" x2="360.4" y2="310.0"/>
+      <g class="iso-obj" id="iso-producer-0"><line class="iso-edge iso-hidden" x1="175.1" y1="37.0" x2="192.4" y2="47.0"/><line class="iso-edge iso-hidden" x1="175.1" y1="37.0" x2="157.8" y2="47.0"/><line class="iso-edge iso-hidden" x1="175.1" y1="37.0" x2="175.1" y2="17.0"/><line class="iso-edge" x1="175.1" y1="17.0" x2="192.4" y2="27.0"/><line class="iso-edge" x1="175.1" y1="17.0" x2="157.8" y2="27.0"/><line class="iso-edge" x1="157.8" y1="47.0" x2="157.8" y2="27.0"/><line class="iso-edge" x1="157.8" y1="47.0" x2="175.1" y2="57.0"/><line class="iso-edge" x1="192.4" y1="47.0" x2="175.1" y2="57.0"/><line class="iso-edge" x1="192.4" y1="47.0" x2="192.4" y2="27.0"/><line class="iso-edge" x1="157.8" y1="27.0" x2="175.1" y2="37.0"/><line class="iso-edge" x1="192.4" y1="27.0" x2="175.1" y2="37.0"/><line class="iso-edge" x1="175.1" y1="57.0" x2="175.1" y2="37.0"/></g>
+      <g class="iso-obj" id="iso-producer-1"><line class="iso-edge iso-hidden" x1="123.1" y1="67.0" x2="140.5" y2="77.0"/><line class="iso-edge iso-hidden" x1="123.1" y1="67.0" x2="105.8" y2="77.0"/><line class="iso-edge iso-hidden" x1="123.1" y1="67.0" x2="123.1" y2="47.0"/><line class="iso-edge" x1="123.1" y1="47.0" x2="140.5" y2="57.0"/><line class="iso-edge" x1="123.1" y1="47.0" x2="105.8" y2="57.0"/><line class="iso-edge" x1="105.8" y1="77.0" x2="105.8" y2="57.0"/><line class="iso-edge" x1="105.8" y1="77.0" x2="123.1" y2="87.0"/><line class="iso-edge" x1="140.5" y1="77.0" x2="123.1" y2="87.0"/><line class="iso-edge" x1="140.5" y1="77.0" x2="140.5" y2="57.0"/><line class="iso-edge" x1="105.8" y1="57.0" x2="123.1" y2="67.0"/><line class="iso-edge" x1="140.5" y1="57.0" x2="123.1" y2="67.0"/><line class="iso-edge" x1="123.1" y1="87.0" x2="123.1" y2="67.0"/></g>
+      <g class="iso-obj" id="iso-producer-2"><line class="iso-edge iso-hidden" x1="71.2" y1="97.0" x2="88.5" y2="107.0"/><line class="iso-edge iso-hidden" x1="71.2" y1="97.0" x2="53.9" y2="107.0"/><line class="iso-edge iso-hidden" x1="71.2" y1="97.0" x2="71.2" y2="77.0"/><line class="iso-edge" x1="71.2" y1="77.0" x2="88.5" y2="87.0"/><line class="iso-edge" x1="71.2" y1="77.0" x2="53.9" y2="87.0"/><line class="iso-edge" x1="53.9" y1="107.0" x2="53.9" y2="87.0"/><line class="iso-edge" x1="53.9" y1="107.0" x2="71.2" y2="117.0"/><line class="iso-edge" x1="88.5" y1="107.0" x2="71.2" y2="117.0"/><line class="iso-edge" x1="88.5" y1="107.0" x2="88.5" y2="87.0"/><line class="iso-edge" x1="53.9" y1="87.0" x2="71.2" y2="97.0"/><line class="iso-edge" x1="88.5" y1="87.0" x2="71.2" y2="97.0"/><line class="iso-edge" x1="71.2" y1="117.0" x2="71.2" y2="97.0"/></g>
+      <g class="iso-obj" id="iso-disk-0"><line class="iso-edge iso-disk iso-hidden" x1="284.2" y1="94.0" x2="311.9" y2="110.0"/><line class="iso-edge iso-disk iso-hidden" x1="284.2" y1="94.0" x2="256.5" y2="110.0"/><line class="iso-edge iso-disk iso-hidden" x1="284.2" y1="94.0" x2="284.2" y2="87.0"/><line class="iso-edge iso-disk" x1="284.2" y1="87.0" x2="311.9" y2="103.0"/><line class="iso-edge iso-disk" x1="284.2" y1="87.0" x2="256.5" y2="103.0"/><line class="iso-edge iso-disk" x1="256.5" y1="110.0" x2="256.5" y2="103.0"/><line class="iso-edge iso-disk" x1="256.5" y1="110.0" x2="284.2" y2="126.0"/><line class="iso-edge iso-disk" x1="311.9" y1="110.0" x2="284.2" y2="126.0"/><line class="iso-edge iso-disk" x1="311.9" y1="110.0" x2="311.9" y2="103.0"/><line class="iso-edge iso-disk" x1="256.5" y1="103.0" x2="284.2" y2="119.0"/><line class="iso-edge iso-disk" x1="311.9" y1="103.0" x2="284.2" y2="119.0"/><line class="iso-edge iso-disk" x1="284.2" y1="126.0" x2="284.2" y2="119.0"/></g>
+      <g class="iso-obj" id="iso-broker-0"><line class="iso-edge iso-hidden" x1="284.2" y1="82.0" x2="311.9" y2="98.0"/><line class="iso-edge iso-hidden" x1="284.2" y1="82.0" x2="256.5" y2="98.0"/><line class="iso-edge iso-hidden" x1="284.2" y1="82.0" x2="284.2" y2="38.0"/><line class="iso-edge" x1="284.2" y1="38.0" x2="311.9" y2="54.0"/><line class="iso-edge" x1="284.2" y1="38.0" x2="256.5" y2="54.0"/><line class="iso-edge" x1="256.5" y1="98.0" x2="256.5" y2="54.0"/><line class="iso-edge" x1="256.5" y1="98.0" x2="284.2" y2="114.0"/><line class="iso-edge" x1="311.9" y1="98.0" x2="284.2" y2="114.0"/><line class="iso-edge" x1="311.9" y1="98.0" x2="311.9" y2="54.0"/><line class="iso-edge" x1="256.5" y1="54.0" x2="284.2" y2="70.0"/><line class="iso-edge" x1="311.9" y1="54.0" x2="284.2" y2="70.0"/><line class="iso-edge" x1="284.2" y1="114.0" x2="284.2" y2="70.0"/></g>
+      <g class="iso-obj" id="iso-disk-1"><line class="iso-edge iso-disk iso-hidden" x1="232.3" y1="124.0" x2="260.0" y2="140.0"/><line class="iso-edge iso-disk iso-hidden" x1="232.3" y1="124.0" x2="204.5" y2="140.0"/><line class="iso-edge iso-disk iso-hidden" x1="232.3" y1="124.0" x2="232.3" y2="117.0"/><line class="iso-edge iso-disk" x1="232.3" y1="117.0" x2="260.0" y2="133.0"/><line class="iso-edge iso-disk" x1="232.3" y1="117.0" x2="204.5" y2="133.0"/><line class="iso-edge iso-disk" x1="204.5" y1="140.0" x2="204.5" y2="133.0"/><line class="iso-edge iso-disk" x1="204.5" y1="140.0" x2="232.3" y2="156.0"/><line class="iso-edge iso-disk" x1="260.0" y1="140.0" x2="232.3" y2="156.0"/><line class="iso-edge iso-disk" x1="260.0" y1="140.0" x2="260.0" y2="133.0"/><line class="iso-edge iso-disk" x1="204.5" y1="133.0" x2="232.3" y2="149.0"/><line class="iso-edge iso-disk" x1="260.0" y1="133.0" x2="232.3" y2="149.0"/><line class="iso-edge iso-disk" x1="232.3" y1="156.0" x2="232.3" y2="149.0"/></g>
+      <g class="iso-obj" id="iso-broker-1"><line class="iso-edge iso-hidden" x1="232.3" y1="112.0" x2="260.0" y2="128.0"/><line class="iso-edge iso-hidden" x1="232.3" y1="112.0" x2="204.5" y2="128.0"/><line class="iso-edge iso-hidden" x1="232.3" y1="112.0" x2="232.3" y2="68.0"/><line class="iso-edge" x1="232.3" y1="68.0" x2="260.0" y2="84.0"/><line class="iso-edge" x1="232.3" y1="68.0" x2="204.5" y2="84.0"/><line class="iso-edge" x1="204.5" y1="128.0" x2="204.5" y2="84.0"/><line class="iso-edge" x1="204.5" y1="128.0" x2="232.3" y2="144.0"/><line class="iso-edge" x1="260.0" y1="128.0" x2="232.3" y2="144.0"/><line class="iso-edge" x1="260.0" y1="128.0" x2="260.0" y2="84.0"/><line class="iso-edge" x1="204.5" y1="84.0" x2="232.3" y2="100.0"/><line class="iso-edge" x1="260.0" y1="84.0" x2="232.3" y2="100.0"/><line class="iso-edge" x1="232.3" y1="144.0" x2="232.3" y2="100.0"/></g>
+      <g class="iso-obj" id="iso-disk-2"><line class="iso-edge iso-disk iso-hidden" x1="180.3" y1="154.0" x2="208.0" y2="170.0"/><line class="iso-edge iso-disk iso-hidden" x1="180.3" y1="154.0" x2="152.6" y2="170.0"/><line class="iso-edge iso-disk iso-hidden" x1="180.3" y1="154.0" x2="180.3" y2="147.0"/><line class="iso-edge iso-disk" x1="180.3" y1="147.0" x2="208.0" y2="163.0"/><line class="iso-edge iso-disk" x1="180.3" y1="147.0" x2="152.6" y2="163.0"/><line class="iso-edge iso-disk" x1="152.6" y1="170.0" x2="152.6" y2="163.0"/><line class="iso-edge iso-disk" x1="152.6" y1="170.0" x2="180.3" y2="186.0"/><line class="iso-edge iso-disk" x1="208.0" y1="170.0" x2="180.3" y2="186.0"/><line class="iso-edge iso-disk" x1="208.0" y1="170.0" x2="208.0" y2="163.0"/><line class="iso-edge iso-disk" x1="152.6" y1="163.0" x2="180.3" y2="179.0"/><line class="iso-edge iso-disk" x1="208.0" y1="163.0" x2="180.3" y2="179.0"/><line class="iso-edge iso-disk" x1="180.3" y1="186.0" x2="180.3" y2="179.0"/></g>
+      <g class="iso-obj" id="iso-broker-2"><line class="iso-edge iso-hidden" x1="180.3" y1="142.0" x2="208.0" y2="158.0"/><line class="iso-edge iso-hidden" x1="180.3" y1="142.0" x2="152.6" y2="158.0"/><line class="iso-edge iso-hidden" x1="180.3" y1="142.0" x2="180.3" y2="98.0"/><line class="iso-edge" x1="180.3" y1="98.0" x2="208.0" y2="114.0"/><line class="iso-edge" x1="180.3" y1="98.0" x2="152.6" y2="114.0"/><line class="iso-edge" x1="152.6" y1="158.0" x2="152.6" y2="114.0"/><line class="iso-edge" x1="152.6" y1="158.0" x2="180.3" y2="174.0"/><line class="iso-edge" x1="208.0" y1="158.0" x2="180.3" y2="174.0"/><line class="iso-edge" x1="208.0" y1="158.0" x2="208.0" y2="114.0"/><line class="iso-edge" x1="152.6" y1="114.0" x2="180.3" y2="130.0"/><line class="iso-edge" x1="208.0" y1="114.0" x2="180.3" y2="130.0"/><line class="iso-edge" x1="180.3" y1="174.0" x2="180.3" y2="130.0"/></g>
+      <line class="iso-raft" x1="284.2" y1="54.0" x2="232.3" y2="84.0"/>
+      <line class="iso-raft" x1="232.3" y1="84.0" x2="180.3" y2="114.0"/>
+      <g class="iso-obj" id="iso-bucket"><line class="iso-edge iso-bucket iso-hidden" x1="362.2" y1="149.0" x2="414.1" y2="179.0"/><line class="iso-edge iso-bucket iso-hidden" x1="362.2" y1="149.0" x2="247.8" y2="215.0"/><line class="iso-edge iso-bucket iso-hidden" x1="362.2" y1="149.0" x2="362.2" y2="105.0"/><line class="iso-edge iso-bucket" x1="247.8" y1="215.0" x2="247.8" y2="171.0"/><line class="iso-edge iso-bucket" x1="247.8" y1="215.0" x2="299.8" y2="245.0"/><line class="iso-edge iso-bucket" x1="414.1" y1="179.0" x2="299.8" y2="245.0"/><line class="iso-edge iso-bucket" x1="414.1" y1="179.0" x2="414.1" y2="135.0"/><line class="iso-edge iso-bucket" x1="299.8" y1="245.0" x2="299.8" y2="201.0"/></g>
+      <g class="iso-obj" id="iso-consumer-0"><line class="iso-edge iso-hidden" x1="469.6" y1="207.0" x2="486.9" y2="217.0"/><line class="iso-edge iso-hidden" x1="469.6" y1="207.0" x2="452.2" y2="217.0"/><line class="iso-edge iso-hidden" x1="469.6" y1="207.0" x2="469.6" y2="187.0"/><line class="iso-edge" x1="469.6" y1="187.0" x2="486.9" y2="197.0"/><line class="iso-edge" x1="469.6" y1="187.0" x2="452.2" y2="197.0"/><line class="iso-edge" x1="452.2" y1="217.0" x2="452.2" y2="197.0"/><line class="iso-edge" x1="452.2" y1="217.0" x2="469.6" y2="227.0"/><line class="iso-edge" x1="486.9" y1="217.0" x2="469.6" y2="227.0"/><line class="iso-edge" x1="486.9" y1="217.0" x2="486.9" y2="197.0"/><line class="iso-edge" x1="452.2" y1="197.0" x2="469.6" y2="207.0"/><line class="iso-edge" x1="486.9" y1="197.0" x2="469.6" y2="207.0"/><line class="iso-edge" x1="469.6" y1="227.0" x2="469.6" y2="207.0"/></g>
+      <g class="iso-obj" id="iso-consumer-1"><line class="iso-edge iso-hidden" x1="417.6" y1="237.0" x2="434.9" y2="247.0"/><line class="iso-edge iso-hidden" x1="417.6" y1="237.0" x2="400.3" y2="247.0"/><line class="iso-edge iso-hidden" x1="417.6" y1="237.0" x2="417.6" y2="217.0"/><line class="iso-edge" x1="417.6" y1="217.0" x2="434.9" y2="227.0"/><line class="iso-edge" x1="417.6" y1="217.0" x2="400.3" y2="227.0"/><line class="iso-edge" x1="400.3" y1="247.0" x2="400.3" y2="227.0"/><line class="iso-edge" x1="400.3" y1="247.0" x2="417.6" y2="257.0"/><line class="iso-edge" x1="434.9" y1="247.0" x2="417.6" y2="257.0"/><line class="iso-edge" x1="434.9" y1="247.0" x2="434.9" y2="227.0"/><line class="iso-edge" x1="400.3" y1="227.0" x2="417.6" y2="237.0"/><line class="iso-edge" x1="434.9" y1="227.0" x2="417.6" y2="237.0"/><line class="iso-edge" x1="417.6" y1="257.0" x2="417.6" y2="237.0"/></g>
+      <g class="iso-obj" id="iso-consumer-2"><line class="iso-edge iso-hidden" x1="365.6" y1="267.0" x2="382.9" y2="277.0"/><line class="iso-edge iso-hidden" x1="365.6" y1="267.0" x2="348.3" y2="277.0"/><line class="iso-edge iso-hidden" x1="365.6" y1="267.0" x2="365.6" y2="247.0"/><line class="iso-edge" x1="365.6" y1="247.0" x2="382.9" y2="257.0"/><line class="iso-edge" x1="365.6" y1="247.0" x2="348.3" y2="257.0"/><line class="iso-edge" x1="348.3" y1="277.0" x2="348.3" y2="257.0"/><line class="iso-edge" x1="348.3" y1="277.0" x2="365.6" y2="287.0"/><line class="iso-edge" x1="382.9" y1="277.0" x2="365.6" y2="287.0"/><line class="iso-edge" x1="382.9" y1="277.0" x2="382.9" y2="257.0"/><line class="iso-edge" x1="348.3" y1="257.0" x2="365.6" y2="267.0"/><line class="iso-edge" x1="382.9" y1="257.0" x2="365.6" y2="267.0"/><line class="iso-edge" x1="365.6" y1="287.0" x2="365.6" y2="267.0"/></g>
+      <line class="iso-edge iso-bucket" x1="362.2" y1="105.0" x2="414.1" y2="135.0"/>
+      <line class="iso-edge iso-bucket" x1="414.1" y1="135.0" x2="299.8" y2="201.0"/>
+      <line class="iso-edge iso-bucket" x1="299.8" y1="201.0" x2="247.8" y2="171.0"/>
+      <line class="iso-edge iso-bucket" x1="247.8" y1="171.0" x2="362.2" y2="105.0"/>
+      <text class="iso-label" x="31.3" y="152.0" text-anchor="middle">Producers</text>
+      <text class="iso-label" x="131.8" y="210.0" text-anchor="middle">Brokers</text>
+      <text class="iso-label" x="228.8" y="266.0" text-anchor="middle">R2 bucket</text>
+      <text class="iso-label" x="322.3" y="320.0" text-anchor="middle">Consumers</text>
+      <g id="iso-stack"></g>
+      <g id="iso-packets"></g>
+      </svg>
+      <div class="iso-modes" role="group" aria-label="Durability mode">
+      <button type="button" data-mode="wal" aria-pressed="true"><code>wal</code></button>
+      <button type="button" data-mode="r2" aria-pressed="false"><code>r2</code></button>
+      </div>
+      <figcaption id="iso-caption"><code>wal</code>: a batch goes to the leader and reaches a majority's write-ahead log, and then the producer gets its ack. Objects go up to the bucket afterwards.</figcaption>
+      </figure>
+    </section>
+    <div class="home-body">
       <h2>One process</h2>
       <p>Camus is a single binary. It accepts Kafka TCP, writes record batches as objects, and keeps topics, groups, offsets, and transactions in a Raft group. A deployment does not add a JVM inside the broker, ZooKeeper, KRaft, or a separate database.</p>
       <p>The brokers are the same program with different node ids. They agree on metadata through Raft. In the default durability mode they also replicate a short write-ahead log, so a produce can be acknowledged after a disk quorum. The object upload still happens. The write-ahead log is a buffer of seconds, then it is truncated.</p>
@@ -98,17 +128,50 @@
       <p>Three clients have been run against the broker: kafka-clients 4.4.0, librdkafka through confluent-kafka 2.16.1, and franz-go v1.22.0. They produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the compatibility doc stays unmarked until that client has really passed the call.</p>
       <h2>Where to go next</h2>
       <ul>
-        <li><a href="run.html">Run</a> one broker with Docker, or from a checkout.</li>
-        <li><a href="minio.html">Give it a bucket</a> before you care about the sealed log.</li>
-        <li><a href="clients.html">Clients</a> lists what those libraries can do, and the differences that will surprise you.</li>
-        <li><a href="durability.html">Durability</a> is the choice between acknowledging on a disk quorum and acknowledging only after the object is stored.</li>
+      <li><a href="run.html">Run</a> one broker with Docker, or from a checkout.</li>
+      <li><a href="minio.html">Give it a bucket</a> before you care about the sealed log.</li>
+      <li><a href="clients.html">Clients</a> lists what those libraries can do, and the differences that will surprise you.</li>
+      <li><a href="durability.html">Durability</a> is the choice between acknowledging on a disk quorum and acknowledging only after the object is stored.</li>
       </ul>
-
-      <footer>
-        <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
-      </footer>
-    </main>
-  </div>
+    </div>
+  </main>
+  <footer class="site-footer">
+    <div class="site-footer-inner">
+      <div class="site-footer-brand">
+        <span class="mark-name">Camus</span>
+        <p>A Kafka broker in one Rust binary. The log lives in R2, or any S3-compatible bucket.</p>
+      </div>
+      <nav class="site-footer-links" aria-label="Footer">
+        <div>
+          <h2>Use</h2>
+          <ul>
+            <li><a href="run.html">Run</a></li>
+            <li><a href="clients.html">Clients</a></li>
+            <li><a href="durability.html">Durability</a></li>
+            <li><a href="benchmarks.html">Benchmarks</a></li>
+          </ul>
+        </div>
+        <div>
+          <h2>Set up</h2>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </div>
+        <div>
+          <h2>Project</h2>
+          <ul>
+            <li><a href="docs.html">Docs</a></li>
+            <li><a href="recovery.html">Recovery</a></li>
+            <li><a href="https://github.com/nidheesh-m-vakharia/camus">GitHub</a></li>
+          </ul>
+        </div>
+      </nav>
+    </div>
+    <p class="site-footer-legal">License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
+  </footer>
   <script src="site.js"></script>
 </body>
 </html>
