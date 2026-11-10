@@ -299,6 +299,7 @@ pub fn delete_records(
             state.log_start,
         )?);
         catalog::migrate_extents(id, partition, &mut state, &mut put)?;
+        catalog::prune_spans(&mut state);
         put.push((
             catalog::partition_storage_key(id, partition),
             serde_json::to_string(&state).map_err(|err| err.to_string())?,
@@ -510,6 +511,56 @@ mod tests {
             .collect();
         assert_eq!(extents.len(), 1);
         assert_eq!(extents[0].start, 3);
+    }
+
+    #[test]
+    fn moving_the_log_start_drops_the_transaction_spans_below_it() -> Result<(), String> {
+        let mut map = world();
+        let key = catalog::partition_storage_key("topic-1", 0);
+        let row = map.get(&key).ok_or("no partition row")?;
+        let mut state = catalog::parse_partition(row)?;
+        state.next_offset = 20;
+        state.txn_committed = vec![
+            catalog::Span { start: 0, end: 4 },
+            catalog::Span { start: 8, end: 12 },
+        ];
+        state.txn_aborted = vec![
+            catalog::Span { start: 4, end: 8 },
+            catalog::Span { start: 12, end: 14 },
+        ];
+        map.insert(
+            key.clone(),
+            serde_json::to_string(&state).map_err(|err| err.to_string())?,
+        );
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let scan = |from: &str, to: &str, limit: usize| catalog::scan_map(&map, from, to, limit);
+        let done = delete_records(
+            &get,
+            &scan,
+            &[RecordCut {
+                topic: "events".into(),
+                partition: 0,
+                offset: 10,
+                high_watermark: -1,
+            }],
+        )?;
+        let (_, row) = done
+            .put
+            .iter()
+            .find(|(stored, _)| *stored == key)
+            .ok_or("partition row not written")?;
+        let state: Partition = serde_json::from_str(row).map_err(|err| err.to_string())?;
+        assert_eq!(state.log_start, 10);
+        assert_eq!(
+            state.txn_committed,
+            vec![catalog::Span { start: 8, end: 12 }],
+            "a span reaching past the log start stays"
+        );
+        assert_eq!(
+            state.txn_aborted,
+            vec![catalog::Span { start: 12, end: 14 }]
+        );
+        Ok(())
     }
 
     #[test]
