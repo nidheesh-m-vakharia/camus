@@ -84,8 +84,36 @@
       <h2>Setup</h2>
       <p>2026-11-10, commit <span class="ports">56f0c3a</span>. Apple M4 Pro, macOS, APFS on the internal SSD. Release build. MinIO in Docker on the same machine. The machine was otherwise idle, and each benchmark ran once.</p>
       <p>The baseline is 2026-11-05, commit <span class="ports">97cd9f3</span>, on the same machine. All brokers share one SSD, and on macOS <code>fsync</code> is a full device flush. Numbers with three brokers are pessimistic for that reason.</p>
+      <h2>What an acknowledgement is</h2>
+      <p>A producer sends a batch and waits for the broker to answer. That answer is the acknowledgement, or ack. It is the broker's promise that the batch is safe, and it is what every latency below measures: the time from sending a batch to its ack. A producer asks for a promise with the <code>acks</code> setting:</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Setting</th><th>Kafka acknowledges when</th><th>Camus acknowledges when</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>acks=0</code></td><td>Never. The producer does not wait.</td><td>Never. The batch may be lost. Not benchmarked.</td></tr>
+            <tr><td><code>acks=1</code></td><td>The leader has written the batch.</td><td>The same moment as <code>acks=all</code>.</td></tr>
+            <tr><td><code>acks=all</code></td><td>Every in-sync replica has the batch.</td><td>The topic's durability mode is satisfied, as below.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>So for Camus the ack depends on the topic's <code>durability.mode</code>, not on <code>acks</code>:</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Mode</th><th>The ack means</th><th>What can still be lost</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>wal</code></td><td>A majority of the WAL shard has fsynced the batch to local disk. The upload to the bucket follows.</td><td>Acknowledged batches not uploaded yet, normally a few seconds of log at most. They are lost only if a majority of brokers lose their disks before the upload.</td></tr>
+            <tr><td><code>r2</code></td><td>The object is in the bucket, and the metadata group has committed its offsets.</td><td>Nothing acknowledged, even if every broker's disk is gone.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>That is why the two modes differ by more than 20 times in the latency table. A <code>wal</code> ack waits for disk flushes on a majority of brokers. An <code>r2</code> ack waits for an object store put and a metadata commit. The fsyncs per ack column in the throughput table shows how many acks share one disk flush. Under load, one flush answers many producers.</p>
+      <p>Consumers acknowledge too, in a different sense. A consumer group commits the offset it has processed up to, and that commit is a metadata write. The metadata writes row near the end measures it. The ack to a waiting consumer row measures something else: how soon after a producer's ack a consumer sees the batch.</p>
       <h2>Latency, 3 brokers</h2>
-      <p>One producer sends 1 KiB records with <code>acks=all</code> and waits for each acknowledgement. <code>wal</code> answers after a disk majority has the batch. <code>r2</code> answers after the object is stored. See <a href="durability.html">durability</a>.</p>
+      <p>One producer sends 1 KiB records with <code>acks=all</code> and waits for each acknowledgement before sending the next. <code>wal</code> answers after a disk majority has the batch. <code>r2</code> answers after the object is stored. See <a href="durability.html">durability</a>.</p>
       <div class="table-scroll">
         <table>
           <thead>
