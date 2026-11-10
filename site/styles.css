@@ -394,11 +394,133 @@ td.num {
   padding: 0.9rem 1.1rem;
   background: var(--indigo-wash);
   border-radius: 16px;
-  color: var(--text-strong);
+  /* Blue, pulled toward the text colour so it reads on the wash in both themes. */
+  color: color-mix(in srgb, var(--indigo) 70%, var(--text-strong));
 }
 
 .notice p {
   margin: 0;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.chart {
+  margin: 1.5rem 0 2rem;
+  padding: 1.25rem 1.25rem 1rem;
+  background: var(--well);
+  border-radius: 16px;
+}
+
+.chart figcaption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  margin-block-end: 1rem;
+}
+
+.chart-title {
+  color: var(--text-strong);
+  font-weight: var(--weight-label);
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  color: var(--muted);
+  font-size: var(--step-1);
+}
+
+.key {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.key::before {
+  content: "";
+  width: 0.65rem;
+  height: 0.65rem;
+  border-radius: 3px;
+  background: var(--key);
+}
+
+.key-now,
+.bar-now {
+  --key: var(--indigo);
+}
+
+.key-base,
+.bar-base {
+  --key: var(--gray-8);
+}
+
+.bars {
+  display: grid;
+  gap: 0.9rem;
+  margin: 0;
+}
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 11rem minmax(0, 1fr);
+  align-items: center;
+  gap: 1rem;
+}
+
+.bar-row dt {
+  color: var(--text);
+  font-size: var(--step-1);
+}
+
+.bar-row dd {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+}
+
+.bar-line {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.bar {
+  flex: none;
+  width: var(--w);
+  min-width: 2px;
+  height: 0.7rem;
+  border-radius: 0 4px 4px 0;
+  background: var(--key);
+  transform-origin: left center;
+}
+
+.bar-value {
+  color: var(--muted);
+  font-size: var(--step-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.bar-now + .bar-value {
+  color: var(--text-strong);
+}
+
+@media (max-width: 36rem) {
+  .bar-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.35rem;
+  }
 }
 
 footer {

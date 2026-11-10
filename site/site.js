@@ -42,6 +42,30 @@
   var main = document.querySelector("main");
   if (!main) return;
 
+  // Chart bars grow in once, when the chart scrolls into view.
+  if (!reduce && "IntersectionObserver" in window) {
+    var seen = new IntersectionObserver(
+      function (entries) {
+        entries.forEach(function (entry) {
+          if (!entry.isIntersecting) return;
+          seen.unobserve(entry.target);
+          entry.target.querySelectorAll(".bar").forEach(function (bar, i) {
+            bar.animate([{ transform: "scaleX(0)" }, { transform: "scaleX(1)" }], {
+              duration: 520,
+              delay: i * 40,
+              easing: "cubic-bezier(0.23, 1, 0.32, 1)",
+              fill: "backwards",
+            });
+          });
+        });
+      },
+      { threshold: 0.3 }
+    );
+    document.querySelectorAll(".chart").forEach(function (chart) {
+      seen.observe(chart);
+    });
+  }
+
   var easeOut = "cubic-bezier(0.23, 1, 0.32, 1)";
   var easeIn = "cubic-bezier(0.55, 0, 1, 0.45)";
 
