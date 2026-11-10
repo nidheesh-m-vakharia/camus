@@ -162,7 +162,8 @@ fn mark(
             partition.txn_aborted.push(range);
         }
     }
-    for (key, partition) in dirty {
+    for (key, mut partition) in dirty {
+        crate::catalog::prune_spans(&mut partition);
         put.push((
             key,
             serde_json::to_string(&partition).map_err(|err| err.to_string())?,
