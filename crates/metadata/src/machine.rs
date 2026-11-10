@@ -305,6 +305,7 @@ fn may_change_acls(command: &Command) -> bool {
     match command {
         Command::CreateAcls { .. } | Command::DeleteAcls { .. } => true,
         Command::Put { key, .. } | Command::Delete { key } => key == acl::KEY,
+        Command::Batch(commands) => commands.iter().any(may_change_acls),
         _ => false,
     }
 }
@@ -313,6 +314,17 @@ fn apply_command(
     kv: &mut redb::Table<&str, &str>,
     command: Command,
 ) -> Result<Response, StorageError<NodeId>> {
+    if let Command::Batch(commands) = command {
+        let mut each = Vec::with_capacity(commands.len());
+        for command in commands {
+            each.push(apply_command(kv, command)?);
+        }
+        return Ok(Response {
+            value: None,
+            error_code: 0,
+            each,
+        });
+    }
     match command {
         Command::SaveGroup { .. }
         | Command::CommitOffsets { .. }
@@ -355,7 +367,9 @@ fn apply_command(
             scan_range(kv, from, to, limit)
         };
         match command {
-            Command::Put { .. } | Command::Delete { .. } => unreachable!("handled above"),
+            Command::Put { .. } | Command::Delete { .. } | Command::Batch(_) => {
+                unreachable!("handled above")
+            }
             Command::CreateTopic {
                 name,
                 id,
