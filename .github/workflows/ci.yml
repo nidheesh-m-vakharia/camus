@@ -6,11 +6,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# A new push replaces the run it supersedes, so old jobs stop holding runners.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
 
