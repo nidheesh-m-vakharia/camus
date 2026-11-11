@@ -41,7 +41,7 @@ use std::sync::Arc;
 use openraft::{Config, Raft};
 use serde::{Deserialize, Serialize};
 
-pub use machine::RedbMachine;
+pub use machine::{snapshot_rows, RedbMachine};
 pub use network::SharedRouter;
 pub use openraft::BasicNode;
 pub use openraft::RaftMetrics;
@@ -660,6 +660,24 @@ impl MetadataNode {
     }
 
     /// Stop Raft tasks. The files stay on disk.
+    /// Build a snapshot and return `(term, log index, body)` when this node
+    /// leads the group and the snapshot covers a log entry.
+    pub async fn snapshot_for_upload(&self) -> anyhow::Result<Option<(u64, u64, Vec<u8>)>> {
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics.current_leader != Some(metrics.id) {
+            return Ok(None);
+        }
+        self.raft
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let Some((index, bytes)) = self.machine.snapshot_index_and_body().await else {
+            return Ok(None);
+        };
+        Ok(Some((metrics.current_term, index, bytes)))
+    }
+
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.raft.shutdown().await?;
         Ok(())

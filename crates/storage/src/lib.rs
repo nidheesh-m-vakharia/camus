@@ -123,6 +123,14 @@ impl Bucket {
         Path::from(format!("{}{key}", self.prefix))
     }
 
+    /// Write `bytes` to `key`, replacing an object that is already there.
+    pub async fn put(&self, key: &str, bytes: Bytes) -> anyhow::Result<()> {
+        self.store
+            .put(&self.path(key), PutPayload::from_bytes(bytes))
+            .await?;
+        Ok(())
+    }
+
     /// Write `bytes` to `key`. A second create of the same key fails.
     pub async fn put_new(&self, key: &str, bytes: Bytes) -> anyhow::Result<()> {
         let opts = PutOptions {

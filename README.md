@@ -141,6 +141,12 @@ The full list is in [docs/compatibility.md](docs/compatibility.md).
 limited by object-storage latency. `r2` keeps no log bytes on the broker.
 See [ADR 0005](docs/adr/0005-durability-and-acks.md).
 
+The metadata leader writes a snapshot to `meta/snap/` every 30 seconds or
+10,000 applied entries, and moves `meta/snap/CURRENT` at most once a
+second. If every broker disk is lost, metadata newer than that snapshot is
+gone. Sealed log bytes can still be rebuilt from the objects (ADR 0008).
+`CAMUS_META_SNAPSHOT_MS=0` turns the upload off.
+
 Set the mode at topic creation with `durability.mode`. The cluster default
 is `CAMUS_DEFAULT_DURABILITY`.
 
