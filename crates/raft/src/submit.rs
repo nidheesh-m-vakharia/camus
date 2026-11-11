@@ -662,16 +662,18 @@ impl Ring {
         const FSYNC: u64 = 2;
         let raw = file.as_raw_fd();
         let flags = if dsync { libc::RWF_DSYNC as i32 } else { 0 };
-        let fd = if self.use_files {
-            io_uring::types::Fixed(0)
+        let write = if self.use_files {
+            io_uring::opcode::Write::new(io_uring::types::Fixed(0), ptr, len as u32)
+                .offset(offset)
+                .rw_flags(flags)
+                .build()
         } else {
-            io_uring::types::Fd(raw)
-        };
-        let write = io_uring::opcode::Write::new(fd, ptr, len as u32)
-            .offset(offset)
-            .rw_flags(flags)
-            .build()
-            .user_data(WRITE);
+            io_uring::opcode::Write::new(io_uring::types::Fd(raw), ptr, len as u32)
+                .offset(offset)
+                .rw_flags(flags)
+                .build()
+        }
+        .user_data(WRITE);
         let write = if sync {
             write.flags(io_uring::squeue::Flags::IO_LINK)
         } else {
