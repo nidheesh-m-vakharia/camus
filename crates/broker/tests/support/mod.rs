@@ -26,8 +26,8 @@ use camus_protocol::messages::{
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 use camus_protocol::records::{
-    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions,
+    TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
 };
 
 pub const TOPIC: &str = "orders";
@@ -347,6 +347,57 @@ pub fn fetch_code(addr: &str, offset: i64) -> i16 {
     recv::<FetchResponse>(&mut stream, 11).responses[0].partitions[0].error_code
 }
 
+/// One fetch at `offset`. The error code and the record values in the
+/// response. An error leaves the values empty when the broker attached none,
+/// so a consumer that stops on the code does not advance.
+pub fn fetch_at(addr: &str, offset: i64) -> (i16, Vec<String>) {
+    let mut stream = connect(addr);
+    let mut part = FetchPartition::default();
+    part.partition = 0;
+    part.fetch_offset = offset;
+    part.partition_max_bytes = 1024 * 1024;
+    let mut topic = FetchTopic::default();
+    topic.topic = TopicName(StrBytes::from_static_str(TOPIC));
+    topic.partitions = vec![part];
+    send(
+        &mut stream,
+        ApiKey::Fetch,
+        11,
+        &FetchRequest::default()
+            .with_max_wait_ms(0)
+            .with_topics(vec![topic]),
+    );
+    let fetched = recv::<FetchResponse>(&mut stream, 11);
+    let row = &fetched.responses[0].partitions[0];
+    let code = row.error_code;
+    let Some(bytes) = row.records.clone() else {
+        return (code, Vec::new());
+    };
+    let Ok(info) = camus_protocol::batch::inspect(&bytes, 1024 * 1024) else {
+        return (code, Vec::new());
+    };
+    let mut values = Vec::new();
+    let mut cursor = 0;
+    for batch in info {
+        let raw = &bytes[cursor..cursor + batch.len];
+        cursor += batch.len;
+        let mut buf = Bytes::copy_from_slice(raw);
+        let Ok(set) = RecordBatchDecoder::decode(&mut buf) else {
+            continue;
+        };
+        for record in set.records {
+            let Some(value) = record.value else {
+                continue;
+            };
+            let Ok(text) = String::from_utf8(value.to_vec()) else {
+                continue;
+            };
+            values.push(text);
+        }
+    }
+    (code, values)
+}
+
 /// How to start a broker. Kept on the node so a restart uses the same.
 #[derive(Clone, Default)]
 pub struct Opts {
@@ -654,6 +705,12 @@ pub fn produce_full(addr: &str, value: &str, timeout_ms: i32) -> (i16, i64, i32)
 /// error and offset.
 pub fn produce_batch(addr: &str, records: Bytes) -> (i16, i64) {
     let (code, offset, _) = produce_raw(addr, records, 5_000);
+    (code, offset)
+}
+
+/// Produce `records` as one batch with `acks=all` and `timeout_ms`.
+pub fn produce_batch_timeout(addr: &str, records: Bytes, timeout_ms: i32) -> (i16, i64) {
+    let (code, offset, _) = produce_raw(addr, records, timeout_ms);
     (code, offset)
 }
 

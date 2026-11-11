@@ -247,11 +247,24 @@ const IN_FLIGHT: usize = 2;
 /// committed wait here and go into the next entry together, so concurrent
 /// producers share one quorum fsync. Entries are submitted to Raft in arrival
 /// order, which is the order offsets are assigned.
+fn ack_delay() -> Option<std::time::Duration> {
+    let Ok(raw) = std::env::var("CAMUS_ACK_DELAY_MS") else {
+        return None;
+    };
+    let Ok(ms) = raw.parse::<u64>() else {
+        return None;
+    };
+    (ms > 0).then_some(std::time::Duration::from_millis(ms))
+}
+
 async fn commit_loop(
     raft: Raft<TypeConfig>,
     storage_failed: Arc<AtomicBool>,
     mut queue: tokio::sync::mpsc::UnboundedReceiver<Vec<Queued>>,
 ) {
+    // Test hook: the entry is already committed. Holding the ack lets a
+    // produce time out and still leave the record in the log.
+    let ack_delay = ack_delay();
     let slots = Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT));
     // Batches received but not yet packed, in arrival order. A request's
     // batches arrive as one chunk; a chunk larger than a group spills into
@@ -311,6 +324,7 @@ async fn commit_loop(
         let submitted = raft.client_write_ff(command).await;
         let raft = raft.clone();
         let flag = storage_failed.clone();
+        let ack_delay = ack_delay;
         tokio::spawn(async move {
             let _slot = slot;
             // Dropped once this task has sent every result.
@@ -350,6 +364,9 @@ async fn commit_loop(
                     return failure(code, waiters);
                 }
             };
+            if let Some(delay) = ack_delay {
+                tokio::time::sleep(delay).await;
+            }
             if written.data.each.is_empty() {
                 if let Some(waiter) = waiters.into_iter().next() {
                     let _ = waiter.send(Ok(written.data));
