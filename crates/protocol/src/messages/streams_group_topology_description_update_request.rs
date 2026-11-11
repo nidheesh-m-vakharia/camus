@@ -105,7 +105,7 @@ impl Encodable for StreamsGroupTopologyDescriptionUpdateRequest {
         types::Int32.encode(buf, &self.topology_epoch)?;
         types::Struct { version }.encode(buf, &self.topology_description)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -123,7 +123,7 @@ impl Encodable for StreamsGroupTopologyDescriptionUpdateRequest {
         total_size += types::Int32.compute_size(&self.topology_epoch)?;
         total_size += types::Struct { version }.compute_size(&self.topology_description)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -239,7 +239,7 @@ impl Encodable for TopologyDescription {
         types::CompactArray(types::Struct { version }).encode(buf, &self.subtopologies)?;
         types::CompactArray(types::Struct { version }).encode(buf, &self.global_stores)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -257,7 +257,7 @@ impl Encodable for TopologyDescription {
         total_size +=
             types::CompactArray(types::Struct { version }).compute_size(&self.global_stores)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -367,7 +367,7 @@ impl Encodable for TopologyDescriptionGlobalStore {
         types::Struct { version }.encode(buf, &self.source)?;
         types::Struct { version }.encode(buf, &self.processor)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -383,7 +383,7 @@ impl Encodable for TopologyDescriptionGlobalStore {
         total_size += types::Struct { version }.compute_size(&self.source)?;
         total_size += types::Struct { version }.compute_size(&self.processor)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -553,7 +553,7 @@ impl Encodable for TopologyDescriptionNode {
         types::CompactArray(types::CompactString).encode(buf, &self.stores)?;
         types::CompactArray(types::CompactString).encode(buf, &self.successors)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -574,7 +574,7 @@ impl Encodable for TopologyDescriptionNode {
         total_size += types::CompactArray(types::CompactString).compute_size(&self.stores)?;
         total_size += types::CompactArray(types::CompactString).compute_size(&self.successors)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -696,7 +696,7 @@ impl Encodable for TopologyDescriptionSubtopology {
         types::CompactString.encode(buf, &self.subtopology_id)?;
         types::CompactArray(types::Struct { version }).encode(buf, &self.nodes)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -712,7 +712,7 @@ impl Encodable for TopologyDescriptionSubtopology {
         total_size += types::CompactString.compute_size(&self.subtopology_id)?;
         total_size += types::CompactArray(types::Struct { version }).compute_size(&self.nodes)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

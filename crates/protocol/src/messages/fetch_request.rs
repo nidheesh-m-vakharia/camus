@@ -184,7 +184,7 @@ impl Encodable for FetchPartition {
                     num_tagged_fields += 1;
                 }
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -194,7 +194,7 @@ impl Encodable for FetchPartition {
             if version >= 17 {
                 if &self.replica_directory_id != &Uuid::nil() {
                     let computed_size = types::Uuid.compute_size(&self.replica_directory_id)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -208,7 +208,7 @@ impl Encodable for FetchPartition {
             if version >= 18 {
                 if self.high_watermark != 9223372036854775807 {
                     let computed_size = types::Int64.compute_size(&self.high_watermark)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -253,7 +253,7 @@ impl Encodable for FetchPartition {
                     num_tagged_fields += 1;
                 }
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -263,7 +263,7 @@ impl Encodable for FetchPartition {
             if version >= 17 {
                 if &self.replica_directory_id != &Uuid::nil() {
                     let computed_size = types::Uuid.compute_size(&self.replica_directory_id)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -277,7 +277,7 @@ impl Encodable for FetchPartition {
             if version >= 18 {
                 if self.high_watermark != 9223372036854775807 {
                     let computed_size = types::Int64.compute_size(&self.high_watermark)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -629,7 +629,7 @@ impl Encodable for FetchRequest {
                     num_tagged_fields += 1;
                 }
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -638,7 +638,7 @@ impl Encodable for FetchRequest {
             types::UnsignedVarInt.encode(buf, num_tagged_fields as u32)?;
             if !self.cluster_id.is_none() {
                 let computed_size = types::CompactString.compute_size(&self.cluster_id)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -652,7 +652,7 @@ impl Encodable for FetchRequest {
                 if &self.replica_state != &Default::default() {
                     let computed_size =
                         types::Struct { version }.compute_size(&self.replica_state)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -722,7 +722,7 @@ impl Encodable for FetchRequest {
                     num_tagged_fields += 1;
                 }
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -731,7 +731,7 @@ impl Encodable for FetchRequest {
             total_size += types::UnsignedVarInt.compute_size(num_tagged_fields as u32)?;
             if !self.cluster_id.is_none() {
                 let computed_size = types::CompactString.compute_size(&self.cluster_id)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -745,7 +745,7 @@ impl Encodable for FetchRequest {
                 if &self.replica_state != &Default::default() {
                     let computed_size =
                         types::Struct { version }.compute_size(&self.replica_state)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -965,7 +965,7 @@ impl Encodable for FetchTopic {
         }
         if version >= 12 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -997,7 +997,7 @@ impl Encodable for FetchTopic {
         }
         if version >= 12 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -1163,7 +1163,7 @@ impl Encodable for ForgottenTopic {
         }
         if version >= 12 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -1200,7 +1200,7 @@ impl Encodable for ForgottenTopic {
         }
         if version >= 12 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -1349,7 +1349,7 @@ impl Encodable for ReplicaState {
         }
         if version >= 12 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -1379,7 +1379,7 @@ impl Encodable for ReplicaState {
         }
         if version >= 12 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields

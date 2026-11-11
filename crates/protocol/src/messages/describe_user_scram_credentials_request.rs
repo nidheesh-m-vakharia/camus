@@ -60,7 +60,7 @@ impl Encodable for DescribeUserScramCredentialsRequest {
         }
         types::CompactArray(types::Struct { version }).encode(buf, &self.users)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -75,7 +75,7 @@ impl Encodable for DescribeUserScramCredentialsRequest {
         let mut total_size = 0;
         total_size += types::CompactArray(types::Struct { version }).compute_size(&self.users)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -167,7 +167,7 @@ impl Encodable for UserName {
         }
         types::CompactString.encode(buf, &self.name)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -182,7 +182,7 @@ impl Encodable for UserName {
         let mut total_size = 0;
         total_size += types::CompactString.compute_size(&self.name)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

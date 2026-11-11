@@ -75,7 +75,7 @@ impl Encodable for Cursor {
         types::CompactString.encode(buf, &self.topic_name)?;
         types::Int32.encode(buf, &self.partition_index)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -91,7 +91,7 @@ impl Encodable for Cursor {
         total_size += types::CompactString.compute_size(&self.topic_name)?;
         total_size += types::Int32.compute_size(&self.partition_index)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -216,7 +216,7 @@ impl Encodable for DescribeTopicPartitionsRequest {
         types::Int32.encode(buf, &self.response_partition_limit)?;
         types::OptionStruct { version }.encode(buf, &self.cursor)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -233,7 +233,7 @@ impl Encodable for DescribeTopicPartitionsRequest {
         total_size += types::Int32.compute_size(&self.response_partition_limit)?;
         total_size += types::OptionStruct { version }.compute_size(&self.cursor)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -331,7 +331,7 @@ impl Encodable for TopicRequest {
         }
         types::CompactString.encode(buf, &self.name)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -346,7 +346,7 @@ impl Encodable for TopicRequest {
         let mut total_size = 0;
         total_size += types::CompactString.compute_size(&self.name)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
