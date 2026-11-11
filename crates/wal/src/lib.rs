@@ -225,12 +225,13 @@ impl From<Failure> for WriteError {
 /// Bytes one packed entry may carry before the committer starts another.
 const GROUP_BYTES: usize = 1024 * 1024;
 
-/// Packed entries that may be committing at once. Two: the next group's disk
-/// flush runs while the previous group waits on its quorum. The group is
-/// packed before a slot is taken, so the extra slot does not flush one batch
-/// at a time. Four slots, taken before the pack, measured 10.4 MiB/s and
-/// 0.18 fsyncs per ack against 14.9 MiB/s and 0.07 with a single slot
-/// (`broker/tests/throughput.rs`, 32 producers).
+/// Packed entries that may be committing at once. A second one starts only
+/// when a full group is already waiting, so its disk flush overlaps the
+/// previous quorum. Starting it sooner halves the group: on 2026-11-10, 32
+/// producers did 0.12 fsyncs per ack against 0.06 with one slot
+/// ([#129](https://github.com/nidheesh-m-vakharia/camus/issues/129)). Four
+/// slots, taken before the pack, measured 10.4 MiB/s and 0.18 fsyncs per ack
+/// against 14.9 MiB/s and 0.07 (`broker/tests/throughput.rs`, 32 producers).
 const IN_FLIGHT: usize = 2;
 
 /// Group commit (ADR 0006). Batches that arrive while entries are being
@@ -254,11 +255,32 @@ async fn commit_loop(
             };
             ready.extend(chunk);
         }
+        // While one commit is in flight, leave a short group queued. The
+        // slot that just freed would otherwise flush it immediately, and the
+        // queue never fills during the quorum wait.
+        loop {
+            while let Ok(chunk) = queue.try_recv() {
+                ready.extend(chunk);
+            }
+            let waiting: usize = ready.iter().map(|(append, _, _)| append.raw.len()).sum();
+            let idle = slots.available_permits() == IN_FLIGHT;
+            if waiting >= GROUP_BYTES || ready.len() >= machine::MAX_PACKED || idle {
+                break;
+            }
+            let idle_slots = slots.clone();
+            tokio::select! {
+                biased;
+                chunk = queue.recv() => {
+                    let Some(chunk) = chunk else {
+                        return;
+                    };
+                    ready.extend(chunk);
+                }
+                _ = wait_until_idle(idle_slots) => {}
+            }
+        }
         let mut size = 0;
         let mut group = Vec::new();
-        // Pack before taking a slot. With two commits allowed, the queue
-        // still fills to `GROUP_BYTES` while both slots are busy, and a free
-        // slot then flushes that whole pack instead of the next single batch.
         pack(&mut queue, &mut ready, &mut group, &mut size);
         let Ok(slot) = slots.clone().acquire_owned().await else {
             return;
@@ -390,6 +412,18 @@ async fn purge_to(raft: &Raft<TypeConfig>, machine: &Machine, upto: u64) {
     }
     if let Err(err) = raft.trigger().purge_log(upto).await {
         tracing::warn!(%err, "wal log purge failed");
+    }
+}
+
+/// Wait until every commit slot is free, then release them. Dropping this
+/// future releases any slot it has already taken.
+async fn wait_until_idle(slots: Arc<tokio::sync::Semaphore>) {
+    let mut held = Vec::with_capacity(IN_FLIGHT);
+    for _ in 0..IN_FLIGHT {
+        let Ok(permit) = slots.clone().acquire_owned().await else {
+            return;
+        };
+        held.push(permit);
     }
 }
 
