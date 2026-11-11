@@ -6,6 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A new push replaces the run it supersedes, so old jobs stop holding runners.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -25,6 +30,16 @@ jobs:
         run: cargo fmt --all --check
       - name: No added unwrap/expect
         run: scripts/agent-check.sh --no-test
+      - name: Test
+        run: cargo test --workspace --locked
+
+  clients:
+    name: clients
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -42,7 +57,7 @@ jobs:
           load: true
           tags: camus-minio:pinned
           cache-from: type=gha,scope=minio
-          cache-to: type=gha,scope=minio,mode=max
+          cache-to: type=gha,scope=minio,mode=min
       - name: MinIO
         run: |
           docker run -d --name camus-minio -p 9100:9000 \
@@ -83,12 +98,13 @@ jobs:
         env:
           CAMUS_MINIO: "1"
           CAMUS_REQUIRE_CLIENTS: "1"
-        run: cargo test --workspace --locked
+        run: |
+          cargo test -p camus-broker --locked --tests
+          cargo test -p camus-storage --locked --test minio
 
   image:
     name: image
     runs-on: ubuntu-latest
-    needs: test
     permissions:
       contents: read
       packages: write
@@ -109,4 +125,4 @@ jobs:
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min

@@ -38,7 +38,7 @@ jobs:
           load: true
           tags: camus-minio:pinned
           cache-from: type=gha,scope=minio
-          cache-to: type=gha,scope=minio,mode=max
+          cache-to: type=gha,scope=minio,mode=min
       - name: MinIO
         run: |
           docker run -d --name camus-minio -p 9100:9000 \
