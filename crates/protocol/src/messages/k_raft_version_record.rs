@@ -74,7 +74,7 @@ impl Encodable for KRaftVersionRecord {
         types::Int16.encode(buf, &self.version)?;
         types::Int16.encode(buf, &self.k_raft_version)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -90,7 +90,7 @@ impl Encodable for KRaftVersionRecord {
         total_size += types::Int16.compute_size(&self.version)?;
         total_size += types::Int16.compute_size(&self.k_raft_version)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

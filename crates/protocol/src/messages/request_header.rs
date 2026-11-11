@@ -105,7 +105,7 @@ impl Encodable for RequestHeader {
         types::String.encode(buf, &self.client_id)?;
         if version >= 2 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -125,7 +125,7 @@ impl Encodable for RequestHeader {
         total_size += types::String.compute_size(&self.client_id)?;
         if version >= 2 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
