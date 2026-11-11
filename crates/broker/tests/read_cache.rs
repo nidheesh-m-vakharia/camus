@@ -26,7 +26,7 @@ fn cached_files(dir: &std::path::Path) -> usize {
 #[test]
 fn a_restarted_broker_serves_sealed_data_from_disk_without_object_storage() -> TestResult {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping read cache test; set CAMUS_MINIO=1");
+        support::skipped("read cache test; set CAMUS_MINIO=1");
         return Ok(());
     }
     let proxy = Proxy::start("127.0.0.1:9100");

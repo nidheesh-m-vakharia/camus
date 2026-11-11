@@ -25,7 +25,7 @@ fn truncate(http: &str, accept: bool) -> reqwest::blocking::Response {
 #[test]
 fn majority_loss_needs_truncate_to_sealed() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping majority-loss test; set CAMUS_MINIO=1");
+        support::skipped("majority-loss test; set CAMUS_MINIO=1");
         return;
     }
     let proxy = Proxy::start("127.0.0.1:9100");

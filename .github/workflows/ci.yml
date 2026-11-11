@@ -17,7 +17,66 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/broker/tests/gophase5/go.mod
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: deploy/minio
+          load: true
+          tags: camus-minio:pinned
+          cache-from: type=gha,scope=minio
+          cache-to: type=gha,scope=minio,mode=max
+      - name: MinIO
+        run: |
+          docker run -d --name camus-minio -p 9100:9000 \
+            -e MINIO_ROOT_USER=camus \
+            -e MINIO_ROOT_PASSWORD=camus-dev-secret \
+            camus-minio:pinned server /data --console-address :9001
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9100/minio/health/live && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:9100/minio/health/live
+          docker run --rm --network host --entrypoint mc camus-minio:pinned \
+            alias set local http://127.0.0.1:9100 camus camus-dev-secret
+          docker run --rm --network host --entrypoint mc camus-minio:pinned \
+            mb -p local/camus
+      - name: Small filesystem
+        run: |
+          image=$(mktemp)
+          truncate -s 32M "$image"
+          mkfs.ext4 -F "$image"
+          sudo mkdir -p /mnt/camus-small
+          sudo mount -o loop "$image" /mnt/camus-small
+          sudo chmod 777 /mnt/camus-small
+          echo "CAMUS_SMALL_FS=/mnt/camus-small" >> "$GITHUB_ENV"
+      - name: Client toolchains
+        run: |
+          jars=target/kafka-jars
+          mkdir -p "$jars"
+          curl -fsSL -o "$jars/kafka-clients-4.4.0.jar" https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/4.4.0/kafka-clients-4.4.0.jar
+          curl -fsSL -o "$jars/zstd-jni-1.5.7-17.jar" https://repo1.maven.org/maven2/com/github/luben/zstd-jni/1.5.7-17/zstd-jni-1.5.7-17.jar
+          curl -fsSL -o "$jars/lz4-java-1.11.2.jar" https://repo1.maven.org/maven2/at/yawk/lz4/lz4-java/1.11.2/lz4-java-1.11.2.jar
+          curl -fsSL -o "$jars/snappy-java-1.1.10.7.jar" https://repo1.maven.org/maven2/org/xerial/snappy/snappy-java/1.1.10.7/snappy-java-1.1.10.7.jar
+          curl -fsSL -o "$jars/slf4j-api-1.7.36.jar" https://repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar
+          curl -fsSL -o "$jars/slf4j-simple-1.7.36.jar" https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/1.7.36/slf4j-simple-1.7.36.jar
+          python3 -m venv target/pykafka
+          target/pykafka/bin/pip install --disable-pip-version-check 'confluent-kafka==2.16.1'
+          mkdir -p target/go/bin
+          ln -sfn "$(command -v go)" target/go/bin/go
       - name: Test
+        env:
+          CAMUS_MINIO: "1"
+          CAMUS_REQUIRE_CLIENTS: "1"
         run: cargo test --workspace --locked
 
   image:

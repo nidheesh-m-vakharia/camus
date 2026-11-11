@@ -25,7 +25,7 @@ use support::*;
 fn minio() -> bool {
     let on = std::env::var("CAMUS_MINIO").ok().as_deref() == Some("1");
     if !on {
-        eprintln!("skipping; set CAMUS_MINIO=1");
+        support::skipped("wal fault test; set CAMUS_MINIO=1");
     }
     on
 }
@@ -246,7 +246,7 @@ fn full_wal_disk_answers_storage_error() {
     }
     let root = tempfile::tempdir().unwrap();
     let Some(fs) = SmallFs::new(root.path()) else {
-        eprintln!("skipping; no small filesystem (macOS hdiutil or CAMUS_SMALL_FS)");
+        support::skipped("no small filesystem (macOS hdiutil or CAMUS_SMALL_FS)");
         return;
     };
     let proxy = Proxy::start("127.0.0.1:9100");
