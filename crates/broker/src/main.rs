@@ -759,14 +759,23 @@ async fn shard_hand_over(
     let Some(opened) = admin.wal.shard(shard) else {
         return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
     };
-    if !opened.is_leader() {
-        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
-    }
     if body.to == admin.node_id {
         return Ok(StatusCode::OK);
     }
-    if !opened.follower_caught_up(body.to) {
-        return Err((StatusCode::CONFLICT, format!("voter {} is behind", body.to)));
+    // Replication metrics lag the moment leadership is won. Give the target
+    // a moment to match the log before refusing.
+    let caught_up = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if !opened.is_leader() {
+            return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+        }
+        if opened.follower_caught_up(body.to) {
+            break;
+        }
+        if tokio::time::Instant::now() >= caught_up {
+            return Err((StatusCode::CONFLICT, format!("voter {} is behind", body.to)));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let addr = opened
         .voter_addr(body.to)
