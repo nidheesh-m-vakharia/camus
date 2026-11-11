@@ -146,6 +146,9 @@ The metadata leader writes a snapshot to `meta/snap/` every 30 seconds or
 second. If every broker disk is lost, metadata newer than that snapshot is
 gone. Sealed log bytes can still be rebuilt from the objects (ADR 0008).
 `CAMUS_META_SNAPSHOT_MS=0` turns the upload off.
+`camus admin restore-cluster` loads that snapshot onto a fresh metadata
+group and rebuilds sealed extents from object footers. Unsealed WAL
+entries stay lost. Group offsets can move back by one snapshot interval.
 
 Set the mode at topic creation with `durability.mode`. The cluster default
 is `CAMUS_DEFAULT_DURABILITY`.

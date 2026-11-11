@@ -15,6 +15,7 @@ pub mod groups;
 mod machine;
 mod network;
 mod producers;
+mod recover;
 mod txn;
 
 pub use acl::{
@@ -45,6 +46,7 @@ pub use machine::{snapshot_rows, RedbMachine};
 pub use network::SharedRouter;
 pub use openraft::BasicNode;
 pub use openraft::RaftMetrics;
+pub use recover::{offline_key, plan_restore, ObjectSlice, RestorePlan};
 
 /// Node id in the metadata group.
 pub type NodeId = u64;

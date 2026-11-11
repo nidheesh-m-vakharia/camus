@@ -2769,6 +2769,15 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
+    /// A restore found two objects for this range whose batch bytes differ.
+    fn restore_offline(&self, topic_id: &str, partition: i32) -> bool {
+        self.node
+            .read_local(&camus_metadata::offline_key(topic_id, partition))
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     async fn enqueue_partition(
         &self,
         name: &str,
@@ -2783,6 +2792,9 @@ impl Kafka {
         let Some(topic) = topic else {
             return Err(UNKNOWN_TOPIC);
         };
+        if self.restore_offline(&topic.id, partition) {
+            return Err(LEADER_NOT_AVAILABLE);
+        }
         if topic.durability == "wal" {
             return self
                 .write_wal(
@@ -3580,6 +3592,10 @@ impl Kafka {
             row.error_code = UNKNOWN_TOPIC;
             return row;
         };
+        if self.restore_offline(&topic.id, partition) {
+            row.error_code = LEADER_NOT_AVAILABLE;
+            return row;
+        }
         if topic.durability == "wal" && !self.leads_wal(topic, partition) {
             row.error_code = NOT_LEADER;
             return row;
