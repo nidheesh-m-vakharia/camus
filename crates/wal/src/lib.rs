@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::{Config, Raft};
+use openraft::{Config, EntryPayload, Raft};
 use serde::{Deserialize, Serialize};
 
 pub use machine::Batch;
@@ -65,6 +65,77 @@ openraft::declare_raft_types!(
         D = Command,
         R = Response,
 );
+
+fn batch_slices(entry: &openraft::Entry<TypeConfig>) -> Vec<&[u8]> {
+    match &entry.payload {
+        EntryPayload::Normal(Command::Append(batch)) => vec![batch.raw.as_ref()],
+        EntryPayload::Normal(Command::Appends(batches)) => {
+            batches.iter().map(|batch| batch.raw.as_ref()).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn clear_batches(entry: &mut openraft::Entry<TypeConfig>) {
+    match &mut entry.payload {
+        EntryPayload::Normal(Command::Append(batch)) => batch.raw.clear(),
+        EntryPayload::Normal(Command::Appends(batches)) => {
+            for batch in batches {
+                batch.raw.clear();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fill_batches(entry: &mut openraft::Entry<TypeConfig>, raws: Vec<Vec<u8>>) {
+    let mut raws = raws.into_iter();
+    match &mut entry.payload {
+        EntryPayload::Normal(Command::Append(batch)) => {
+            if let Some(raw) = raws.next() {
+                batch.raw = bytes::Bytes::from(raw);
+            }
+        }
+        EntryPayload::Normal(Command::Appends(batches)) => {
+            for batch in batches {
+                if let Some(raw) = raws.next() {
+                    batch.raw = bytes::Bytes::from(raw);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn encode_log(entry: &openraft::Entry<TypeConfig>, out: &mut Vec<u8>) -> std::io::Result<()> {
+    let slices = batch_slices(entry);
+    let mut stripped = entry.clone();
+    clear_batches(&mut stripped);
+    let header = camus_raft::codec::encode(&stripped)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+    camus_raft::layout::write_parts(&header, &slices, out)
+}
+
+fn decode_log(bytes: &[u8]) -> std::io::Result<openraft::Entry<TypeConfig>> {
+    let Some((header, raws)) = camus_raft::layout::read_parts(bytes)? else {
+        return camus_raft::codec::decode(bytes)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()));
+    };
+    let mut entry: openraft::Entry<TypeConfig> = camus_raft::codec::decode(header)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+    fill_batches(&mut entry, raws);
+    Ok(entry)
+}
+
+fn log_batch_at(entry: &openraft::Entry<TypeConfig>, pos: usize) -> std::io::Result<Option<u64>> {
+    let slices = batch_slices(entry);
+    let mut stripped = entry.clone();
+    clear_batches(&mut stripped);
+    let header = camus_raft::codec::encode(&stripped)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+    let lens: Vec<usize> = slices.iter().map(|batch| batch.len()).collect();
+    Ok(camus_raft::layout::batch_offset(header.len(), &lens, pos))
+}
 
 /// A committed command.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -555,7 +626,8 @@ impl Shard {
             ..Default::default()
         };
         let config = Arc::new(config.validate()?);
-        let log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
+        let mut log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
+        log.set_codec(encode_log, decode_log);
         let log_stats = log.stats();
         let machine = Arc::new(Machine::open(&dir.join("state.redb"), log.clone())?);
         let raft = Raft::new(node_id, config, network, log, machine.clone()).await?;
@@ -601,6 +673,23 @@ impl Shard {
             && metrics
                 .millis_since_quorum_ack
                 .is_some_and(|ms| u128::from(ms) < within.as_millis())
+    }
+
+    /// Add `id` as a learner, wait until it has this shard's log, then make
+    /// it a voter. The caller is the leader. `node.addr` is that broker's
+    /// HTTP address, the same form `initialize` stores.
+    pub async fn add_voter(&self, id: NodeId, node: BasicNode) -> anyhow::Result<()> {
+        self.raft
+            .add_learner(id, node, true)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        let mut ids = std::collections::BTreeSet::new();
+        ids.insert(id);
+        self.raft
+            .change_membership(openraft::ChangeMembers::AddVoterIds(ids), false)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
     }
 
     /// Voter ids in the latest membership this node has seen.

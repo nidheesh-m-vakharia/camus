@@ -85,6 +85,11 @@ struct Head {
     log_index: u64,
     /// Position inside a packed entry. `0` for a single append.
     pos: u32,
+    /// Offset of this batch inside the log record. `0` means the record was
+    /// written before batches had their own range, so the read decodes the
+    /// whole entry.
+    #[serde(default)]
+    at: u64,
     topic_id: [u8; 16],
     base_timestamp: i64,
     max_timestamp: i64,
@@ -452,12 +457,13 @@ impl Machine {
         }
         let wanted: BTreeSet<u64> = heads
             .iter()
-            .filter(|head| !detached.contains_key(&head.key()))
+            .filter(|head| head.at == 0 && !detached.contains_key(&head.key()))
             .map(|head| head.log_index)
             .collect();
         let mut entries: BTreeMap<u64, Command> = BTreeMap::new();
-        // Read only the entries these heads are in, one range per run of
-        // consecutive indexes, not everything between the first and last.
+        // A head that knows its byte offset is read on its own. Older heads,
+        // written before that offset was stored, still decode their entry.
+        // Those entries are read one range per run of consecutive indexes.
         let mut log = self.log.clone();
         for (first, last) in runs(&wanted) {
             for entry in log.try_get_log_entries(first..=last).await? {
@@ -470,6 +476,15 @@ impl Machine {
         for head in heads {
             let bytes = if let Some(bytes) = detached.remove(&head.key()) {
                 bytes
+            } else if head.at > 0 {
+                let raw = log
+                    .read_slice(head.log_index, head.at, head.len as usize)
+                    .await
+                    .map_err(|err| io(ErrorSubject::Logs, &err))?
+                    .ok_or_else(|| missing(&head))?;
+                camus_protocol::batch::seal(&raw, head.start, head.epoch, MAX_BATCH)
+                    .map_err(|_| missing(&head))?
+                    .to_vec()
             } else {
                 let raw = match entries.get(&head.log_index) {
                     Some(Command::Append(append)) if head.pos == 0 => &append.raw,
@@ -677,18 +692,43 @@ fn write_changes(
     Ok(())
 }
 
-fn apply_one(state: &mut State, command: Command, log_index: u64) -> Response {
-    apply_at(state, command, log_index, 0)
+fn batch_offsets(entry: &openraft::Entry<TypeConfig>) -> Vec<u64> {
+    let count = match &entry.payload {
+        EntryPayload::Normal(Command::Append(_)) => 1,
+        EntryPayload::Normal(Command::Appends(batches)) => batches.len(),
+        _ => 0,
+    };
+    (0..count)
+        .filter_map(|pos| crate::log_batch_at(entry, pos).ok().flatten())
+        .collect()
 }
 
-fn apply_at(state: &mut State, command: Command, log_index: u64, pos: u32) -> Response {
+fn apply_one(state: &mut State, command: Command, log_index: u64, offsets: &[u64]) -> Response {
+    apply_at(state, command, log_index, 0, offsets)
+}
+
+fn apply_at(
+    state: &mut State,
+    command: Command,
+    log_index: u64,
+    pos: u32,
+    offsets: &[u64],
+) -> Response {
     match command {
         Command::Appends(batches) => {
             let each = batches
                 .into_iter()
                 .take(MAX_PACKED)
                 .enumerate()
-                .map(|(pos, batch)| apply_at(state, Command::Append(batch), log_index, pos as u32))
+                .map(|(pos, batch)| {
+                    apply_at(
+                        state,
+                        Command::Append(batch),
+                        log_index,
+                        pos as u32,
+                        offsets,
+                    )
+                })
                 .collect();
             Response {
                 base_offset: -1,
@@ -778,6 +818,7 @@ fn apply_at(state: &mut State, command: Command, log_index: u64, pos: u32) -> Re
                 max_timestamp: batch.max_timestamp,
                 epoch: batch.epoch,
                 len: batch.raw.len() as u64,
+                at: offsets.get(pos as usize).copied().unwrap_or(0),
             };
             state.dirty.add(head.clone());
             state.heads.insert(head);
@@ -898,6 +939,7 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
         let mut responses = Vec::new();
         let mut membership_changed = false;
         for entry in entries {
+            let offsets = batch_offsets(&entry);
             state.last_applied = Some(entry.log_id);
             state.dirty.meta = true;
             let response = match entry.payload {
@@ -906,7 +948,9 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
                     error_code: 0,
                     each: Vec::new(),
                 },
-                EntryPayload::Normal(command) => apply_one(&mut state, command, entry.log_id.index),
+                EntryPayload::Normal(command) => {
+                    apply_one(&mut state, command, entry.log_id.index, &offsets)
+                }
                 EntryPayload::Membership(membership) => {
                     membership_changed = true;
                     state.membership = Some(StoredMembership::new(Some(entry.log_id), membership));
@@ -1037,6 +1081,7 @@ mod tests {
             max_timestamp: 0,
             epoch: 0,
             len: (end - start) as u64 * 10,
+            at: 0,
         }
     }
 
@@ -1228,5 +1273,109 @@ mod tests {
         let txn = machine.db.begin_read().unwrap();
         let json = txn.open_table(META).unwrap().get(STATE).unwrap().unwrap();
         assert!(!json.value().contains("\"next\""), "{}", json.value());
+    }
+
+    #[tokio::test]
+    async fn a_tail_read_loads_one_batch() -> std::io::Result<()> {
+        let raw0 = one_batch("alpha-batch")?;
+        let raw1 = one_batch("beta-batch-is-longer")?;
+        let topic_id = [9u8; 16];
+        let entry = openraft::Entry {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Normal(Command::Appends(vec![
+                produced(topic_id, 0, raw0.clone()),
+                produced(topic_id, 1, raw1.clone()),
+            ])),
+        };
+        let dir = tempfile::tempdir().map_err(|err| std::io::Error::other(err))?;
+        let log = camus_raft::SegmentLogStore::open(dir.path().join("log"))
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let mut encoded = Vec::new();
+        crate::encode_log(&entry, &mut encoded)?;
+        log.write_record(1, encoded)?;
+        let mut machine = Arc::new(
+            Machine::open(&dir.path().join("state.redb"), log)
+                .map_err(|err| std::io::Error::other(err.to_string()))?,
+        );
+        openraft::storage::RaftStateMachine::apply(&mut machine, [entry])
+            .await
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let got = machine
+            .read(&topic_id, 1, 0, 0, 1 << 20)
+            .await
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let read = machine
+            .log
+            .stats()
+            .read_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if read != raw1.len() as u64 {
+            return Err(std::io::Error::other(format!(
+                "read {read} bytes, the batch is {}",
+                raw1.len()
+            )));
+        }
+        if !got
+            .windows(b"beta-batch-is-longer".len())
+            .any(|window| window == b"beta-batch-is-longer")
+        {
+            return Err(std::io::Error::other(
+                "the fetched batch is not the one asked for",
+            ));
+        }
+        if got
+            .windows(b"alpha-batch".len())
+            .any(|window| window == b"alpha-batch")
+        {
+            return Err(std::io::Error::other("the fetch included the other batch"));
+        }
+        Ok(())
+    }
+
+    fn one_batch(value: &str) -> std::io::Result<bytes::Bytes> {
+        use camus_protocol::records::{
+            Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+            NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+        };
+        let records = vec![Record {
+            transactional: false,
+            control: false,
+            delete_horizon: false,
+            partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+            producer_id: NO_PRODUCER_ID,
+            producer_epoch: NO_PRODUCER_EPOCH,
+            sequence: 0,
+            timestamp_type: TimestampType::Creation,
+            offset: 0,
+            timestamp: 9,
+            key: None,
+            value: Some(bytes::Bytes::copy_from_slice(value.as_bytes())),
+            headers: Default::default(),
+        }];
+        let mut buf = bytes::BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            &records,
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+        Ok(buf.freeze())
+    }
+
+    fn produced(topic_id: [u8; 16], partition: i32, raw: bytes::Bytes) -> crate::Append {
+        crate::Append {
+            topic: "events".into(),
+            partition,
+            topic_id,
+            epoch: 1,
+            records: 1,
+            base_timestamp: 9,
+            max_timestamp: 9,
+            floor: 0,
+            raw,
+        }
     }
 }
