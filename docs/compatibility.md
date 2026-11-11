@@ -335,7 +335,7 @@ acceptance test. `-` means not run.
 | DescribeTransactions | 65 | 5 | 0 | implemented | pass | - | pass |
 | ListTransactions | 66 | 5 | 0-2 | implemented | pass | - | pass |
 | AllocateProducerIds | 67 | | broker-internal | unimplemented | - | - | - |
-| ConsumerGroupHeartbeat | 68 | 3 | 0-1 | implemented | pass | - | - |
+| ConsumerGroupHeartbeat | 68 | 3 | 0-1 | implemented | pass | pass | pass |
 | ConsumerGroupDescribe | 69 | 3 | 0-1 | implemented | pass | - | - |
 | GetTelemetrySubscriptions | 71 | | not planned | unimplemented | - | - | - |
 | PushTelemetry | 72 | | not planned | unimplemented | - | - | - |

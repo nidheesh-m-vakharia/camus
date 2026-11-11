@@ -180,6 +180,51 @@ fn java_consumer_group_commits_and_resumes() {
 }
 
 #[test]
+fn librdkafka_consumer_group_commits_and_resumes() -> std::io::Result<()> {
+    if !minio() {
+        return Ok(());
+    }
+    let python = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pykafka/bin/python");
+    if !python.is_file() {
+        support::skipped(&format!("librdkafka; missing {}", python.display()));
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (_nodes, bootstrap) = cluster(root.path());
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/python/group_roundtrip.py");
+    let ran = Command::new(python)
+        .arg(script)
+        .arg(&bootstrap)
+        .arg("consumer")
+        .output()?;
+    check(root.path(), ran, "librdkafka consumer protocol");
+    Ok(())
+}
+
+#[test]
+fn franz_go_consumer_group_commits_and_resumes() -> std::io::Result<()> {
+    if !minio() {
+        return Ok(());
+    }
+    let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
+    if !go.is_file() {
+        support::skipped(&format!("franz-go; missing {}", go.display()));
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (_nodes, bootstrap) = cluster(root.path());
+    let ran = Command::new(go)
+        .args(["run", "."])
+        .arg(&bootstrap)
+        .arg("consumer")
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gogroup"))
+        .env("GOTOOLCHAIN", "local")
+        .output()?;
+    check(root.path(), ran, "franz-go consumer protocol");
+    Ok(())
+}
+
+#[test]
 fn franz_go_group_commits_and_resumes() {
     if !minio() {
         return;
