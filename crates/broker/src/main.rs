@@ -267,7 +267,13 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
          camus_sweep_bytes_deleted_total {}\n\
          # HELP camus_produce_hold_ms_total Milliseconds produce requests were held at the WAL disk limit.\n\
          # TYPE camus_produce_hold_ms_total counter\n\
-         camus_produce_hold_ms_total {}\n",
+         camus_produce_hold_ms_total {}\n\
+         # HELP camus_meta_snapshot_index Log index of the newest metadata snapshot in object storage.\n\
+         # TYPE camus_meta_snapshot_index gauge\n\
+         camus_meta_snapshot_index {}\n\
+         # HELP camus_meta_snapshot_unix_ms Unix milliseconds of that snapshot, or 0.\n\
+         # TYPE camus_meta_snapshot_unix_ms gauge\n\
+         camus_meta_snapshot_unix_ms {}\n",
         metrics.current_term,
         if metrics.current_leader == Some(metrics.id) {
             1
@@ -279,6 +285,8 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
         stats.objects_deleted.load(Relaxed),
         stats.bytes_deleted.load(Relaxed),
         kafka::PRODUCE_HOLD_MS.load(Relaxed),
+        kafka::META_SNAPSHOT_INDEX.load(Relaxed),
+        kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
     )
 }
 
@@ -306,6 +314,8 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "sweep_objects_deleted": camus_compactor::STATS.objects_deleted.load(std::sync::atomic::Ordering::Relaxed),
         "sweep_bytes_deleted": camus_compactor::STATS.bytes_deleted.load(std::sync::atomic::Ordering::Relaxed),
         "produce_hold_ms": kafka::PRODUCE_HOLD_MS.load(std::sync::atomic::Ordering::Relaxed),
+        "meta_snapshot_index": kafka::META_SNAPSHOT_INDEX.load(std::sync::atomic::Ordering::Relaxed),
+        "meta_snapshot_unix_ms": kafka::META_SNAPSHOT_AT_MS.load(std::sync::atomic::Ordering::Relaxed),
         "wal_shards": admin
             .wal
             .all()

@@ -1417,7 +1417,95 @@ impl Kafka {
     }
 
     /// Accept connections until the listener closes.
+    /// Write a metadata snapshot to object storage on the leader. The object
+    /// is `meta/snap/{term}-{index}.snap`. `meta/snap/CURRENT` names the
+    /// newest one and moves at most once a second (ADR 0004).
+    async fn metadata_snapshots(&self) {
+        let interval_ms = std::env::var("CAMUS_META_SNAPSHOT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30_000);
+        if interval_ms == 0 {
+            return;
+        }
+        let every = std::env::var("CAMUS_META_SNAPSHOT_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10_000)
+            .max(1);
+        let interval = Duration::from_millis(interval_ms);
+        let mut uploaded: Option<u64> = None;
+        let mut since = Instant::now();
+        let mut current_at: Option<Instant> = None;
+        let mut pending: Option<String> = None;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some(key) = pending.clone() {
+                let due = current_at
+                    .map(|at| at.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if due
+                    && self
+                        .bucket
+                        .put("meta/snap/CURRENT", bytes::Bytes::from(key))
+                        .await
+                        .is_ok()
+                {
+                    current_at = Some(Instant::now());
+                    pending = None;
+                }
+            }
+            let metrics = self.node.raft.metrics().borrow().clone();
+            if metrics.current_leader != Some(metrics.id) {
+                continue;
+            }
+            let Some(applied) = metrics.last_applied.map(|id| id.index) else {
+                continue;
+            };
+            let advanced = match uploaded {
+                Some(prev) => applied > prev,
+                None => applied > 0,
+            };
+            let by_count = uploaded.is_some_and(|prev| applied.saturating_sub(prev) >= every);
+            let by_time = since.elapsed() >= interval;
+            if !advanced || !(by_time || by_count) {
+                continue;
+            }
+            let Ok(Some((term, index, body))) = self.node.snapshot_for_upload().await else {
+                continue;
+            };
+            if uploaded.is_some_and(|prev| index <= prev) {
+                continue;
+            }
+            let key = format!("meta/snap/{term}-{index}.snap");
+            let missing = self.bucket.is_missing(&key).await.unwrap_or(true);
+            if missing
+                && self
+                    .bucket
+                    .put_new(&key, bytes::Bytes::from(body))
+                    .await
+                    .is_err()
+            {
+                tracing::warn!(%key, "metadata snapshot upload failed");
+                continue;
+            }
+            uploaded = Some(index);
+            since = Instant::now();
+            META_SNAPSHOT_INDEX.store(index, std::sync::atomic::Ordering::Relaxed);
+            META_SNAPSHOT_AT_MS.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or(0),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            pending = Some(key);
+        }
+    }
+
     pub async fn run(self: Arc<Self>, listener: TcpListener) {
+        let snaps = Arc::clone(&self);
+        tokio::spawn(async move { snaps.metadata_snapshots().await });
         let flush = Arc::clone(&self);
         tokio::spawn(async move {
             loop {
@@ -3853,6 +3941,11 @@ impl Kafka {
 
 /// Milliseconds produce requests spent held at `wal.disk.limit`, in total.
 pub static PRODUCE_HOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Log index of the newest metadata snapshot written to object storage.
+pub static META_SNAPSHOT_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Unix milliseconds when that snapshot was written. `0` means none yet.
+pub static META_SNAPSHOT_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Kafka ACL resource types, operations, and authorization errors.
 pub(crate) mod auth {
