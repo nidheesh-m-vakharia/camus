@@ -16,4 +16,5 @@ description: Branch, commit, and open a pull request for Camus, matching the rep
 5. PR body follows `.github/pull_request_template.md`: `## Summary`, then
    `## Test plan`. List the exact commands run, and any gated tests that
    were skipped.
-6. CI runs `cargo test --workspace --locked`, then builds the image.
+6. CI runs `cargo fmt --all --check`, `scripts/agent-check.sh --no-test`,
+   and `cargo test --workspace --locked`, then builds the image.

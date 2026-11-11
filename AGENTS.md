@@ -46,8 +46,7 @@ scripts/agent-check.sh                     # rules below + tests, before a PR
 - Kafka 4.4.0 decides behaviour. Record any intended difference in
   `docs/compatibility.md`.
 - Don't hand-edit `crates/protocol/src/messages/`; it is generated.
-- Don't run `cargo fmt` across the workspace. `main` isn't fmt-clean yet, so
-  format only the files you touch.
+- Run `cargo fmt --all` before committing. CI checks it.
 - Commit subject: one sentence saying what changed and why, ending in a
   period. Example: "Start a second WAL commit only when a full group is
   waiting."
