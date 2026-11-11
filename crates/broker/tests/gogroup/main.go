@@ -236,7 +236,7 @@ func goMember() {
 	protocol := os.Args[6]
 	seen := os.Args[7]
 	marker := os.Args[8]
-	need := os.Args[9]
+	_ = os.Args[9]
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.ClientID(role),
@@ -272,7 +272,7 @@ func goMember() {
 			must(file.Close())
 		}
 		if role == "survivor" {
-			if _, err := os.Stat(marker); err == nil && containsAll(got, readValues(need)) && len(got) >= 40 {
+			if _, err := os.Stat(marker); err == nil && equal(got, producedValues()) {
 				return
 			}
 		}
@@ -298,6 +298,10 @@ func producePinned(ctx context.Context, name string) {
 		}
 		must(client.ProduceSync(ctx, record).FirstErr())
 	}
+}
+
+func producedValues() map[string]bool {
+	return span(0, 40)
 }
 
 func readValues(path string) map[string]bool {

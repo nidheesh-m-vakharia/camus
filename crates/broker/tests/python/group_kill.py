@@ -107,7 +107,7 @@ def member():
                     with path.open("a") as out:
                         out.write(value + "\n")
                         out.flush()
-            if role == "survivor" and Path(marker).exists() and read(Path(need)) <= got and len(got) >= COUNT:
+            if role == "survivor" and Path(marker).exists() and got == produced():
                 return
     finally:
         consumer.close()
@@ -126,6 +126,10 @@ def produce(bootstrap, topic):
             partition=index % 4,
         )
     assert producer.flush(30) == 0
+
+
+def produced():
+    return {f"v{index}" for index in range(COUNT)}
 
 
 def read(path):

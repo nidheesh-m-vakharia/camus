@@ -143,11 +143,8 @@ public class GroupKill {
                                 Files.readString(seen) + record.value() + "\n");
                     }
                 }
-                if (role.equals("survivor") && Files.exists(marker)) {
-                    Set<String> required = read(need);
-                    if (got.containsAll(required) && got.size() >= COUNT) {
-                        return;
-                    }
+                if (role.equals("survivor") && Files.exists(marker) && got.equals(produced())) {
+                    return;
                 }
             }
         } catch (IOException err) {
@@ -168,6 +165,14 @@ public class GroupKill {
                         .get();
             }
         }
+    }
+
+    static Set<String> produced() {
+        Set<String> out = new HashSet<>();
+        for (int index = 0; index < COUNT; index++) {
+            out.add("v" + index);
+        }
+        return out;
     }
 
     static Set<String> read(Path path) throws IOException {
