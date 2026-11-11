@@ -91,8 +91,14 @@ the voters as replicas and ISR. A broker that is not the shard leader
 answers produce, fetch, and list-offsets with `NOT_LEADER_OR_FOLLOWER` (6).
 A produce that cannot commit within `timeout_ms`, for example with no
 quorum, gets `REQUEST_TIMED_OUT` (7); the entry may still commit later, so a
-client without idempotence can duplicate on retry. The upload to object
-storage follows the ack. A `wal` partition's leader epoch is the WAL shard's
+client without idempotence can duplicate on retry. Producers should set
+`enable.idempotence=true`. The Java client has done so by default since
+Kafka 3.0, and franz-go does unless the application calls
+`DisableIdempotentWrite`. librdkafka, including confluent-kafka, leaves
+`enable.idempotence` off until the application sets it. With idempotence
+the retry carries the same producer id and sequence, and the broker returns
+the original offset instead of appending a second copy. Without it, the
+retry is a new batch. The upload to object storage follows the ack. A `wal` partition's leader epoch is the WAL shard's
 Raft term plus a base kept in metadata; `truncate-to-sealed` raises the
 base, so the epoch only grows. An `r2` partition's epoch is the metadata
 group's term. Batches are sealed with that epoch, publish records where each
