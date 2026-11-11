@@ -1,6 +1,8 @@
 //! A transactional produce stays hidden from `read_committed` until `EndTxn`.
 //! Abort keeps the batch hidden. `read_uncommitted` sees both.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -404,7 +406,7 @@ fn committed_offset(stream: &mut TcpStream) -> i64 {
 fn java_transaction_hides_an_open_batch_and_commits_its_offset() {
     let jars = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-jars");
     if !jars.join("kafka-clients-4.4.0.jar").is_file() {
-        eprintln!("skipping java; run the SASL tests once to download the jars");
+        support::skipped("java; run the SASL tests once to download the jars");
         return;
     }
     let root = tempfile::tempdir().unwrap();

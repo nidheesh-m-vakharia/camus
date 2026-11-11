@@ -12,7 +12,7 @@ use support::{Node, Opts};
 #[test]
 fn metadata_snapshot_lands_in_object_storage() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping metadata snapshot test; set CAMUS_MINIO=1");
+        support::skipped("metadata snapshot test; set CAMUS_MINIO=1");
         return;
     }
     let root = tempfile::tempdir().unwrap();
