@@ -74,7 +74,7 @@ impl Encodable for SnapshotHeaderRecord {
         types::Int16.encode(buf, &self.version)?;
         types::Int64.encode(buf, &self.last_contained_log_timestamp)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -90,7 +90,7 @@ impl Encodable for SnapshotHeaderRecord {
         total_size += types::Int16.compute_size(&self.version)?;
         total_size += types::Int64.compute_size(&self.last_contained_log_timestamp)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

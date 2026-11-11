@@ -82,7 +82,7 @@ impl Encodable for OffsetForLeaderEpochRequest {
         }
         if version >= 4 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -107,7 +107,7 @@ impl Encodable for OffsetForLeaderEpochRequest {
         }
         if version >= 4 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -244,7 +244,7 @@ impl Encodable for OffsetForLeaderPartition {
         types::Int32.encode(buf, &self.leader_epoch)?;
         if version >= 4 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -263,7 +263,7 @@ impl Encodable for OffsetForLeaderPartition {
         total_size += types::Int32.compute_size(&self.leader_epoch)?;
         if version >= 4 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -388,7 +388,7 @@ impl Encodable for OffsetForLeaderTopic {
         }
         if version >= 4 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -415,7 +415,7 @@ impl Encodable for OffsetForLeaderTopic {
         }
         if version >= 4 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields

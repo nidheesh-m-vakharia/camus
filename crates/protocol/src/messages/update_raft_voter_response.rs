@@ -105,7 +105,7 @@ impl Encodable for CurrentLeader {
         types::CompactString.encode(buf, &self.host)?;
         types::Int32.encode(buf, &self.port)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -123,7 +123,7 @@ impl Encodable for CurrentLeader {
         total_size += types::CompactString.compute_size(&self.host)?;
         total_size += types::Int32.compute_size(&self.port)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -256,7 +256,7 @@ impl Encodable for UpdateRaftVoterResponse {
         if &self.current_leader != &Default::default() {
             num_tagged_fields += 1;
         }
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -265,7 +265,7 @@ impl Encodable for UpdateRaftVoterResponse {
         types::UnsignedVarInt.encode(buf, num_tagged_fields as u32)?;
         if &self.current_leader != &Default::default() {
             let computed_size = types::Struct { version }.compute_size(&self.current_leader)?;
-            if computed_size > std::u32::MAX as usize {
+            if computed_size > u32::MAX as usize {
                 bail!(
                     "Tagged field is too large to encode ({} bytes)",
                     computed_size
@@ -287,7 +287,7 @@ impl Encodable for UpdateRaftVoterResponse {
         if &self.current_leader != &Default::default() {
             num_tagged_fields += 1;
         }
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -296,7 +296,7 @@ impl Encodable for UpdateRaftVoterResponse {
         total_size += types::UnsignedVarInt.compute_size(num_tagged_fields as u32)?;
         if &self.current_leader != &Default::default() {
             let computed_size = types::Struct { version }.compute_size(&self.current_leader)?;
-            if computed_size > std::u32::MAX as usize {
+            if computed_size > u32::MAX as usize {
                 bail!(
                     "Tagged field is too large to encode ({} bytes)",
                     computed_size
