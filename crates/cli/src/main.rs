@@ -31,6 +31,18 @@ enum Admin {
         #[arg(long, default_value_t = false)]
         i_accept_data_loss: bool,
     },
+    /// After every broker disk is gone, load the newest metadata snapshot
+    /// and rebuild sealed extents from object footers. The broker must be a
+    /// fresh metadata leader. Unsealed WAL entries and metadata newer than
+    /// the snapshot do not come back. See docs/adr/0008-failure-and-recovery.md.
+    RestoreCluster {
+        /// HTTP `host:port` of the fresh metadata leader.
+        #[arg(long)]
+        broker: String,
+        /// Required. The command accepts the snapshot loss bound.
+        #[arg(long, default_value_t = false)]
+        i_accept_data_loss: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -49,6 +61,30 @@ fn main() -> anyhow::Result<()> {
             }
             let response = reqwest::blocking::Client::new()
                 .post(format!("http://{broker}/admin/truncate-to-sealed"))
+                .json(&serde_json::json!({ "i_accept_data_loss": true }))
+                .send()?;
+            let status = response.status();
+            let body = response.text()?;
+            if !status.is_success() {
+                eprintln!("{broker} refused ({status}): {body}");
+                std::process::exit(1);
+            }
+            println!("{body}");
+        }
+        Top::Admin(Admin::RestoreCluster {
+            broker,
+            i_accept_data_loss,
+        }) => {
+            if !i_accept_data_loss {
+                eprintln!(
+                    "restore-cluster loses unsealed WAL entries and metadata newer than the \
+                     last snapshot. Group offsets can move back by one snapshot interval. \
+                     To proceed, pass --i-accept-data-loss."
+                );
+                std::process::exit(2);
+            }
+            let response = reqwest::blocking::Client::new()
+                .post(format!("http://{broker}/admin/restore-cluster"))
                 .json(&serde_json::json!({ "i_accept_data_loss": true }))
                 .send()?;
             let status = response.status();

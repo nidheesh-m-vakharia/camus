@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod kafka;
+mod recover;
 mod slot;
 
 use std::collections::BTreeMap;
@@ -190,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/admin/metrics", get(admin_metrics))
                 .route("/admin/init", post(init))
                 .route("/admin/truncate-to-sealed", post(truncate_to_sealed))
+                .route("/admin/restore-cluster", post(restore_cluster))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .with_state(Arc::clone(&admin)),
         )
@@ -1204,17 +1206,7 @@ async fn start_kafka(
             );
         }
     }
-    let bucket = Bucket::connect(&BucketConfig {
-        endpoint: std::env::var("CAMUS_S3_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),
-        bucket: std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into()),
-        region: std::env::var("CAMUS_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
-        access_key: std::env::var("CAMUS_S3_ACCESS_KEY").unwrap_or_else(|_| "camus".into()),
-        secret_key: std::env::var("CAMUS_S3_SECRET_KEY")
-            .unwrap_or_else(|_| "camus-dev-secret".into()),
-        prefix: std::env::var("CAMUS_S3_PREFIX").unwrap_or_default(),
-        virtual_hosted: env_flag("CAMUS_S3_VIRTUAL_HOST"),
-    })?;
+    let bucket = open_bucket()?;
     let user = std::env::var("CAMUS_SASL_USER").unwrap_or_default();
     let password = std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default();
     // TLS alone means SASL_SSL. With a client CA it is Kafka's SSL listener,
@@ -1242,6 +1234,48 @@ async fn start_kafka(
     info!(%bound, sasl = require_sasl, "kafka listener");
     tokio::spawn(async move { kafka.run(listener).await });
     Ok(())
+}
+
+fn open_bucket() -> anyhow::Result<Bucket> {
+    Bucket::connect(&BucketConfig {
+        endpoint: std::env::var("CAMUS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),
+        bucket: std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into()),
+        region: std::env::var("CAMUS_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
+        access_key: std::env::var("CAMUS_S3_ACCESS_KEY").unwrap_or_else(|_| "camus".into()),
+        secret_key: std::env::var("CAMUS_S3_SECRET_KEY")
+            .unwrap_or_else(|_| "camus-dev-secret".into()),
+        prefix: std::env::var("CAMUS_S3_PREFIX").unwrap_or_default(),
+        virtual_hosted: env_flag("CAMUS_S3_VIRTUAL_HOST"),
+    })
+}
+
+async fn restore_cluster(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<Truncate>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !body.i_accept_data_loss {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "restore-cluster drops the unsealed WAL and metadata newer than the snapshot. \
+             Pass i_accept_data_loss."
+                .into(),
+        ));
+    }
+    let bucket =
+        open_bucket().map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    match recover::restore(&admin.node, &bucket).await {
+        Ok(body) => Ok(Json(body)),
+        Err(err) => {
+            let text = err.to_string();
+            let status = if text.contains("does not lead") || text.contains("already has topics") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            Err((status, text))
+        }
+    }
 }
 
 fn env_flag(name: &str) -> bool {
