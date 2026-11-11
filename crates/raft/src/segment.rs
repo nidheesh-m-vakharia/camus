@@ -305,6 +305,24 @@ impl SegmentLog {
         }
         Ok(())
     }
+
+    /// Append records whose payloads are written into the buffer that is
+    /// submitted. `encode` must write exactly `size` bytes. The payload is
+    /// not staged in a second `Vec`, and it is not kept in the tail: a later
+    /// read preads it.
+    pub fn append_encoded<T, F>(&self, records: &[(u64, usize, T)], encode: F) -> io::Result<()>
+    where
+        F: FnMut(&T, &mut dyn Write) -> io::Result<()>,
+    {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut writer = self.writer()?;
+        let added = writer.write_encoded(&self.dir, self.last_index(), records, encode)?;
+        let mut index = self.index()?;
+        index.locs.extend(added);
+        Ok(())
+    }
 }
 
 impl Writer {
@@ -378,6 +396,168 @@ impl Writer {
         Ok(added)
     }
 
+    /// [`Writer::write`], with each payload encoded into the submit buffer.
+    fn write_encoded<T, F>(
+        &mut self,
+        dir: &Path,
+        last_stored: Option<u64>,
+        records: &[(u64, usize, T)],
+        mut encode: F,
+    ) -> io::Result<Vec<(u64, Loc)>>
+    where
+        F: FnMut(&T, &mut dyn Write) -> io::Result<()>,
+    {
+        let mark = self.active_len;
+        let mark_segment = self.active_segment;
+        self.submit.out_clear();
+        let bytes: usize = records
+            .iter()
+            .map(|(_, size, _)| record_len(*size) as usize)
+            .sum();
+        if let Err(err) = self.submit.out_reserve(bytes + 8192) {
+            return self.fail_append(mark_segment, mark, self.active_len, err);
+        }
+        let mut added: Vec<(u64, Loc)> = Vec::with_capacity(records.len());
+        let mut chunk_at = self.active_len;
+        for (index, size, item) in records {
+            if *size > MAX_PAYLOAD as usize {
+                return self.fail_append(
+                    mark_segment,
+                    mark,
+                    chunk_at,
+                    io::Error::new(io::ErrorKind::InvalidInput, "payload exceeds 32MiB"),
+                );
+            }
+            let last_batch = added.last().map(|(index, _)| *index);
+            if let Some(last) = last_stored.max(last_batch) {
+                if *index <= last {
+                    return self.fail_append(
+                        mark_segment,
+                        mark,
+                        chunk_at,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("index {index} is not after {last}"),
+                        ),
+                    );
+                }
+            }
+            let need = record_len(*size);
+            if self.active_len > 0 && self.active_len + need > self.segment_bytes {
+                if let Err(err) = self.flush_out(chunk_at) {
+                    return self.fail_append(mark_segment, mark, chunk_at, err);
+                }
+                self.active = create_segment(dir, *index)?;
+                self.active_segment = *index;
+                self.active_len = 0;
+                self.active_gen = self.active_gen.wrapping_add(1);
+                chunk_at = 0;
+            }
+            let header = self.active_len;
+            let start = self.submit.out_len();
+            if let Err(err) = self.push_encoded(*index, *size, item, &mut encode) {
+                return self.fail_append(mark_segment, mark, chunk_at, err);
+            }
+            let wrote = self.submit.out_len() - start - HEADER - CRC_LEN;
+            if wrote != *size {
+                return self.fail_append(
+                    mark_segment,
+                    mark,
+                    chunk_at,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("encoded {wrote} bytes, expected {size}"),
+                    ),
+                );
+            }
+            self.active_len += need;
+            added.push((
+                *index,
+                Loc {
+                    segment: self.active_segment,
+                    header,
+                    len: *size as u32,
+                },
+            ));
+        }
+        if let Err(err) = self.flush_out(chunk_at) {
+            return self.fail_append(mark_segment, mark, chunk_at, err);
+        }
+        Ok(added)
+    }
+
+    fn push_encoded<T, F>(
+        &mut self,
+        index: u64,
+        size: usize,
+        item: &T,
+        encode: &mut F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&T, &mut dyn Write) -> io::Result<()>,
+    {
+        let start = self.submit.out_len();
+        self.submit.out_extend(&index.to_le_bytes())?;
+        self.submit.out_extend(&(size as u32).to_le_bytes())?;
+        {
+            let mut writer = OutWrite {
+                submit: &mut self.submit,
+            };
+            encode(item, &mut writer)?;
+        }
+        let crc = {
+            let slice = self.submit.out_slice();
+            let mut digest = CRC32C.digest();
+            digest.update(&slice[start..]);
+            digest.finalize()
+        };
+        self.submit.out_extend(&crc.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn flush_out(&mut self, offset: u64) -> io::Result<()> {
+        if self.submit.out_len() == 0 {
+            return Ok(());
+        }
+        let before = self.submit.out_len();
+        let align = self.submit.io_align();
+        if align > 1 {
+            self.pad_out(offset, align)?;
+        }
+        let gen = self.active_gen;
+        self.submit.write_out(&mut self.active, gen, offset)?;
+        self.active_len += (self.submit.out_len() - before) as u64;
+        self.submit.out_clear();
+        Ok(())
+    }
+
+    fn pad_out(&mut self, offset: u64, align: usize) -> io::Result<()> {
+        let end = offset.saturating_add(self.submit.out_len() as u64);
+        let mis = (end % align as u64) as usize;
+        if mis == 0 {
+            return Ok(());
+        }
+        let need = align - mis;
+        let overhead = HEADER + CRC_LEN;
+        let payload = if need >= overhead {
+            need - overhead
+        } else {
+            need + align - overhead
+        };
+        let zeros = vec![0u8; payload];
+        let start = self.submit.out_len();
+        self.submit.out_extend(&PAD_INDEX.to_le_bytes())?;
+        self.submit.out_extend(&(payload as u32).to_le_bytes())?;
+        self.submit.out_extend(&zeros)?;
+        let crc = {
+            let slice = self.submit.out_slice();
+            let mut digest = CRC32C.digest();
+            digest.update(&slice[start..]);
+            digest.finalize()
+        };
+        self.submit.out_extend(&crc.to_le_bytes())
+    }
+
     fn flush_chunk(&mut self, offset: u64, bytes: &mut Vec<u8>) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -413,7 +593,23 @@ impl Writer {
         let _ = self.active.set_len(rewind);
         let _ = self.active.sync_all();
         self.active_len = rewind;
+        self.submit.out_clear();
         Err(err)
+    }
+}
+
+struct OutWrite<'a> {
+    submit: &'a mut crate::submit::Submitter,
+}
+
+impl Write for OutWrite<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.submit.out_extend(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -970,5 +1166,24 @@ mod tests {
             .map(|reader| reader.join().unwrap())
             .sum();
         assert!(seen > 0, "readers never overlapped the writer");
+    }
+
+    #[test]
+    fn append_encoded_roundtrips_through_the_durable_buffer() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = b"hello-batch".as_slice();
+        {
+            let log = SegmentLog::open_with_segment_size(dir.path(), 1024)?;
+            log.append_encoded(&[(1, payload.len(), payload)], |bytes, writer| {
+                writer.write_all(bytes)?;
+                Ok(())
+            })?;
+        }
+        let log = SegmentLog::open_with_segment_size(dir.path(), 1024)?;
+        let got = log
+            .get(1)?
+            .ok_or_else(|| io::Error::other("encoded record missing after reopen"))?;
+        assert_eq!(&got[..], payload);
+        Ok(())
     }
 }

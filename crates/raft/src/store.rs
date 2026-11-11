@@ -223,19 +223,25 @@ where
         I: IntoIterator<Item = C::Entry> + Send,
         I::IntoIter: Send,
     {
-        let mut payloads = Vec::new();
+        // Size every entry first so the log can reserve the durable buffer
+        // and write each batch into it once.
+        let mut prepared = Vec::new();
+        let mut bytes = 0u64;
         for entry in entries {
             let index = entry.get_log_id().index;
-            let bytes = crate::codec::encode(&entry)
+            let size = crate::codec::encoded_len(&entry)
                 .map_err(|err| io_err::<C>(Some(entry.get_log_id().clone()), &err))?;
-            payloads.push((index, Arc::new(bytes)));
+            bytes += size as u64;
+            prepared.push((index, size, entry));
         }
-        let entries = payloads.len() as u64;
-        let bytes: u64 = payloads.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        let entries = prepared.len() as u64;
         let log = self.log.clone();
         tokio::task::spawn_blocking(move || {
-            log.append_shared(payloads)
-                .map_err(|err| io_err::<C>(None, &err))
+            log.append_encoded(&prepared, |entry, writer| {
+                crate::codec::encode_into(entry, writer)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+            })
+            .map_err(|err| io_err::<C>(None, &err))
         })
         .await
         .map_err(|err| io_err::<C>(None, &err))??;

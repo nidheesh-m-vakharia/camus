@@ -27,6 +27,9 @@ const DIRECT_ALIGN: usize = 4096;
 pub struct Submitter {
     #[cfg(target_os = "linux")]
     ring: Option<Ring>,
+    /// Buffer the produce path fills and then submits. On Linux it is aligned
+    /// for a direct write, so that write does not copy it again.
+    out: OutBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -109,10 +112,72 @@ impl Submitter {
     pub fn new() -> Self {
         #[cfg(target_os = "linux")]
         {
-            return Self { ring: open_ring() };
+            return Self {
+                ring: open_ring(),
+                out: OutBuf::new(),
+            };
         }
         #[cfg(not(target_os = "linux"))]
-        Self {}
+        Self { out: OutBuf::new() }
+    }
+
+    /// Drop bytes staged for the next durable write.
+    pub fn out_clear(&mut self) {
+        self.out.clear();
+    }
+
+    /// Bytes staged for the next durable write.
+    pub fn out_len(&self) -> usize {
+        self.out.len()
+    }
+
+    /// Make room for `additional` more bytes so a later extend does not move
+    /// what is already staged.
+    pub fn out_reserve(&mut self, additional: usize) -> io::Result<()> {
+        self.out.reserve(additional)
+    }
+
+    /// Append `src` to the staged write.
+    pub fn out_extend(&mut self, src: &[u8]) -> io::Result<()> {
+        self.out.extend_from_slice(src)
+    }
+
+    /// Staged bytes.
+    pub fn out_slice(&self) -> &[u8] {
+        self.out.as_slice()
+    }
+
+    /// Make the staged bytes durable at `offset` and then leave the buffer
+    /// in place (the caller clears it). No second userspace copy.
+    pub fn write_out(&mut self, file: &mut File, file_gen: u64, offset: u64) -> io::Result<()> {
+        if self.out.len() == 0 {
+            return file.sync_all();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let ptr = self.out.as_ptr();
+            let len = self.out.len();
+            let rejected = if let Some(ring) = self.ring.as_mut() {
+                match ring.write_raw(file, file_gen, offset, ptr, len) {
+                    Ok(()) => return Ok(()),
+                    Err(err) if ring_rejected(&err) => Some(err),
+                    Err(err) => return Err(err),
+                }
+            } else {
+                None
+            };
+            if rejected.is_some() {
+                tracing::warn!("io_uring append is unavailable; using pwrite and fsync");
+                self.ring = None;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+            return std_write_at_sync(file, offset, bytes);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = file_gen;
+            std_write_at_sync(file, offset, self.out.as_slice())
+        }
     }
 
     /// Block size of a direct durable write. `0` means a buffered `fsync`.
@@ -498,6 +563,160 @@ impl Ring {
         }
     }
 
+    /// Durable write of `len` bytes at `ptr`. The pointer is the caller's
+    /// buffer, not the registered fixed buffer, so this does not copy.
+    fn write_raw(
+        &mut self,
+        file: &mut File,
+        file_gen: u64,
+        offset: u64,
+        ptr: *const u8,
+        len: usize,
+    ) -> io::Result<()> {
+        self.bind(file, file_gen)?;
+        let aligned = self.direct
+            && offset % self.align as u64 == 0
+            && len % self.align == 0
+            && !ptr.is_null()
+            && (ptr as usize) % self.align == 0;
+        if aligned {
+            match self.direct_raw(file, offset, ptr, len) {
+                Ok(()) => return Ok(()),
+                Err(err) if direct_rejected(&err) => {
+                    tracing::warn!(
+                        %err,
+                        "direct durable write is unavailable; using buffered fsync"
+                    );
+                    self.direct = false;
+                    let _ = set_direct(file, false);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if self.iopoll {
+            let _ = set_direct(file, false);
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+            return std_write_at_sync(file, offset, bytes);
+        }
+        let _ = set_direct(file, false);
+        let mut done = 0;
+        while done < len {
+            let window = (len - done).min(u32::MAX as usize);
+            let last = done + window == len;
+            let wrote = self.submit_ptr(
+                file,
+                offset + done as u64,
+                unsafe { ptr.add(done) },
+                window,
+                last,
+                false,
+            )?;
+            if wrote == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "io_uring write returned 0",
+                ));
+            }
+            done += wrote;
+        }
+        Ok(())
+    }
+
+    fn direct_raw(
+        &mut self,
+        file: &mut File,
+        mut offset: u64,
+        ptr: *const u8,
+        len: usize,
+    ) -> io::Result<()> {
+        set_direct(file, true)?;
+        let mut done = 0;
+        while done < len {
+            let window = (len - done).min(FIXED_BYTES);
+            let wrote =
+                self.submit_ptr(file, offset, unsafe { ptr.add(done) }, window, false, true)?;
+            if wrote == 0 || wrote % self.align != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "direct write returned a short unaligned count",
+                ));
+            }
+            offset += wrote as u64;
+            done += wrote;
+        }
+        Ok(())
+    }
+
+    /// `dsync` sets `RWF_DSYNC` and is the ack. `sync` links an `fsync`.
+    fn submit_ptr(
+        &mut self,
+        file: &File,
+        offset: u64,
+        ptr: *const u8,
+        len: usize,
+        sync: bool,
+        dsync: bool,
+    ) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        const WRITE: u64 = 1;
+        const FSYNC: u64 = 2;
+        let raw = file.as_raw_fd();
+        let flags = if dsync { libc::RWF_DSYNC as i32 } else { 0 };
+        let write = if self.use_files {
+            io_uring::opcode::Write::new(io_uring::types::Fixed(0), ptr, len as u32)
+                .offset(offset)
+                .rw_flags(flags)
+                .build()
+        } else {
+            io_uring::opcode::Write::new(io_uring::types::Fd(raw), ptr, len as u32)
+                .offset(offset)
+                .rw_flags(flags)
+                .build()
+        }
+        .user_data(WRITE);
+        let write = if sync {
+            write.flags(io_uring::squeue::Flags::IO_LINK)
+        } else {
+            write
+        };
+        let fsync = if self.use_files {
+            io_uring::opcode::Fsync::new(io_uring::types::Fixed(0))
+                .build()
+                .user_data(FSYNC)
+        } else {
+            io_uring::opcode::Fsync::new(io_uring::types::Fd(raw))
+                .build()
+                .user_data(FSYNC)
+        };
+        // SAFETY: `ptr` addresses the caller's `OutBuf`, which stays allocated
+        // and is not written until this wait returns. This ring has no other
+        // submission in flight. The kernel reads that memory, and uses the
+        // descriptor, only for these operations.
+        unsafe {
+            let mut queue = self.ring.submission();
+            queue
+                .push(&write)
+                .map_err(|err| io::Error::other(format!("io_uring push: {err:?}")))?;
+            if sync {
+                queue
+                    .push(&fsync)
+                    .map_err(|err| io::Error::other(format!("io_uring push: {err:?}")))?;
+            }
+        }
+        let mut ids = vec![WRITE];
+        if sync {
+            ids.push(FSYNC);
+        }
+        let results = self.reap(&ids)?;
+        if results[0] < 0 {
+            return Err(io::Error::from_raw_os_error(-results[0]));
+        }
+        if sync && results[1] < 0 {
+            return Err(io::Error::from_raw_os_error(-results[1]));
+        }
+        Ok(results[0] as usize)
+    }
+
     /// Wait for `ids` and return one result each, in that order.
     ///
     /// A completion whose `user_data` is not one of `ids` is still consumed.
@@ -533,5 +752,152 @@ impl Ring {
             .completion()
             .map(|completed| (completed.user_data(), completed.result()))
             .collect()
+    }
+}
+
+/// Bytes the produce path fills and the durable write submits.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+struct OutBuf {
+    bytes: Vec<u8>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl OutBuf {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn reserve(&mut self, additional: usize) -> io::Result<()> {
+        self.bytes.reserve(additional);
+        Ok(())
+    }
+
+    fn extend_from_slice(&mut self, src: &[u8]) -> io::Result<()> {
+        self.bytes.extend_from_slice(src);
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Aligned allocation. A direct write submits this pointer and does not copy.
+#[cfg(target_os = "linux")]
+struct OutBuf {
+    ptr: *mut u8,
+    cap: usize,
+    len: usize,
+    align: usize,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for OutBuf {}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for OutBuf {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OutBuf")
+            .field("len", &self.len)
+            .field("cap", &self.cap)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl OutBuf {
+    fn new() -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+            cap: 0,
+            len: 0,
+            align: DIRECT_ALIGN,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn reserve(&mut self, additional: usize) -> io::Result<()> {
+        let need = self.len.saturating_add(additional);
+        if need <= self.cap {
+            return Ok(());
+        }
+        let mut cap = self.cap.max(self.align);
+        while cap < need {
+            cap = cap.saturating_mul(2).max(need);
+        }
+        cap = cap.next_multiple_of(self.align);
+        self.realloc(cap)
+    }
+
+    fn extend_from_slice(&mut self, src: &[u8]) -> io::Result<()> {
+        self.reserve(src.len())?;
+        if src.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(self.len), src.len());
+        }
+        self.len += src.len();
+        Ok(())
+    }
+
+    fn realloc(&mut self, cap: usize) -> io::Result<()> {
+        let layout = std::alloc::Layout::from_size_align(cap, self.align)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+        }
+        if self.len > 0 {
+            unsafe { std::ptr::copy_nonoverlapping(self.ptr, ptr, self.len) };
+        }
+        if self.cap > 0 {
+            if let Ok(old) = std::alloc::Layout::from_size_align(self.cap, self.align) {
+                unsafe { std::alloc::dealloc(self.ptr, old) };
+            }
+        }
+        self.ptr = ptr;
+        self.cap = cap;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OutBuf {
+    fn drop(&mut self) {
+        if self.cap == 0 {
+            return;
+        }
+        if let Ok(layout) = std::alloc::Layout::from_size_align(self.cap, self.align) {
+            unsafe { std::alloc::dealloc(self.ptr, layout) };
+        }
     }
 }
