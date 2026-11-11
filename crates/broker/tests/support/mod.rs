@@ -698,23 +698,29 @@ pub fn produce(addr: &str, value: &str) -> (i16, i64) {
 /// Produce one batch with `acks=all` and `timeout_ms`. Returns the partition
 /// error, the base offset, and the response's `throttle_time_ms`.
 pub fn produce_full(addr: &str, value: &str, timeout_ms: i32) -> (i16, i64, i32) {
-    produce_raw(addr, batch(value), timeout_ms)
+    produce_raw(addr, 0, batch(value), timeout_ms)
+}
+
+/// Produce one batch to `partition` with `acks=all`.
+pub fn produce_partition(addr: &str, partition: i32, value: &str) -> (i16, i64) {
+    let (code, offset, _) = produce_raw(addr, partition, batch(value), 5_000);
+    (code, offset)
 }
 
 /// Produce `records` as one batch with `acks=all`. Returns the partition
 /// error and offset.
 pub fn produce_batch(addr: &str, records: Bytes) -> (i16, i64) {
-    let (code, offset, _) = produce_raw(addr, records, 5_000);
+    let (code, offset, _) = produce_raw(addr, 0, records, 5_000);
     (code, offset)
 }
 
 /// Produce `records` as one batch with `acks=all` and `timeout_ms`.
 pub fn produce_batch_timeout(addr: &str, records: Bytes, timeout_ms: i32) -> (i16, i64) {
-    let (code, offset, _) = produce_raw(addr, records, timeout_ms);
+    let (code, offset, _) = produce_raw(addr, 0, records, timeout_ms);
     (code, offset)
 }
 
-fn produce_raw(addr: &str, records: Bytes, timeout_ms: i32) -> (i16, i64, i32) {
+fn produce_raw(addr: &str, partition: i32, records: Bytes, timeout_ms: i32) -> (i16, i64, i32) {
     let mut stream = connect(addr);
     stream
         .set_read_timeout(Some(Duration::from_millis(timeout_ms as u64 + 15_000)))
@@ -722,7 +728,7 @@ fn produce_raw(addr: &str, records: Bytes, timeout_ms: i32) -> (i16, i64, i32) {
     let mut topic = TopicProduceData::default();
     topic.name = TopicName(StrBytes::from_static_str(TOPIC));
     topic.partition_data = vec![PartitionProduceData::default()
-        .with_index(0)
+        .with_index(partition)
         .with_records(Some(records))];
     send(
         &mut stream,

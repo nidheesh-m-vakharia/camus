@@ -35,6 +35,14 @@ func main() {
 		fmt.Println("franz-go kill ok: uncommitted records redelivered, classic and consumer")
 		return
 	}
+	protocol := "classic"
+	if len(os.Args) > 2 && os.Args[2] == "consumer" {
+		protocol = "consumer"
+	}
+	roundTrip(protocol)
+}
+
+func roundTrip(protocol string) {
 	ctx := context.Background()
 	admin, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	must(err)
@@ -44,7 +52,7 @@ func main() {
 	admin.Close()
 
 	produce(ctx, 0, 40)
-	first, second := consumer("first"), consumer("second")
+	first, second := consumer("first", protocol), consumer("second", protocol)
 	seen := drain(ctx, []*kgo.Client{first, second}, 40)
 	check(equal(seen, span(0, 40)), "first 40")
 	for _, member := range []*kgo.Client{first, second} {
@@ -52,7 +60,7 @@ func main() {
 		member.Close()
 	}
 	produce(ctx, 40, 20)
-	third := consumer("third")
+	third := consumer("third", protocol)
 	resumed := drain(ctx, []*kgo.Client{third}, 20)
 	check(equal(resumed, span(40, 60)), fmt.Sprintf("resumed %v", keys(resumed)))
 	quiet, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -74,7 +82,7 @@ func main() {
 	_, err = adm.DeleteGroup(ctx, group)
 	must(err)
 	adminClient.Close()
-	fmt.Println("franz-go group ok: 40 shared by two members, 20 resumed by a third")
+	fmt.Printf("franz-go group ok (%s): 40 shared by two members, 20 resumed by a third\n", protocol)
 }
 
 func produce(ctx context.Context, first, count int) {
@@ -87,17 +95,22 @@ func produce(ctx context.Context, first, count int) {
 	}
 }
 
-func consumer(name string) *kgo.Client {
-	client, err := kgo.NewClient(
+func consumer(name, protocol string) *kgo.Client {
+	opts := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.ClientID(name),
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.DisableAutoCommit(),
-		kgo.SessionTimeout(10*time.Second),
-		kgo.HeartbeatInterval(time.Second),
-	)
+	}
+	// The consumer protocol takes its session from the broker.
+	if protocol == "consumer" {
+		opts = append(opts, kgo.ServerSideBalancer())
+	} else {
+		opts = append(opts, kgo.SessionTimeout(10*time.Second), kgo.HeartbeatInterval(time.Second))
+	}
+	client, err := kgo.NewClient(opts...)
 	must(err)
 	return client
 }

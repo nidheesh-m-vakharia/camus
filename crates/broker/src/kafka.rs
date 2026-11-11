@@ -3092,7 +3092,7 @@ impl Kafka {
             let Some(wal) = self.wal.shard(id) else {
                 continue;
             };
-            match self.upload_shard(wal).await {
+            match self.upload_shard(id, wal).await {
                 Upload::Failed => {
                     failures = failures.saturating_add(1);
                     backlog = false;
@@ -3109,9 +3109,18 @@ impl Kafka {
     /// One upload pass for one shard this broker leads. The shard is fixed
     /// for the whole pass, so a truncate mid-upload cannot seal into the
     /// shard that replaced it.
-    async fn upload_shard(&self, wal: Arc<Shard>) -> Upload {
+    async fn upload_shard(&self, id: u32, wal: Arc<Shard>) -> Upload {
         if !wal.is_leader() {
             return Upload::Done;
+        }
+        // Hold the whole pass, including the object put. A seal-only delay
+        // would still publish, which is what a stuck quorum must not do for
+        // this shard while the others continue.
+        if std::env::var("CAMUS_FAILPOINT")
+            .ok()
+            .is_some_and(|raw| raw == format!("slow-seal:{id}"))
+        {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
         }
         let pending = match wal.pending(UPLOAD_PASS_BYTES as u64).await {
             Ok(pending) => pending,
