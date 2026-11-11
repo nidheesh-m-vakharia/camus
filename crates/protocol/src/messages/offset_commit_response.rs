@@ -82,7 +82,7 @@ impl Encodable for OffsetCommitResponse {
         }
         if version >= 8 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -107,7 +107,7 @@ impl Encodable for OffsetCommitResponse {
         }
         if version >= 8 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -229,7 +229,7 @@ impl Encodable for OffsetCommitResponsePartition {
         types::Int16.encode(buf, &self.error_code)?;
         if version >= 8 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -247,7 +247,7 @@ impl Encodable for OffsetCommitResponsePartition {
         total_size += types::Int16.compute_size(&self.error_code)?;
         if version >= 8 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -388,7 +388,7 @@ impl Encodable for OffsetCommitResponseTopic {
         }
         if version >= 8 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -420,7 +420,7 @@ impl Encodable for OffsetCommitResponseTopic {
         }
         if version >= 8 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields

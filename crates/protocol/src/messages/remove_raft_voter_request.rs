@@ -90,7 +90,7 @@ impl Encodable for RemoveRaftVoterRequest {
         types::Int32.encode(buf, &self.voter_id)?;
         types::Uuid.encode(buf, &self.voter_directory_id)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -107,7 +107,7 @@ impl Encodable for RemoveRaftVoterRequest {
         total_size += types::Int32.compute_size(&self.voter_id)?;
         total_size += types::Uuid.compute_size(&self.voter_directory_id)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

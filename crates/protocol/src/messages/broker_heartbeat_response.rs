@@ -120,7 +120,7 @@ impl Encodable for BrokerHeartbeatResponse {
         types::Boolean.encode(buf, &self.is_fenced)?;
         types::Boolean.encode(buf, &self.should_shut_down)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -139,7 +139,7 @@ impl Encodable for BrokerHeartbeatResponse {
         total_size += types::Boolean.compute_size(&self.is_fenced)?;
         total_size += types::Boolean.compute_size(&self.should_shut_down)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

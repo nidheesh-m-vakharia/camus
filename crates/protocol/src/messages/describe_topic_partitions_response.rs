@@ -75,7 +75,7 @@ impl Encodable for Cursor {
         types::CompactString.encode(buf, &self.topic_name)?;
         types::Int32.encode(buf, &self.partition_index)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -91,7 +91,7 @@ impl Encodable for Cursor {
         total_size += types::CompactString.compute_size(&self.topic_name)?;
         total_size += types::Int32.compute_size(&self.partition_index)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -216,7 +216,7 @@ impl Encodable for DescribeTopicPartitionsResponse {
         types::CompactArray(types::Struct { version }).encode(buf, &self.topics)?;
         types::OptionStruct { version }.encode(buf, &self.next_cursor)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -233,7 +233,7 @@ impl Encodable for DescribeTopicPartitionsResponse {
         total_size += types::CompactArray(types::Struct { version }).compute_size(&self.topics)?;
         total_size += types::OptionStruct { version }.compute_size(&self.next_cursor)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -451,7 +451,7 @@ impl Encodable for DescribeTopicPartitionsResponsePartition {
         types::CompactArray(types::Int32).encode(buf, &self.last_known_elr)?;
         types::CompactArray(types::Int32).encode(buf, &self.offline_replicas)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -475,7 +475,7 @@ impl Encodable for DescribeTopicPartitionsResponsePartition {
         total_size += types::CompactArray(types::Int32).compute_size(&self.last_known_elr)?;
         total_size += types::CompactArray(types::Int32).compute_size(&self.offline_replicas)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -666,7 +666,7 @@ impl Encodable for DescribeTopicPartitionsResponseTopic {
         types::CompactArray(types::Struct { version }).encode(buf, &self.partitions)?;
         types::Int32.encode(buf, &self.topic_authorized_operations)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -687,7 +687,7 @@ impl Encodable for DescribeTopicPartitionsResponseTopic {
             types::CompactArray(types::Struct { version }).compute_size(&self.partitions)?;
         total_size += types::Int32.compute_size(&self.topic_authorized_operations)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

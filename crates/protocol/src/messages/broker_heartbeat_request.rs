@@ -158,7 +158,7 @@ impl Encodable for BrokerHeartbeatRequest {
                 num_tagged_fields += 1;
             }
         }
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -169,7 +169,7 @@ impl Encodable for BrokerHeartbeatRequest {
             if !self.offline_log_dirs.is_empty() {
                 let computed_size =
                     types::CompactArray(types::Uuid).compute_size(&self.offline_log_dirs)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -184,7 +184,7 @@ impl Encodable for BrokerHeartbeatRequest {
             if !self.cordoned_log_dirs.is_none() {
                 let computed_size =
                     types::CompactArray(types::Uuid).compute_size(&self.cordoned_log_dirs)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -216,7 +216,7 @@ impl Encodable for BrokerHeartbeatRequest {
                 num_tagged_fields += 1;
             }
         }
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -227,7 +227,7 @@ impl Encodable for BrokerHeartbeatRequest {
             if !self.offline_log_dirs.is_empty() {
                 let computed_size =
                     types::CompactArray(types::Uuid).compute_size(&self.offline_log_dirs)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -242,7 +242,7 @@ impl Encodable for BrokerHeartbeatRequest {
             if !self.cordoned_log_dirs.is_none() {
                 let computed_size =
                     types::CompactArray(types::Uuid).compute_size(&self.cordoned_log_dirs)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
