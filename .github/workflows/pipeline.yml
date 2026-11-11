@@ -85,8 +85,11 @@ jobs:
           curl -fsSL -o "$jars/snappy-java-1.1.10.7.jar" https://repo1.maven.org/maven2/org/xerial/snappy/snappy-java/1.1.10.7/snappy-java-1.1.10.7.jar
           curl -fsSL -o "$jars/slf4j-api-1.7.36.jar" https://repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar
           curl -fsSL -o "$jars/slf4j-simple-1.7.36.jar" https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/1.7.36/slf4j-simple-1.7.36.jar
+          # The Rust cache restores target/, including a venv whose pip
+          # script points at a Python that is not on this runner.
+          rm -rf target/pykafka
           python3 -m venv target/pykafka
-          target/pykafka/bin/pip install --disable-pip-version-check 'confluent-kafka==2.16.1'
+          target/pykafka/bin/python -m pip install --disable-pip-version-check 'confluent-kafka==2.16.1'
           mkdir -p target/go/bin
           ln -sfn "$(command -v go)" target/go/bin/go
       - name: Test
