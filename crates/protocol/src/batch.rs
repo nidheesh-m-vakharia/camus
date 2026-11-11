@@ -43,14 +43,17 @@ pub struct ProducerBatch {
 }
 
 /// Why a record batch cannot be sealed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BatchError {
     /// Truncated, bad magic, or a CRC that does not match the body.
+    #[error("batch is corrupt (truncated, invalid magic byte, or CRC mismatch)")]
     Corrupt,
     /// One batch is larger than the broker limit.
+    #[error("batch exceeds maximum allowed size")]
     TooLarge,
     /// Kept so older callers can still name the transactional attribute.
     /// Inspect no longer returns it; the broker decides from [`BatchInfo::transactional`].
+    #[error("batch is transactional")]
     Transactional,
 }
 

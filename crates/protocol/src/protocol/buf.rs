@@ -3,20 +3,11 @@ use std::io::Cursor;
 use std::ops::Range;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::error::Error;
-use std::fmt::{Display, Formatter};
 
 /// Error indicating there are not enough remaining bytes in a buffer to perform a read.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("Not enough bytes remaining in buffer!")]
 pub struct NotEnoughBytesError;
-
-impl Display for NotEnoughBytesError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Not enough bytes remaining in buffer!")
-    }
-}
-
-impl Error for NotEnoughBytesError {}
 
 /// Extension for working with [`bytes::Buf`].
 pub trait ByteBuf: Buf {

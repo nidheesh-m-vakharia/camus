@@ -134,29 +134,20 @@ pub struct Response {
 }
 
 /// Why a proposal did not commit.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WriteError {
     /// This node is not the shard leader. The entry was not appended here.
+    #[error("not the wal shard leader")]
     NotLeader,
     /// The log or state machine could not write, for example a full disk.
     /// openraft stops the shard on the first such error; every later write
     /// reports this too.
+    #[error("wal storage failed")]
     Storage,
     /// Anything else: shutdown, storage, or a lost quorum.
-    Other(anyhow::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
-
-impl std::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotLeader => f.write_str("not the wal shard leader"),
-            Self::Storage => f.write_str("wal storage failed"),
-            Self::Other(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for WriteError {}
 
 /// A running shard.
 pub struct Shard {
