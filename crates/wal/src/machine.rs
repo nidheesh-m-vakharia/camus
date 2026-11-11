@@ -736,9 +736,9 @@ fn apply_at(state: &mut State, command: Command, log_index: u64, pos: u32) -> Re
                     each: Vec::new(),
                 };
             }
-            // Validate here, where every replica decides the same way. The
-            // sealed bytes are rebuilt from the log entry when read.
-            if camus_protocol::batch::seal(&batch.raw, start, batch.epoch, MAX_BATCH).is_err() {
+            // Validate in place. Sealing rewrites the base offset and epoch,
+            // which the read path does when it builds the bytes a consumer sees.
+            if camus_protocol::batch::inspect(&batch.raw, MAX_BATCH).is_err() {
                 return Response {
                     base_offset: -1,
                     error_code: 2,
