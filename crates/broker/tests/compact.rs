@@ -1,6 +1,8 @@
 //! `cleanup.policy=compact` keeps the latest record for each key at the
 //! offset it was produced at. A record with no key is corrupt.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -273,7 +275,7 @@ fn fetched(stream: &mut TcpStream) -> Vec<Record> {
 #[test]
 fn compaction_keeps_the_latest_value_at_its_offset() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping compaction test; set CAMUS_MINIO=1");
+        support::skipped("compaction test; set CAMUS_MINIO=1");
         return;
     }
     let node = spawn("100");
@@ -328,7 +330,7 @@ fn configure(stream: &mut TcpStream, configs: &[(&'static str, &'static str)]) {
 #[test]
 fn an_expired_tombstone_is_removed_with_its_key() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping compaction test; set CAMUS_MINIO=1");
+        support::skipped("compaction test; set CAMUS_MINIO=1");
         return;
     }
     let node = spawn("100");
@@ -359,7 +361,7 @@ fn an_expired_tombstone_is_removed_with_its_key() {
 #[test]
 fn min_compaction_lag_keeps_recent_records() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping compaction test; set CAMUS_MINIO=1");
+        support::skipped("compaction test; set CAMUS_MINIO=1");
         return;
     }
     let node = spawn("100");

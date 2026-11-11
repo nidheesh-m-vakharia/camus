@@ -12,7 +12,7 @@ use support::{
 #[test]
 fn a_wiped_disk_restores_sealed_data_and_snapshot_metadata() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping cluster restore test; set CAMUS_MINIO=1");
+        support::skipped("cluster restore test; set CAMUS_MINIO=1");
         return;
     }
     let root = tempfile::tempdir().unwrap();

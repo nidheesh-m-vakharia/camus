@@ -32,6 +32,15 @@ use camus_protocol::records::{
 
 pub const TOPIC: &str = "orders";
 
+/// A test is leaving early. CI sets `CAMUS_REQUIRE_CLIENTS=1` so a skip
+/// fails the job instead of counting as a pass.
+pub fn skipped(reason: &str) {
+    if std::env::var("CAMUS_REQUIRE_CLIENTS").ok().as_deref() == Some("1") {
+        panic!("required test skipped: {reason}");
+    }
+    eprintln!("skipping {reason}");
+}
+
 /// Resident set size of a process in KiB, from `ps`. `None` once it exits.
 pub fn rss_kib(pid: u32) -> Option<u64> {
     let out = std::process::Command::new("ps")

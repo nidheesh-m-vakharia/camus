@@ -1,0 +1,61 @@
+name: ecosystem
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ecosystem:
+    name: ecosystem
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/broker/tests/gophase5/go.mod
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: librdkafka
+        run: sudo apt-get update && sudo apt-get install -y pkg-config librdkafka-dev
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: deploy/minio
+          load: true
+          tags: camus-minio:pinned
+          cache-from: type=gha,scope=minio
+          cache-to: type=gha,scope=minio,mode=min
+      - name: MinIO
+        run: |
+          docker run -d --name camus-minio -p 9100:9000 \
+            -e MINIO_ROOT_USER=camus \
+            -e MINIO_ROOT_PASSWORD=camus-dev-secret \
+            camus-minio:pinned server /data --console-address :9001
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9100/minio/health/live && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:9100/minio/health/live
+          docker exec -e MC_HOST_local=http://camus:camus-dev-secret@127.0.0.1:9000 \
+            camus-minio mc mb -p local/camus
+      - name: Ecosystem
+        env:
+          CAMUS_MINIO: "1"
+          CAMUS_ECOSYSTEM: "1"
+          CAMUS_ECOSYSTEM_DOCKER: "1"
+          CAMUS_REQUIRE_CLIENTS: "1"
+        run: cargo test -p camus-broker --locked --test ecosystem -- --test-threads=1

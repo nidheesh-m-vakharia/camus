@@ -66,7 +66,7 @@ fn check(root: &std::path::Path, ran: Output, client: &str) {
 fn minio() -> bool {
     let on = std::env::var("CAMUS_MINIO").ok().as_deref() == Some("1");
     if !on {
-        eprintln!("skipping; set CAMUS_MINIO=1");
+        support::skipped("group test; set CAMUS_MINIO=1");
     }
     on
 }
@@ -78,7 +78,7 @@ fn librdkafka_group_commits_and_resumes() {
     }
     let python = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pykafka/bin/python");
     if !python.is_file() {
-        eprintln!("skipping librdkafka; missing {}", python.display());
+        support::skipped(&format!("librdkafka; missing {}", python.display()));
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -99,7 +99,7 @@ fn java_group_commits_and_resumes() {
     }
     let jars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-jars");
     if !jars.join("kafka-clients-4.4.0.jar").is_file() {
-        eprintln!("skipping java; run the SASL tests once to download the jars");
+        support::skipped("java; run the SASL tests once to download the jars");
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -140,7 +140,7 @@ fn java_consumer_group_commits_and_resumes() {
     }
     let jars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-jars");
     if !jars.join("kafka-clients-4.4.0.jar").is_file() {
-        eprintln!("skipping java; run the SASL tests once to download the jars");
+        support::skipped("java; run the SASL tests once to download the jars");
         return;
     }
     // The server tells the client how often to heartbeat. A short interval
@@ -186,7 +186,7 @@ fn franz_go_group_commits_and_resumes() {
     }
     let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
     if !go.is_file() {
-        eprintln!("skipping franz-go; missing {}", go.display());
+        support::skipped(&format!("franz-go; missing {}", go.display()));
         return;
     }
     let root = tempfile::tempdir().unwrap();

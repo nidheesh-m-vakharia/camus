@@ -62,7 +62,23 @@ fn dist() -> PathBuf {
 }
 
 fn java_home() -> String {
-    std::env::var("JAVA_HOME").unwrap_or_else(|_| "/opt/homebrew/opt/openjdk@21".into())
+    if let Ok(home) = std::env::var("JAVA_HOME") {
+        if !home.is_empty() {
+            return home;
+        }
+    }
+    if let Ok(output) = Command::new("java")
+        .args(["-XshowSettings:properties", "-version"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stderr);
+        for line in text.lines() {
+            if let Some(home) = line.trim().strip_prefix("java.home = ") {
+                return home.to_string();
+            }
+        }
+    }
+    "/opt/homebrew/opt/openjdk@21".into()
 }
 
 fn free_port() -> u16 {
@@ -752,7 +768,7 @@ fn kafkajs_round_trips() {
         return;
     }
     if Command::new("npm").arg("--version").output().is_err() {
-        eprintln!("skipping KafkaJS; npm is not installed");
+        support::skipped("KafkaJS; npm is not installed");
         return;
     }
     let modules = target().join("kafkajs");
@@ -806,7 +822,7 @@ fn confluent_kafka_go_round_trips() {
         return;
     }
     let Some(go) = program("go", &["/opt/homebrew/bin/go"]) else {
-        eprintln!("skipping confluent-kafka-go; go is not installed");
+        support::skipped("confluent-kafka-go; go is not installed");
         return;
     };
     let source =
@@ -853,7 +869,7 @@ fn confluent_kafka_dotnet_round_trips() {
     let home = std::env::var("HOME").unwrap_or_default();
     let fallback = format!("{home}/.dotnet/dotnet");
     let Some(dotnet) = program("dotnet", &["/opt/homebrew/bin/dotnet", &fallback]) else {
-        eprintln!("skipping confluent-kafka-dotnet; dotnet is not installed");
+        support::skipped("confluent-kafka-dotnet; dotnet is not installed");
         return;
     };
     let source =
@@ -946,8 +962,11 @@ fn schema_registry_ready(http: &reqwest::blocking::Client, base: &str) {
 /// load the same schema id from `_schemas`. Opt-in: `CAMUS_ECOSYSTEM_DOCKER=1`.
 #[test]
 fn schema_registry_stores_a_schema() {
-    if !enabled() || std::env::var("CAMUS_ECOSYSTEM_DOCKER").ok().as_deref() != Some("1") {
-        eprintln!("skipping Schema Registry; set CAMUS_ECOSYSTEM_DOCKER=1");
+    if !enabled() {
+        return;
+    }
+    if std::env::var("CAMUS_ECOSYSTEM_DOCKER").ok().as_deref() != Some("1") {
+        support::skipped("Schema Registry; set CAMUS_ECOSYSTEM_DOCKER=1");
         return;
     }
     let dir = tempfile::tempdir().unwrap();

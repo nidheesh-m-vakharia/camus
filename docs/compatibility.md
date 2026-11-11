@@ -348,17 +348,17 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 
 | Client | Library | Phase first required |
 | --- | --- | --- |
-| Java | `kafka-clients` 4.4.0, SASL_SSL, passed | 1 |
-| Python / librdkafka | `confluent-kafka` 2.16.1, SASL_SSL, passed | 1 |
-| Go | `franz-go` v1.22.0, SASL_SSL, passed | 1 |
+| Java | `kafka-clients` 4.4.0, SASL_SSL, [CI `test`](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml) | 1 |
+| Python / librdkafka | `confluent-kafka` 2.16.1, SASL_SSL, [CI `test`](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml) | 1 |
+| Go | `franz-go` v1.22.0, SASL_SSL, [CI `test`](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml) | 1 |
 | kcat | CLI against the dev listener | 1, smoke |
-| KafkaJS 2 | round trip with a consumer group, in the ecosystem harness | passed |
-| confluent-kafka-go 2.11.1 | round trip with a consumer group, in the ecosystem harness | passed |
-| confluent-kafka-dotnet 2.11.1 | round trip with a consumer group, in the ecosystem harness | passed |
-| Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, describe-producers, preferred leader election, API versions | passed |
-| Kafka Connect 4.4.0, distributed | FileStream source and sink, compacted internal topics, resume after restart | passed |
-| Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | passed |
-| MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | passed |
+| KafkaJS 2 | round trip with a consumer group, in the ecosystem harness | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| confluent-kafka-go 2.11.1 | round trip with a consumer group, in the ecosystem harness | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| confluent-kafka-dotnet 2.11.1 | round trip with a consumer group, in the ecosystem harness | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, describe-producers, preferred leader election, API versions | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| Kafka Connect 4.4.0, distributed | FileStream source and sink, compacted internal topics, resume after restart | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Schema Registry | in the harness behind `CAMUS_ECOSYSTEM_DOCKER=1` | not run here |
 | kafka-python | tracked; not in the harness | - |
 

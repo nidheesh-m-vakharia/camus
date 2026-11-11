@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+mod support;
+
 use bytes::{Bytes, BytesMut};
 use camus_protocol::messages::create_topics_request::CreatableTopic;
 use camus_protocol::messages::create_topics_response::CreateTopicsResponse;
@@ -156,7 +158,7 @@ fn recv<M: Decodable + HeaderVersion>(stream: &mut TcpStream, version: i16) -> (
 #[test]
 fn produce_fetch_and_restart_keep_acked_bytes() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping r2 produce test; set CAMUS_MINIO=1");
+        support::skipped("r2 produce test; set CAMUS_MINIO=1");
         return;
     }
     let root = tempfile::tempdir().unwrap();
