@@ -29,7 +29,6 @@ def run(bootstrap, protocol):
     group = "kill-" + uuid.uuid4().hex[:8]
     admin = AdminClient({"bootstrap.servers": bootstrap})
     admin.create_topics([NewTopic(topic, num_partitions=4, replication_factor=3)])[topic].result()
-    produce(bootstrap, topic)
     directory = Path(os.environ.get("TMPDIR", "/tmp")) / f"group-kill-{uuid.uuid4().hex[:8]}"
     directory.mkdir()
     victim_seen = directory / "victim"
@@ -40,6 +39,18 @@ def run(bootstrap, protocol):
     survivor_seen.write_text("")
     victim = spawn(bootstrap, topic, group, "victim", protocol, victim_seen, marker, need)
     survivor = spawn(bootstrap, topic, group, "survivor", protocol, survivor_seen, marker, need)
+    # Produce only after the two members own disjoint partitions. Otherwise
+    # the first member is assigned the whole topic and reads every record
+    # before the second joins, and there is nothing left to redeliver.
+    assign_deadline = time.time() + 45
+    victim_parts = victim_seen.with_name(victim_seen.name + ".parts")
+    survivor_parts = survivor_seen.with_name(survivor_seen.name + ".parts")
+    while time.time() < assign_deadline and not partitions_split(victim_parts, survivor_parts):
+        time.sleep(0.2)
+    assert partitions_split(victim_parts, survivor_parts), (
+        f"{protocol}: members never took disjoint partitions"
+    )
+    produce(bootstrap, topic)
     deadline = time.time() + 45
     snapshot = None
     while time.time() < deadline:
@@ -95,7 +106,7 @@ def member():
     consumer = Consumer(config)
     consumer.subscribe([topic])
     got = set()
-    deadline = time.time() + 90
+    deadline = time.time() + 150
     path = Path(seen)
     try:
         while time.time() < deadline:
@@ -107,6 +118,12 @@ def member():
                     with path.open("a") as out:
                         out.write(value + "\n")
                         out.flush()
+            assigned = consumer.assignment()
+            if assigned:
+                parts = ",".join(
+                    str(tp.partition) for tp in sorted(assigned, key=lambda tp: tp.partition)
+                )
+                path.with_name(path.name + ".parts").write_text(parts)
             if role == "survivor" and Path(marker).exists() and got == produced():
                 return
     finally:
@@ -130,6 +147,20 @@ def produce(bootstrap, topic):
 
 def produced():
     return {f"v{index}" for index in range(COUNT)}
+
+
+def part_set(path):
+    if not path.exists():
+        return set()
+    text = path.read_text().strip()
+    if not text:
+        return set()
+    return set(text.split(","))
+
+
+def partitions_split(victim, survivor):
+    left, right = part_set(victim), part_set(survivor)
+    return bool(left) and bool(right) and left.isdisjoint(right) and len(left | right) == 4
 
 
 def read(path):
