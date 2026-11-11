@@ -54,10 +54,8 @@ jobs:
             sleep 2
           done
           curl -sf http://127.0.0.1:9100/minio/health/live
-          docker run --rm --network host --entrypoint mc camus-minio:pinned \
-            alias set local http://127.0.0.1:9100 camus camus-dev-secret
-          docker run --rm --network host --entrypoint mc camus-minio:pinned \
-            mb -p local/camus
+          docker exec -e MC_HOST_local=http://camus:camus-dev-secret@127.0.0.1:9000 \
+            camus-minio mc mb -p local/camus
       - name: Small filesystem
         run: |
           image=$(mktemp)
