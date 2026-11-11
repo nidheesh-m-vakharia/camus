@@ -994,17 +994,11 @@ impl Kafka {
         if !camus_protocol::compact::compacts(&topic.cleanup_policy) {
             return Ok(());
         }
-        let mut bytes = bytes::Bytes::copy_from_slice(raw);
-        let sets = camus_protocol::records::RecordBatchDecoder::decode_all(&mut bytes)
-            .map_err(|_| CORRUPT)?;
-        if sets
-            .iter()
-            .flat_map(|set| &set.records)
-            .any(|record| record.key.is_none())
-        {
-            return Err(INVALID_RECORD);
+        match camus_protocol::batch::has_null_key(raw, MAX_BATCH) {
+            Ok(true) => Err(INVALID_RECORD),
+            Ok(false) => Ok(()),
+            Err(_) => Err(CORRUPT),
         }
-        Ok(())
     }
 
     /// Move each partition's log start past the sealed extents that
@@ -1326,9 +1320,7 @@ impl Kafka {
         };
         let covered_end = last.end;
         let tombstones_before = now.saturating_sub(topic.config_i64("delete.retention.ms"));
-        let mut records = Vec::new();
-        let mut base_timestamp = i64::MAX;
-        let mut max_timestamp = i64::MIN;
+        let mut bodies = Vec::new();
         for extent in &eligible {
             if extent.length == 0 {
                 continue;
@@ -1341,44 +1333,49 @@ impl Kafka {
             else {
                 return;
             };
-            let mut cursor = bytes::Bytes::from(bytes);
-            let Ok(sets) = camus_protocol::records::RecordBatchDecoder::decode_all(&mut cursor)
-            else {
-                return;
-            };
-            for set in sets {
-                for record in set.records {
-                    let covers = |spans: &[camus_metadata::Span]| {
-                        spans
-                            .iter()
-                            .any(|span| span.start <= record.offset && record.offset < span.end)
-                    };
-                    if record.transactional
-                        && !covers(&state.txn_committed)
-                        && !covers(&state.txn_aborted)
-                    {
-                        return;
+            bodies.push(bytes);
+        }
+        let committed = state.txn_committed;
+        let aborted = state.txn_aborted;
+        // Decoding, planning, and rebuilding run on the blocking pool, off
+        // the threads that serve requests.
+        let rebuilt = tokio::task::spawn_blocking(move || {
+            let mut records = Vec::new();
+            let mut base_timestamp = i64::MAX;
+            let mut max_timestamp = i64::MIN;
+            for bytes in bodies {
+                let mut cursor = bytes;
+                let sets =
+                    camus_protocol::records::RecordBatchDecoder::decode_all(&mut cursor).ok()?;
+                for set in sets {
+                    for record in set.records {
+                        let covers = |spans: &[camus_metadata::Span]| {
+                            spans
+                                .iter()
+                                .any(|span| span.start <= record.offset && record.offset < span.end)
+                        };
+                        if record.transactional && !covers(&committed) && !covers(&aborted) {
+                            return None;
+                        }
+                        if covers(&aborted) {
+                            continue;
+                        }
+                        base_timestamp = base_timestamp.min(record.timestamp);
+                        max_timestamp = max_timestamp.max(record.timestamp);
+                        records.push(record);
                     }
-                    if covers(&state.txn_aborted) {
-                        continue;
-                    }
-                    base_timestamp = base_timestamp.min(record.timestamp);
-                    max_timestamp = max_timestamp.max(record.timestamp);
-                    records.push(record);
                 }
             }
-        }
-        // Planning and rebuilding run on the blocking pool, off the threads
-        // that serve requests.
-        let rebuilt = tokio::task::spawn_blocking(move || {
             let kept = camus_protocol::compact::plan_expiring(&records, tombstones_before)?;
-            if kept.is_empty() {
-                return Some(None);
-            }
-            camus_protocol::compact::rebuild(&kept).ok().map(Some)
+            let body = if kept.is_empty() {
+                None
+            } else {
+                Some(camus_protocol::compact::rebuild(&kept).ok()?)
+            };
+            Some((base_timestamp, max_timestamp, body))
         })
         .await;
-        let Ok(Some(rebuilt)) = rebuilt else {
+        let Ok(Some((mut base_timestamp, mut max_timestamp, rebuilt))) = rebuilt else {
             return;
         };
         // When nothing survives, the prefix becomes an extent with no
@@ -3203,10 +3200,15 @@ impl Kafka {
         if drops.is_empty() {
             return done;
         }
-        if let Ok(Ok(index)) = tokio::time::timeout(COMMIT_TIMEOUT, wal.seal(drops)).await {
-            let _ = wal.purge(index).await;
+        // A shard without quorum never finishes the seal. Fail the pass so
+        // this shard backs off instead of retrying on every flush interval.
+        match tokio::time::timeout(COMMIT_TIMEOUT, wal.seal(drops)).await {
+            Ok(Ok(index)) => {
+                let _ = wal.purge(index).await;
+                done
+            }
+            _ => Upload::Failed,
         }
-        done
     }
 
     /// Buffer one `r2` batch. Returns how long it waited for buffer space.

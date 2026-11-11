@@ -374,20 +374,33 @@ fn elect_leaders_moves_a_shard_back_to_its_preferred_broker() {
         assert!(Instant::now() < deadline, "broker 2 never led shard 1");
         std::thread::sleep(Duration::from_millis(200));
     }
+    let client = reqwest::blocking::Client::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let handed = reqwest::blocking::Client::new()
+        let Ok(handed) = client
             .post(format!("http://{}/wal/1/hand-over", nodes[1].http))
             .json(&serde_json::json!({ "to": 3 }))
             .send()
-            .unwrap();
+        else {
+            assert!(Instant::now() < deadline, "hand-over request failed");
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
         if handed.status().is_success() {
             break;
         }
+        let status = handed.status();
+        let body = handed.text().unwrap_or_default();
+        // Metadata can name broker 2 while its Raft group has already moved
+        // on. Ask it to take the shard again instead of repeating a 409.
+        if body.contains("not the shard leader") {
+            let _ = client
+                .post(format!("http://{}/wal/1/campaign", nodes[1].http))
+                .send();
+        }
         assert!(
             Instant::now() < deadline,
-            "hand-over refused: {}",
-            handed.status()
+            "hand-over refused: {status} {body}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }

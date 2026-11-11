@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -176,7 +177,6 @@ func kill(protocol string) {
 	must(err)
 	must(created.Err)
 	admin.Close()
-	producePinned(ctx, topic)
 	dir, err := os.MkdirTemp("", "group-kill")
 	must(err)
 	victimSeen := dir + "/victim"
@@ -187,6 +187,15 @@ func kill(protocol string) {
 	must(os.WriteFile(survivorSeen, nil, 0o644))
 	victim := spawnMember("victim", protocol, victimSeen, marker, need)
 	survivor := spawnMember("survivor", protocol, survivorSeen, marker, need)
+	// Produce only after the two members own disjoint partitions. Otherwise
+	// the first member is assigned the whole topic and reads every record
+	// before the second joins, and there is nothing left to redeliver.
+	assignDeadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(assignDeadline) && !partitionsSplit(victimSeen+".parts", survivorSeen+".parts") {
+		time.Sleep(200 * time.Millisecond)
+	}
+	check(partitionsSplit(victimSeen+".parts", survivorSeen+".parts"), protocol+": members never took disjoint partitions")
+	producePinned(ctx, topic)
 	deadline := time.Now().Add(45 * time.Second)
 	var snapshot map[string]bool
 	for time.Now().Before(deadline) {
@@ -250,11 +259,38 @@ func goMember() {
 	} else {
 		opts = append(opts, kgo.SessionTimeout(6*time.Second), kgo.HeartbeatInterval(time.Second))
 	}
+	owned := map[int32]struct{}{}
+	writeOwned := func() {
+		ids := make([]int, 0, len(owned))
+		for id := range owned {
+			ids = append(ids, int(id))
+		}
+		sort.Ints(ids)
+		parts := make([]string, len(ids))
+		for i, id := range ids {
+			parts[i] = strconv.Itoa(id)
+		}
+		must(os.WriteFile(seen+".parts", []byte(strings.Join(parts, ",")), 0o644))
+	}
+	opts = append(opts,
+		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
+			for _, partition := range assigned[topic] {
+				owned[partition] = struct{}{}
+			}
+			writeOwned()
+		}),
+		kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, revoked map[string][]int32) {
+			for _, partition := range revoked[topic] {
+				delete(owned, partition)
+			}
+			writeOwned()
+		}),
+	)
 	client, err := kgo.NewClient(opts...)
 	must(err)
 	defer client.Close()
 	got := map[string]bool{}
-	deadline := time.Now().Add(90 * time.Second)
+	deadline := time.Now().Add(150 * time.Second)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		fetches := client.PollFetches(ctx)
@@ -278,6 +314,39 @@ func goMember() {
 		}
 	}
 	fatal(fmt.Errorf("%s %s timed out with %d", role, protocol, len(got)))
+}
+
+func partitionsSplit(victim, survivor string) bool {
+	left := partSet(victim)
+	right := partSet(survivor)
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	all := map[string]bool{}
+	for part := range left {
+		if right[part] {
+			return false
+		}
+		all[part] = true
+	}
+	for part := range right {
+		all[part] = true
+	}
+	return len(all) == 4
+}
+
+func partSet(path string) map[string]bool {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]bool{}
+	}
+	out := map[string]bool{}
+	for _, part := range strings.Split(strings.TrimSpace(string(body)), ",") {
+		if part != "" {
+			out[part] = true
+		}
+	}
+	return out
 }
 
 func producePinned(ctx context.Context, name string) {

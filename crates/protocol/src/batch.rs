@@ -160,6 +160,102 @@ pub fn producer_batches(bytes: &[u8], max_batch: usize) -> Result<Vec<ProducerBa
     Ok(out)
 }
 
+/// Whether any record has no key. Uncompressed batches are scanned in place.
+/// A compressed batch is decoded, because its keys sit inside the codec.
+pub fn has_null_key(bytes: &[u8], max_batch: usize) -> Result<bool, BatchError> {
+    let info = inspect(bytes, max_batch)?;
+    let mut offset = 0;
+    for batch in &info {
+        let raw = &bytes[offset..offset + batch.len];
+        let Ok(attr) = raw[ATTR_AT..ATTR_AT + 2].try_into() else {
+            return Err(BatchError::Corrupt);
+        };
+        let attributes = i16::from_be_bytes(attr);
+        let missing = if attributes & 0x07 != 0 {
+            let mut owned = Bytes::copy_from_slice(raw);
+            let sets = crate::records::RecordBatchDecoder::decode_all(&mut owned)
+                .map_err(|_| BatchError::Corrupt)?;
+            sets.iter()
+                .flat_map(|set| &set.records)
+                .any(|record| record.key.is_none())
+        } else {
+            null_key_uncompressed(raw)?
+        };
+        if missing {
+            return Ok(true);
+        }
+        offset += batch.len;
+    }
+    Ok(false)
+}
+
+/// Records of one uncompressed batch. `true` when a key length is `-1`.
+fn null_key_uncompressed(batch: &[u8]) -> Result<bool, BatchError> {
+    if batch.len() < PREFIX {
+        return Err(BatchError::Corrupt);
+    }
+    let Ok(count_bytes) = batch[COUNT_AT..COUNT_AT + 4].try_into() else {
+        return Err(BatchError::Corrupt);
+    };
+    let count = i32::from_be_bytes(count_bytes);
+    if count < 0 {
+        return Err(BatchError::Corrupt);
+    }
+    let records = &batch[PREFIX..];
+    let mut at = 0;
+    for _ in 0..count {
+        let (size, read) = read_ivar(records, at, 5)?;
+        at += read;
+        if size < 0 {
+            return Err(BatchError::Corrupt);
+        }
+        let end = at + size as usize;
+        if end > records.len() {
+            return Err(BatchError::Corrupt);
+        }
+        if null_key_in_record(&records[at..end])? {
+            return Ok(true);
+        }
+        at = end;
+    }
+    Ok(false)
+}
+
+fn null_key_in_record(record: &[u8]) -> Result<bool, BatchError> {
+    if record.is_empty() {
+        return Err(BatchError::Corrupt);
+    }
+    let mut at = 1;
+    let (_, read) = read_ivar(record, at, 10)?;
+    at += read;
+    let (_, read) = read_ivar(record, at, 5)?;
+    at += read;
+    let (key_len, _) = read_ivar(record, at, 5)?;
+    if key_len < -1 {
+        return Err(BatchError::Corrupt);
+    }
+    Ok(key_len == -1)
+}
+
+/// Zigzag varint. `max_bytes` is 5 for a varint and 10 for a varlong.
+fn read_ivar(buf: &[u8], at: usize, max_bytes: usize) -> Result<(i64, usize), BatchError> {
+    let mut zigzag = 0u64;
+    for i in 0..max_bytes {
+        let Some(byte) = buf.get(at + i).copied() else {
+            return Err(BatchError::Corrupt);
+        };
+        zigzag |= u64::from(byte & 0x7f) << (i * 7);
+        if byte < 0x80 {
+            if max_bytes == 5 {
+                zigzag &= 0xffff_ffff;
+            }
+            let signed = ((zigzag >> 1) as i64) ^ (-((zigzag & 1) as i64));
+            return Ok((signed, i + 1));
+        }
+    }
+    Err(BatchError::Corrupt)
+}
+
 /// Copy `bytes` and write `base_offset` into the first batch, then continue
 /// by each batch's record count. `epoch` is written into every batch.
 ///
@@ -240,6 +336,40 @@ mod tests {
             );
             inspect(&sealed, 1024 * 1024).unwrap();
         }
+    }
+
+    #[test]
+    fn a_missing_key_is_visible_without_decoding_values() {
+        let keyed = sample(Compression::None);
+        assert_eq!(has_null_key(&keyed, 1024 * 1024), Ok(false));
+        let compressed = sample(Compression::Gzip);
+        assert_eq!(has_null_key(&compressed, 1024 * 1024), Ok(false));
+        let records = vec![Record {
+            transactional: false,
+            control: false,
+            delete_horizon: false,
+            partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+            producer_id: NO_PRODUCER_ID,
+            producer_epoch: NO_PRODUCER_EPOCH,
+            sequence: 0,
+            timestamp_type: TimestampType::Creation,
+            offset: 0,
+            timestamp: 5,
+            key: None,
+            value: Some(bytes::Bytes::from_static(b"hello")),
+            headers: Default::default(),
+        }];
+        let mut buf = BytesMut::new();
+        let encoded = RecordBatchEncoder::encode(
+            &mut buf,
+            &records,
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        );
+        assert!(encoded.is_ok());
+        assert_eq!(has_null_key(&buf, 1024 * 1024), Ok(true));
     }
 
     #[test]

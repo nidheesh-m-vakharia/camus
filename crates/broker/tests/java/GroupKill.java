@@ -6,6 +6,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
@@ -21,6 +23,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
@@ -47,7 +50,6 @@ public class GroupKill {
         try (Admin client = Admin.create(admin)) {
             client.createTopics(List.of(new NewTopic(topic, 4, (short) 3))).all().get();
         }
-        produce(bootstrap, topic);
         Path dir = Files.createTempDirectory("group-kill");
         Path victimSeen = dir.resolve("victim");
         Path survivorSeen = dir.resolve("survivor");
@@ -58,6 +60,17 @@ public class GroupKill {
         Process victim = spawn(bootstrap, topic, group, "victim", protocol, victimSeen, marker, need);
         Process survivor =
                 spawn(bootstrap, topic, group, "survivor", protocol, survivorSeen, marker, need);
+        // Produce only after the two members own disjoint partitions. Otherwise
+        // the first member is assigned the whole topic and reads every record
+        // before the second joins, and there is nothing left to redeliver.
+        long assignDeadline = System.currentTimeMillis() + 45_000;
+        Path victimParts = victimSeen.resolveSibling("victim.parts");
+        Path survivorParts = survivorSeen.resolveSibling("survivor.parts");
+        while (System.currentTimeMillis() < assignDeadline && !partitionsSplit(victimParts, survivorParts)) {
+            Thread.sleep(200);
+        }
+        check(partitionsSplit(victimParts, survivorParts), protocol + ": members never took disjoint partitions");
+        produce(bootstrap, topic);
         long deadline = System.currentTimeMillis() + 45_000;
         Set<String> snapshot = null;
         while (System.currentTimeMillis() < deadline) {
@@ -134,7 +147,7 @@ public class GroupKill {
         try (KafkaConsumer<String, String> consumer =
                 new KafkaConsumer<>(props, new StringDeserializer(), new StringDeserializer())) {
             consumer.subscribe(List.of(topic));
-            long deadline = System.currentTimeMillis() + 90_000;
+            long deadline = System.currentTimeMillis() + 150_000;
             while (System.currentTimeMillis() < deadline) {
                 for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofMillis(200))) {
                     if (got.add(record.value())) {
@@ -142,6 +155,15 @@ public class GroupKill {
                                 seen,
                                 Files.readString(seen) + record.value() + "\n");
                     }
+                }
+                Set<TopicPartition> assigned = consumer.assignment();
+                if (!assigned.isEmpty()) {
+                    List<String> ids = new ArrayList<>();
+                    for (TopicPartition tp : assigned) {
+                        ids.add(Integer.toString(tp.partition()));
+                    }
+                    Collections.sort(ids);
+                    Files.writeString(seen.resolveSibling(seen.getFileName() + ".parts"), String.join(",", ids));
                 }
                 if (role.equals("survivor") && Files.exists(marker) && got.equals(produced())) {
                     return;
@@ -171,6 +193,31 @@ public class GroupKill {
         Set<String> out = new HashSet<>();
         for (int index = 0; index < COUNT; index++) {
             out.add("v" + index);
+        }
+        return out;
+    }
+
+    static boolean partitionsSplit(Path victim, Path survivor) throws IOException {
+        Set<String> left = partSet(victim);
+        Set<String> right = partSet(survivor);
+        if (left.isEmpty() || right.isEmpty()) {
+            return false;
+        }
+        Set<String> all = new HashSet<>(left);
+        all.addAll(right);
+        left.retainAll(right);
+        return left.isEmpty() && all.size() == 4;
+    }
+
+    static Set<String> partSet(Path path) throws IOException {
+        Set<String> out = new HashSet<>();
+        if (!Files.exists(path)) {
+            return out;
+        }
+        for (String part : Files.readString(path).trim().split(",")) {
+            if (!part.isEmpty()) {
+                out.add(part);
+            }
         }
         return out;
     }
