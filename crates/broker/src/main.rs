@@ -176,7 +176,6 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(prometheus))
         .route("/admin/write", post(write))
         .route("/admin/publish", post(publish))
         .route("/admin/apply", post(apply_command))
@@ -188,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(Arc::clone(&node))
         .merge(
             Router::new()
+                .route("/metrics", get(prometheus))
                 .route("/admin/metrics", get(admin_metrics))
                 .route("/admin/init", post(init))
                 .route("/admin/truncate-to-sealed", post(truncate_to_sealed))
@@ -237,15 +237,16 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
+async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
     use std::sync::atomic::Ordering::Relaxed;
+    let node = &admin.node;
     let stats = &camus_compactor::STATS;
     let metrics = node.raft.metrics().borrow().clone();
     let leader = metrics
         .current_leader
         .map(|id| id.to_string())
         .unwrap_or_else(|| "NaN".into());
-    format!(
+    let mut text = format!(
         "# HELP camus_up Broker process is running.\n\
          # TYPE camus_up gauge\n\
          camus_up 1\n\
@@ -292,7 +293,37 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
         kafka::PRODUCE_HOLD_MS.load(Relaxed),
         kafka::META_SNAPSHOT_INDEX.load(Relaxed),
         kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
-    )
+    );
+    // One series per open shard. The shard count is fixed at init.
+    let shards = admin.wal.all();
+    let families: [(&str, &str, &str, fn(&camus_wal::Shard, NodeId) -> u64); 3] = [
+        (
+            "camus_wal_unsealed_bytes",
+            "Committed WAL bytes not yet sealed into object storage.",
+            "gauge",
+            |shard, _| shard.unsealed_bytes(),
+        ),
+        (
+            "camus_wal_leader",
+            "1 when this broker leads the WAL shard.",
+            "gauge",
+            |shard, me| u64::from(shard.leader() == Some(me)),
+        ),
+        (
+            "camus_wal_storage_failed",
+            "1 when a WAL write failed and the shard stopped.",
+            "gauge",
+            |shard, _| u64::from(shard.storage_failed()),
+        ),
+    ];
+    for (name, help, kind, value) in families {
+        text.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+        for (id, shard) in &shards {
+            let value = value(shard, admin.node_id);
+            text.push_str(&format!("{name}{{shard=\"{id}\"}} {value}\n"));
+        }
+    }
+    text
 }
 
 async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Value> {

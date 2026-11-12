@@ -131,6 +131,7 @@ fn three_processes_survive_losing_the_leader() {
         .unwrap();
     assert!(metrics.contains("camus_up 1"));
     assert!(metrics.contains("camus_raft_term"));
+    assert!(metrics.contains("camus_wal_unsealed_bytes{shard=\"0\"}"));
 }
 
 fn wait_leader(nodes: &[Node]) -> (u64, String) {
