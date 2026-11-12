@@ -67,7 +67,7 @@ AppendEntries and snapshots stay on HTTP.
   RPC. Datagrams for announcements (`max_datagram_frame_size` enabled).
 - The UDP port is the HTTP port by default, so peers need no new address:
   `BasicNode.addr` already names `host:port`. `CAMUS_QUIC_PORT` overrides it
-  on every broker. The endpoint is on unless `CAMUS_QUIC` is `off`.
+  on every broker. The endpoint stays off unless `CAMUS_QUIC=on`.
   Amended 2026-11-12: it was turned off the same day because the clients
   job, `wal_shards`, and `wal_cluster` lost leaders while the endpoint was
   installed. One connection carries every group's votes and heartbeats, and
@@ -131,9 +131,12 @@ phase-0 baseline.
    50–100 ms while the endpoint is installed. `CAMUS_QUIC=off` keeps the
    previous 50 ms / 150–300 ms timings and sends every RPC over HTTP.
 
-Phases 1–4 are in the tree. QUIC is on unless `CAMUS_QUIC` is `off`. It
-was on, then off, on 2026-11-12: moving the handshake off the heartbeat was
-not enough, because the accept loop still served one stream at a time.
+Phases 1–4 are in the tree. QUIC stays off unless `CAMUS_QUIC=on`. Handling
+streams together did not make the default safe: with the endpoint on, the
+clients job's Java group timed out waiting for a partition assignment
+(2026-11-12). Moving the handshake off the heartbeat was not enough either,
+because the accept loop still served one stream at a time. That loop now
+handles streams together, and the default remains off.
 Phase 5's shorter timings are not applied. On that runner, with 15 /
 50–100, the three-process test's first metadata write did not commit within
 the client's 30 second timeout. The heartbeat stays 50 ms and the election
