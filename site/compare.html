@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Compare — Camus</title>
+  <meta name="description" content="How Camus differs from AutoMQ, Redpanda, Apache Iggy, Nisshi, WarpStream, and Bufstream. Dated 2026-11-11.">
+  <link rel="canonical" href="https://camus.nidheesh.dev/compare">
+  <meta name="robots" content="index,follow">
+  <meta property="og:site_name" content="Camus">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Compare — Camus">
+  <meta property="og:description" content="How Camus differs from AutoMQ, Redpanda, Apache Iggy, Nisshi, WarpStream, and Bufstream. Dated 2026-11-11.">
+  <meta property="og:url" content="https://camus.nidheesh.dev/compare">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Compare — Camus">
+  <meta name="twitter:description" content="How Camus differs from AutoMQ, Redpanda, Apache Iggy, Nisshi, WarpStream, and Bufstream. Dated 2026-11-11.">
+  <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="fonts/Pollen-variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li><a href="index.html">Intro</a></li>
+        <li><a href="why.html">Why</a></li>
+        <li><a href="run.html">Run</a></li>
+        <li><a href="clients.html">Clients</a></li>
+        <li><a href="durability.html">Durability</a></li>
+        <li><a href="benchmarks.html">Benchmarks</a></li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="limits.html">Production</a></li>
+            <li><a href="delivery.html">Delivery</a></li>
+            <li><a href="compare.html" aria-current="page">Compare</a></li>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">Other logs people mention next to Camus.</h1>
+      </header>
+      <p class="lede">Dated 2026-11-11. Cells are what each project publishes about itself. Performance numbers on those pages are theirs. Camus numbers are only the ones in <a href="benchmarks.html">benchmarks</a>.</p>
+
+      <table>
+        <thead>
+          <tr><th>Project</th><th>Runtime and license</th><th>Kafka wire</th><th>Log and acknowledgement</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Camus</td>
+            <td>Rust. Apache-2.0. One binary.</td>
+            <td>Pinned to Apache Kafka 4.4.0. Transactions use metadata ranges. See <a href="limits.html">production</a>.</td>
+            <td>Sealed batches in R2 or S3. <code>wal</code> acks a disk majority, then uploads. <code>r2</code> acks after the object and the metadata commit.</td>
+          </tr>
+          <tr>
+            <td><a href="https://kafka.apache.org/">Apache Kafka</a></td>
+            <td>Java. Apache-2.0. Brokers plus KRaft.</td>
+            <td>The reference, including transactions.</td>
+            <td>Replicated local disks. An acknowledgement is a replica quorum. Tiered storage is optional.</td>
+          </tr>
+          <tr>
+            <td><a href="https://github.com/AutoMQ/automq">AutoMQ</a></td>
+            <td>Java, a fork of Kafka. Apache-2.0 for the open-source build. One broker process, plus object storage.</td>
+            <td>Kafka protocol, as a fork of the broker.</td>
+            <td>Shared object storage. Open source uses an S3 write-ahead log. Their licensing page says that path's produce p99 is above 600 ms, and that commercial WAL options (EBS, FSx) are the sub-10 ms path.</td>
+          </tr>
+          <tr>
+            <td><a href="https://github.com/redpanda-data/redpanda">Redpanda</a></td>
+            <td>C++. Community edition is the Business Source License, which converts to Apache-2.0 four years after a release and forbids offering it as a streaming service. One binary.</td>
+            <td>Kafka API compatible, in their words.</td>
+            <td>Local disk and Raft. Their enterprise edition documents tiered storage.</td>
+          </tr>
+          <tr>
+            <td><a href="https://github.com/apache/iggy">Apache Iggy</a></td>
+            <td>Rust. Apache-2.0. One binary.</td>
+            <td>Its own protocol over QUIC, TCP, WebSocket, and HTTP. The Kafka wire gateway is in development and not in a release.</td>
+            <td>Its own persistent log on disk. An acknowledgement is Iggy's, not a Kafka <code>acks</code> setting, until that gateway ships.</td>
+          </tr>
+          <tr>
+            <td><a href="https://github.com/nisshi-io/nisshi">Nisshi</a></td>
+            <td>Rust. Apache-2.0. Stateless brokers in front of a storage engine.</td>
+            <td>Kafka wire generated from the 3.9.1 descriptors. Their README says 4.x clients negotiate down, idempotent produce works, and transactions are unsupported.</td>
+            <td>PostgreSQL, SQLite, S3, or memory. The storage engine holds the log. Brokers keep none of it.</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.warpstream.com/executive-summary">WarpStream</a></td>
+            <td>Go. Commercial, usage-priced, BYOC. Their October 2026 summary calls the agent a single stateless binary. Source is not published under an OSI license there.</td>
+            <td>Kafka protocol, in their words.</td>
+            <td>Object storage only. They describe the agent as diskless and free of a KRaft quorum. You pay them to run it.</td>
+          </tr>
+          <tr>
+            <td><a href="https://buf.build/blog/coreweave-acquires-bufstream">Bufstream</a></td>
+            <td>Closed source. On 8 May 2026 Buf announced that CoreWeave had acquired it for CoreWeave's own platform.</td>
+            <td>Buf called it an Apache Kafka-compatible streaming platform. It is no longer a product you can buy from Buf.</td>
+            <td>Was an object-storage design. The announcement is the current source. Treat older feature lists as historical.</td>
+          </tr>
+          <tr>
+            <td><a href="https://nats.io/">NATS JetStream</a></td>
+            <td>Go. Apache-2.0. One binary.</td>
+            <td>Its own protocol. A Kafka client does not connect to it.</td>
+            <td>A file or memory store on the server, replicated by the cluster.</td>
+          </tr>
+          <tr>
+            <td><a href="https://pulsar.apache.org/">Apache Pulsar</a></td>
+            <td>Java. Apache-2.0. Brokers plus BookKeeper, and often ZooKeeper or a metadata store.</td>
+            <td>Its own protocol. Kafka clients need a separate protocol handler.</td>
+            <td>BookKeeper ledgers. Tiered offload to object storage is a later copy.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Sources</h2>
+      <ul>
+        <li>AutoMQ license and the open-source S3 WAL latency note: <a href="https://docs.automq.com/automq/what-is-automq/licensing-and-enterprise-features">licensing</a>, <a href="https://docs.automq.com/automq/architecture/overview">architecture</a>, <a href="https://github.com/AutoMQ/automq">repository</a>.</li>
+        <li>Redpanda license: <a href="https://docs.redpanda.com/current/licensing/overview">licensing overview</a>, <a href="https://github.com/redpanda-data/redpanda/blob/dev/licenses/bsl.md">BSL text</a>.</li>
+        <li>Apache Iggy Kafka gateway status: <a href="https://github.com/apache/iggy">repository README</a>.</li>
+        <li>Nisshi wire version and transactions: <a href="https://github.com/nisshi-io/nisshi">repository README</a>.</li>
+        <li>WarpStream, October 2026: <a href="https://www.warpstream.com/executive-summary">executive summary</a>.</li>
+        <li>Bufstream: <a href="https://buf.build/blog/coreweave-acquires-bufstream">CoreWeave acquires Bufstream</a>, 8 May 2026.</li>
+      </ul>
+
+      <h2>When not to use Camus</h2>
+      <p>A job queue that acknowledges one message at a time wants a queue, not a log. BullMQ and Restate are the usual answers in that conversation. A large Kafka deployment whose JVM and disk cost is already fine has little reason to move. The measured limits, including the object-storage p99, are on the <a href="limits.html#when-not">production page</a>.</p>
+
+      <footer>
+        <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
+        <p>Apache, Apache Kafka and Kafka are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Camus is not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>
