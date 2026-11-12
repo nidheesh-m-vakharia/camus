@@ -60,6 +60,24 @@ where
     log: Arc<SegmentLog>,
     meta: Arc<Mutex<Meta<C>>>,
     stats: Arc<AppendStats>,
+    encode_len: fn(&C::Entry) -> std::io::Result<usize>,
+    encode: fn(&C::Entry, &mut dyn std::io::Write) -> std::io::Result<()>,
+    decode: fn(&[u8]) -> std::io::Result<C::Entry>,
+}
+
+fn postcard_len<T: Serialize>(entry: &T) -> std::io::Result<usize> {
+    crate::codec::encoded_len(entry)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
+}
+
+fn postcard_encode<T: Serialize>(entry: &T, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    crate::codec::encode_into(entry, out)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
+}
+
+fn postcard_decode<T: DeserializeOwned>(bytes: &[u8]) -> std::io::Result<T> {
+    crate::codec::decode(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
 }
 
 /// Counters for the append path. Clones of a store share them.
@@ -71,6 +89,9 @@ pub struct AppendStats {
     pub entries: std::sync::atomic::AtomicU64,
     /// Encoded entry bytes written.
     pub bytes: std::sync::atomic::AtomicU64,
+    /// Bytes returned by [`SegmentLogStore::read_slice`]. A ranged read adds
+    /// the requested length, not the rest of the entry.
+    pub read_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl<C> SegmentLogStore<C>
@@ -96,12 +117,58 @@ where
             log: Arc::new(log),
             meta: Arc::new(Mutex::new(Meta { dir, disk })),
             stats: Arc::new(AppendStats::default()),
+            encode_len: postcard_len::<C::Entry>,
+            encode: postcard_encode::<C::Entry>,
+            decode: postcard_decode::<C::Entry>,
         })
+    }
+
+    /// Use these functions for records written from now on. A decode that
+    /// does not recognize a record can still read the previous encoding.
+    /// `encode` must write exactly `encode_len` bytes, straight into the
+    /// buffer the durable write submits.
+    pub fn set_codec(
+        &mut self,
+        encode_len: fn(&C::Entry) -> std::io::Result<usize>,
+        encode: fn(&C::Entry, &mut dyn std::io::Write) -> std::io::Result<()>,
+        decode: fn(&[u8]) -> std::io::Result<C::Entry>,
+    ) {
+        self.encode_len = encode_len;
+        self.encode = encode;
+        self.decode = decode;
     }
 
     /// Append counters: fsyncs, entries, and bytes since open.
     pub fn stats(&self) -> Arc<AppendStats> {
         self.stats.clone()
+    }
+
+    /// `len` bytes of record `index`, starting `at` bytes into its payload.
+    /// The rest of the record stays on disk.
+    pub async fn read_slice(
+        &self,
+        index: u64,
+        at: u64,
+        len: usize,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let log = self.log.clone();
+        let stats = self.stats.clone();
+        tokio::task::spawn_blocking(move || {
+            let found = log.read_slice(index, at, len)?;
+            if let Some(bytes) = &found {
+                stats
+                    .read_bytes
+                    .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(found)
+        })
+        .await
+        .map_err(|err| std::io::Error::other(err))?
+    }
+
+    /// Write one already-encoded record. Raft replication goes through the log store append path.
+    pub fn write_record(&self, index: u64, bytes: Vec<u8>) -> std::io::Result<()> {
+        self.log.append_batch(&[(index, bytes.as_slice())])
     }
 }
 
@@ -118,15 +185,14 @@ where
         let start = bound_owned(range.start_bound());
         let end = bound_owned(range.end_bound());
         let log = self.log.clone();
+        let decode = self.decode;
         tokio::task::spawn_blocking(move || {
             let records = log
                 .range(start, end)
                 .map_err(|err| io_err::<C>(None, &err))?;
             records
                 .into_iter()
-                .map(|(_, bytes)| {
-                    crate::codec::decode(&bytes).map_err(|err| io_err::<C>(None, &err))
-                })
+                .map(|(_, bytes)| decode(&bytes).map_err(|err| io_err::<C>(None, &err)))
                 .collect()
         })
         .await
@@ -145,6 +211,7 @@ where
     async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<C::NodeId>> {
         let log = self.log.clone();
         let meta = self.meta.clone();
+        let decode = self.decode;
         tokio::task::spawn_blocking(move || {
             let last_purged = lock(&meta)?.disk.last_purged.clone();
             let last = match log.last_index() {
@@ -155,8 +222,7 @@ where
                         .ok_or_else(|| {
                             io_err::<C>(None, &std::io::Error::other("missing last record"))
                         })?;
-                    let entry: C::Entry =
-                        crate::codec::decode(&bytes).map_err(|err| io_err::<C>(None, &err))?;
+                    let entry: C::Entry = decode(&bytes).map_err(|err| io_err::<C>(None, &err))?;
                     Some(entry.get_log_id().clone())
                 }
                 None => last_purged.clone(),
@@ -226,29 +292,27 @@ where
         // Size every entry first so the log can reserve the durable buffer
         // and write each batch into it once.
         let mut prepared = Vec::new();
-        let mut bytes = 0u64;
+        let mut total = 0u64;
         for entry in entries {
             let index = entry.get_log_id().index;
-            let size = crate::codec::encoded_len(&entry)
+            let size = (self.encode_len)(&entry)
                 .map_err(|err| io_err::<C>(Some(entry.get_log_id().clone()), &err))?;
-            bytes += size as u64;
+            total += size as u64;
             prepared.push((index, size, entry));
         }
         let entries = prepared.len() as u64;
         let log = self.log.clone();
+        let encode = self.encode;
         tokio::task::spawn_blocking(move || {
-            log.append_encoded(&prepared, |entry, writer| {
-                crate::codec::encode_into(entry, writer)
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
-            })
-            .map_err(|err| io_err::<C>(None, &err))
+            log.append_encoded(&prepared, |entry, writer| encode(entry, writer))
+                .map_err(|err| io_err::<C>(None, &err))
         })
         .await
         .map_err(|err| io_err::<C>(None, &err))??;
         use std::sync::atomic::Ordering::Relaxed;
         self.stats.fsyncs.fetch_add(1, Relaxed);
         self.stats.entries.fetch_add(entries, Relaxed);
-        self.stats.bytes.fetch_add(bytes, Relaxed);
+        self.stats.bytes.fetch_add(total, Relaxed);
         callback.log_io_completed(Ok(()));
         Ok(())
     }

@@ -191,6 +191,8 @@ async fn main() -> anyhow::Result<()> {
                 .route("/admin/metrics", get(admin_metrics))
                 .route("/admin/init", post(init))
                 .route("/admin/truncate-to-sealed", post(truncate_to_sealed))
+                .route("/admin/join-wal", post(join_wal))
+                .route("/admin/add-wal-voter", post(add_wal_voter))
                 .route("/admin/restore-cluster", post(restore_cluster))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .with_state(Arc::clone(&admin)),
@@ -920,6 +922,129 @@ async fn truncate_to_sealed(
         "voters": [me],
         "moved_aside": aside.display().to_string(),
     })))
+}
+
+#[derive(Deserialize)]
+struct JoinWal {
+    /// The old shard directory is moved aside only when this is set. A fresh
+    /// node waits to be added; it does not initialize a membership of its own.
+    #[serde(default)]
+    replace: bool,
+    #[serde(default)]
+    shard: u32,
+}
+
+/// Drop this broker's copy of a shard and open an empty one that can be
+/// added to a membership. Used after `truncate-to-sealed`, when this broker
+/// still holds the old membership.
+async fn join_wal(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<JoinWal>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !body.replace {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "join-wal replaces this broker's shard; pass replace".into(),
+        ));
+    }
+    let _held = admin.truncating.lock().await;
+    let Some(old) = admin.wal.shard(body.shard) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no wal shard {}", body.shard),
+        ));
+    };
+    let internal = |err: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    let _ = old.raft.shutdown().await;
+    let dir = shard_dir(&admin.wal_dir, body.shard);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wal".into());
+    let aside = dir.with_file_name(format!("{name}.joined-{stamp}"));
+    std::fs::rename(&dir, &aside).map_err(|err| internal(err.into()))?;
+    let fresh = Shard::open_shard(admin.node_id, &dir, body.shard)
+        .await
+        .map_err(internal)?;
+    admin.wal.replace(body.shard, fresh);
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct AddWalVoter {
+    id: NodeId,
+    /// `host:port` of the broker being added, as stored in a membership.
+    addr: String,
+    #[serde(default)]
+    shard: u32,
+}
+
+/// On the shard leader: wipe `id`'s old shard, replicate this shard's log to
+/// it, and make it a voter.
+async fn add_wal_voter(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<AddWalVoter>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if body.id == admin.node_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a broker does not add itself".into(),
+        ));
+    }
+    let Some(opened) = admin.wal.shard(body.shard) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no wal shard {}", body.shard),
+        ));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let join = admin
+        .http
+        .post(format!("http://{}/admin/join-wal", body.addr))
+        .json(&serde_json::json!({ "replace": true, "shard": body.shard }))
+        .send()
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    if !join.status().is_success() {
+        let status =
+            StatusCode::from_u16(join.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Err((status, join.text().await.unwrap_or_default()));
+    }
+    // The fresh shard is listening before join returns, and the first
+    // append can still arrive before it is ready to take a learner.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut last = String::new();
+    loop {
+        if opened.voters().contains(&body.id) {
+            break;
+        }
+        match opened
+            .add_voter(
+                body.id,
+                BasicNode {
+                    addr: body.addr.clone(),
+                },
+            )
+            .await
+        {
+            Ok(()) => break,
+            Err(err) if std::time::Instant::now() < deadline => {
+                last = err.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err((StatusCode::BAD_GATEWAY, err.to_string())),
+        }
+    }
+    if !opened.voters().contains(&body.id) {
+        return Err((StatusCode::BAD_GATEWAY, last));
+    }
+    Ok(Json(serde_json::json!({ "voters": opened.voters() })))
 }
 
 /// Write one metadata key here when this node leads the group, otherwise

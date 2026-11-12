@@ -116,3 +116,156 @@ fn majority_loss_needs_truncate_to_sealed() {
     assert_eq!(read_all(&now_addr, 3), vec!["v0", "v1", "v4"]);
     wait_sealed(&nodes[3].http, 3);
 }
+
+/// Lose two of three voters, truncate, add the two back, then lose one more.
+/// The remaining two are a majority of the new membership, so produce still
+/// commits.
+#[test]
+fn fresh_voters_restore_a_quorum() -> std::io::Result<()> {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("fresh-voter test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let proxy = Proxy::start("127.0.0.1:9100");
+    let s3 = format!("http://{}", proxy.addr);
+    let root = tempfile::tempdir().map_err(|err| std::io::Error::other(err))?;
+    let mut nodes: Vec<Node> = (1..=5)
+        .map(|id| Node::spawn_via(id, &root.path().join(format!("node-{id}")), &s3))
+        .collect();
+    init(&nodes, &[1, 2, 3]);
+    let meta_leader = wait_settled(&nodes.iter().collect::<Vec<_>>());
+    create_wal_topic(&kafka_addr(node_by(&nodes, meta_leader)?));
+    let outsider = kafka_addr(node_by(&nodes, 4)?);
+    let (_, offset) = produce_retrying(&outsider, "v0");
+    if offset != 0 {
+        return Err(std::io::Error::other(format!("first offset was {offset}")));
+    }
+    wait_sealed(&node_by(&nodes, 4)?.http, 1);
+
+    let (leader, _) = partition_leader(&outsider, None);
+    let other = [1, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader)
+        .ok_or_else(|| std::io::Error::other("no second voter"))?;
+    let survivor = [1, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader && *id != other)
+        .ok_or_else(|| std::io::Error::other("no survivor"))?;
+    for id in [leader, other] {
+        nodes[(id - 1) as usize].kill();
+    }
+    let survivor_http = node_by(&nodes, survivor)?.http.clone();
+    // The dead leader stays in metrics until the election times out. Truncate
+    // refuses while that id is still there.
+    let quiet = Instant::now() + Duration::from_secs(5);
+    loop {
+        let view = admin(&survivor_http).ok_or_else(|| std::io::Error::other("no wal metrics"))?;
+        if view["wal_leader"].is_null() {
+            break;
+        }
+        if Instant::now() > quiet {
+            return Err(std::io::Error::other(format!(
+                "the shard still reports a leader: {view}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let until = Instant::now() + Duration::from_secs(10);
+    let truncated = loop {
+        let response = post_json(
+            &format!("http://{survivor_http}/admin/truncate-to-sealed"),
+            &serde_json::json!({ "i_accept_data_loss": true }),
+        )?;
+        if response.status().is_success()
+            || response.status().as_u16() != 503
+            || Instant::now() > until
+        {
+            break response;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if !truncated.status().is_success() {
+        let status = truncated.status();
+        let body = truncated
+            .text()
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        return Err(std::io::Error::other(format!("truncate {status}: {body}")));
+    }
+    for id in [leader, other] {
+        nodes[(id - 1) as usize].restart();
+    }
+    for id in [leader, other] {
+        let addr = node_by(&nodes, id)?.http.clone();
+        let added = post_json(
+            &format!("http://{survivor_http}/admin/add-wal-voter"),
+            &serde_json::json!({ "id": id, "addr": addr }),
+        )?;
+        if !added.status().is_success() {
+            let status = added.status();
+            let body = added
+                .text()
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            return Err(std::io::Error::other(format!(
+                "add voter {id} {status}: {body}"
+            )));
+        }
+    }
+    wait_voters(&survivor_http, 3)?;
+    let (_, offset) = produce_retrying(&kafka_addr(node_by(&nodes, leader)?), "v1");
+    if offset != 1 {
+        return Err(std::io::Error::other(format!(
+            "produce after the new voters joined landed at {offset}"
+        )));
+    }
+    nodes[(survivor - 1) as usize].kill();
+    let (_, offset) = produce_retrying(&kafka_addr(node_by(&nodes, other)?), "v2");
+    if offset != 2 {
+        return Err(std::io::Error::other(format!(
+            "produce after losing one more voter landed at {offset}"
+        )));
+    }
+    Ok(())
+}
+
+fn node_by(nodes: &[Node], id: i32) -> std::io::Result<&Node> {
+    nodes
+        .iter()
+        .find(|node| node.id == id)
+        .ok_or_else(|| std::io::Error::other(format!("no node {id}")))
+}
+
+fn post_json(url: &str, body: &serde_json::Value) -> std::io::Result<reqwest::blocking::Response> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| std::io::Error::other(err.to_string()))?
+        .post(url)
+        .json(body)
+        .send()
+        .map_err(|err| std::io::Error::other(err.to_string()))
+}
+
+fn wait_voters(http: &str, count: usize) -> std::io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let body = reqwest::blocking::get(format!("http://{http}/admin/metrics"))
+            .map_err(|err| std::io::Error::other(err.to_string()))?
+            .text()
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|err| std::io::Error::other(err.to_string()))?;
+        let voters = value["wal_voters"]
+            .as_array()
+            .map(|rows| rows.len())
+            .unwrap_or(0);
+        if voters == count {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(std::io::Error::other(format!(
+                "shard has {voters} voters, wanted {count}: {body}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

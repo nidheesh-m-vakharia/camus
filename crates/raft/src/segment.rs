@@ -614,6 +614,40 @@ impl Write for OutWrite<'_> {
 }
 
 impl SegmentLog {
+    /// `len` bytes of the payload at `index`, starting `offset` bytes in.
+    /// Reads that range and nothing after it.
+    pub fn read_slice(&self, index: u64, offset: u64, len: usize) -> io::Result<Option<Vec<u8>>> {
+        if len > MAX_PAYLOAD as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slice too large",
+            ));
+        }
+        loop {
+            let (generation, loc, file) = {
+                let mut found = self.index()?;
+                let Some(loc) = found.locs.get(&index).copied() else {
+                    return Ok(None);
+                };
+                let file = found.file(&self.dir, loc.segment)?;
+                (found.generation, loc, file)
+            };
+            if offset.saturating_add(len as u64) > u64::from(loc.len) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "slice outside the record",
+                ));
+            }
+            let mut buf = vec![0u8; len];
+            if len > 0 {
+                file.read_exact_at(&mut buf, loc.header + HEADER as u64 + offset)?;
+            }
+            if self.index()?.generation == generation {
+                return Ok(Some(buf));
+            }
+        }
+    }
+
     /// Payload at `index`, if it is still in the log.
     pub fn get(&self, index: u64) -> io::Result<Option<Payload>> {
         Ok(self

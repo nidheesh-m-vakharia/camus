@@ -7,6 +7,7 @@
 //! choose a leader or speak Kafka.
 
 pub mod codec;
+pub mod layout;
 mod segment;
 mod store;
 mod submit;
