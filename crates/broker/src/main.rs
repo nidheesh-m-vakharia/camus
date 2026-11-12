@@ -195,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/admin/add-wal-voter", post(add_wal_voter))
                 .route("/admin/restore-cluster", post(restore_cluster))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
+                .route("/wal/{shard}/end-offset", post(shard_end_offset))
                 .with_state(Arc::clone(&admin)),
         )
         .merge(
@@ -805,6 +806,40 @@ async fn shard_hand_over(
             format!("voter {} did not take shard {shard}", body.to),
         ))
     }
+}
+
+#[derive(Deserialize)]
+struct EndOffset {
+    topic: String,
+    partition: i32,
+}
+
+/// On a shard's leader: the next offset of one partition, which `EndTxn`
+/// uses as the exclusive end of that partition's span (ADR 0015).
+async fn shard_end_offset(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<EndOffset>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let Some(raw) = admin
+        .node
+        .read_local(&camus_metadata::topic_storage_key(&body.topic))
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+    else {
+        return Err((StatusCode::NOT_FOUND, format!("no topic {}", body.topic)));
+    };
+    let topic = camus_metadata::parse_topic(&raw)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let id = uuid::Uuid::parse_str(&topic.id)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let end = opened.end_offset(id.as_bytes(), body.partition);
+    Ok(Json(serde_json::json!({ "end": end })))
 }
 
 async fn initialize_shard(

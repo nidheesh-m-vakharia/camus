@@ -636,11 +636,89 @@ impl Kafka {
             .is_some_and(|shard| shard.is_leader())
     }
 
+    /// The transaction already recorded a span for this partition, so a later
+    /// batch does not write metadata again (ADR 0015).
+    fn txn_span_open(&self, transactional_id: &str, topic: &str, partition: i32) -> bool {
+        let Some(raw) = self
+            .node
+            .read_local(&format!("txn/{transactional_id}"))
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        camus_metadata::txn_spans(&raw).ok().is_some_and(|spans| {
+            spans
+                .iter()
+                .any(|span| span.topic == topic && span.partition == partition)
+        })
+    }
+
     /// A partition's WAL end, or 0 when this broker does not have its shard.
     fn wal_end(&self, topic: &Topic, partition: i32) -> i64 {
         self.wal_of(topic, partition)
             .map(|shard| shard.end_offset(&topic_id(topic), partition))
             .unwrap_or(0)
+    }
+
+    /// The log end from the shard leader. A leader that cannot be reached
+    /// is `LEADER_NOT_AVAILABLE`, which the client retries (ADR 0015).
+    async fn shard_end(&self, topic: &Topic, partition: i32) -> Result<i64, i16> {
+        if self.leads_wal(topic, partition) {
+            return Ok(self.wal_end(topic, partition));
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/end-offset", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if !response.status().is_success() {
+            return Err(LEADER_NOT_AVAILABLE);
+        }
+        let body: serde_json::Value = response.json().await.map_err(|_| LEADER_NOT_AVAILABLE)?;
+        body.get("end")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or(LEADER_NOT_AVAILABLE)
+    }
+
+    /// One span per partition the transaction wrote, with the end taken from
+    /// the shard leader.
+    async fn txn_ends(&self, transactional_id: &str) -> Result<Vec<TxnSpan>, i16> {
+        let Some(raw) = self
+            .node
+            .read_local(&format!("txn/{transactional_id}"))
+            .ok()
+            .flatten()
+        else {
+            return Ok(Vec::new());
+        };
+        let spans = camus_metadata::txn_spans(&raw).map_err(|_| NOT_LEADER)?;
+        let mut ends = Vec::with_capacity(spans.len());
+        for span in spans {
+            let Some(topic) = self.topic(&span.topic) else {
+                return Err(UNKNOWN_TOPIC);
+            };
+            let end = self.shard_end(&topic, span.partition).await?;
+            ends.push(TxnSpan {
+                end,
+                producer_id: span.producer_id,
+                ..span
+            });
+        }
+        Ok(ends)
     }
 
     /// Shard leader and voters as clients should see them. The shard leader
@@ -1373,7 +1451,7 @@ impl Kafka {
                         let covers = |spans: &[camus_metadata::Span]| {
                             spans
                                 .iter()
-                                .any(|span| span.start <= record.offset && record.offset < span.end)
+                                .any(|span| span.covers(record.offset, record.producer_id))
                         };
                         if record.transactional && !covers(&committed) && !covers(&aborted) {
                             return None;
@@ -2756,6 +2834,9 @@ impl Kafka {
         }
         self.arrived(&produce.topic, produce.partition);
         if let Some((id, producer, epoch)) = produce.txn {
+            if self.txn_span_open(&id, &produce.topic, produce.partition) {
+                return Ok(response.base_offset);
+            }
             let noted = self
                 .meta_apply(Command::NoteTxn {
                     transactional_id: id,
@@ -2766,6 +2847,7 @@ impl Kafka {
                         partition: produce.partition,
                         start: response.base_offset,
                         end: response.base_offset + i64::from(produce.records),
+                        producer_id: Some(producer),
                     },
                 })
                 .await;
@@ -3512,6 +3594,9 @@ impl Kafka {
                 }
                 Plan::Error(_) => continue,
             };
+            if self.txn_span_open(&id, &item.topic, item.partition) {
+                continue;
+            }
             let applied = self
                 .meta_apply(Command::NoteTxn {
                     transactional_id: id,
@@ -3522,6 +3607,7 @@ impl Kafka {
                         partition: item.partition,
                         start,
                         end,
+                        producer_id: Some(item.producer_id),
                     },
                 })
                 .await;
@@ -3716,10 +3802,20 @@ impl Kafka {
                     };
                     let mut cursor = 0;
                     let mut span: Option<usize> = None;
-                    for batch in info {
+                    let producers = batch::producer_batches(&bytes, MAX_FRAME).unwrap_or_default();
+                    for (index, batch) in info.iter().enumerate() {
                         let next = batch.last_offset + 1;
+                        let producer = producers
+                            .get(index)
+                            .map(|row| row.producer_id)
+                            .unwrap_or(-1);
                         if isolation == 1 {
-                            match txn_batch(batch.base_offset, batch.transactional, &state) {
+                            match txn_batch(
+                                batch.base_offset,
+                                producer,
+                                batch.transactional,
+                                &state,
+                            ) {
                                 TxnView::Stop => {
                                     if let Some(start) = span.take() {
                                         out.push(bytes.slice(start..cursor));
@@ -4315,21 +4411,26 @@ enum TxnView {
     Stop,
 }
 
-fn txn_batch(offset: i64, transactional: bool, state: &camus_metadata::Partition) -> TxnView {
+fn txn_batch(
+    offset: i64,
+    producer_id: i64,
+    transactional: bool,
+    state: &camus_metadata::Partition,
+) -> TxnView {
     if !transactional {
         return TxnView::Take;
     }
     if state
         .txn_aborted
         .iter()
-        .any(|span| span.start <= offset && offset < span.end)
+        .any(|span| span.covers(offset, producer_id))
     {
         return TxnView::Skip;
     }
     if state
         .txn_committed
         .iter()
-        .any(|span| span.start <= offset && offset < span.end)
+        .any(|span| span.covers(offset, producer_id))
     {
         TxnView::Take
     } else {
@@ -4343,8 +4444,13 @@ fn filter_txn(bytes: &[u8], state: &camus_metadata::Partition, stable: &mut i64)
     };
     let mut out = Vec::new();
     let mut cursor = 0;
-    for batch in info {
-        match txn_batch(batch.base_offset, batch.transactional, state) {
+    let producers = batch::producer_batches(bytes, MAX_FRAME).unwrap_or_default();
+    for (index, batch) in info.iter().enumerate() {
+        let producer = producers
+            .get(index)
+            .map(|row| row.producer_id)
+            .unwrap_or(-1);
+        match txn_batch(batch.base_offset, producer, batch.transactional, state) {
             TxnView::Stop => {
                 *stable = (*stable).min(batch.base_offset);
                 break;

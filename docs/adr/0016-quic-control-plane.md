@@ -109,7 +109,10 @@ phase-0 baseline.
 1. **The endpoint.** `crates/raft/src/quic.rs`: the endpoint, a peer connection
    cache, the frame codec, certificates, `CAMUS_QUIC` / `CAMUS_QUIC_PORT`. Tests:
    request/response over loopback, reconnect after a peer restarts, an unknown
-   certificate refused.
+   certificate refused. This phase is in the tree. The endpoint stays off
+   unless `CAMUS_QUIC=on`, and the broker does not open it yet. Phases 2–5
+   have not started: every Raft RPC is still HTTP, and the timings are
+   unchanged.
 2. **Votes over QUIC** for metadata and WAL, with HTTP fallback. Tests:
    `wal_cluster`, `wal_majority` and `group_failover` pass with QUIC on; an
    election completes with HTTP to that peer blocked.

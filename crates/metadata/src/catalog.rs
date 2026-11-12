@@ -189,6 +189,20 @@ pub struct Span {
     pub start: i64,
     /// Exclusive.
     pub end: i64,
+    /// Producer this span belongs to. Absent on spans stored before ADR 0015,
+    /// which match any producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_id: Option<i64>,
+}
+
+impl Span {
+    /// `offset` falls in this span, and `producer_id` is the span's producer
+    /// when the span names one.
+    pub fn covers(&self, offset: i64, producer_id: i64) -> bool {
+        self.start <= offset
+            && offset < self.end
+            && self.producer_id.is_none_or(|id| id == producer_id)
+    }
 }
 
 /// One partition slice inside a publish command.

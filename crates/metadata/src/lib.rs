@@ -223,6 +223,10 @@ pub enum Command {
         /// Proposer's clock. `0` in commands written before it was carried.
         #[serde(default)]
         now_ms: i64,
+        /// Partition ends from the shard leaders. Empty on commands written
+        /// before ADR 0015, which keep the spans `NoteTxn` stored.
+        #[serde(default)]
+        ends: Vec<txn::TxnSpan>,
     },
     /// Replace a sealed offset prefix with one object. The high watermark stays.
     Compact {

@@ -1,7 +1,9 @@
 # Architecture decision records
 
 Records 0001–0013 were accepted on 2026-11-05 and are implemented, with the
-amendments their files note. 0014 is proposed.
+amendments their files note. 0014, 0015, and 0017 are accepted. 0016 is
+proposed: its endpoint is in the tree and off unless `CAMUS_QUIC=on`, and
+votes and heartbeats still travel over HTTP.
 
 | ADR | Title |
 | --- | --- |
@@ -18,8 +20,8 @@ amendments their files note. 0014 is proposed.
 | [0011](0011-local-log-storage.md) | Segment-file Raft log, `redb` state machine |
 | [0012](0012-auth.md) | SASL/PLAIN + TLS, and opt-in dev PLAINTEXT |
 | [0013](0013-delivery-phases.md) | Phases 0–5 and their acceptance tests |
-| [0014](0014-multiple-wal-shards.md) | Multiple WAL shards and leadership balance (proposed) |
-| [0015](0015-transaction-spans.md) | Transaction spans without a metadata write per produce (proposed) |
+| [0014](0014-multiple-wal-shards.md) | Multiple WAL shards and leadership balance |
+| [0015](0015-transaction-spans.md) | Transaction spans without a metadata write per produce |
 | [0016](0016-quic-control-plane.md) | QUIC for Raft control traffic (proposed) |
 | [0017](0017-ignored-topic-configs.md) | Accepted topic configs that do not change behavior |
 
