@@ -203,6 +203,12 @@ fn fresh_voters_restore_a_quorum() -> std::io::Result<()> {
         loop {
             let view =
                 admin(&survivor_http).ok_or_else(|| std::io::Error::other("no wal metrics"))?;
+            // A restarted voter can win the election before this loop asks
+            // for it. It is already in the membership, and the leader
+            // refuses to add itself.
+            if view["wal_leader"].as_i64() == Some(i64::from(id)) {
+                break;
+            }
             let target = view["wal_leader"]
                 .as_i64()
                 .and_then(|led| nodes.iter().find(|node| node.id == led as i32))
