@@ -343,6 +343,11 @@ pub struct Kafka {
     host: String,
     port: i32,
     flush_ms: u64,
+    /// How long a quiet shard may hold an object that is still under 8 MiB.
+    /// A shard that has reached half an object keeps `flush_ms`.
+    quiet_ms: u64,
+    /// `broker.rack`. Empty means this broker has no zone.
+    rack: Option<String>,
     /// How often to compact sealed extents of `cleanup.policy=compact` topics.
     /// `0` turns compaction off. Kafka's cleaner is on by default, and so is
     /// this.
@@ -452,6 +457,13 @@ impl Kafka {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(250);
+        let quiet_ms = std::env::var("CAMUS_QUIET_FLUSH_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30_000);
+        let rack = std::env::var("CAMUS_RACK")
+            .ok()
+            .filter(|rack| !rack.is_empty());
         let env_ms = |name: &str, default: u64| {
             std::env::var(name)
                 .ok()
@@ -532,6 +544,8 @@ impl Kafka {
             host,
             port,
             flush_ms,
+            quiet_ms,
+            rack,
             compact_ms,
             auto_create_topics,
             default_partitions,
@@ -706,6 +720,52 @@ impl Kafka {
                 .iter()
                 .any(|span| span.topic == topic && span.partition == partition)
         })
+    }
+
+    /// A `wal` fetch can be served here when this broker holds the shard.
+    /// An `r2` fetch can be served from any broker that has the metadata.
+    fn can_fetch(&self, topic: &Topic, partition: i32) -> bool {
+        topic.durability != "wal" || self.wal_of(topic, partition).is_some()
+    }
+
+    /// Rack stored for `id`, once that broker has registered it.
+    fn broker_rack(&self, id: i32) -> Option<String> {
+        self.node
+            .read_local(&format!("broker/{id}/rack"))
+            .ok()
+            .flatten()
+    }
+
+    /// A voter in the client's zone, when this broker leads the shard and
+    /// the client would otherwise read across zones. Fetch v11 and later.
+    fn preferred_read_replica(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        client_rack: &str,
+        version: i16,
+    ) -> Option<i32> {
+        if version < 11
+            || client_rack.is_empty()
+            || topic.durability != "wal"
+            || !self.leads_wal(topic, partition)
+            || self.rack.as_deref() == Some(client_rack)
+        {
+            return None;
+        }
+        let view = self.shard_view(self.partition_shard(topic, partition));
+        for voter in view.voters {
+            let Ok(id) = i32::try_from(voter) else {
+                continue;
+            };
+            if id == self.node_id {
+                continue;
+            }
+            if self.broker_rack(id).as_deref() == Some(client_rack) {
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// A partition's WAL end, or 0 when this broker does not have its shard.
@@ -1786,8 +1846,6 @@ impl Kafka {
                 }
             });
         }
-        // One upload loop per shard, started as shards open, so a shard
-        // that is slow or without quorum delays and backs off only itself.
         let upload = Arc::clone(&self);
         tokio::spawn(async move {
             let mut started = std::collections::BTreeSet::new();
@@ -1838,6 +1896,13 @@ impl Kafka {
                 let stored = register.node.read_local(&key).ok().flatten();
                 if stored.as_deref() != Some(addr.as_str()) {
                     let _ = register.meta_write(key.clone(), addr.clone()).await;
+                }
+                if let Some(rack) = &register.rack {
+                    let rack_key = format!("broker/{}/rack", register.node_id);
+                    let stored = register.node.read_local(&rack_key).ok().flatten();
+                    if stored.as_deref() != Some(rack.as_str()) {
+                        let _ = register.meta_write(rack_key, rack.clone()).await;
+                    }
                 }
                 register.announce_shard().await;
                 let announce_ms = std::env::var("CAMUS_SHARD_ANNOUNCE_MS")
@@ -2197,6 +2262,7 @@ impl Kafka {
                 broker.node_id = BrokerId(id);
                 broker.host = StrBytes::from_string(host.to_string());
                 broker.port = port;
+                broker.rack = self.broker_rack(id).map(StrBytes::from_string);
                 Some(broker)
             })
             .collect()
@@ -3317,6 +3383,7 @@ impl Kafka {
     async fn upload_loop(self: Arc<Self>, id: u32) {
         let mut failures = 0u32;
         let mut backlog = false;
+        let mut quiet = QuietHold::default();
         loop {
             // A pass that filled its object leaves more behind; start the
             // next one at once so a backlog drains at R2's pace.
@@ -3331,11 +3398,15 @@ impl Kafka {
             let Some(wal) = self.wal.shard(id) else {
                 continue;
             };
-            match self.upload_shard(id, wal).await {
+            match self.upload_shard(id, wal, &mut quiet).await {
                 Upload::Failed => {
                     failures = failures.saturating_add(1);
                     backlog = false;
                     tracing::warn!(shard = id, failures, "wal upload failed; retrying");
+                }
+                Upload::Hold => {
+                    failures = 0;
+                    backlog = false;
                 }
                 pass => {
                     failures = 0;
@@ -3348,8 +3419,9 @@ impl Kafka {
     /// One upload pass for one shard this broker leads. The shard is fixed
     /// for the whole pass, so a truncate mid-upload cannot seal into the
     /// shard that replaced it.
-    async fn upload_shard(&self, id: u32, wal: Arc<Shard>) -> Upload {
+    async fn upload_shard(&self, id: u32, wal: Arc<Shard>, quiet: &mut QuietHold) -> Upload {
         if !wal.is_leader() {
+            *quiet = QuietHold::default();
             return Upload::Done;
         }
         // Hold the whole pass, including the object put. A seal-only delay
@@ -3369,6 +3441,7 @@ impl Kafka {
             }
         };
         if pending.is_empty() {
+            *quiet = QuietHold::default();
             return Upload::Done;
         }
         let taken: usize = pending.iter().map(|batch| batch.bytes.len()).sum();
@@ -3415,6 +3488,16 @@ impl Kafka {
             cursor.insert(key, batch.end);
             upload.push(batch);
         }
+        let queued: usize = upload.iter().map(|batch| batch.bytes.len()).sum();
+        if queued == 0 {
+            *quiet = QuietHold::default();
+        } else {
+            let started = quiet.since.get_or_insert_with(Instant::now);
+            let waited = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if !upload_due(queued, waited, self.flush_ms, self.quiet_ms) {
+                return Upload::Hold;
+            }
+        }
         if !upload.is_empty() {
             let (parts, producers, seals, all_put) = self.put_objects(upload).await;
             if !all_put {
@@ -3445,6 +3528,9 @@ impl Kafka {
         } else {
             Upload::Done
         };
+        if ok {
+            *quiet = QuietHold::default();
+        }
         if drops.is_empty() {
             return done;
         }
@@ -3759,6 +3845,8 @@ impl Kafka {
             return Reply::Close;
         };
         let mut response = FetchResponse::default();
+        let client_rack = request.rack_id.as_str();
+        let version = header.request_api_version;
         let deadline = Instant::now() + Duration::from_millis(request.max_wait_ms.max(0) as u64);
         let min_bytes = usize::try_from(request.min_bytes.max(1)).unwrap_or(1);
         // Woken when a batch commits on one of these partitions here.
@@ -3802,6 +3890,8 @@ impl Kafka {
                             partition.fetch_offset,
                             partition.partition_max_bytes,
                             request.isolation_level,
+                            client_rack,
+                            version,
                         )
                     })
                     .collect();
@@ -3851,6 +3941,8 @@ impl Kafka {
         offset: i64,
         max_bytes: i32,
         isolation: i8,
+        client_rack: &str,
+        version: i16,
     ) -> PartitionData {
         let mut row = PartitionData::default();
         row.partition_index = partition;
@@ -3862,7 +3954,13 @@ impl Kafka {
             row.error_code = LEADER_NOT_AVAILABLE;
             return row;
         }
-        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
+        if let Some(preferred) = self.preferred_read_replica(topic, partition, client_rack, version)
+        {
+            row.preferred_read_replica = BrokerId(preferred);
+            row.error_code = 0;
+            return row;
+        }
+        if !self.can_fetch(topic, partition) {
             row.error_code = NOT_LEADER;
             return row;
         }
@@ -4100,7 +4198,7 @@ impl Kafka {
             row.offset = -1;
             return row;
         };
-        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
+        if !self.can_fetch(topic, partition) {
             row.error_code = NOT_LEADER;
             row.offset = -1;
             return row;
@@ -4307,6 +4405,30 @@ enum Upload {
     Full,
     /// The put or the publish failed; back off.
     Failed,
+    /// Unsealed bytes are waiting for a full object, or for the busy timer.
+    Hold,
+}
+
+/// When the current quiet prefix started. Cleared after an upload.
+#[derive(Default)]
+struct QuietHold {
+    since: Option<Instant>,
+}
+
+/// A full object uploads immediately. Half an object uploads on `flush_ms`.
+/// Anything smaller waits until `quiet_ms`, so a trickle does not put four
+/// times a second.
+fn upload_due(pending: usize, waited_ms: u64, flush_ms: u64, quiet_ms: u64) -> bool {
+    if pending == 0 {
+        return false;
+    }
+    if pending >= FLUSH_BYTES {
+        return true;
+    }
+    if pending >= FLUSH_BYTES / 2 && waited_ms >= flush_ms {
+        return true;
+    }
+    waited_ms >= quiet_ms
 }
 
 /// Exponential backoff from 100ms to 5s, with up to half again as jitter so
@@ -4726,5 +4848,32 @@ mod principal_tests {
             .collect();
         assert_eq!(encoded, vec!["2.5.4.3", "2.5.4.10"]);
         assert_eq!(rfc2253(parsed.subject()), "O=example,CN=alice\\, the admin");
+    }
+}
+
+#[cfg(test)]
+mod upload_due_tests {
+    use super::upload_due;
+
+    const OBJECT: usize = 8 * 1024 * 1024;
+
+    #[test]
+    fn a_trickle_waits_and_a_full_object_uploads() -> Result<(), String> {
+        if upload_due(100, 0, 250, 30_000) {
+            return Err("a new trickle must wait".into());
+        }
+        if !upload_due(100, 30_000, 250, 30_000) {
+            return Err("a trickle uploads at the quiet bound".into());
+        }
+        if !upload_due(OBJECT, 0, 250, 30_000) {
+            return Err("a full object uploads immediately".into());
+        }
+        if upload_due(OBJECT / 2, 0, 250, 30_000) {
+            return Err("half an object waits for the busy timer".into());
+        }
+        if !upload_due(OBJECT / 2, 250, 250, 30_000) {
+            return Err("half an object uploads on the busy timer".into());
+        }
+        Ok(())
     }
 }

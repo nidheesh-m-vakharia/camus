@@ -185,7 +185,9 @@ lists each default next to Kafka's.
 | `CAMUS_NUM_PARTITIONS` | 1 | `num.partitions` |
 | `CAMUS_MESSAGE_MAX_BYTES` | 1048588 | `message.max.bytes` |
 | `CAMUS_WAL_DISK_LIMIT` | 8 GiB | Unsealed WAL bytes before produce is held |
-| `CAMUS_FLUSH_MS` | 250 | How often unsealed data is uploaded |
+| `CAMUS_FLUSH_MS` | 250 | Busy upload interval. A shard with at least 4 MiB unsealed uses this |
+| `CAMUS_QUIET_FLUSH_MS` | 30000 | How long a smaller unsealed prefix waits before upload |
+| `CAMUS_RACK` | — | `broker.rack`. Fetch v11 sends a client in this zone to a local voter |
 | `CAMUS_RETENTION_CHECK_MS` | 300000 | `log.retention.check.interval.ms` |
 | `CAMUS_COMPACT_MS` | 300000 | Compaction interval; `0` turns it off |
 | `CAMUS_SWEEP_MS` | 300000 | Orphaned-object sweep interval |

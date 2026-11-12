@@ -87,9 +87,12 @@ Produce acks in `r2` mode after the object is stored and the extent is
 committed. `wal` produce acks after the WAL shard commits, which means a
 majority of its voters has fsynced the batch. Every broker is a voter.
 Metadata reports the shard leader as the leader of each `wal` partition and
-the voters as replicas and ISR. A broker that is not the shard leader
-answers produce, fetch, and list-offsets with `NOT_LEADER_OR_FOLLOWER` (6).
-A produce that cannot commit within `timeout_ms`, for example with no
+the voters as replicas and ISR. Produce on a broker that is not the shard
+leader returns `NOT_LEADER_OR_FOLLOWER` (6). Fetch and list-offsets are
+served by any broker that holds the shard. On Fetch v11 and later, a leader
+whose `broker.rack` (`CAMUS_RACK`) differs from the client's `rack_id`
+returns `preferred_read_replica` set to a voter in the client's zone, and
+the client reads there. A produce that cannot commit within `timeout_ms`, for example with no
 quorum, gets `REQUEST_TIMED_OUT` (7); the entry may still commit later, so a
 client without idempotence can duplicate on retry. Producers should set
 `enable.idempotence=true`. The Java client has done so by default since
@@ -217,7 +220,7 @@ the broker logs that config once. ADR 0017 records the decision.
 | Config | Why it is ignored | What applies |
 | --- | --- | --- |
 | `min.insync.replicas` | There is no ISR, and a produce is not acknowledged by one replica | A WAL majority. In `r2` mode, the object put and the metadata commit |
-| `flush.messages`, `flush.ms` | Acknowledgements are the group commit, not a message or time flush | The WAL fsync on commit. `CAMUS_FLUSH_MS` is the upload interval |
+| `flush.messages`, `flush.ms` | Acknowledgements are the group commit, not a message or time flush | The WAL fsync on commit. `CAMUS_FLUSH_MS` is the busy upload interval. `CAMUS_QUIET_FLUSH_MS` (30s) holds a prefix under 4 MiB |
 | `segment.bytes`, `segment.ms`, `segment.jitter.ms`, `segment.index.bytes` | There are no Kafka log segments | The write-ahead log and sealed objects, sized by the broker |
 | `index.interval.bytes` | There is no byte index | Extent metadata |
 | `file.delete.delay.ms` | Object deletion is the orphan sweep | `CAMUS_SWEEP_MIN_AGE_MS` |

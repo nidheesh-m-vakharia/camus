@@ -15,5 +15,7 @@ if [[ -n "$hits" ]]; then
 fi
 echo "no added unwrap/expect"
 
+python3 scripts/cost.py --check
+
 [[ "${1:-}" == "--no-test" ]] && exit 0
 cargo test --workspace --locked
