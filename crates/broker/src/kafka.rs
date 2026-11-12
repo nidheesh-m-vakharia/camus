@@ -728,6 +728,17 @@ impl Kafka {
         topic.durability != "wal" || self.wal_of(topic, partition).is_some()
     }
 
+    /// A failed read. A `wal` follower that cannot read tells the client to
+    /// use the leader. Reporting storage there would look like a broken log
+    /// on a broker that has lost its quorum (ADR 0008).
+    fn read_failure(&self, topic: &Topic, partition: i32) -> i16 {
+        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
+            NOT_LEADER
+        } else {
+            STORAGE
+        }
+    }
+
     /// Rack stored for `id`, once that broker has registered it.
     fn broker_rack(&self, id: i32) -> Option<String> {
         self.node
@@ -3996,7 +4007,7 @@ impl Kafka {
             'extents: loop {
                 let Ok(page) = self.extents_after(topic, partition, &state, after, EXTENT_PAGE)
                 else {
-                    row.error_code = STORAGE;
+                    row.error_code = self.read_failure(topic, partition);
                     return row;
                 };
                 let full = page.len() == EXTENT_PAGE;
@@ -4017,7 +4028,7 @@ impl Kafka {
                 let mut reads = futures::stream::iter(pending).buffered(EXTENT_READS);
                 while let Some(read) = reads.next().await {
                     let Ok(bytes) = read else {
-                        row.error_code = STORAGE;
+                        row.error_code = self.read_failure(topic, partition);
                         return row;
                     };
                     let Ok(info) = batch::inspect(&bytes, MAX_FRAME) else {
@@ -4095,7 +4106,7 @@ impl Kafka {
                 let extra = match unsealed {
                     Ok(extra) => extra,
                     Err(_) => {
-                        row.error_code = STORAGE;
+                        row.error_code = self.read_failure(topic, partition);
                         return row;
                     }
                 };
