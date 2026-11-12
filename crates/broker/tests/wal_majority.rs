@@ -194,26 +194,48 @@ fn fresh_voters_restore_a_quorum() -> std::io::Result<()> {
     for id in [leader, other] {
         nodes[(id - 1) as usize].restart();
     }
-    // Election can take the full 400–800 ms, and a restarted voter can win
-    // it. Add through whoever leads, and try again while the answer is
-    // "not the shard leader".
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The restarted brokers still have the pre-truncate shard, and a higher
+    // term there can show up as `wal_leader` on the reset shard. Add only
+    // through a node that is actually a voter of shard 0, and try again
+    // while an election is in progress.
+    let deadline = Instant::now() + Duration::from_secs(15);
     for id in [leader, other] {
         let addr = node_by(&nodes, id)?.http.clone();
         loop {
             let view =
                 admin(&survivor_http).ok_or_else(|| std::io::Error::other("no wal metrics"))?;
-            // A restarted voter can win the election before this loop asks
-            // for it. It is already in the membership, and the leader
-            // refuses to add itself.
-            if view["wal_leader"].as_i64() == Some(i64::from(id)) {
+            let shard = view["wal_shards"].as_array().and_then(|shards| {
+                shards.iter().find(|row| row["id"].as_u64() == Some(0))
+            });
+            let voters = shard.and_then(|row| row["voters"].as_array());
+            let in_set = voters.is_some_and(|rows| {
+                rows.iter()
+                    .any(|voter| voter.as_i64() == Some(i64::from(id)))
+            });
+            if in_set {
                 break;
             }
-            let target = view["wal_leader"]
-                .as_i64()
-                .and_then(|led| nodes.iter().find(|node| node.id == led as i32))
-                .map(|node| node.http.clone())
-                .unwrap_or_else(|| survivor_http.clone());
+            let reported = shard.and_then(|row| row["leader"].as_i64());
+            let reported_is_member = reported.is_some_and(|led| {
+                voters.is_some_and(|rows| rows.iter().any(|voter| voter.as_i64() == Some(led)))
+            });
+            let target = if reported_is_member {
+                reported
+                    .and_then(|led| nodes.iter().find(|node| i64::from(node.id) == led))
+                    .map(|node| node.http.clone())
+                    .unwrap_or_else(|| survivor_http.clone())
+            } else {
+                survivor_http.clone()
+            };
+            if target == addr {
+                if Instant::now() > deadline {
+                    return Err(std::io::Error::other(format!(
+                        "add voter {id}: the only reported leader is that broker"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             let added = post_json(
                 &format!("http://{target}/admin/add-wal-voter"),
                 &serde_json::json!({ "id": id, "addr": addr }),
@@ -225,10 +247,9 @@ fn fresh_voters_restore_a_quorum() -> std::io::Result<()> {
             let body = added
                 .text()
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
-            if status.as_u16() == 409
-                && body.contains("not the shard leader")
-                && Instant::now() < deadline
-            {
+            let retry = (status.as_u16() == 409 && body.contains("not the shard leader"))
+                || body.contains("does not add itself");
+            if retry && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
