@@ -240,6 +240,7 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let node = &admin.node;
     let stats = &camus_compactor::STATS;
+    let store = &camus_storage::STATS;
     let metrics = node.raft.metrics().borrow().clone();
     let leader = metrics
         .current_leader
@@ -278,7 +279,23 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          camus_meta_snapshot_index {}\n\
          # HELP camus_meta_snapshot_unix_ms Unix milliseconds of that snapshot, or 0.\n\
          # TYPE camus_meta_snapshot_unix_ms gauge\n\
-         camus_meta_snapshot_unix_ms {}\n",
+         camus_meta_snapshot_unix_ms {}\n\
+         # HELP camus_object_store_requests_total Object-store calls by operation. A retried call or a paged list counts once.\n\
+         # TYPE camus_object_store_requests_total counter\n\
+         camus_object_store_requests_total{{op=\"put\"}} {}\n\
+         camus_object_store_requests_total{{op=\"get\"}} {}\n\
+         camus_object_store_requests_total{{op=\"head\"}} {}\n\
+         camus_object_store_requests_total{{op=\"list\"}} {}\n\
+         camus_object_store_requests_total{{op=\"delete\"}} {}\n\
+         # HELP camus_object_store_errors_total Object-store calls that returned an error.\n\
+         # TYPE camus_object_store_errors_total counter\n\
+         camus_object_store_errors_total {}\n\
+         # HELP camus_object_store_put_bytes_total Bytes written to object storage.\n\
+         # TYPE camus_object_store_put_bytes_total counter\n\
+         camus_object_store_put_bytes_total {}\n\
+         # HELP camus_object_store_get_bytes_total Bytes read from object storage.\n\
+         # TYPE camus_object_store_get_bytes_total counter\n\
+         camus_object_store_get_bytes_total {}\n",
         metrics.current_term,
         if metrics.current_leader == Some(metrics.id) {
             1
@@ -292,6 +309,14 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         kafka::PRODUCE_HOLD_MS.load(Relaxed),
         kafka::META_SNAPSHOT_INDEX.load(Relaxed),
         kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
+        store.puts.load(Relaxed),
+        store.gets.load(Relaxed),
+        store.heads.load(Relaxed),
+        store.lists.load(Relaxed),
+        store.deletes.load(Relaxed),
+        store.errors.load(Relaxed),
+        store.put_bytes.load(Relaxed),
+        store.get_bytes.load(Relaxed),
     );
     // One series per open shard. The shard count is fixed at init.
     let shards = admin.wal.all();

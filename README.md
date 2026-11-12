@@ -63,7 +63,9 @@ the address clients should dial. On Railway those fall back to
 `RAILWAY_TCP_PROXY_DOMAIN` and `RAILWAY_TCP_PROXY_PORT`.
 
 `GET /admin/metrics` returns JSON, including `current_leader` and
-`wal_leader`. `GET /metrics` is Prometheus.
+`wal_leader`. `GET /metrics` is Prometheus. `camus_object_store_*` counts
+object-store calls by operation and bytes moved, for checking R2 cost
+against ADR 0007.
 
 Three brokers plus MinIO: `docker compose --profile brokers up`. The image
 is published from `main` to `ghcr.io/<owner>/camus`, tagged `latest` and
