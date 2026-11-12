@@ -204,9 +204,9 @@ fn fresh_voters_restore_a_quorum() -> std::io::Result<()> {
         loop {
             let view =
                 admin(&survivor_http).ok_or_else(|| std::io::Error::other("no wal metrics"))?;
-            let shard = view["wal_shards"].as_array().and_then(|shards| {
-                shards.iter().find(|row| row["id"].as_u64() == Some(0))
-            });
+            let shard = view["wal_shards"]
+                .as_array()
+                .and_then(|shards| shards.iter().find(|row| row["id"].as_u64() == Some(0)));
             let voters = shard.and_then(|row| row["voters"].as_array());
             let in_set = voters.is_some_and(|rows| {
                 rows.iter()
