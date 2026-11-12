@@ -720,7 +720,23 @@ pub fn produce_batch_timeout(addr: &str, records: Bytes, timeout_ms: i32) -> (i1
     (code, offset)
 }
 
+/// Produce one batch with the given `acks` and `timeout_ms`.
+pub fn produce_acks(addr: &str, value: &str, acks: i16, timeout_ms: i32) -> (i16, i64) {
+    let (code, offset, _) = produce_raw_acks(addr, 0, batch(value), timeout_ms, acks);
+    (code, offset)
+}
+
 fn produce_raw(addr: &str, partition: i32, records: Bytes, timeout_ms: i32) -> (i16, i64, i32) {
+    produce_raw_acks(addr, partition, records, timeout_ms, -1)
+}
+
+fn produce_raw_acks(
+    addr: &str,
+    partition: i32,
+    records: Bytes,
+    timeout_ms: i32,
+    acks: i16,
+) -> (i16, i64, i32) {
     let mut stream = connect(addr);
     stream
         .set_read_timeout(Some(Duration::from_millis(timeout_ms as u64 + 15_000)))
@@ -735,7 +751,7 @@ fn produce_raw(addr: &str, partition: i32, records: Bytes, timeout_ms: i32) -> (
         ApiKey::Produce,
         9,
         &ProduceRequest::default()
-            .with_acks(-1)
+            .with_acks(acks)
             .with_timeout_ms(timeout_ms)
             .with_topic_data(vec![topic]),
     );

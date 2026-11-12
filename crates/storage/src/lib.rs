@@ -12,6 +12,7 @@ mod disk_cache;
 pub use disk_cache::DiskCache;
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -43,6 +44,50 @@ fn virtual_host_endpoint(endpoint: &str, bucket: &str) -> anyhow::Result<String>
     url.set_query(None);
     url.set_fragment(None);
     Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+/// Object-store calls made through [`Bucket`], for `/metrics`. One count per
+/// call: `object_store` may retry a call, and a list may fetch several pages.
+#[derive(Default)]
+pub struct Stats {
+    /// Puts, conditional or not (R2 Class A).
+    pub puts: AtomicU64,
+    /// Ranged gets (R2 Class B).
+    pub gets: AtomicU64,
+    /// Heads (R2 Class B).
+    pub heads: AtomicU64,
+    /// Lists (R2 Class A).
+    pub lists: AtomicU64,
+    /// Deletes (free on R2).
+    pub deletes: AtomicU64,
+    /// Calls that returned an error, including a conditional put that lost.
+    /// A head that finds nothing is not one.
+    pub errors: AtomicU64,
+    /// Bytes written by puts.
+    pub put_bytes: AtomicU64,
+    /// Bytes returned by gets.
+    pub get_bytes: AtomicU64,
+}
+
+/// Process-wide counters.
+pub static STATS: Stats = Stats {
+    puts: AtomicU64::new(0),
+    gets: AtomicU64::new(0),
+    heads: AtomicU64::new(0),
+    lists: AtomicU64::new(0),
+    deletes: AtomicU64::new(0),
+    errors: AtomicU64::new(0),
+    put_bytes: AtomicU64::new(0),
+    get_bytes: AtomicU64::new(0),
+};
+
+/// Count one call to `op`, and an error if it failed.
+fn counted<T, E>(op: &AtomicU64, result: Result<T, E>) -> Result<T, E> {
+    op.fetch_add(1, Relaxed);
+    if result.is_err() {
+        STATS.errors.fetch_add(1, Relaxed);
+    }
+    result
 }
 
 /// An S3-compatible bucket.
@@ -125,9 +170,13 @@ impl Bucket {
 
     /// Write `bytes` to `key`, replacing an object that is already there.
     pub async fn put(&self, key: &str, bytes: Bytes) -> anyhow::Result<()> {
-        self.store
+        let len = bytes.len() as u64;
+        let result = self
+            .store
             .put(&self.path(key), PutPayload::from_bytes(bytes))
-            .await?;
+            .await;
+        counted(&STATS.puts, result)?;
+        STATS.put_bytes.fetch_add(len, Relaxed);
         Ok(())
     }
 
@@ -137,21 +186,28 @@ impl Bucket {
             mode: PutMode::Create,
             ..Default::default()
         };
-        self.store
+        let len = bytes.len() as u64;
+        let result = self
+            .store
             .put_opts(&self.path(key), PutPayload::from_bytes(bytes), opts)
-            .await?;
+            .await;
+        counted(&STATS.puts, result)?;
+        STATS.put_bytes.fetch_add(len, Relaxed);
         Ok(())
     }
 
     /// Read `range` of an object. `range` is half-open.
     pub async fn get_range(&self, key: &str, range: Range<u64>) -> anyhow::Result<Bytes> {
-        let bytes = self.store.get_range(&self.path(key), range).await?;
+        let result = self.store.get_range(&self.path(key), range).await;
+        let bytes = counted(&STATS.gets, result)?;
+        STATS.get_bytes.fetch_add(bytes.len() as u64, Relaxed);
         Ok(bytes)
     }
 
     /// Delete `key`. Missing keys are an error from the store, not a success.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.store.delete(&self.path(key)).await?;
+        let result = self.store.delete(&self.path(key)).await;
+        counted(&STATS.deletes, result)?;
         Ok(())
     }
 
@@ -159,11 +215,12 @@ impl Bucket {
     /// Keys are returned without the bucket's own prefix.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64, i64)>> {
         use futures::TryStreamExt;
-        let objects: Vec<_> = self
+        let result = self
             .store
             .list(Some(&self.path(prefix)))
-            .try_collect()
-            .await?;
+            .try_collect::<Vec<_>>()
+            .await;
+        let objects = counted(&STATS.lists, result)?;
         Ok(objects
             .into_iter()
             .filter_map(|meta| {
@@ -176,10 +233,14 @@ impl Bucket {
 
     /// Whether `key` is absent. `true` means a get would not return bytes.
     pub async fn is_missing(&self, key: &str) -> anyhow::Result<bool> {
+        STATS.heads.fetch_add(1, Relaxed);
         match self.store.head(&self.path(key)).await {
             Ok(_) => Ok(false),
             Err(object_store::Error::NotFound { .. }) => Ok(true),
-            Err(err) => Err(err.into()),
+            Err(err) => {
+                STATS.errors.fetch_add(1, Relaxed);
+                Err(err.into())
+            }
         }
     }
 }
@@ -285,6 +346,46 @@ mod tests {
             virtual_host_endpoint("https://camus-abc.t3.storageapi.dev/extra", "camus-abc")
                 .unwrap();
         assert_eq!(endpoint, "https://camus-abc.t3.storageapi.dev");
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn each_call_counts_its_operation_and_bytes() -> anyhow::Result<()> {
+        let bucket = Bucket {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            prefix: String::new(),
+        };
+        let before = |counter: &AtomicU64| counter.load(Relaxed);
+        let (puts, gets, heads, lists, deletes) = (
+            before(&STATS.puts),
+            before(&STATS.gets),
+            before(&STATS.heads),
+            before(&STATS.lists),
+            before(&STATS.deletes),
+        );
+        let (put_bytes, get_bytes) = (before(&STATS.put_bytes), before(&STATS.get_bytes));
+
+        bucket
+            .put_new("a", Bytes::from_static(b"0123456789"))
+            .await?;
+        bucket.get_range("a", 2..6).await?;
+        bucket.list("").await?;
+        bucket.delete("a").await?;
+        anyhow::ensure!(bucket.is_missing("a").await?);
+
+        // Other tests may run in parallel, so check at least this test's calls.
+        anyhow::ensure!(STATS.puts.load(Relaxed) > puts);
+        anyhow::ensure!(STATS.gets.load(Relaxed) > gets);
+        anyhow::ensure!(STATS.heads.load(Relaxed) > heads);
+        anyhow::ensure!(STATS.lists.load(Relaxed) > lists);
+        anyhow::ensure!(STATS.deletes.load(Relaxed) > deletes);
+        anyhow::ensure!(STATS.put_bytes.load(Relaxed) >= put_bytes + 10);
+        anyhow::ensure!(STATS.get_bytes.load(Relaxed) >= get_bytes + 4);
+        Ok(())
     }
 }
 
