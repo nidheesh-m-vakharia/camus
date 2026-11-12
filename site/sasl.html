@@ -83,10 +83,10 @@
         <li><code>--tls-cert</code> and <code>--tls-key</code> for the listener certificate.</li>
         <li><code>CAMUS_SASL_USER</code> and <code>CAMUS_SASL_PASSWORD</code> for the one PLAIN identity.</li>
       </ul>
-      <p>The mechanism is PLAIN. There is no SCRAM and no delegation token. With a certificate configured, the listener allows ApiVersions and the SASL handshake, and requires SASL before any other API.</p>
+      <p>PLAIN is the identity in <code>CAMUS_SASL_USER</code> and <code>CAMUS_SASL_PASSWORD</code>. SCRAM-SHA-256 and SCRAM-SHA-512 users are created with <code>AlterUserScramCredentials</code>. Delegation tokens stay unimplemented. With a certificate configured, the listener allows ApiVersions and the SASL handshake, and requires SASL before any other API.</p>
       <h2>Plaintext, on purpose</h2>
       <p><code>--dev-plaintext</code> skips TLS. It is refused when the bind address is not loopback, unless you also pass <code>--allow-non-loopback</code>. The Docker image binds <span class="ports">0.0.0.0</span> and sets that flag, because a container's listener is never the host's loopback. Do not use that combination as a stand-in for SASL on a shared network.</p>
-      <p>ACLs are a separate switch from the handshake. A client that has authenticated can still be denied a topic. That denial is <code>TOPIC_AUTHORIZATION_FAILED</code> (29), described on the <a href="clients.html">clients</a> page. A resource with no matching ACL is allowed.</p>
+      <p>ACLs are a separate switch from the handshake. A client that has authenticated can still be denied a topic. That denial is <code>TOPIC_AUTHORIZATION_FAILED</code> (29), described on the <a href="clients.html">clients</a> page. On a listener that requires SASL or a client certificate, a resource no ACL names is denied. The dev PLAINTEXT listener allows it. <code>CAMUS_ACL_ALLOW_IF_NO_ACL</code> overrides either default.</p>
 
       <footer>
         <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
