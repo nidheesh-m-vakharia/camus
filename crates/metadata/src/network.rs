@@ -219,6 +219,10 @@ impl HttpConn {
             body,
         };
         let peer = camus_raft::quic::ControlEndpoint::peer_socket(&self.addr).ok()?;
+        if !endpoint.live(peer).await {
+            endpoint.warm(peer);
+            return None;
+        }
         let ttl = option.hard_ttl();
         let outcome = tokio::time::timeout(ttl, endpoint.call(peer, &frame)).await;
         let bytes = match outcome {

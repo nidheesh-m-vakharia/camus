@@ -970,6 +970,127 @@ footer {
   }
 }
 
+.cost-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  margin: 1.5rem 0 2rem;
+}
+
+.cost-form fieldset {
+  margin: 0;
+  padding: 1rem 1.15rem 1.2rem;
+  border: 0;
+  border-radius: 16px;
+  background: var(--gray-2);
+  min-inline-size: 0;
+}
+
+.cost-form legend {
+  float: left;
+  width: 100%;
+  margin: 0 0 0.85rem;
+  padding: 0;
+  color: var(--text-strong);
+  font-size: var(--step-0);
+  font-weight: var(--weight-heading);
+}
+
+.cost-fields {
+  clear: both;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 1rem 1.5rem;
+}
+
+.cost-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  color: var(--text-strong);
+  font-size: var(--step-1);
+  font-weight: var(--weight-label);
+}
+
+.cost-form input,
+.cost-form select {
+  font: inherit;
+  font-weight: var(--weight-body);
+  color: var(--text-strong);
+  background-color: var(--well);
+  border: 1px solid var(--gray-7);
+  border-radius: 0.4rem;
+  padding: 0.45rem 0.6rem;
+  accent-color: var(--text-strong);
+}
+
+.cost-form select {
+  appearance: none;
+  padding-inline-end: 2rem;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath fill='none' stroke='%23171717' stroke-width='1.5' d='M1 1.5 6 6.5 11 1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.65rem center;
+  background-size: 0.7rem;
+}
+
+.cost-form input[type="number"] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+  padding-inline-end: 1.7rem;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 16'%3E%3Cpath fill='none' stroke='%23171717' stroke-width='1.5' d='M1 6.2 6 1.8 11 6.2M1 9.8 6 14.2 11 9.8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+  background-size: 0.65rem 0.95rem;
+}
+
+.cost-form input[type="number"]::-webkit-inner-spin-button,
+.cost-form input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .cost-form select {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath fill='none' stroke='%23ededed' stroke-width='1.5' d='M1 1.5 6 6.5 11 1.5'/%3E%3C/svg%3E");
+  }
+
+  .cost-form input[type="number"] {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 16'%3E%3Cpath fill='none' stroke='%23ededed' stroke-width='1.5' d='M1 6.2 6 1.8 11 6.2M1 9.8 6 14.2 11 9.8'/%3E%3C/svg%3E");
+  }
+}
+
+.cost-form .check {
+  flex-direction: row;
+  align-items: center;
+  align-self: end;
+  gap: 0.6rem;
+  min-block-size: 2.35rem;
+}
+
+.cost-form .check input {
+  appearance: none;
+  width: 1.05rem;
+  height: 1.05rem;
+  margin: 0;
+  border-radius: 0.22rem;
+  flex: 0 0 auto;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 0.7rem;
+}
+
+.cost-form .check input:checked {
+  background-color: var(--text-strong);
+  border-color: var(--text-strong);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 10'%3E%3Cpath fill='none' stroke='%23fcfcfc' stroke-width='2' d='M1.5 5.2 4.4 8.2 10.5 1.8'/%3E%3C/svg%3E");
+}
+
+@media (prefers-color-scheme: dark) {
+  .cost-form .check input:checked {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 10'%3E%3Cpath fill='none' stroke='%230a0a0a' stroke-width='2' d='M1.5 5.2 4.4 8.2 10.5 1.8'/%3E%3C/svg%3E");
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .nav li a,
   .nav-toggle svg,

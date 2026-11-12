@@ -83,11 +83,15 @@ AppendEntries and snapshots stay on HTTP.
 ### Routing in the Raft network
 
 `HttpConn::vote` and `HttpConn::append_entries` (both groups) try QUIC first
-when the RPC is a vote or carries no entries, with the RPC's `hard_ttl` as the
-timeout. If the peer has no QUIC endpoint, or the connection cannot be made,
-they fall back to HTTP for that RPC and retry QUIC after a backoff. A cluster
-in the middle of a rolling upgrade, or one where UDP is blocked, keeps
-working on HTTP.
+when the RPC is a vote or carries no entries and the peer connection is
+already up, with the RPC's `hard_ttl` as the timeout. A missing connection
+is dialed in the background and that RPC goes over HTTP. The heartbeat
+budget is 50 ms, and a handshake on a busy host does not fit in it
+(2026-11-12: the clients job's group tests and `wal_shards` lost leadership
+while every heartbeat waited on a new handshake). If the peer has no QUIC
+endpoint, or the call fails, they fall back to HTTP for that RPC and retry
+QUIC after a backoff. A cluster in the middle of a rolling upgrade, or one
+where UDP is blocked, keeps working on HTTP.
 
 ### Leader announcements
 
