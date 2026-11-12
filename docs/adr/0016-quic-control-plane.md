@@ -119,11 +119,14 @@ phase-0 baseline.
    50–100 ms while the endpoint is installed. `CAMUS_QUIC=off` keeps the
    previous 50 ms / 150–300 ms timings and sends every RPC over HTTP.
 
-Phases 1–5 are in the tree. The phase-0 failover timings, heartbeat
-percentiles, and spurious-election count have not been recorded; this record
-does not invent them. `CAMUS_QUIC=off` is the switch back to the previous
-control path. The 10-minute packet-loss soak is not part of the default test
-suite.
+Phases 1–4 are in the tree, and QUIC is on unless `CAMUS_QUIC=off`. Phase 5's
+shorter timings are not. On the GitHub runner, with 15 / 50–100, the
+three-process test's first metadata write did not commit within the client's
+30 second timeout. The heartbeat stays 50 ms and the election timeout stays
+150–300 ms until a phase-0 run shows the shorter window does not do that.
+The phase-0 failover timings, heartbeat percentiles, and spurious-election
+count have not been recorded; this record does not invent them. The
+10-minute packet-loss soak is not part of the default test suite.
 
 ## Consequences
 

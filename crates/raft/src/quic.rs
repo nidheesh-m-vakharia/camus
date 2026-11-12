@@ -148,14 +148,12 @@ pub fn flag_enabled(value: Option<&str>) -> bool {
     !matches!(value, Some("off") | Some("0") | Some("false"))
 }
 
-/// Heartbeat and election timeouts, in milliseconds. Shorter when QUIC is on
-/// (ADR 0016 phase 5). `election_timeout_min` stays above the heartbeat.
+/// Heartbeat and election timeouts, in milliseconds: 50, then 150–300.
+/// ADR 0016 phase 5's 15 / 50–100 stayed off. With those values the
+/// three-process metadata write in `cluster.rs` did not commit within the
+/// client's 30 second timeout on the GitHub runner.
 pub fn raft_timeouts() -> (u64, u64, u64) {
-    if current().is_some() {
-        (15, 50, 100)
-    } else {
-        (50, 150, 300)
-    }
+    (50, 150, 300)
 }
 
 /// The process endpoint, after [`install`](ControlEndpoint::install).
