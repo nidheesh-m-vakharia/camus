@@ -961,6 +961,49 @@ impl Kafka {
         }
     }
 
+    /// Freeze the span before EndTxn reads it. A batch that commits after
+    /// this is refused by the shard and is not part of the transaction.
+    async fn finish_wal_span(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<(), i16> {
+        if self.leads_wal(topic, partition) {
+            let Some(shard) = self.wal_of(topic, partition) else {
+                return Err(LEADER_NOT_AVAILABLE);
+            };
+            return shard
+                .finish_txn(topic_id(topic), partition, producer_id)
+                .await
+                .map_err(|_| LEADER_NOT_AVAILABLE);
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/finish-txn", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+                "producer_id": producer_id,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(LEADER_NOT_AVAILABLE)
+        }
+    }
+
     /// Drop the open span after metadata has stored it.
     async fn close_wal_span(
         &self,
@@ -1046,6 +1089,10 @@ impl Kafka {
             let Some(topic) = self.topic(name) else {
                 return Err(UNKNOWN_TOPIC);
             };
+            if topic.durability == "wal" {
+                self.finish_wal_span(&topic, *partition, open.producer_id)
+                    .await?;
+            }
             if let Some((start, end)) = self
                 .shard_txn_span(&topic, *partition, open.producer_id)
                 .await?
@@ -1308,6 +1355,29 @@ impl Kafka {
                 return Ok(all);
             }
         }
+    }
+
+    /// The committed transaction spans cover every offset of this batch.
+    fn txn_batch_committed(
+        &self,
+        topic_name: &str,
+        partition: i32,
+        producer_id: i64,
+        start: i64,
+        end: i64,
+    ) -> bool {
+        let Some(topic) = self.topic(topic_name) else {
+            return false;
+        };
+        let Some(state) = self.partition_state(&topic, partition) else {
+            return false;
+        };
+        (start..end).all(|offset| {
+            state
+                .txn_committed
+                .iter()
+                .any(|span| span.covers(offset, producer_id))
+        })
     }
 
     fn partition_state(&self, topic: &Topic, partition: i32) -> Option<camus_metadata::Partition> {
@@ -3336,17 +3406,13 @@ impl Kafka {
             if self.txn_is_ongoing(&id, producer, epoch) {
                 return Ok(response.base_offset);
             }
-            let (start, end) = self
-                .topic(&produce.topic)
-                .and_then(|topic| {
-                    let id = topic_id(&topic);
-                    self.wal_of(&topic, produce.partition)
-                        .and_then(|shard| shard.txn_span(&id, produce.partition, producer))
-                })
-                .unwrap_or((
-                    response.base_offset,
-                    response.base_offset + i64::from(produce.records),
-                ));
+            let start = response.base_offset;
+            let end = start + i64::from(produce.records);
+            // EndTxn already stored this batch. Aborting the whole open span
+            // would hide the batches it committed.
+            if self.txn_batch_committed(&produce.topic, produce.partition, producer, start, end) {
+                return Ok(response.base_offset);
+            }
             let noted = self
                 .meta_apply(Command::NoteTxn {
                     transactional_id: id,

@@ -240,6 +240,10 @@ impl Dirty {
 struct OpenSpan {
     start: i64,
     end: i64,
+    /// `EndTxn` has frozen the span. Later batches from this producer are
+    /// refused. `start < 0` means the producer had not written one.
+    #[serde(default)]
+    finished: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -357,7 +361,13 @@ impl Machine {
     ) -> Option<(i64, i64)> {
         let key = span_key(topic_id, partition, producer_id);
         let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
-        state.txn_spans.get(&key).map(|span| (span.start, span.end))
+        state.txn_spans.get(&key).and_then(|span| {
+            if span.start < 0 {
+                None
+            } else {
+                Some((span.start, span.end))
+            }
+        })
     }
 
     pub fn end_offset(&self, topic_id: &[u8; 16], partition: i32) -> i64 {
@@ -658,15 +668,43 @@ fn spans_fit(
 fn remember_span(state: &mut State, key: String, start: i64, end: i64) {
     state.dirty.spans.insert(key.clone());
     match state.txn_spans.get_mut(&key) {
+        Some(span) if span.finished => {}
         Some(span) => {
             if end > span.end {
                 span.end = end;
             }
         }
         None => {
-            state.txn_spans.insert(key, OpenSpan { start, end });
+            state.txn_spans.insert(
+                key,
+                OpenSpan {
+                    start,
+                    end,
+                    finished: false,
+                },
+            );
         }
     }
+}
+
+/// `true` when one of these transactional producers was frozen by `FinishTxn`.
+fn span_finished(
+    state: &State,
+    partition: &str,
+    identities: &[camus_protocol::batch::ProducerBatch],
+    transactional: &[bool],
+) -> bool {
+    identities
+        .iter()
+        .zip(transactional)
+        .any(|(identity, flag)| {
+            *flag
+                && identity.producer_id >= 0
+                && state
+                    .txn_spans
+                    .get(&format!("{partition}/{}", identity.producer_id))
+                    .is_some_and(|span| span.finished)
+        })
 }
 
 fn load_state(db: &Database) -> Result<State, StorageError<NodeId>> {
@@ -904,7 +942,9 @@ fn apply_at(
             };
             let transactional: Vec<bool> = infos.iter().map(|info| info.transactional).collect();
             if let camus_protocol::idempotence::Class::Fresh = class {
-                if !spans_fit(state, &key, &identities, &transactional) {
+                if span_finished(state, &key, &identities, &transactional)
+                    || !spans_fit(state, &key, &identities, &transactional)
+                {
                     return Response {
                         base_offset: -1,
                         error_code: 48,
@@ -967,6 +1007,32 @@ fn apply_at(
                 }
             }
             crate::SEALED.notify_waiters();
+            Response {
+                base_offset: -1,
+                error_code: 0,
+                each: Vec::new(),
+            }
+        }
+        Command::FinishTxn {
+            topic_id,
+            partition,
+            producer_id,
+        } => {
+            let key = span_key(&topic_id, partition, producer_id);
+            if let Some(span) = state.txn_spans.get_mut(&key) {
+                span.finished = true;
+                state.dirty.spans.insert(key);
+            } else if state.txn_spans.len() < SPAN_CAP {
+                state.dirty.spans.insert(key.clone());
+                state.txn_spans.insert(
+                    key,
+                    OpenSpan {
+                        start: -1,
+                        end: -1,
+                        finished: true,
+                    },
+                );
+            }
             Response {
                 base_offset: -1,
                 error_code: 0,
@@ -1516,12 +1582,38 @@ mod tests {
         }
         apply_one(
             &mut state,
-            Command::CloseTxn {
+            Command::FinishTxn {
                 topic_id,
                 partition: 0,
                 producer_id: 9,
             },
             4,
+            &[],
+        );
+        let Some(span) = state.txn_spans.get(&key) else {
+            return Err("finish dropped the span".into());
+        };
+        if !span.finished || span.start != 0 || span.end != 3 {
+            return Err(format!("frozen {span:?}"));
+        }
+        let late = apply_one(&mut state, txn_append(true, 9, 3, 1)?, 5, &[0]);
+        if late.error_code != 48 {
+            return Err(format!("late {late:?}"));
+        }
+        let Some(span) = state.txn_spans.get(&key) else {
+            return Err("late batch dropped the span".into());
+        };
+        if span.end != 3 {
+            return Err(format!("late batch moved the end to {}", span.end));
+        }
+        apply_one(
+            &mut state,
+            Command::CloseTxn {
+                topic_id,
+                partition: 0,
+                producer_id: 9,
+            },
+            6,
             &[],
         );
         if state.txn_spans.contains_key(&key) {

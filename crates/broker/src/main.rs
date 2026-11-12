@@ -221,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
                 .route("/wal/{shard}/txn-span", post(shard_txn_span))
+                .route("/wal/{shard}/finish-txn", post(shard_finish_txn))
                 .route("/wal/{shard}/close-txn", post(shard_close_txn))
                 .with_state(Arc::clone(&admin)),
         )
@@ -1069,6 +1070,26 @@ async fn shard_txn_span(
         return Err((StatusCode::NOT_FOUND, "no open span".into()));
     };
     Ok(Json(serde_json::json!({ "start": start, "end": end })))
+}
+
+/// On a shard's leader: freeze the span so a later batch is not part of it.
+async fn shard_finish_txn(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<TxnSpanQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let id = topic_id_of(&admin, &body.topic)?;
+    opened
+        .finish_txn(*id.as_bytes(), body.partition, body.producer_id)
+        .await
+        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// On a shard's leader: forget the open span after metadata has stored it.
