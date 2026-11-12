@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Production — Camus</title>
+  <meta name="description" content="What Camus can be trusted for, the limits that are still real, and the workloads it is a poor fit for.">
+  <link rel="canonical" href="https://camus.nidheesh.dev/limits">
+  <meta name="robots" content="index,follow">
+  <meta property="og:site_name" content="Camus">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Production — Camus">
+  <meta property="og:description" content="What Camus can be trusted for, the limits that are still real, and the workloads it is a poor fit for.">
+  <meta property="og:url" content="https://camus.nidheesh.dev/limits">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Production — Camus">
+  <meta name="twitter:description" content="What Camus can be trusted for, the limits that are still real, and the workloads it is a poor fit for.">
+  <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="fonts/Pollen-variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li><a href="index.html">Intro</a></li>
+        <li><a href="why.html">Why</a></li>
+        <li><a href="run.html">Run</a></li>
+        <li><a href="clients.html">Clients</a></li>
+        <li><a href="durability.html">Durability</a></li>
+        <li><a href="benchmarks.html">Benchmarks</a></li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="limits.html" aria-current="page">Production</a></li>
+            <li><a href="delivery.html">Delivery</a></li>
+            <li><a href="compare.html">Compare</a></li>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">What you would want to see before trusting it.</h1>
+      </header>
+      <p class="lede">Three brokers in one region, a bucket, and a client that can retry. The rest of this page is the list of things that are still sharp edges.</p>
+
+      <h2>Three brokers</h2>
+      <p>Metadata commits through a majority, and a <code>wal</code> produce acknowledges after a majority of its shard has fsynced. One process can die and the remaining majority still commits. That is the same shape as the <a href="brokers.html">three-broker</a> profile and the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/broker/tests/cluster.rs">cluster test</a>. A single broker has nothing to fail over to.</p>
+
+      <h2>One region</h2>
+      <p>Raft election waits 150–300 ms (<a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/wal/src/lib.rs">wal</a>, <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/metadata/src/lib.rs">metadata</a>). Brokers belong in one region, where a round trip is a small part of that window. Two regions means two clusters and a copy between them. MirrorMaker 2 is tested from Apache Kafka 4.4.0 into Camus, with checkpoints and heartbeats (<a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility</a>). Camus as the source is not in that suite yet.</p>
+
+      <h2>Losing a shard majority</h2>
+      <p>A shard that has lost its majority stays offline. <a href="recovery.html"><code>truncate-to-sealed</code></a> resumes it at the sealed end and drops acknowledged batches that were not sealed. <code>POST /admin/add-wal-voter</code> moves the other voters onto that new shard. Both are in <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr/0008-failure-and-recovery.md">ADR 0008</a> and <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/broker/tests/wal_majority.rs"><code>wal_majority.rs</code></a>.</p>
+      <p>If every broker disk is gone and the bucket remains, <code>camus admin restore-cluster</code> loads the newest metadata snapshot and rebuilds sealed extents from object footers. The metadata leader writes that snapshot every 30 seconds or 10,000 entries. Group offsets can move back by one snapshot interval. Unsealed write-ahead log entries are gone. The bound is ADR 0008.</p>
+
+      <h2>APIs and deliberate differences</h2>
+      <p>The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> is the list. Delegation tokens, client quotas, partition reassignment, and share groups are unimplemented. Transactions hide and reveal batches with metadata ranges, and Camus does not write control-batch markers. <code>acks=1</code> waits for the same barrier as <code>acks=all</code>. The <a href="clients.html">clients</a> page is the short version. <a href="delivery.html">Delivery</a> is how to build on what is implemented.</p>
+
+      <h2>What CI runs</h2>
+      <p>On a pull request, the required job runs <code>cargo fmt --all --check</code> and <code>cargo test --workspace --locked</code>. It does not start MinIO. A separate job starts MinIO and runs the broker tests with <code>CAMUS_MINIO=1</code>. The ecosystem suite (Kafka CLI, Connect, Streams, MirrorMaker 2 from Kafka into Camus) is nightly, not that required job. <a href="tests.html">Tests</a> has the commands.</p>
+
+      <h2 id="when-not">When not to use Camus</h2>
+      <p>The honest fit is a log with several independent consumers and replay, without a full replica of that log on every broker disk. These are the workloads that want something else.</p>
+      <ul>
+        <li>A produce that must finish with a p99 under 10 ms on the object-storage path. The measured <code>r2</code> p99 is 576.16 ms on the Linux OrbStack run and 284.75 ms on the Mac (<a href="benchmarks.html">benchmarks</a>, <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/README.md">README</a>). <code>wal</code> on that Linux run is 16.55 ms p99. A budget under 10 ms wants a broker that acknowledges from local disks.</li>
+        <li>One cluster stretched across regions. The election window above is 150–300 ms. Run one cluster per region. Copying between them with Camus as the source is not in the ecosystem suite yet.</li>
+        <li>A Raft group for every tiny partition. Partitions share a shard log, <code>partition id mod shard count</code> (<a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr/0006-wal-shards.md">ADR 0006</a>). With no count at init, the count follows the cores of that process and stops at eight shards per voter. Key into fewer partitions, or raise the shard count inside that cap.</li>
+        <li>A task queue that acknowledges one message at a time. A consumer commits an offset, which is a cursor for the group (<a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">OffsetCommit</a>). Share groups are not in the API matrix. A job queue such as BullMQ or Restate matches that shape.</li>
+        <li>A Kafka deployment whose disk and JVM cost is already acceptable. Camus exists to move the long-term log off broker disks (<a href="why.html">why</a>). If that cost is fine, the broker you run is the one your operators already know.</li>
+      </ul>
+      <p>How those projects differ on storage and license is on the <a href="compare.html">comparison</a> page.</p>
+
+      <footer>
+        <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
+        <p>Apache, Apache Kafka and Kafka are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Camus is not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>

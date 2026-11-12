@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Delivery — Camus</title>
+  <meta name="description" content="Ordering, idempotent produce, at-least-once consumption, transactions, and the loss window of each durability mode.">
+  <link rel="canonical" href="https://camus.nidheesh.dev/delivery">
+  <meta name="robots" content="index,follow">
+  <meta property="og:site_name" content="Camus">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Delivery — Camus">
+  <meta property="og:description" content="Ordering, idempotent produce, at-least-once consumption, transactions, and the loss window of each durability mode.">
+  <meta property="og:url" content="https://camus.nidheesh.dev/delivery">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Delivery — Camus">
+  <meta name="twitter:description" content="Ordering, idempotent produce, at-least-once consumption, transactions, and the loss window of each durability mode.">
+  <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="fonts/Pollen-variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li><a href="index.html">Intro</a></li>
+        <li><a href="why.html">Why</a></li>
+        <li><a href="run.html">Run</a></li>
+        <li><a href="clients.html">Clients</a></li>
+        <li><a href="durability.html">Durability</a></li>
+        <li><a href="benchmarks.html">Benchmarks</a></li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="limits.html">Production</a></li>
+            <li><a href="delivery.html" aria-current="page">Delivery</a></li>
+            <li><a href="compare.html">Compare</a></li>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">What a consumer is allowed to assume.</h1>
+      </header>
+      <p class="lede">An agent pipeline that treats the log as an audit trail needs the order, the retry rule, and the loss window written down. Each claim below points at the test or the ADR that owns it.</p>
+
+      <h2>Order is per partition</h2>
+      <p>Records on one partition stay in commit order. Two producers that both write that partition interleave as their batches commit. A producer that sends one batch at a time keeps its own sequence inside that interleaving. Key by agent or session so one agent's events share a partition. <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/broker/tests/ordering.rs"><code>concurrent_producers_keep_each_send_order</code></a> is the test. Offsets themselves are <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr/0009-offsets-and-record-batches.md">ADR 0009</a>.</p>
+
+      <h2>Idempotent produce</h2>
+      <p>Turn on <code>enable.idempotence</code>. A retry of a sequence the broker already accepted returns the original offset. A sequence that skips ahead is <code>OUT_OF_ORDER_SEQUENCE_NUMBER</code> (45) and is not appended. The checks live in <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/protocol/src/idempotence.rs"><code>idempotence.rs</code></a>. <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/broker/tests/ordering.rs"><code>idempotent_inflight_retries_keep_order</code></a> retries five in-flight batches and reads them back in sequence order. A timeout can still commit, which <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/broker/tests/produce_timeout.rs"><code>produce_timeout.rs</code></a> covers: the idempotent retry returns the first offset.</p>
+
+      <h2>Consumers are at least once</h2>
+      <p>A handler should treat a record it has already applied as a no-op, keyed by whatever identity you put in the record. The group cursor moves when the consumer commits, and a crash before that commit delivers the record again. <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/broker/tests/groups.rs"><code>groups.rs</code></a> commits and resumes. OffsetCommit is in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility matrix</a>.</p>
+
+      <h2>Transactions</h2>
+      <p><code>read_committed</code> hides a batch until <code>EndTxn</code> commits it. An abort stays hidden. Visibility is the committed and aborted ranges in metadata, not a control batch in the log. A produce after the transaction has ended is <code>INVALID_TXN_STATE</code> (48). The client tests are <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/broker/tests/txn.rs"><code>txn.rs</code></a>. The span still costs a second metadata write; collapsing that is <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr/0015-transaction-spans.md">ADR 0015</a>, which is proposed, so the second write is still there.</p>
+
+      <h2>Which mode, and what a failure can drop</h2>
+      <p><code>wal</code>, the default, acknowledges after a majority of the shard has fsynced (<a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr/0005-durability-and-acks.md">ADR 0005</a>). The upload follows on <code>CAMUS_FLUSH_MS</code>, default 250 ms. If the bucket is down, acknowledged data can sit unsealed up to <code>CAMUS_WAL_DISK_LIMIT</code>, default 8 GiB. Losing the whole shard majority then drops that unsealed tail (<a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr/0008-failure-and-recovery.md">ADR 0008</a>). Use <code>wal</code> when that window is acceptable and produce latency matters. The <a href="durability.html">durability</a> page is the short form.</p>
+      <p><code>r2</code> acknowledges only after the object is stored and metadata has committed the offsets. A restarted broker has no local tail to replay. Use <code>r2</code> for an audit trail that must not contain an acknowledgement for a batch the bucket never stored. The produce waits for the bucket. The measured p99 on that path is on the <a href="benchmarks.html">benchmarks</a> page.</p>
+
+      <footer>
+        <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
+        <p>Apache, Apache Kafka and Kafka are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Camus is not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+</body>
+</html>
