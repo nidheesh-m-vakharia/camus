@@ -69,6 +69,7 @@
             <li><a href="limits.html">Production</a></li>
             <li><a href="delivery.html">Delivery</a></li>
             <li><a href="compare.html">Compare</a></li>
+            <li><a href="cost.html">Cost</a></li>
             <li><a href="recovery.html">Recovery</a></li>
           </ul>
         </li>
@@ -89,7 +90,7 @@
       <p>The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> is the 4.4.0 pin and every API. A tested-client column stays empty until kafka-clients, librdkafka, or franz-go has actually passed that call. The summary of what those clients can do is on the <a href="clients.html">clients</a> page.</p>
       <h2>Crates</h2>
       <p>The workspace is <code>protocol</code>, <code>broker</code>, <code>raft</code>, <code>metadata</code>, <code>wal</code>, <code>storage</code>, <code>uploader</code>, <code>coordinator</code>, <code>compactor</code>, <code>cli</code>, and <code>engine-bench</code>. <code>camus-broker</code> is the binary you run. The uploader, coordinator, and compactor crates are part of that process. They are not empty placeholders.</p>
-      <p>Losing a majority of a write-ahead log shard is not a test failure you retry. It is <a href="recovery.html">recovery</a>, and it drops acknowledged data that was not sealed yet. What is safe to trust, and the workloads that want a different system, are on the <a href="limits.html">production</a> page. Ordering, retries, and the loss window are on <a href="delivery.html">delivery</a>. Other brokers people compare are on <a href="compare.html">compare</a>.</p>
+      <p>Losing a majority of a write-ahead log shard is not a test failure you retry. It is <a href="recovery.html">recovery</a>, and it drops acknowledged data that was not sealed yet. What is safe to trust, and the workloads that want a different system, are on the <a href="limits.html">production</a> page. Ordering, retries, and the loss window are on <a href="delivery.html">delivery</a>. Other brokers people compare are on the <a href="compare.html">compare</a> page. A month of R2, disk, and network for a workload you type in is the <a href="cost.html">cost</a> page.</p>
 
       <footer>
         <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
