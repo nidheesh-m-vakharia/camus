@@ -1,11 +1,10 @@
-//! QUIC endpoint for Raft control traffic (ADR 0016, phase 1).
+//! QUIC endpoint for Raft control traffic (ADR 0016).
 //!
-//! Off unless `CAMUS_QUIC=on`. This module binds the endpoint, keeps one
-//! connection per peer, and frames a vote or an empty heartbeat. The broker
-//! does not open it yet, and Raft RPCs still go over HTTP.
-//!
-//! The peer cache holds at most [`PEER_CAP`] connections. A frame body is at
-//! most [`MAX_BODY`] bytes.
+//! On unless `CAMUS_QUIC=off`. Votes and empty heartbeats use one stream per
+//! RPC. Shard announcements are datagrams. Data AppendEntries and snapshots
+//! stay on HTTP. The peer cache holds at most [`PEER_CAP`] connections. A
+//! frame body is at most [`MAX_BODY`] bytes. A datagram is at most
+//! [`MAX_DATAGRAM`] bytes.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -16,6 +15,7 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Connection, Endpoint, Incoming, RecvStream, SendStream, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
+use serde::{Deserialize, Serialize};
 
 /// Metadata Raft group.
 pub const ROUTE_METADATA: u8 = 0;
@@ -31,6 +31,10 @@ pub const KIND_HEARTBEAT: u8 = 2;
 const PEER_CAP: usize = 64;
 /// Votes and empty heartbeats are small. A longer body is refused.
 pub const MAX_BODY: usize = 256 * 1024;
+/// Announcements stay under a typical path MTU.
+pub const MAX_DATAGRAM: usize = 1024;
+/// Hint table and datagram-reader set. One entry per shard or connection.
+const TRACK_CAP: usize = 256;
 const HEADER: usize = 10;
 const SERVER_NAME: &str = "camus";
 
@@ -47,11 +51,22 @@ pub struct Frame {
     pub body: Vec<u8>,
 }
 
+/// Shard leadership, sent as a datagram. A lower `term` is ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Announcement {
+    pub shard: u32,
+    pub term: u64,
+    pub leader: u64,
+    pub epoch: i32,
+}
+
 /// Certificate and the CAs this process trusts for peers.
 pub struct Identity {
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     trusted: Vec<CertificateDer<'static>>,
+    /// `--dev-plaintext` on loopback. Peers are not pinned to a CA.
+    loopback: bool,
 }
 
 impl Clone for Identity {
@@ -60,6 +75,7 @@ impl Clone for Identity {
             certs: self.certs.clone(),
             key: self.key.clone_key(),
             trusted: self.trusted.clone(),
+            loopback: self.loopback,
         }
     }
 }
@@ -79,6 +95,26 @@ impl Identity {
             certs,
             key,
             trusted,
+            loopback: false,
+        })
+    }
+
+    /// A fresh self-signed certificate for `--dev-plaintext` on loopback.
+    /// Refused when the bind address is not loopback.
+    pub fn loopback_dev() -> Result<Self, QuicError> {
+        let key = rcgen::KeyPair::generate().map_err(quic_error)?;
+        let mut params =
+            rcgen::CertificateParams::new(vec!["camus".to_string()]).map_err(quic_error)?;
+        let dns = "camus".try_into().map_err(|_| quic_error("server name"))?;
+        params.subject_alt_names = vec![rcgen::SanType::DnsName(dns)];
+        let cert = params.self_signed(&key).map_err(quic_error)?;
+        Ok(Self {
+            certs: vec![CertificateDer::from(cert.der().to_vec())],
+            key: PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                key.serialize_der(),
+            )),
+            trusted: Vec::new(),
+            loopback: true,
         })
     }
 }
@@ -94,14 +130,37 @@ struct Inner {
     peers: tokio::sync::Mutex<BTreeMap<SocketAddr, Connection>>,
     /// Handler tasks. `close` aborts them so the UDP socket can be bound again.
     tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    datagrams: tokio::sync::Mutex<Option<DatagramHandler>>,
+    /// Connections that already have a datagram reader. Capped at [`TRACK_CAP`].
+    readers: tokio::sync::Mutex<BTreeMap<usize, ()>>,
 }
 
-/// `true` only when `CAMUS_QUIC` is `on`, `1`, or `true`. Unset stays off.
+type DatagramHandler = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
+
+static CURRENT: std::sync::OnceLock<ControlEndpoint> = std::sync::OnceLock::new();
+
+/// `false` only when `CAMUS_QUIC` is `off`, `0`, or `false`. Unset is on.
 pub fn enabled() -> bool {
-    matches!(
-        std::env::var("CAMUS_QUIC").as_deref(),
-        Ok("on") | Ok("1") | Ok("true")
-    )
+    flag_enabled(std::env::var("CAMUS_QUIC").ok().as_deref())
+}
+
+pub fn flag_enabled(value: Option<&str>) -> bool {
+    !matches!(value, Some("off") | Some("0") | Some("false"))
+}
+
+/// Heartbeat and election timeouts, in milliseconds. Shorter when QUIC is on
+/// (ADR 0016 phase 5). `election_timeout_min` stays above the heartbeat.
+pub fn raft_timeouts() -> (u64, u64, u64) {
+    if current().is_some() {
+        (15, 50, 100)
+    } else {
+        (50, 150, 300)
+    }
+}
+
+/// The process endpoint, after [`install`](ControlEndpoint::install).
+pub fn current() -> Option<ControlEndpoint> {
+    CURRENT.get().cloned()
 }
 
 /// `CAMUS_QUIC_PORT` when it is set to a port. Unset means the HTTP port.
@@ -118,7 +177,11 @@ pub fn port_override() -> Result<Option<u16>, QuicError> {
 
 impl ControlEndpoint {
     /// Bind a client and server on `addr`. `addr`'s port may be 0.
+    /// A loopback identity is refused off loopback.
     pub fn bind(addr: SocketAddr, identity: Identity) -> Result<Self, QuicError> {
+        if identity.loopback && !(addr.ip().is_loopback() || addr.ip().is_unspecified()) {
+            return Err(quic_error("dev QUIC certificates are refused off loopback"));
+        }
         let server = server_config(&identity)?;
         let mut endpoint = Endpoint::server(server, addr)?;
         endpoint.set_default_client_config(client_config(&identity)?);
@@ -127,8 +190,26 @@ impl ControlEndpoint {
                 endpoint,
                 peers: tokio::sync::Mutex::new(BTreeMap::new()),
                 tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+                datagrams: tokio::sync::Mutex::new(None),
+                readers: tokio::sync::Mutex::new(BTreeMap::new()),
             }),
         })
+    }
+
+    /// Publish this endpoint for Raft RPC in this process.
+    pub fn install(self) -> Result<(), QuicError> {
+        CURRENT
+            .set(self)
+            .map_err(|_| quic_error("quic endpoint already installed"))
+    }
+
+    /// `http_addr` is `host:port`. `CAMUS_QUIC_PORT` replaces the port when set.
+    pub fn peer_socket(http_addr: &str) -> Result<SocketAddr, QuicError> {
+        let mut addr: SocketAddr = http_addr.parse().map_err(|_| quic_error("peer address"))?;
+        if let Some(port) = port_override()? {
+            addr.set_port(port);
+        }
+        Ok(addr)
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, QuicError> {
@@ -148,17 +229,38 @@ impl ControlEndpoint {
     }
 
     /// Accept RPCs until [`close`](Self::close). `handler` builds the reply.
-    pub async fn serve<F>(&self, handler: F)
+    pub async fn serve<F, Fut>(&self, handler: F)
     where
-        F: Fn(Frame) -> Result<Vec<u8>, QuicError> + Send + Sync + 'static,
+        F: Fn(Frame) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Vec<u8>, QuicError>> + Send + 'static,
     {
         let handler = Arc::new(handler);
+        let handler: Handler = Arc::new(move |frame| Box::pin(handler(frame)));
         while let Some(incoming) = self.inner.endpoint.accept().await {
             let handler = Arc::clone(&handler);
+            let inner = Arc::clone(&self.inner);
             self.inner.tasks.lock().await.spawn(async move {
-                let _ = answer(incoming, handler).await;
+                let _ = answer(incoming, handler, inner).await;
             });
         }
+    }
+
+    /// Keep `handler` for announcement datagrams. At most one is stored.
+    pub async fn set_datagram_handler<F>(&self, handler: F)
+    where
+        F: Fn(Vec<u8>) + Send + Sync + 'static,
+    {
+        *self.inner.datagrams.lock().await = Some(Arc::new(handler));
+    }
+
+    /// Send an announcement. A body longer than [`MAX_DATAGRAM`] is refused.
+    pub async fn send_datagram(&self, peer: SocketAddr, bytes: &[u8]) -> Result<(), QuicError> {
+        if bytes.len() > MAX_DATAGRAM {
+            return Err(quic_error("datagram exceeds 1024 bytes"));
+        }
+        let conn = self.connection(peer).await?;
+        conn.send_datagram(bytes.to_vec().into())?;
+        Ok(())
     }
 
     /// Close the endpoint and wait until its connections are gone.
@@ -193,6 +295,7 @@ impl ControlEndpoint {
         }
         let connecting = self.inner.endpoint.connect(peer, SERVER_NAME)?;
         let conn = connecting.await?;
+        self.arm_datagrams(conn.clone()).await;
         let mut peers = self.inner.peers.lock().await;
         if peers.len() >= PEER_CAP && !peers.contains_key(&peer) {
             let stale = peers
@@ -208,6 +311,10 @@ impl ControlEndpoint {
         }
         peers.insert(peer, conn.clone());
         Ok(conn)
+    }
+
+    async fn arm_datagrams(&self, conn: Connection) {
+        watch_datagrams(&self.inner, conn).await;
     }
 
     async fn drop_peer(&self, peer: SocketAddr) {
@@ -259,11 +366,46 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, QuicError> {
     })
 }
 
-async fn answer(
-    incoming: Incoming,
-    handler: Arc<dyn Fn(Frame) -> Result<Vec<u8>, QuicError> + Send + Sync>,
-) -> Result<(), QuicError> {
+async fn watch_datagrams(inner: &Arc<Inner>, conn: Connection) {
+    let id = conn.stable_id();
+    {
+        let mut readers = inner.readers.lock().await;
+        if readers.contains_key(&id) {
+            return;
+        }
+        if readers.len() >= TRACK_CAP {
+            if let Some(stale) = readers.keys().next().copied() {
+                readers.remove(&stale);
+            }
+        }
+        readers.insert(id, ());
+    }
+    let inner = Arc::clone(inner);
+    tokio::spawn(async move {
+        loop {
+            let Ok(bytes) = conn.read_datagram().await else {
+                break;
+            };
+            let handler = inner.datagrams.lock().await.clone();
+            if let Some(handler) = handler {
+                handler(bytes.to_vec());
+            }
+        }
+    });
+}
+
+type Handler = Arc<
+    dyn Fn(
+            Frame,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>, QuicError>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+async fn answer(incoming: Incoming, handler: Handler, inner: Arc<Inner>) -> Result<(), QuicError> {
     let conn = incoming.await?;
+    watch_datagrams(&inner, conn.clone()).await;
     loop {
         let Ok((send, recv)) = conn.accept_bi().await else {
             break;
@@ -277,11 +419,11 @@ async fn answer(
 async fn answer_stream(
     mut send: SendStream,
     mut recv: RecvStream,
-    handler: Arc<dyn Fn(Frame) -> Result<Vec<u8>, QuicError> + Send + Sync>,
+    handler: Handler,
 ) -> Result<(), QuicError> {
     let bytes = recv.read_to_end(HEADER + MAX_BODY).await?;
     let frame = decode(&bytes)?;
-    let response = handler(frame)?;
+    let response = handler(frame).await?;
     if response.len() > MAX_BODY {
         return Err(quic_error("reply exceeds 256 KiB"));
     }
@@ -292,16 +434,24 @@ async fn answer_stream(
 
 fn server_config(identity: &Identity) -> Result<ServerConfig, QuicError> {
     let provider = crypto_provider();
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in &identity.trusted {
-        roots.add(cert.clone())?;
-    }
-    let verifier =
-        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build()?;
-    let crypto = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(identity.certs.clone(), identity.key.clone_key())?;
+    let crypto = if identity.loopback {
+        rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_client_cert_verifier(Arc::new(LoopbackDev::new(provider)))
+            .with_single_cert(identity.certs.clone(), identity.key.clone_key())?
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in &identity.trusted {
+            roots.add(cert.clone())?;
+        }
+        let verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                .build()?;
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(identity.certs.clone(), identity.key.clone_key())?
+    };
     let mut server = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
     server.transport_config(transport()?);
     Ok(server)
@@ -309,17 +459,144 @@ fn server_config(identity: &Identity) -> Result<ServerConfig, QuicError> {
 
 fn client_config(identity: &Identity) -> Result<ClientConfig, QuicError> {
     let provider = crypto_provider();
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in &identity.trusted {
-        roots.add(cert.clone())?;
-    }
-    let crypto = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_root_certificates(roots)
-        .with_client_auth_cert(identity.certs.clone(), identity.key.clone_key())?;
+    let crypto = if identity.loopback {
+        rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(LoopbackDev::new(provider)))
+            .with_client_auth_cert(identity.certs.clone(), identity.key.clone_key())?
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in &identity.trusted {
+            roots.add(cert.clone())?;
+        }
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(identity.certs.clone(), identity.key.clone_key())?
+    };
     let mut client = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
     client.transport_config(transport()?);
     Ok(client)
+}
+
+/// `--dev-plaintext` on loopback. The handshake signature is checked. The
+/// certificate is not pinned to a CA, and this verifier is not used off
+/// loopback.
+#[derive(Debug)]
+struct LoopbackDev {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl LoopbackDev {
+    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
+        Self { provider }
+    }
+
+    fn schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for LoopbackDev {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        match server_name {
+            rustls::pki_types::ServerName::DnsName(name) if name.as_ref() == SERVER_NAME => {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            _ => Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
+            )),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.schemes()
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for LoopbackDev {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.schemes()
+    }
 }
 
 fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -402,6 +679,7 @@ from_display!(rustls::Error);
 from_display!(rustls::server::VerifierBuilderError);
 from_display!(quinn::crypto::rustls::NoInitialCipherSuite);
 from_display!(quinn::ClosedStream);
+from_display!(quinn::SendDatagramError);
 
 #[cfg(test)]
 mod tests {
@@ -486,7 +764,7 @@ mod tests {
     async fn echo(server: &ControlEndpoint) -> tokio::task::JoinHandle<()> {
         let serving = server.clone();
         tokio::spawn(async move {
-            serving.serve(|frame| Ok(frame.body)).await;
+            serving.serve(|frame| async move { Ok(frame.body) }).await;
         })
     }
 
@@ -502,6 +780,15 @@ mod tests {
     #[test]
     fn a_short_frame_is_refused() {
         assert!(decode(&[0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn quic_stays_on_unless_it_is_turned_off() {
+        assert!(super::flag_enabled(None));
+        assert!(super::flag_enabled(Some("on")));
+        assert!(!super::flag_enabled(Some("off")));
+        assert!(!super::flag_enabled(Some("0")));
+        assert!(!super::flag_enabled(Some("false")));
     }
 
     #[tokio::test]

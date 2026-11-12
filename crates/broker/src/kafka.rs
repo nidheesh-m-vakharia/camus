@@ -268,6 +268,56 @@ fn shard_key(shard: u32) -> String {
     format!("wal/{shard}")
 }
 
+/// Highest-term shard announcement per shard. Capped at 256 shards.
+const HINT_CAP: usize = 256;
+
+#[derive(Clone, Default)]
+pub struct Hints {
+    inner: Arc<std::sync::Mutex<BTreeMap<u32, (u64, NodeId, i32)>>>,
+}
+
+impl Hints {
+    /// Keep `announcement` when its term is strictly higher than the one stored.
+    pub fn note(&self, shard: u32, term: u64, leader: NodeId, epoch: i32) {
+        let Ok(mut hints) = self.inner.lock() else {
+            return;
+        };
+        if hints
+            .get(&shard)
+            .is_some_and(|(stored, _, _)| *stored >= term)
+        {
+            return;
+        }
+        if hints.len() >= HINT_CAP && !hints.contains_key(&shard) {
+            if let Some(stale) = hints.keys().next().copied() {
+                hints.remove(&stale);
+            }
+        }
+        hints.insert(shard, (term, leader, epoch));
+    }
+
+    fn get(&self, shard: u32) -> Option<(u64, NodeId, i32)> {
+        self.inner.lock().ok()?.get(&shard).copied()
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::Hints;
+
+    #[test]
+    fn a_lower_term_is_ignored() -> Result<(), String> {
+        let hints = Hints::default();
+        hints.note(0, 2, 1, 2);
+        hints.note(0, 1, 9, 1);
+        let (_, leader, epoch) = hints.get(0).ok_or("missing hint")?;
+        if leader != 1 || epoch != 2 {
+            return Err(format!("hint {leader} epoch {epoch}"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
 struct ShardView {
     leader: Option<NodeId>,
@@ -350,6 +400,9 @@ pub struct Kafka {
     sasl_pass: String,
     tls: Option<TlsAcceptor>,
     wal: Arc<WalSlot>,
+    /// QUIC shard announcements. A hint never outranks a stored view with a
+    /// higher epoch (ADR 0016).
+    hints: Hints,
     http: reqwest::Client,
     /// Classic consumer groups, coordinated while this broker leads metadata.
     coordinator: Arc<camus_coordinator::Coordinator>,
@@ -507,6 +560,7 @@ impl Kafka {
             sasl_pass,
             tls,
             wal,
+            hints: Hints::default(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
@@ -725,12 +779,24 @@ impl Kafka {
     /// records itself in metadata so brokers outside the shard can answer
     /// Metadata; until it has, this broker's own view is used.
     fn shard_view(&self, shard: u32) -> ShardView {
-        self.node
+        let stored = self
+            .node
             .read_local(&shard_key(shard))
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_else(|| self.local_shard_view(shard))
+            .unwrap_or_else(|| self.local_shard_view(shard));
+        let Some((_, leader, epoch)) = self.hints.get(shard) else {
+            return stored;
+        };
+        if epoch <= stored.epoch {
+            return stored;
+        }
+        ShardView {
+            leader: Some(leader),
+            voters: stored.voters,
+            epoch,
+        }
     }
 
     fn local_shard_view(&self, shard: u32) -> ShardView {
@@ -826,6 +892,36 @@ impl Kafka {
             }
             if let Ok(raw) = serde_json::to_string(&mine) {
                 let _ = self.meta_write(shard_key(id), raw).await;
+            }
+        }
+    }
+
+    /// Tell peers this broker leads `id`, without waiting for the metadata write.
+    async fn announce_quic(&self, endpoint: &camus_raft::quic::ControlEndpoint) {
+        for (id, wal) in self.wal.all() {
+            if !wal.is_leader() {
+                continue;
+            }
+            let announcement = camus_raft::quic::Announcement {
+                shard: id,
+                term: wal.term(),
+                leader: self.node_id as u64,
+                epoch: self.shard_epoch(id),
+            };
+            let Ok(bytes) = camus_raft::codec::encode(&announcement) else {
+                continue;
+            };
+            for voter in wal.voters() {
+                if voter == self.node_id as u64 {
+                    continue;
+                }
+                let Some(addr) = wal.voter_addr(voter) else {
+                    continue;
+                };
+                let Ok(peer) = camus_raft::quic::ControlEndpoint::peer_socket(&addr) else {
+                    continue;
+                };
+                let _ = endpoint.send_datagram(peer, &bytes).await;
             }
         }
     }
@@ -1708,6 +1804,32 @@ impl Kafka {
             Arc::clone(&self),
             Arc::clone(&self.coordinator),
         ));
+        if let Some(endpoint) = camus_raft::quic::current() {
+            let hints = self.hints.clone();
+            endpoint
+                .set_datagram_handler(move |bytes| {
+                    let Ok(announcement) =
+                        camus_raft::codec::decode::<camus_raft::quic::Announcement>(&bytes)
+                    else {
+                        return;
+                    };
+                    hints.note(
+                        announcement.shard,
+                        announcement.term,
+                        announcement.leader,
+                        announcement.epoch,
+                    );
+                })
+                .await;
+            let announcing = Arc::clone(&self);
+            tokio::spawn(async move {
+                let (heartbeat_ms, _, _) = camus_raft::quic::raft_timeouts();
+                loop {
+                    announcing.announce_quic(&endpoint).await;
+                    tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
+                }
+            });
+        }
         let register = Arc::clone(&self);
         tokio::spawn(async move {
             let key = format!("broker/{}", register.node_id);
@@ -1718,7 +1840,11 @@ impl Kafka {
                     let _ = register.meta_write(key.clone(), addr.clone()).await;
                 }
                 register.announce_shard().await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                let announce_ms = std::env::var("CAMUS_SHARD_ANNOUNCE_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(200);
+                tokio::time::sleep(Duration::from_millis(announce_ms)).await;
             }
         });
         loop {

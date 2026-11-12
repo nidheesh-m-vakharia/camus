@@ -130,6 +130,8 @@ pub struct HttpConn {
     /// Kept for the connection's life, so RPCs reuse pooled keep-alive
     /// connections instead of a new TCP handshake each.
     client: reqwest::Client,
+    /// After a QUIC failure, HTTP is used until this instant (ADR 0016).
+    quic_after: std::time::Instant,
 }
 
 impl RaftNetworkFactory<TypeConfig> for HttpFactory {
@@ -140,6 +142,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpFactory {
             target,
             addr: node.addr.clone(),
             client: reqwest::Client::new(),
+            quic_after: std::time::Instant::now(),
         }
     }
 }
@@ -150,6 +153,14 @@ impl RaftNetwork<TypeConfig> for HttpConn {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RpcError> {
+        if rpc.entries.is_empty() {
+            if let Some(result) = self
+                .try_quic(camus_raft::quic::KIND_HEARTBEAT, &rpc, &option)
+                .await
+            {
+                return result;
+            }
+        }
         self.send("raft-append", rpc, option).await
     }
 
@@ -166,6 +177,12 @@ impl RaftNetwork<TypeConfig> for HttpConn {
         rpc: VoteRequest<NodeId>,
         option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RpcError> {
+        if let Some(result) = self
+            .try_quic(camus_raft::quic::KIND_VOTE, &rpc, &option)
+            .await
+        {
+            return result;
+        }
         self.send("raft-vote", rpc, option).await
     }
     /// Retry an unreachable peer every 100ms. openraft's default is 500ms,
@@ -176,6 +193,51 @@ impl RaftNetwork<TypeConfig> for HttpConn {
 }
 
 impl HttpConn {
+    /// QUIC for a vote or an empty heartbeat. `None` means use HTTP.
+    async fn try_quic<Req, Resp, E>(
+        &mut self,
+        kind: u8,
+        req: &Req,
+        option: &RPCOption,
+    ) -> Option<Result<Resp, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+        E: std::error::Error + DeserializeOwned,
+    {
+        if !camus_raft::quic::enabled() || std::time::Instant::now() < self.quic_after {
+            return None;
+        }
+        let Some(endpoint) = camus_raft::quic::current() else {
+            return None;
+        };
+        let body = camus_raft::codec::encode(req).ok()?;
+        let frame = camus_raft::quic::Frame {
+            route: camus_raft::quic::ROUTE_METADATA,
+            shard: 0,
+            kind,
+            body,
+        };
+        let peer = camus_raft::quic::ControlEndpoint::peer_socket(&self.addr).ok()?;
+        let ttl = option.hard_ttl();
+        let outcome = tokio::time::timeout(ttl, endpoint.call(peer, &frame)).await;
+        let bytes = match outcome {
+            Ok(Ok(bytes)) => bytes,
+            _ => {
+                self.quic_after = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                return None;
+            }
+        };
+        let decoded: Result<Resp, RaftError<NodeId, E>> = match camus_raft::codec::decode(&bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                self.quic_after = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                return None;
+            }
+        };
+        Some(decoded.map_err(|err| RPCError::RemoteError(RemoteError::new(self.target, err))))
+    }
+
     async fn send<Req, Resp, E>(
         &self,
         path: &str,

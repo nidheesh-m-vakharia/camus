@@ -494,10 +494,12 @@ impl MetadataNode {
     where
         N: openraft::RaftNetworkFactory<TypeConfig>,
     {
+        let (heartbeat_interval, election_timeout_min, election_timeout_max) =
+            camus_raft::quic::raft_timeouts();
         let config = Config {
-            heartbeat_interval: 50,
-            election_timeout_min: 150,
-            election_timeout_max: 300,
+            heartbeat_interval,
+            election_timeout_min,
+            election_timeout_max,
             ..Default::default()
         };
         let config = Arc::new(config.validate()?);

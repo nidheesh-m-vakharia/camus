@@ -152,11 +152,34 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir)?;
+    let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
+    let http_bound = listener.local_addr()?;
+    if camus_raft::quic::enabled() {
+        let identity = quic_identity(&args, http_bound)?;
+        let mut quic_addr = http_bound;
+        if let Some(port) = camus_raft::quic::port_override()? {
+            quic_addr.set_port(port);
+        }
+        camus_raft::quic::ControlEndpoint::bind(quic_addr, identity)?.install()?;
+    }
     let node = Arc::new(MetadataNode::open(args.node_id, &args.data_dir, &args.http_addr).await?);
     let wal_dir = resolve_wal_dir(args.wal_dir.clone(), &args.data_dir);
     std::fs::create_dir_all(&wal_dir)?;
     let wal = Arc::new(WalSlot::new(Shard::open(args.node_id, &wal_dir).await?));
     warn_if_rotating_wal(&wal_dir);
+    if let Some(endpoint) = camus_raft::quic::current() {
+        let node_q = Arc::clone(&node);
+        let wal_q = Arc::clone(&wal);
+        tokio::spawn(async move {
+            endpoint
+                .serve(move |frame| {
+                    let node_q = Arc::clone(&node_q);
+                    let wal_q = Arc::clone(&wal_q);
+                    async move { quic_dispatch(node_q, wal_q, frame).await }
+                })
+                .await;
+        });
+    }
     tokio::spawn(open_shards(
         Arc::clone(&node),
         Arc::clone(&wal),
@@ -216,8 +239,7 @@ async fn main() -> anyhow::Result<()> {
         start_kafka(node.clone(), wal, args.node_id, kafka_addr, &args).await?;
     }
 
-    let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
-    let bound = listener.local_addr()?;
+    let bound = http_bound;
     std::fs::write(args.data_dir.join("listen-addr"), bound.to_string())?;
     info!(node_id = args.node_id, %bound, "metadata broker listening");
     // AppendEntries carries produce batches. axum's default 2 MB body limit
@@ -231,6 +253,63 @@ async fn main() -> anyhow::Result<()> {
     });
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn quic_identity(args: &Args, addr: SocketAddr) -> anyhow::Result<camus_raft::quic::Identity> {
+    if let (Some(cert), Some(key), Some(ca)) = (&args.tls_cert, &args.tls_key, &args.tls_client_ca)
+    {
+        let mut cert_reader = std::io::BufReader::new(std::fs::File::open(cert)?);
+        let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+        let mut key_reader = std::io::BufReader::new(std::fs::File::open(key)?);
+        let key = rustls_pemfile::private_key(&mut key_reader)?
+            .ok_or_else(|| anyhow::anyhow!("no private key in {key:?}"))?;
+        let mut ca_reader = std::io::BufReader::new(std::fs::File::open(ca)?);
+        let trusted = rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+        return Ok(camus_raft::quic::Identity::new(certs, key, trusted)?);
+    }
+    if args.dev_plaintext && (addr.ip().is_loopback() || addr.ip().is_unspecified()) {
+        return Ok(camus_raft::quic::Identity::loopback_dev()?);
+    }
+    anyhow::bail!("QUIC off loopback needs --tls-cert, --tls-key, and --tls-client-ca")
+}
+
+fn qerr(err: impl std::fmt::Display) -> camus_raft::quic::QuicError {
+    std::io::Error::other(err.to_string()).into()
+}
+
+async fn quic_dispatch(
+    node: Arc<MetadataNode>,
+    wal: Arc<WalSlot>,
+    frame: camus_raft::quic::Frame,
+) -> Result<Vec<u8>, camus_raft::quic::QuicError> {
+    use camus_raft::quic::{KIND_HEARTBEAT, KIND_VOTE, ROUTE_METADATA, ROUTE_WAL};
+    match (frame.route, frame.kind) {
+        (ROUTE_METADATA, KIND_VOTE) => {
+            let req: VoteRequest<NodeId> = camus_raft::codec::decode(&frame.body).map_err(qerr)?;
+            camus_raft::codec::encode(&node.raft.vote(req).await).map_err(qerr)
+        }
+        (ROUTE_METADATA, KIND_HEARTBEAT) => {
+            let req: AppendEntriesRequest<camus_metadata::TypeConfig> =
+                camus_raft::codec::decode(&frame.body).map_err(qerr)?;
+            camus_raft::codec::encode(&node.raft.append_entries(req).await).map_err(qerr)
+        }
+        (ROUTE_WAL, KIND_VOTE) => {
+            let shard = wal
+                .shard(frame.shard)
+                .ok_or_else(|| qerr(format!("no wal shard {}", frame.shard)))?;
+            let req: VoteRequest<NodeId> = camus_raft::codec::decode(&frame.body).map_err(qerr)?;
+            camus_raft::codec::encode(&shard.raft.vote(req).await).map_err(qerr)
+        }
+        (ROUTE_WAL, KIND_HEARTBEAT) => {
+            let shard = wal
+                .shard(frame.shard)
+                .ok_or_else(|| qerr(format!("no wal shard {}", frame.shard)))?;
+            let req: AppendEntriesRequest<camus_wal::TypeConfig> =
+                camus_raft::codec::decode(&frame.body).map_err(qerr)?;
+            camus_raft::codec::encode(&shard.raft.append_entries(req).await).map_err(qerr)
+        }
+        _ => Err(qerr("unknown quic frame")),
+    }
 }
 
 async fn health() -> &'static str {
@@ -1196,10 +1275,23 @@ fn rpc_reply<T: serde::Serialize>(value: &T) -> axum::response::Response {
     }
 }
 
+fn raft_http_blocked() -> bool {
+    matches!(
+        std::env::var("CAMUS_BLOCK_RAFT_HTTP").as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    )
+}
+
 async fn vote(
     State(node): State<Arc<MetadataNode>>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
+    if raft_http_blocked() {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft http blocked",
+        ));
+    }
     let req: VoteRequest<NodeId> = match rpc_body(&body) {
         Ok(req) => req,
         Err(reply) => return reply,
@@ -1215,6 +1307,12 @@ async fn append(
         Ok(req) => req,
         Err(reply) => return reply,
     };
+    if raft_http_blocked() && req.entries.is_empty() {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft http blocked",
+        ));
+    }
     rpc_reply(&node.raft.append_entries(req).await)
 }
 
@@ -1237,6 +1335,12 @@ fn open_shard(wal: &WalSlot, id: u32) -> Result<Arc<Shard>, axum::response::Resp
 }
 
 async fn vote_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
+    if raft_http_blocked() {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft http blocked",
+        ));
+    }
     let shard = match open_shard(wal, id) {
         Ok(shard) => shard,
         Err(reply) => return reply,
@@ -1257,6 +1361,12 @@ async fn append_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::re
         Ok(req) => req,
         Err(reply) => return reply,
     };
+    if raft_http_blocked() && req.entries.is_empty() {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft http blocked",
+        ));
+    }
     let carries = !req.entries.is_empty();
     let started = std::time::Instant::now();
     let result = shard.raft.append_entries(req).await;
