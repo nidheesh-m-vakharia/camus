@@ -223,8 +223,13 @@ impl HttpConn {
             endpoint.warm(peer);
             return None;
         }
-        let ttl = option.hard_ttl();
-        let outcome = tokio::time::timeout(ttl, endpoint.call(peer, &frame)).await;
+        // Half the budget. openraft cancels the whole RPC at `hard_ttl`, so a
+        // QUIC attempt that uses all of it never reaches the HTTP fallback.
+        let quic_budget = option.hard_ttl() / 2;
+        if quic_budget.is_zero() {
+            return None;
+        }
+        let outcome = tokio::time::timeout(quic_budget, endpoint.call(peer, &frame)).await;
         let bytes = match outcome {
             Ok(Ok(bytes)) => bytes,
             // The peer is up but slow. Falling through to HTTP for this RPC
