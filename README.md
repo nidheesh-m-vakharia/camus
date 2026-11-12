@@ -185,7 +185,9 @@ lists each default next to Kafka's.
 | `CAMUS_NUM_PARTITIONS` | 1 | `num.partitions` |
 | `CAMUS_MESSAGE_MAX_BYTES` | 1048588 | `message.max.bytes` |
 | `CAMUS_WAL_DISK_LIMIT` | 8 GiB | Unsealed WAL bytes before produce is held |
-| `CAMUS_FLUSH_MS` | 250 | How often unsealed data is uploaded |
+| `CAMUS_FLUSH_MS` | 250 | Busy upload interval. A shard with at least 4 MiB unsealed uses this |
+| `CAMUS_QUIET_FLUSH_MS` | 30000 | How long a smaller unsealed prefix waits before upload |
+| `CAMUS_RACK` | — | `broker.rack`. Fetch v11 sends a client in this zone to a local voter |
 | `CAMUS_RETENTION_CHECK_MS` | 300000 | `log.retention.check.interval.ms` |
 | `CAMUS_COMPACT_MS` | 300000 | Compaction interval; `0` turns it off |
 | `CAMUS_SWEEP_MS` | 300000 | Orphaned-object sweep interval |
@@ -204,7 +206,7 @@ lists each default next to Kafka's.
 | `CAMUS_CONSUMER_SESSION_MS`, `CAMUS_CONSUMER_HEARTBEAT_MS` | 45000, 5000 | KIP-848 session and heartbeat |
 | `CAMUS_AUTO_LEADER_REBALANCE` | `true` | `auto.leader.rebalance.enable` |
 | `CAMUS_LEADER_IMBALANCE_CHECK_MS` | 300000 | `leader.imbalance.check.interval.seconds` |
-| `CAMUS_QUIC` | on | Raft votes, empty heartbeats, and shard announcements. `off` keeps them on HTTP |
+| `CAMUS_QUIC` | off | Raft votes, empty heartbeats, and shard announcements. `on` sends them over QUIC |
 | `CAMUS_QUIC_PORT` | the HTTP port | UDP port for that traffic; set the same value on every broker |
 | `CAMUS_SHARD_ANNOUNCE_MS` | 200 | How often a shard leader writes its view to metadata |
 

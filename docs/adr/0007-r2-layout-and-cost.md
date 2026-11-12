@@ -153,7 +153,7 @@ Class A per MiB = 0.125. Per GiB ≈ **$0.0006**. Storage again dominates.
 
 Worked point: **1 MiB/s spread over 1,000 partitions.** Per-partition
 objects still produce 4,000 puts/s because the timer binds on each
-partition. That is about **$1.6 per hour** in Class A
+partition. That is **$64.80 per hour** in Class A
 (4000 * 3600 * $4.50 / 1e6). The bundled path stays at 4 puts/s for the
 same bytes. Empty partitions are not flushed either way.
 
@@ -188,6 +188,38 @@ MiB. Small compared with a 250ms unbundled flush, large compared with a
 size-bound bundled flush. Compaction is off until Phase 2 has something to
 merge, and the policy is ADR 0010.
 
+### Flush arithmetic, amended 2026-11-12
+
+The Class A and Class B products above assume every stream flushes every
+250 ms or at 8 MiB, whichever comes first. `wal` upload no longer does
+that for a quiet shard. A full 8 MiB object still uploads immediately. A
+shard with at least 4 MiB unsealed still uses `CAMUS_FLUSH_MS` (250 ms).
+A smaller prefix waits until it reaches 8 MiB or `CAMUS_QUIET_FLUSH_MS`
+(30 s). `r2` mode still flushes on `CAMUS_FLUSH_MS`, because that
+acknowledgement waits for the put. ADR 0006 records the uploader.
+
+A stream stays on the 250 ms timer when its rate is at least half an
+object per flush interval, 16 MiB/s at the defaults. Below that, puts per
+second for one stream are `max(MiB/s / 8, 1/30)`.
+
+- **1 MiB/s, one stream.** Quiet. 0.125 puts/s, one put per 8 MiB.
+  Class A is `0.125 * 1024 * $4.50 / 1e6` = **$0.000576 per GiB**, the
+  same product as the 100 MiB/s size-bound path, rounded to $0.0006.
+  The **$0.018 per GiB** figure above is the old 4 puts/s timer applied
+  to 1 MiB/s (`4 * 1024 * $4.50 / 1e6` = $0.018432).
+- **20 MiB/s, one stream.** The 250 ms timer still binds at 4 puts/s.
+- **100 MiB/s.** Unchanged. The 8 MiB cap binds at 12.5 puts/s.
+- **1 MiB/s over 1,000 partitions on one stream.** Still one bundled
+  object, 0.125 puts/s. The rejected per-partition path is one put per
+  quiet partition per 30 s, about 33.3 puts/s, not 4,000. **$64.80 per
+  hour** remains the cost of that rejected 250 ms per-partition timer
+  (`4000 * 3600 * $4.50 / 1e6`).
+
+Class B for the quiet 1 MiB/s stream is one GET per 8 MiB. The
+**$0.0015 per GiB** figure is 4 GETs per MiB, which is the old timer
+layout (`4 * 1024 * $0.36 / 1e6` = $0.00147456). `scripts/cost.py
+--check` locks the current rates and those historical products.
+
 ## Consequences
 
 - Recovery lists `bundle/` and `seg/` and reads footers. It does not assume
@@ -202,7 +234,7 @@ merge, and the policy is ADR 0010.
 ## Alternatives
 
 - One object per partition per flush. Rejected for ingest. At 1,000
-  partitions producing every 250ms it is about 4,000 puts/s, roughly $1.6
+  partitions producing every 250ms it is about 4,000 puts/s, $64.80
   per hour in Class A, for the same bytes one bundled put stream would
   write. Compaction still produces per-partition segments, where the extra
   put buys cheaper historical reads.

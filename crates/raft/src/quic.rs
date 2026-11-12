@@ -1,12 +1,12 @@
 //! QUIC endpoint for Raft control traffic (ADR 0016).
 //!
-//! On unless `CAMUS_QUIC=off`. Votes and empty heartbeats use one stream per
+//! Off unless `CAMUS_QUIC=on`. Votes and empty heartbeats use one stream per
 //! RPC. Shard announcements are datagrams. Data AppendEntries and snapshots
 //! stay on HTTP. The peer cache holds at most [`PEER_CAP`] connections. A
 //! frame body is at most [`MAX_BODY`] bytes. A datagram is at most
 //! [`MAX_DATAGRAM`] bytes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,19 +133,21 @@ struct Inner {
     datagrams: tokio::sync::Mutex<Option<DatagramHandler>>,
     /// Connections that already have a datagram reader. Capped at [`TRACK_CAP`].
     readers: tokio::sync::Mutex<BTreeMap<usize, ()>>,
+    /// Peers with a handshake already in flight. Capped at [`PEER_CAP`].
+    warming: tokio::sync::Mutex<BTreeSet<SocketAddr>>,
 }
 
 type DatagramHandler = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
 static CURRENT: std::sync::OnceLock<ControlEndpoint> = std::sync::OnceLock::new();
 
-/// `false` only when `CAMUS_QUIC` is `off`, `0`, or `false`. Unset is on.
+/// `true` only when `CAMUS_QUIC` is `on`, `1`, or `true`. Unset is off.
 pub fn enabled() -> bool {
     flag_enabled(std::env::var("CAMUS_QUIC").ok().as_deref())
 }
 
 pub fn flag_enabled(value: Option<&str>) -> bool {
-    !matches!(value, Some("off") | Some("0") | Some("false"))
+    matches!(value, Some("on") | Some("1") | Some("true"))
 }
 
 /// Heartbeat and election timeouts, in milliseconds: 50, then 150–300.
@@ -190,6 +192,7 @@ impl ControlEndpoint {
                 tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
                 datagrams: tokio::sync::Mutex::new(None),
                 readers: tokio::sync::Mutex::new(BTreeMap::new()),
+                warming: tokio::sync::Mutex::new(BTreeSet::new()),
             }),
         })
     }
@@ -199,6 +202,34 @@ impl ControlEndpoint {
         CURRENT
             .set(self)
             .map_err(|_| quic_error("quic endpoint already installed"))
+    }
+
+    /// True when `peer` already has a connection that has not closed.
+    /// A heartbeat must not wait for a handshake: openraft cancels the RPC
+    /// after the 50 ms heartbeat interval.
+    pub async fn live(&self, peer: SocketAddr) -> bool {
+        let peers = self.inner.peers.lock().await;
+        peers
+            .get(&peer)
+            .is_some_and(|conn| conn.close_reason().is_none())
+    }
+
+    /// Start a handshake without tying it to the RPC that noticed it was missing.
+    /// A second call for the same peer does nothing while the first is in flight.
+    pub fn warm(&self, peer: SocketAddr) {
+        let endpoint = self.clone();
+        tokio::spawn(async move {
+            {
+                let mut warming = endpoint.inner.warming.lock().await;
+                if warming.contains(&peer) || warming.len() >= PEER_CAP {
+                    return;
+                }
+                warming.insert(peer);
+            }
+            let connected = endpoint.connection(peer).await;
+            endpoint.inner.warming.lock().await.remove(&peer);
+            let _ = connected;
+        });
     }
 
     /// `http_addr` is `host:port`. `CAMUS_QUIC_PORT` replaces the port when set.
@@ -781,9 +812,11 @@ mod tests {
     }
 
     #[test]
-    fn quic_stays_on_unless_it_is_turned_off() {
-        assert!(super::flag_enabled(None));
+    fn quic_stays_off_unless_it_is_turned_on() {
+        assert!(!super::flag_enabled(None));
         assert!(super::flag_enabled(Some("on")));
+        assert!(super::flag_enabled(Some("1")));
+        assert!(super::flag_enabled(Some("true")));
         assert!(!super::flag_enabled(Some("off")));
         assert!(!super::flag_enabled(Some("0")));
         assert!(!super::flag_enabled(Some("false")));
@@ -807,6 +840,38 @@ mod tests {
         server.close().await;
         let _ = task.await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cold_peer_becomes_live_after_a_background_dial() -> Result<(), String> {
+        let shared = shared_pair()?;
+        let server =
+            ControlEndpoint::bind(loopback(), shared.server).map_err(|err| err.to_string())?;
+        let client =
+            ControlEndpoint::bind(loopback(), shared.client).map_err(|err| err.to_string())?;
+        let addr = server.local_addr().map_err(|err| err.to_string())?;
+        let task = echo(&server).await;
+        if client.live(addr).await {
+            return Err("a peer with no connection was live".into());
+        }
+        client.warm(addr);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut connected = false;
+        while tokio::time::Instant::now() < deadline {
+            if client.live(addr).await {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        client.close().await;
+        server.close().await;
+        let _ = task.await;
+        if connected {
+            Ok(())
+        } else {
+            Err("background dial did not connect".into())
+        }
     }
 
     #[tokio::test]

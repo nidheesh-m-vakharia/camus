@@ -496,12 +496,30 @@ impl Node {
             ])
             .args(&opts.args)
             .env("CAMUS_FLUSH_MS", "40")
+            .env("CAMUS_QUIET_FLUSH_MS", "40")
             .env("RUST_LOG", "info");
         if let Some(s3) = &opts.s3 {
             command.env("CAMUS_S3_ENDPOINT", s3);
         }
         for (key, value) in &opts.env {
             command.env(key, value);
+        }
+        // A test that lengthens the upload interval wants the quiet hold to
+        // follow it. Otherwise a 40ms quiet hold would upload before the
+        // longer flush the test asked for.
+        if let Some(flush) = opts
+            .env
+            .iter()
+            .find(|(key, _)| key == "CAMUS_FLUSH_MS")
+            .map(|(_, value)| value.clone())
+        {
+            if !opts
+                .env
+                .iter()
+                .any(|(key, _)| key == "CAMUS_QUIET_FLUSH_MS")
+            {
+                command.env("CAMUS_QUIET_FLUSH_MS", flush);
+            }
         }
         let child = command
             .stdout(log.try_clone().unwrap())
