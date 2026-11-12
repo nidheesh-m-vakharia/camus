@@ -119,21 +119,65 @@
       <figcaption id="iso-caption"><code>wal</code>: a batch goes to the leader and reaches a majority's write-ahead log, and then the producer gets its ack. Objects go up to the bucket afterwards.</figcaption>
       </figure>
     </section>
-    <div class="home-body">
-      <h2>One process</h2>
-      <p>Camus is a single binary. It accepts Kafka TCP, writes record batches as objects, and keeps topics, groups, offsets, and transactions in a Raft group. A deployment does not add a JVM inside the broker, ZooKeeper, KRaft, or a separate database.</p>
-      <p>The brokers are the same program with different node ids. They agree on metadata through Raft. In the default durability mode they also replicate a short write-ahead log, so a produce can be acknowledged after a disk quorum. The object upload still happens. The write-ahead log is a buffer of seconds, then it is truncated.</p>
-      <h2>What you point a client at</h2>
-      <p>The bootstrap server. Compatibility is pinned to Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. Where a KIP and that tree disagree, the tree wins. The matrix of implemented APIs, and which client has actually passed each one, is in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a>.</p>
-      <p>Three clients have been run against the broker: kafka-clients 4.4.0, librdkafka through confluent-kafka 2.16.1, and franz-go v1.22.0. They produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the compatibility doc stays unmarked until that client has really passed the call.</p>
-      <h2>Where to go next</h2>
-      <ul>
-      <li><a href="run.html">Run</a> one broker with Docker, or from a checkout.</li>
-      <li><a href="minio.html">Give it a bucket</a> before you care about the sealed log.</li>
-      <li><a href="clients.html">Clients</a> lists what those libraries can do, and the differences that will surprise you.</li>
-      <li><a href="durability.html">Durability</a> is the choice between acknowledging on a disk quorum and acknowledging only after the object is stored.</li>
-      <li><a href="limits.html">Production</a> is what is still sharp, and <a href="limits.html#when-not">when not to use Camus</a>.</li>
-      </ul>
+    <div class="home-sheets">
+      <section class="sheet">
+        <h2>One process</h2>
+        <div class="board">
+          <div class="absent">
+            <p>A deployment does not add</p>
+            <ul>
+              <li>a JVM inside the broker</li>
+              <li>ZooKeeper</li>
+              <li>KRaft</li>
+              <li>a separate database</li>
+            </ul>
+          </div>
+          <div class="arch">
+            <ul class="arch-clients">
+              <li>kafka-clients <span>4.4.0</span></li>
+              <li>confluent-kafka <span>2.16.1</span></li>
+              <li>franz-go <span>v1.22.0</span></li>
+            </ul>
+            <div class="broker">
+              <p class="broker-name">camus-broker</p>
+              <ol>
+                <li><span>Kafka TCP</span> the bootstrap address</li>
+                <li><span>Metadata Raft</span> topics, groups, offsets, transactions</li>
+                <li><span>Write-ahead log</span> seconds, then truncated</li>
+                <li><span>Uploader</span> record batches as objects</li>
+              </ol>
+            </div>
+            <p class="arch-store">R2 <span>or any S3 bucket</span></p>
+            <div class="bus" aria-hidden="true"><span></span><span><span>Kafka wire</span></span><span></span></div>
+            <span class="hwire hwire-store" aria-hidden="true"><span>objects</span></span>
+          </div>
+          <div class="arch-bridge" aria-hidden="true"><span></span></div>
+          <div class="peers">
+            <div class="peer-row" role="group" aria-label="Three copies of the same binary">
+              <span>node 1</span>
+              <span class="raft"><span>Raft</span></span>
+              <span>node 2</span>
+              <span class="raft"><span>Raft</span></span>
+              <span>node 3</span>
+            </div>
+            <p>The same program, different node ids.</p>
+          </div>
+        </div>
+        <div class="sheet-note">
+          <p>In the default durability mode a produce is acknowledged after a majority has the write-ahead log on disk. The object upload still happens. That slice of the log is then truncated.</p>
+          <p>What you point a client at is the bootstrap server. Compatibility is pinned to Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. Where a KIP and that tree disagree, the tree wins. kafka-clients, librdkafka through confluent-kafka, and franz-go produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> stays unmarked until that client has really passed the call.</p>
+        </div>
+      </section>
+      <section class="sheet">
+        <h2>Roadmap</h2>
+        <ol class="roadmap">
+          <li><a href="run.html"><span>Run</span> Start one broker with Docker, or from a checkout. It listens for Kafka and forms a one-node group by itself.</a></li>
+          <li><a href="minio.html"><span>Bucket</span> Give it a bucket before you care about the sealed log. Locally that is MinIO, until you point it at R2 or another S3 store.</a></li>
+          <li><a href="clients.html"><span>Clients</span> Change the bootstrap address and keep the client you already have. kafka-clients, librdkafka, and franz-go have been run against the broker.</a></li>
+          <li><a href="durability.html"><span>Durability</span> Choose when a produce is acknowledged. <code>wal</code> answers after a disk majority. <code>r2</code> answers only after the object is stored.</a></li>
+          <li><a href="limits.html"><span>Production</span> See what is still sharp, and when not to use Camus, before you trust it with a real workload.</a></li>
+        </ol>
+      </section>
     </div>
   </main>
   <footer class="site-footer">
