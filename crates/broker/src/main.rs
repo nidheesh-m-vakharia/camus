@@ -155,12 +155,13 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
     let http_bound = listener.local_addr()?;
     if camus_raft::quic::enabled() {
-        let identity = quic_identity(&args, http_bound)?;
-        let mut quic_addr = http_bound;
-        if let Some(port) = camus_raft::quic::port_override()? {
-            quic_addr.set_port(port);
+        if let Some(identity) = quic_identity(&args, http_bound)? {
+            let mut quic_addr = http_bound;
+            if let Some(port) = camus_raft::quic::port_override()? {
+                quic_addr.set_port(port);
+            }
+            camus_raft::quic::ControlEndpoint::bind(quic_addr, identity)?.install()?;
         }
-        camus_raft::quic::ControlEndpoint::bind(quic_addr, identity)?.install()?;
     }
     let node = Arc::new(MetadataNode::open(args.node_id, &args.data_dir, &args.http_addr).await?);
     let wal_dir = resolve_wal_dir(args.wal_dir.clone(), &args.data_dir);
@@ -255,7 +256,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn quic_identity(args: &Args, addr: SocketAddr) -> anyhow::Result<camus_raft::quic::Identity> {
+/// Cluster CA when all three PEM files are set. `--dev-plaintext` on loopback
+/// (or an unspecified bind) gets a per-process certificate. Anything else
+/// leaves the endpoint off, and votes and heartbeats stay on HTTP. A TLS
+/// Kafka listener without a client CA is that case: it must still reach the
+/// object-storage check instead of dying here.
+fn quic_identity(
+    args: &Args,
+    addr: SocketAddr,
+) -> anyhow::Result<Option<camus_raft::quic::Identity>> {
     if let (Some(cert), Some(key), Some(ca)) = (&args.tls_cert, &args.tls_key, &args.tls_client_ca)
     {
         let mut cert_reader = std::io::BufReader::new(std::fs::File::open(cert)?);
@@ -265,12 +274,15 @@ fn quic_identity(args: &Args, addr: SocketAddr) -> anyhow::Result<camus_raft::qu
             .ok_or_else(|| anyhow::anyhow!("no private key in {key:?}"))?;
         let mut ca_reader = std::io::BufReader::new(std::fs::File::open(ca)?);
         let trusted = rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
-        return Ok(camus_raft::quic::Identity::new(certs, key, trusted)?);
+        return Ok(Some(camus_raft::quic::Identity::new(certs, key, trusted)?));
     }
     if args.dev_plaintext && (addr.ip().is_loopback() || addr.ip().is_unspecified()) {
-        return Ok(camus_raft::quic::Identity::loopback_dev()?);
+        return Ok(Some(camus_raft::quic::Identity::loopback_dev()?));
     }
-    anyhow::bail!("QUIC off loopback needs --tls-cert, --tls-key, and --tls-client-ca")
+    tracing::warn!(
+        "QUIC control plane is off; set --dev-plaintext on loopback, or --tls-cert, --tls-key, and --tls-client-ca"
+    );
+    Ok(None)
 }
 
 fn qerr(err: impl std::fmt::Display) -> camus_raft::quic::QuicError {
