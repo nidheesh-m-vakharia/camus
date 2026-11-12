@@ -220,6 +220,9 @@ async fn main() -> anyhow::Result<()> {
                 .route("/admin/restore-cluster", post(restore_cluster))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
+                .route("/wal/{shard}/txn-span", post(shard_txn_span))
+                .route("/wal/{shard}/finish-txn", post(shard_finish_txn))
+                .route("/wal/{shard}/close-txn", post(shard_close_txn))
                 .with_state(Arc::clone(&admin)),
         )
         .merge(
@@ -1028,6 +1031,87 @@ async fn shard_end_offset(
     Ok(Json(serde_json::json!({ "end": end })))
 }
 
+#[derive(Deserialize)]
+struct TxnSpanQuery {
+    topic: String,
+    partition: i32,
+    producer_id: i64,
+}
+
+fn topic_id_of(admin: &Admin, topic: &str) -> Result<uuid::Uuid, (StatusCode, String)> {
+    let Some(raw) = admin
+        .node
+        .read_local(&camus_metadata::topic_storage_key(topic))
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+    else {
+        return Err((StatusCode::NOT_FOUND, format!("no topic {topic}")));
+    };
+    let topic = camus_metadata::parse_topic(&raw)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    uuid::Uuid::parse_str(&topic.id)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+/// On a shard's leader: the open transaction span for one producer.
+async fn shard_txn_span(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<TxnSpanQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let id = topic_id_of(&admin, &body.topic)?;
+    let Some((start, end)) = opened.txn_span(id.as_bytes(), body.partition, body.producer_id)
+    else {
+        return Err((StatusCode::NOT_FOUND, "no open span".into()));
+    };
+    Ok(Json(serde_json::json!({ "start": start, "end": end })))
+}
+
+/// On a shard's leader: freeze the span so a later batch is not part of it.
+async fn shard_finish_txn(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<TxnSpanQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let id = topic_id_of(&admin, &body.topic)?;
+    opened
+        .finish_txn(*id.as_bytes(), body.partition, body.producer_id)
+        .await
+        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// On a shard's leader: forget the open span after metadata has stored it.
+async fn shard_close_txn(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<TxnSpanQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let id = topic_id_of(&admin, &body.topic)?;
+    opened
+        .close_txn(*id.as_bytes(), body.partition, body.producer_id)
+        .await
+        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn initialize_shard(
     wal: &WalSlot,
     shard: u32,
@@ -1311,6 +1395,9 @@ struct PublishBody {
     parts: Vec<PublishPart>,
     #[serde(default)]
     producers: Vec<ProducerNote>,
+    /// Transaction spans stored in the same commit as the extents.
+    #[serde(default)]
+    notes: Vec<Command>,
 }
 
 /// Commit a metadata command for a broker that does not lead the group.
@@ -1329,7 +1416,7 @@ async fn publish(
     State(node): State<Arc<MetadataNode>>,
     Json(body): Json<PublishBody>,
 ) -> Result<Json<camus_metadata::Response>, (StatusCode, String)> {
-    node.publish(body.parts, body.producers)
+    node.publish_with(body.parts, body.producers, body.notes)
         .await
         .map(Json)
         .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))

@@ -6,7 +6,7 @@
 //! which fsyncs, and the upload to object storage happens after the ack.
 //! `acks=0` does not wait and gets no response.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -648,9 +648,10 @@ impl Kafka {
         &self,
         parts: Vec<PublishPart>,
         producers: Vec<ProducerNote>,
+        notes: Vec<Command>,
     ) -> anyhow::Result<camus_metadata::Response> {
         if self.leader() {
-            return self.node.publish(parts, producers).await;
+            return self.node.publish_with(parts, producers, notes).await;
         }
         let addr = self
             .leader_http()
@@ -658,7 +659,7 @@ impl Kafka {
         let response = self
             .http
             .post(format!("http://{addr}/admin/publish"))
-            .json(&serde_json::json!({ "parts": parts, "producers": producers }))
+            .json(&serde_json::json!({ "parts": parts, "producers": producers, "notes": notes }))
             .send()
             .await?;
         anyhow::ensure!(response.status().is_success(), "forwarded publish failed");
@@ -720,6 +721,79 @@ impl Kafka {
                 .iter()
                 .any(|span| span.topic == topic && span.partition == partition)
         })
+    }
+
+    /// Spans to store in the same metadata commit as the extents being sealed.
+    /// One per producer and partition, and only while the transaction is open
+    /// and metadata does not already have the span.
+    fn seal_span_notes(&self, batches: &[camus_wal::Batch]) -> Vec<Command> {
+        let mut notes = Vec::new();
+        let mut seen = BTreeSet::new();
+        for batch in batches {
+            let Ok(info) = camus_protocol::batch::inspect(
+                &batch.bytes,
+                camus_protocol::batch::MAX_BATCH_CEILING,
+            ) else {
+                continue;
+            };
+            let Ok(identities) = camus_protocol::batch::producer_batches(
+                &batch.bytes,
+                camus_protocol::batch::MAX_BATCH_CEILING,
+            ) else {
+                continue;
+            };
+            for (info, identity) in info.iter().zip(identities) {
+                if !info.transactional || identity.producer_id < 0 {
+                    continue;
+                }
+                if !seen.insert((batch.topic_id, batch.partition, identity.producer_id)) {
+                    continue;
+                }
+                let Some(name) = self.topic_name_by_id(&Uuid::from_bytes(batch.topic_id)) else {
+                    continue;
+                };
+                let Some(txn_id) = self
+                    .node
+                    .read_local(&format!("txn-by-producer/{}", identity.producer_id))
+                    .ok()
+                    .flatten()
+                else {
+                    continue;
+                };
+                let Some(raw) = self.txn_record(&txn_id) else {
+                    continue;
+                };
+                let Ok(Some(open)) = camus_metadata::txn_open(&raw) else {
+                    continue;
+                };
+                if open.producer_id != identity.producer_id
+                    || self.txn_span_open(&txn_id, &name, batch.partition)
+                {
+                    continue;
+                }
+                let Some(topic) = self.topic(&name) else {
+                    continue;
+                };
+                let Some((start, end)) = self.wal_of(&topic, batch.partition).and_then(|shard| {
+                    shard.txn_span(&batch.topic_id, batch.partition, identity.producer_id)
+                }) else {
+                    continue;
+                };
+                notes.push(Command::NoteTxn {
+                    transactional_id: txn_id,
+                    producer_id: identity.producer_id,
+                    producer_epoch: open.epoch,
+                    span: TxnSpan {
+                        topic: name,
+                        partition: batch.partition,
+                        start,
+                        end,
+                        producer_id: Some(identity.producer_id),
+                    },
+                });
+            }
+        }
+        notes
     }
 
     /// A `wal` fetch can be served here when this broker holds the shard.
@@ -819,28 +893,235 @@ impl Kafka {
             .ok_or(LEADER_NOT_AVAILABLE)
     }
 
-    /// One span per partition the transaction wrote, with the end taken from
-    /// the shard leader.
-    async fn txn_ends(&self, transactional_id: &str) -> Result<Vec<TxnSpan>, i16> {
-        let Some(raw) = self
-            .node
+    fn txn_record(&self, transactional_id: &str) -> Option<String> {
+        self.node
             .read_local(&format!("txn/{transactional_id}"))
             .ok()
             .flatten()
-        else {
+    }
+
+    /// This producer still has an ongoing transaction under `id`.
+    fn txn_is_ongoing(&self, transactional_id: &str, producer_id: i64, epoch: i16) -> bool {
+        let Some(raw) = self.txn_record(transactional_id) else {
+            return false;
+        };
+        camus_metadata::txn_open(&raw)
+            .ok()
+            .flatten()
+            .is_some_and(|open| open.producer_id == producer_id && open.epoch == epoch)
+    }
+
+    /// The open span on the shard leader, or `None` when this producer has
+    /// not written one. `Err` when the leader cannot be asked.
+    async fn shard_txn_span(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<Option<(i64, i64)>, i16> {
+        if topic.durability != "wal" {
+            return Ok(None);
+        }
+        if self.leads_wal(topic, partition) {
+            return Ok(self
+                .wal_of(topic, partition)
+                .and_then(|shard| shard.txn_span(&topic_id(topic), partition, producer_id)));
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/txn-span", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+                "producer_id": producer_id,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(LEADER_NOT_AVAILABLE);
+        }
+        let body: serde_json::Value = response.json().await.map_err(|_| LEADER_NOT_AVAILABLE)?;
+        let start = body.get("start").and_then(serde_json::Value::as_i64);
+        let end = body.get("end").and_then(serde_json::Value::as_i64);
+        match (start, end) {
+            (Some(start), Some(end)) => Ok(Some((start, end))),
+            _ => Err(LEADER_NOT_AVAILABLE),
+        }
+    }
+
+    /// Freeze the span before EndTxn reads it. A batch that commits after
+    /// this is refused by the shard and is not part of the transaction.
+    async fn finish_wal_span(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<(), i16> {
+        if self.leads_wal(topic, partition) {
+            let Some(shard) = self.wal_of(topic, partition) else {
+                return Err(LEADER_NOT_AVAILABLE);
+            };
+            return shard
+                .finish_txn(topic_id(topic), partition, producer_id)
+                .await
+                .map_err(|_| LEADER_NOT_AVAILABLE);
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/finish-txn", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+                "producer_id": producer_id,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(LEADER_NOT_AVAILABLE)
+        }
+    }
+
+    /// Drop the open span after metadata has stored it.
+    async fn close_wal_span(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<(), i16> {
+        if self.leads_wal(topic, partition) {
+            let Some(shard) = self.wal_of(topic, partition) else {
+                return Err(LEADER_NOT_AVAILABLE);
+            };
+            return shard
+                .close_txn(topic_id(topic), partition, producer_id)
+                .await
+                .map_err(|_| LEADER_NOT_AVAILABLE);
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/close-txn", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+                "producer_id": producer_id,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(LEADER_NOT_AVAILABLE)
+        }
+    }
+
+    /// Close every open span this transaction still has on a WAL shard.
+    async fn close_producer_spans(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+    ) -> Result<(), i16> {
+        let Some(raw) = self.txn_record(transactional_id) else {
+            return Ok(());
+        };
+        let partitions = camus_metadata::txn_partitions(&raw).map_err(|_| NOT_LEADER)?;
+        for (name, partition) in partitions {
+            let Some(topic) = self.topic(&name) else {
+                continue;
+            };
+            if topic.durability != "wal" {
+                continue;
+            }
+            if self
+                .shard_txn_span(&topic, partition, producer_id)
+                .await?
+                .is_some()
+            {
+                self.close_wal_span(&topic, partition, producer_id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One span per partition the transaction wrote. The WAL shard has the
+    /// open range; a span already stored (a seal, or a `NoteTxn` from before
+    /// ADR 0019) is used when the shard has none.
+    async fn txn_ends(&self, transactional_id: &str) -> Result<Vec<TxnSpan>, i16> {
+        let Some(raw) = self.txn_record(transactional_id) else {
             return Ok(Vec::new());
         };
-        let spans = camus_metadata::txn_spans(&raw).map_err(|_| NOT_LEADER)?;
-        let mut ends = Vec::with_capacity(spans.len());
-        for span in spans {
-            let Some(topic) = self.topic(&span.topic) else {
+        let Some(open) = camus_metadata::txn_open(&raw).map_err(|_| NOT_LEADER)? else {
+            return Ok(Vec::new());
+        };
+        let mut ends = Vec::new();
+        for (name, partition) in &open.partitions {
+            let Some(topic) = self.topic(name) else {
                 return Err(UNKNOWN_TOPIC);
             };
-            let end = self.shard_end(&topic, span.partition).await?;
+            if topic.durability == "wal" {
+                self.finish_wal_span(&topic, *partition, open.producer_id)
+                    .await?;
+            }
+            if let Some((start, end)) = self
+                .shard_txn_span(&topic, *partition, open.producer_id)
+                .await?
+            {
+                ends.push(TxnSpan {
+                    topic: name.clone(),
+                    partition: *partition,
+                    start,
+                    end,
+                    producer_id: Some(open.producer_id),
+                });
+                continue;
+            }
+            let Some(span) = open
+                .spans
+                .iter()
+                .find(|span| span.topic == *name && span.partition == *partition)
+            else {
+                continue;
+            };
+            let end = if topic.durability == "wal" {
+                self.shard_end(&topic, *partition).await?
+            } else {
+                span.end
+            };
             ends.push(TxnSpan {
                 end,
-                producer_id: span.producer_id,
-                ..span
+                producer_id: span.producer_id.or(Some(open.producer_id)),
+                ..span.clone()
             });
         }
         Ok(ends)
@@ -1074,6 +1355,29 @@ impl Kafka {
                 return Ok(all);
             }
         }
+    }
+
+    /// The committed transaction spans cover every offset of this batch.
+    fn txn_batch_committed(
+        &self,
+        topic_name: &str,
+        partition: i32,
+        producer_id: i64,
+        start: i64,
+        end: i64,
+    ) -> bool {
+        let Some(topic) = self.topic(topic_name) else {
+            return false;
+        };
+        let Some(state) = self.partition_state(&topic, partition) else {
+            return false;
+        };
+        (start..end).all(|offset| {
+            state
+                .txn_committed
+                .iter()
+                .any(|span| span.covers(offset, producer_id))
+        })
     }
 
     fn partition_state(&self, topic: &Topic, partition: i32) -> Option<camus_metadata::Partition> {
@@ -1341,17 +1645,73 @@ impl Kafka {
                 continue;
             }
             let id = key.trim_start_matches("txn/").to_string();
-            let applied = self
-                .meta_apply(Command::AbortTimedOutTxn {
-                    transactional_id: id.clone(),
-                    producer_id: clock.producer_id,
-                    producer_epoch: clock.epoch,
-                    now_ms: now,
-                })
-                .await;
-            if let Ok(response) = applied {
-                if response.value.as_deref() == Some("1") {
-                    tracing::info!(transactional_id = %id, "aborted a transaction past its timeout");
+            // The span lives on the WAL until now (ADR 0019). Read it before
+            // the abort, then mark that range in the same commit. A span
+            // already stored by a seal is left to the abort command.
+            let ends = match self.txn_ends(&id).await {
+                Ok(ends) => ends,
+                Err(code) => {
+                    tracing::warn!(transactional_id = %id, code, "could not read the open span");
+                    continue;
+                }
+            };
+            let stored = self
+                .txn_record(&id)
+                .and_then(|raw| camus_metadata::txn_open(&raw).ok().flatten());
+            let mut commands = vec![Command::AbortTimedOutTxn {
+                transactional_id: id.clone(),
+                producer_id: clock.producer_id,
+                producer_epoch: clock.epoch,
+                now_ms: now,
+            }];
+            for span in &ends {
+                let covered = stored.as_ref().is_some_and(|open| {
+                    open.spans.iter().any(|item| {
+                        item.topic == span.topic
+                            && item.partition == span.partition
+                            && item.start == span.start
+                            && item.end == span.end
+                    })
+                });
+                if !covered {
+                    commands.push(Command::NoteTxn {
+                        transactional_id: id.clone(),
+                        producer_id: clock.producer_id,
+                        producer_epoch: clock.epoch,
+                        span: span.clone(),
+                    });
+                }
+            }
+            let command = if commands.len() == 1 {
+                commands.remove(0)
+            } else {
+                Command::Batch(commands)
+            };
+            let Ok(response) = self.meta_apply(command).await else {
+                continue;
+            };
+            let aborted = response.value.as_deref() == Some("1")
+                || response
+                    .each
+                    .first()
+                    .and_then(|child| child.value.as_deref())
+                    == Some("1");
+            if !aborted {
+                continue;
+            }
+            tracing::info!(transactional_id = %id, "aborted a transaction past its timeout");
+            for span in &ends {
+                let Some(topic) = self.topic(&span.topic) else {
+                    continue;
+                };
+                if topic.durability != "wal" {
+                    continue;
+                }
+                if let Err(code) = self
+                    .close_wal_span(&topic, span.partition, clock.producer_id)
+                    .await
+                {
+                    tracing::warn!(transactional_id = %id, code, "the span stayed open after the abort");
                 }
             }
         }
@@ -3040,7 +3400,17 @@ impl Kafka {
         }
         self.arrived(&produce.topic, produce.partition);
         if let Some((id, producer, epoch)) = produce.txn {
-            if self.txn_span_open(&id, &produce.topic, produce.partition) {
+            // The WAL apply recorded the span. Metadata hears about it at
+            // EndTxn. A batch that commits after the transaction ended is
+            // still aborted here, or read_committed would stop in front of it.
+            if self.txn_is_ongoing(&id, producer, epoch) {
+                return Ok(response.base_offset);
+            }
+            let start = response.base_offset;
+            let end = start + i64::from(produce.records);
+            // EndTxn already stored this batch. Aborting the whole open span
+            // would hide the batches it committed.
+            if self.txn_batch_committed(&produce.topic, produce.partition, producer, start, end) {
                 return Ok(response.base_offset);
             }
             let noted = self
@@ -3051,8 +3421,8 @@ impl Kafka {
                     span: TxnSpan {
                         topic: produce.topic,
                         partition: produce.partition,
-                        start: response.base_offset,
-                        end: response.base_offset + i64::from(produce.records),
+                        start,
+                        end,
                         producer_id: Some(producer),
                     },
                 })
@@ -3513,13 +3883,17 @@ impl Kafka {
             }
         }
         if !upload.is_empty() {
+            let span_notes = self.seal_span_notes(&upload);
             let (parts, producers, seals, all_put) = self.put_objects(upload).await;
             if !all_put {
                 ok = false;
             }
             if !parts.is_empty() {
-                let published = self.meta_publish(parts, producers).await;
-                let accepted = published.is_ok_and(|response| response.error_code == 0);
+                let published = self.meta_publish(parts, producers, span_notes).await;
+                let accepted = published.is_ok_and(|response| {
+                    response.error_code == 0
+                        && response.each.iter().all(|child| child.error_code == 0)
+                });
                 if !accepted {
                     ok = false;
                 }
@@ -3746,6 +4120,41 @@ impl Kafka {
                 bytes: sealed,
             });
         }
+        let mut span_notes = Vec::new();
+        let mut noted = pieces.iter();
+        for (item, plan) in items.iter().zip(&plans) {
+            let Some(id) = item.txn_id.clone() else {
+                if matches!(plan, Plan::Append) {
+                    let _ = noted.next();
+                }
+                continue;
+            };
+            let (start, end) = match plan {
+                Plan::Replay(offset) => (*offset, offset + i64::from(item.records)),
+                Plan::Append => {
+                    let Some(piece) = noted.next() else {
+                        return fail(items, STORAGE);
+                    };
+                    (piece.start, piece.end)
+                }
+                Plan::Error(_) => continue,
+            };
+            if self.txn_span_open(&id, &item.topic, item.partition) {
+                continue;
+            }
+            span_notes.push(Command::NoteTxn {
+                transactional_id: id,
+                producer_id: item.producer_id,
+                producer_epoch: item.producer_epoch,
+                span: TxnSpan {
+                    topic: item.topic.clone(),
+                    partition: item.partition,
+                    start,
+                    end,
+                    producer_id: Some(item.producer_id),
+                },
+            });
+        }
         let mut parts = Vec::new();
         if !pieces.is_empty() {
             // Encode each partition's batches together, so they publish as one
@@ -3788,12 +4197,13 @@ impl Kafka {
                     max_timestamp: item.max_timestamp,
                 });
             }
-            let published =
-                tokio::time::timeout(COMMIT_TIMEOUT, self.node.publish(coalesce(parts), notes))
-                    .await;
+            let published = tokio::time::timeout(
+                COMMIT_TIMEOUT,
+                self.node.publish_with(coalesce(parts), notes, span_notes),
+            )
+            .await;
             let code = match published {
-                Ok(Ok(response)) if response.error_code == 0 => None,
-                Ok(Ok(response)) => Some(response.error_code),
+                Ok(Ok(response)) => publish_note_error(&response),
                 Ok(Err(_)) => Some(NOT_LEADER),
                 Err(_) => Some(REQUEST_TIMED_OUT),
             };
@@ -3803,42 +4213,12 @@ impl Kafka {
             for item in &items {
                 self.arrived(&item.topic, item.partition);
             }
-        }
-        let mut noted = pieces.iter();
-        for (item, plan) in items.iter().zip(&plans) {
-            let Some(id) = item.txn_id.clone() else {
-                if matches!(plan, Plan::Append) {
-                    let _ = noted.next();
+        } else {
+            for command in span_notes {
+                let applied = self.meta_apply(command).await;
+                if let Some(code) = noted_error(&applied) {
+                    return fail(items, code);
                 }
-                continue;
-            };
-            let (start, end) = match plan {
-                Plan::Replay(offset) => (*offset, offset + i64::from(item.records)),
-                Plan::Append => {
-                    let piece = noted.next().expect("piece");
-                    (piece.start, piece.end)
-                }
-                Plan::Error(_) => continue,
-            };
-            if self.txn_span_open(&id, &item.topic, item.partition) {
-                continue;
-            }
-            let applied = self
-                .meta_apply(Command::NoteTxn {
-                    transactional_id: id,
-                    producer_id: item.producer_id,
-                    producer_epoch: item.producer_epoch,
-                    span: TxnSpan {
-                        topic: item.topic.clone(),
-                        partition: item.partition,
-                        start,
-                        end,
-                        producer_id: Some(item.producer_id),
-                    },
-                })
-                .await;
-            if let Some(code) = noted_error(&applied) {
-                return fail(items, code);
             }
         }
         let mut appends = pieces.iter();
@@ -4654,6 +5034,21 @@ fn coalesce(mut parts: Vec<PublishPart>) -> Vec<PublishPart> {
         out.push(part);
     }
     out
+}
+
+/// A publish that carried transaction spans fails when the publish or any
+/// span was rejected. An abort marker (`value` set, error code 0) is a
+/// failure for the producer: the batch is in the log and not in the transaction.
+fn publish_note_error(response: &camus_metadata::Response) -> Option<i16> {
+    if response.each.is_empty() {
+        return noted_error(&Ok(response.clone()));
+    }
+    for child in &response.each {
+        if let Some(code) = noted_error(&Ok(child.clone())) {
+            return Some(code);
+        }
+    }
+    None
 }
 
 fn noted_error(applied: &anyhow::Result<camus_metadata::Response>) -> Option<i16> {

@@ -166,6 +166,18 @@ pub enum Command {
         /// Identity of each dropped batch.
         drops: Vec<SealDrop>,
     },
+    /// Stop this producer from extending its span. `EndTxn` sends this
+    /// before it reads the span, so a batch that commits afterwards is not
+    /// part of the transaction. A producer with no span is recorded too,
+    /// until `CloseTxn`, so a later batch is refused the same way.
+    FinishTxn {
+        /// Topic id.
+        topic_id: [u8; 16],
+        /// Partition.
+        partition: i32,
+        /// Producer whose span is frozen.
+        producer_id: i64,
+    },
     /// Forget the open transaction span for one producer on one partition.
     /// Missing spans are not an error. `EndTxn` sends this after metadata
     /// has stored the span (ADR 0019).
@@ -885,6 +897,25 @@ impl Shard {
         producer_id: i64,
     ) -> Option<(i64, i64)> {
         self.machine.txn_span(topic_id, partition, producer_id)
+    }
+
+    /// Freeze this producer's span. A later transactional batch from the
+    /// producer is refused and is not appended.
+    pub async fn finish_txn(
+        &self,
+        topic_id: [u8; 16],
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<(), WriteError> {
+        self.raft
+            .client_write(Command::FinishTxn {
+                topic_id,
+                partition,
+                producer_id,
+            })
+            .await
+            .map_err(|err| self.classify(err))?;
+        Ok(())
     }
 
     /// Forget that producer's open span. A second close is a no-op.

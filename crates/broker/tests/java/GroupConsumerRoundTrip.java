@@ -91,13 +91,29 @@ public class GroupConsumerRoundTrip {
         }
     }
 
+    // Cooperative rebalance revokes on the next poll. Until then the first
+    // member still reports the partitions the second member already owns.
     static void settle(KafkaConsumer<String, String> first, KafkaConsumer<String, String> second) {
         long deadline = System.currentTimeMillis() + 30_000;
-        while (first.assignment().isEmpty() || second.assignment().isEmpty()) {
-            check(System.currentTimeMillis() < deadline, "assignment did not settle");
+        while (!settled(first, second)) {
+            check(
+                    System.currentTimeMillis() < deadline,
+                    "assignment did not settle: " + first.assignment() + " " + second.assignment());
             first.poll(Duration.ofMillis(200));
             second.poll(Duration.ofMillis(200));
         }
+    }
+
+    static boolean settled(KafkaConsumer<String, String> first, KafkaConsumer<String, String> second) {
+        Set<TopicPartition> left = first.assignment();
+        Set<TopicPartition> right = second.assignment();
+        if (left.isEmpty() || right.isEmpty()) return false;
+        Set<TopicPartition> overlap = new HashSet<>(left);
+        overlap.retainAll(right);
+        if (!overlap.isEmpty()) return false;
+        Set<TopicPartition> both = new HashSet<>(left);
+        both.addAll(right);
+        return both.size() == 4;
     }
 
     static void produce(int first, int count) throws Exception {
