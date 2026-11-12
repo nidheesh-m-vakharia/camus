@@ -30,8 +30,9 @@ pub use catalog::{
 };
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{
-    check as txn_allows, clock as txn_clock, ensure as txn_ongoing, inspect as txn_inspect,
-    known_state as txn_state, spans as txn_spans, TxnClock, TxnInfo, TxnSpan,
+    check as txn_allows, clock as txn_clock, ensure as txn_ongoing, finished as txn_finished,
+    inspect as txn_inspect, known_state as txn_state, ongoing as txn_open,
+    partitions as txn_partitions, spans as txn_spans, OpenTxn, TxnClock, TxnInfo, TxnSpan,
 };
 
 use std::collections::BTreeMap;
@@ -578,9 +579,27 @@ impl MetadataNode {
         parts: Vec<PublishPart>,
         producers: Vec<ProducerNote>,
     ) -> anyhow::Result<Response> {
-        let response = self
-            .submit(Command::PublishWithProducers { parts, producers })
-            .await?;
+        self.publish_with(parts, producers, Vec::new()).await
+    }
+
+    /// Publish extents and, in the same log entry, any transaction spans the
+    /// object contains (ADR 0019). Empty `notes` is a plain publish.
+    pub async fn publish_with(
+        &self,
+        parts: Vec<PublishPart>,
+        producers: Vec<ProducerNote>,
+        notes: Vec<Command>,
+    ) -> anyhow::Result<Response> {
+        let publish = Command::PublishWithProducers { parts, producers };
+        let command = if notes.is_empty() {
+            publish
+        } else {
+            let mut commands = Vec::with_capacity(1 + notes.len());
+            commands.push(publish);
+            commands.extend(notes);
+            Command::Batch(commands)
+        };
+        let response = self.submit(command).await?;
         Ok(response)
     }
 

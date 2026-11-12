@@ -24,6 +24,7 @@ use camus_protocol::protocol::{Decodable, StrBytes};
 use super::{auth, frame_of, Caller, Kafka, Reply};
 
 const NOT_COORDINATOR: i16 = 16;
+const INVALID_TXN: i16 = 48;
 const INVALID_REQUEST: i16 = 42;
 const UNKNOWN_TOPIC: i16 = 3;
 const NOT_FOUND: i16 = 72;
@@ -302,7 +303,8 @@ impl Kafka {
             response.error_code = auth::TXN_ID_FAILED;
             return frame_of(header.request_api_version, header.correlation_id, &response);
         }
-        let ends = match self.txn_ends(request.transactional_id.0.as_str()).await {
+        let id = request.transactional_id.0.to_string();
+        let ends = match self.txn_ends(&id).await {
             Ok(ends) => ends,
             Err(code) => {
                 response.error_code = code;
@@ -312,7 +314,7 @@ impl Kafka {
         let applied = self
             .node
             .apply(Command::EndTransaction {
-                transactional_id: request.transactional_id.0.to_string(),
+                transactional_id: id.clone(),
                 producer_id: request.producer_id.0,
                 producer_epoch: request.producer_epoch,
                 committed: request.committed,
@@ -320,10 +322,28 @@ impl Kafka {
                 ends,
             })
             .await;
-        response.error_code = match applied {
+        let code = match applied {
             Ok(result) => result.error_code,
             Err(_) => NOT_COORDINATOR,
         };
+        // A retry after the commit still has to close the WAL span. The
+        // client has not been told the transaction ended, so it has not
+        // started the next one.
+        let already = code == INVALID_TXN
+            && self.txn_record(&id).and_then(|raw| {
+                camus_metadata::txn_finished(&raw, request.producer_id.0, request.producer_epoch)
+                    .ok()
+                    .flatten()
+            }) == Some(request.committed);
+        if code == 0 || already {
+            response.error_code = match self.close_producer_spans(&id, request.producer_id.0).await
+            {
+                Ok(()) => 0,
+                Err(close) => close,
+            };
+        } else {
+            response.error_code = code;
+        }
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
