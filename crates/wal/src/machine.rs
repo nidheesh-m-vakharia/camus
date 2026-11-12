@@ -43,6 +43,11 @@ const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const NEXT: TableDefinition<&str, i64> = TableDefinition::new("next");
 /// Producer sequences per `{partition key}/{producer id}`, postcard.
 const PRODUCERS: TableDefinition<&str, &[u8]> = TableDefinition::new("producers");
+/// Open transaction spans, same key as a producer sequence, postcard.
+const TXN_SPANS: TableDefinition<&str, &[u8]> = TableDefinition::new("txn_spans");
+/// Most open transaction spans one shard keeps. A new producer past this
+/// cap is refused instead of growing the map (ADR 0019).
+const SPAN_CAP: usize = 65_536;
 /// Unsealed batch headers by storage key, postcard.
 const HEADS: TableDefinition<u64, &[u8]> = TableDefinition::new("heads");
 /// Bytes of unsealed batches whose log entry a snapshot may purge.
@@ -184,6 +189,7 @@ struct Dirty {
     removed: BTreeSet<u64>,
     next: BTreeSet<String>,
     producers: BTreeSet<String>,
+    spans: BTreeSet<String>,
     /// `last_applied` or the membership moved.
     meta: bool,
 }
@@ -195,6 +201,7 @@ impl Dirty {
             && self.removed.is_empty()
             && self.next.is_empty()
             && self.producers.is_empty()
+            && self.spans.is_empty()
     }
 
     fn add(&mut self, head: Head) {
@@ -222,8 +229,17 @@ impl Dirty {
         }
         self.next.extend(older.next);
         self.producers.extend(older.producers);
+        self.spans.extend(older.spans);
         self.meta |= older.meta;
     }
+}
+
+/// One producer's open transaction on a partition. The start stays at the
+/// first batch; later batches move only the end.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OpenSpan {
+    start: i64,
+    end: i64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -239,6 +255,11 @@ struct State {
     /// In the `PRODUCERS` table; read here only from state written before it.
     #[serde(default, skip_serializing)]
     producers: BTreeMap<String, camus_protocol::idempotence::ProducerSeq>,
+    /// Open transaction spans, keyed like `producers`. In the `TXN_SPANS`
+    /// table. One entry per producer per partition, dropped when the
+    /// transaction ends, and never more than [`SPAN_CAP`].
+    #[serde(default, skip_serializing)]
+    txn_spans: BTreeMap<String, OpenSpan>,
     #[serde(skip)]
     heads: Heads,
     #[serde(skip)]
@@ -255,6 +276,9 @@ struct SnapshotData {
     /// Producer sequences. Absent from snapshots written before idempotence.
     #[serde(default)]
     producers: BTreeMap<String, camus_protocol::idempotence::ProducerSeq>,
+    /// Open transaction spans. Absent from snapshots written before ADR 0019.
+    #[serde(default)]
+    txn_spans: BTreeMap<String, OpenSpan>,
 }
 
 /// Snapshot body from before producer sequences were stored.
@@ -275,6 +299,7 @@ fn decode_snapshot(data: &[u8]) -> Result<SnapshotData, &'static str> {
         heads: old.heads,
         bytes: old.bytes,
         producers: BTreeMap::new(),
+        txn_spans: BTreeMap::new(),
     })
 }
 
@@ -323,6 +348,18 @@ impl Machine {
         })
     }
 
+    /// Inclusive start and exclusive end of this producer's open span.
+    pub fn txn_span(
+        &self,
+        topic_id: &[u8; 16],
+        partition: i32,
+        producer_id: i64,
+    ) -> Option<(i64, i64)> {
+        let key = span_key(topic_id, partition, producer_id);
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.txn_spans.get(&key).map(|span| (span.start, span.end))
+    }
+
     pub fn end_offset(&self, topic_id: &[u8; 16], partition: i32) -> i64 {
         let state = self.state.lock().expect("wal state");
         state
@@ -336,7 +373,7 @@ impl Machine {
     /// the last flush. Blocks on disk: call it off the async runtime.
     pub fn flush(&self) -> Result<(), StorageError<NodeId>> {
         let _gate = self.flushing.lock().expect("wal flush");
-        let (meta, next, producers, dirty) = {
+        let (meta, next, producers, spans, dirty) = {
             let mut state = self.state.lock().expect("wal state");
             if state.dirty.is_empty() {
                 return Ok(());
@@ -364,9 +401,24 @@ impl Machine {
                     Ok((key.clone(), raw))
                 })
                 .collect::<Result<Vec<_>, StorageError<NodeId>>>()?;
-            (meta, next, producers, dirty)
+            let spans = dirty
+                .spans
+                .iter()
+                .map(|key| {
+                    let raw = state
+                        .txn_spans
+                        .get(key)
+                        .map(|span| {
+                            camus_raft::codec::encode(span)
+                                .map_err(|err| io(ErrorSubject::StateMachine, &err))
+                        })
+                        .transpose()?;
+                    Ok((key.clone(), raw))
+                })
+                .collect::<Result<Vec<_>, StorageError<NodeId>>>()?;
+            (meta, next, producers, spans, dirty)
         };
-        let written = write_changes(&self.db, &meta, &next, &producers, &dirty);
+        let written = write_changes(&self.db, &meta, &next, &producers, &spans, &dirty);
         if written.is_err() {
             self.state.lock().expect("wal state").dirty.restore(dirty);
         }
@@ -578,6 +630,45 @@ fn part_key(topic_id: &[u8; 16], partition: i32) -> String {
     format!("{hex}/{partition}")
 }
 
+fn span_key(topic_id: &[u8; 16], partition: i32, producer_id: i64) -> String {
+    format!("{}/{}", part_key(topic_id, partition), producer_id)
+}
+
+/// `true` when recording these transactional batches stays within [`SPAN_CAP`].
+fn spans_fit(
+    state: &State,
+    partition: &str,
+    identities: &[camus_protocol::batch::ProducerBatch],
+    transactional: &[bool],
+) -> bool {
+    let mut extra = 0usize;
+    for (identity, flag) in identities.iter().zip(transactional) {
+        if !*flag || identity.producer_id < 0 {
+            continue;
+        }
+        let key = format!("{partition}/{}", identity.producer_id);
+        if state.txn_spans.contains_key(&key) {
+            continue;
+        }
+        extra += 1;
+    }
+    state.txn_spans.len().saturating_add(extra) <= SPAN_CAP
+}
+
+fn remember_span(state: &mut State, key: String, start: i64, end: i64) {
+    state.dirty.spans.insert(key.clone());
+    match state.txn_spans.get_mut(&key) {
+        Some(span) => {
+            if end > span.end {
+                span.end = end;
+            }
+        }
+        None => {
+            state.txn_spans.insert(key, OpenSpan { start, end });
+        }
+    }
+}
+
 fn load_state(db: &Database) -> Result<State, StorageError<NodeId>> {
     let err = |err: &dyn std::error::Error| io(ErrorSubject::StateMachine, err);
     let txn = db.begin_read().map_err(|e| err(&e))?;
@@ -619,6 +710,20 @@ fn load_state(db: &Database) -> Result<State, StorageError<NodeId>> {
         }
         Err(e) => return Err(err(&e)),
     }
+    match txn.open_table(TXN_SPANS) {
+        Ok(table) => {
+            state.txn_spans.clear();
+            for row in table.iter().map_err(|e| err(&e))? {
+                let (key, raw) = row.map_err(|e| err(&e))?;
+                let span = camus_raft::codec::decode(raw.value()).map_err(|e| err(&e))?;
+                state.txn_spans.insert(key.value().to_string(), span);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            state.dirty.spans = state.txn_spans.keys().cloned().collect();
+        }
+        Err(e) => return Err(err(&e)),
+    }
     let heads = match txn.open_table(HEADS) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(state),
@@ -654,6 +759,7 @@ fn write_changes(
     meta: &str,
     next: &[(String, Option<i64>)],
     producers: &[(String, Option<Vec<u8>>)],
+    spans: &[(String, Option<Vec<u8>>)],
     dirty: &Dirty,
 ) -> Result<(), StorageError<NodeId>> {
     let err = |err: &dyn std::error::Error| io(ErrorSubject::StateMachine, err);
@@ -674,6 +780,14 @@ fn write_changes(
             match raw {
                 Some(raw) => sequences.insert(key.as_str(), raw.as_slice()).map(|_| ()),
                 None => sequences.remove(key.as_str()).map(|_| ()),
+            }
+            .map_err(|e| err(&e))?;
+        }
+        let mut open = txn.open_table(TXN_SPANS).map_err(|e| err(&e))?;
+        for (key, raw) in spans {
+            match raw {
+                Some(raw) => open.insert(key.as_str(), raw.as_slice()).map(|_| ()),
+                None => open.remove(key.as_str()).map(|_| ()),
             }
             .map_err(|e| err(&e))?;
         }
@@ -778,20 +892,31 @@ fn apply_at(
             }
             // Validate in place. Sealing rewrites the base offset and epoch,
             // which the read path does when it builds the bytes a consumer sees.
-            if camus_protocol::batch::inspect(&batch.raw, MAX_BATCH).is_err() {
-                return Response {
-                    base_offset: -1,
-                    error_code: 2,
-                    each: Vec::new(),
-                };
-            }
+            let infos = match camus_protocol::batch::inspect(&batch.raw, MAX_BATCH) {
+                Ok(infos) => infos,
+                Err(_) => {
+                    return Response {
+                        base_offset: -1,
+                        error_code: 2,
+                        each: Vec::new(),
+                    };
+                }
+            };
+            let transactional: Vec<bool> = infos.iter().map(|info| info.transactional).collect();
             if let camus_protocol::idempotence::Class::Fresh = class {
+                if !spans_fit(state, &key, &identities, &transactional) {
+                    return Response {
+                        base_offset: -1,
+                        error_code: 48,
+                        each: Vec::new(),
+                    };
+                }
                 let mut at = start;
-                for identity in &identities {
+                for (identity, flag) in identities.iter().zip(&transactional) {
                     if identity.producer_id >= 0 {
                         let seq_key = format!("{key}/{}", identity.producer_id);
                         state.dirty.producers.insert(seq_key.clone());
-                        let seq = state.producers.entry(seq_key).or_default();
+                        let seq = state.producers.entry(seq_key.clone()).or_default();
                         camus_protocol::idempotence::record(
                             seq,
                             identity.producer_epoch,
@@ -799,6 +924,10 @@ fn apply_at(
                             identity.records,
                             at,
                         );
+                        if *flag {
+                            let end = at + i64::from(identity.records);
+                            remember_span(state, seq_key, at, end);
+                        }
                     }
                     at += i64::from(identity.records);
                 }
@@ -844,6 +973,21 @@ fn apply_at(
                 each: Vec::new(),
             }
         }
+        Command::CloseTxn {
+            topic_id,
+            partition,
+            producer_id,
+        } => {
+            let key = span_key(&topic_id, partition, producer_id);
+            if state.txn_spans.remove(&key).is_some() {
+                state.dirty.spans.insert(key);
+            }
+            Response {
+                base_offset: -1,
+                error_code: 0,
+                each: Vec::new(),
+            }
+        }
     }
 }
 
@@ -868,6 +1012,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<Machine> {
                     heads: state.heads.in_commit_order().cloned().collect(),
                     bytes,
                     producers: state.producers.clone(),
+                    txn_spans: state.txn_spans.clone(),
                 },
                 state.last_applied,
                 state.membership.clone().unwrap_or_default(),
@@ -991,6 +1136,7 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
             membership: Some(meta.last_membership.clone()),
             next: parsed.next,
             producers: parsed.producers,
+            txn_spans: parsed.txn_spans,
             heads: parsed.heads.into_iter().collect(),
             dirty: Dirty::default(),
         };
@@ -1015,6 +1161,13 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
                     let raw = camus_raft::codec::encode(seq).map_err(|e| err(&e))?;
                     sequences
                         .insert(key.as_str(), raw.as_slice())
+                        .map_err(|e| err(&e))?;
+                }
+                let mut open = txn.open_table(TXN_SPANS).map_err(|e| err(&e))?;
+                open.retain(|_, _| false).map_err(|e| err(&e))?;
+                for (key, span) in &state.txn_spans {
+                    let raw = camus_raft::codec::encode(span).map_err(|e| err(&e))?;
+                    open.insert(key.as_str(), raw.as_slice())
                         .map_err(|e| err(&e))?;
                 }
                 let mut heads = txn.open_table(HEADS).map_err(|e| err(&e))?;
@@ -1330,6 +1483,101 @@ mod tests {
             return Err(std::io::Error::other("the fetch included the other batch"));
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_transaction_span_keeps_its_start_until_it_is_closed() -> Result<(), String> {
+        let mut state = State::default();
+        let topic_id = [7u8; 16];
+        let first = apply_one(&mut state, txn_append(true, 9, 0, 1)?, 1, &[0]);
+        if first.error_code != 0 || first.base_offset != 0 {
+            return Err(format!("first {first:?}"));
+        }
+        let key = span_key(&topic_id, 0, 9);
+        let Some(span) = state.txn_spans.get(&key) else {
+            return Err("missing span".into());
+        };
+        if span.start != 0 || span.end != 1 {
+            return Err(format!("opened {span:?}"));
+        }
+        let second = apply_one(&mut state, txn_append(true, 9, 1, 2)?, 2, &[0]);
+        if second.error_code != 0 {
+            return Err(format!("second {second:?}"));
+        }
+        let Some(span) = state.txn_spans.get(&key) else {
+            return Err("span dropped".into());
+        };
+        if span.start != 0 || span.end != 3 {
+            return Err(format!("extended {span:?}"));
+        }
+        let plain = apply_one(&mut state, txn_append(false, 4, 0, 1)?, 3, &[0]);
+        if plain.error_code != 0 || state.txn_spans.contains_key(&span_key(&topic_id, 0, 4)) {
+            return Err("a normal batch opened a span".into());
+        }
+        apply_one(
+            &mut state,
+            Command::CloseTxn {
+                topic_id,
+                partition: 0,
+                producer_id: 9,
+            },
+            4,
+            &[],
+        );
+        if state.txn_spans.contains_key(&key) {
+            return Err("close left the span".into());
+        }
+        Ok(())
+    }
+
+    fn txn_append(
+        transactional: bool,
+        producer_id: i64,
+        sequence: i32,
+        records: i32,
+    ) -> Result<Command, String> {
+        use camus_protocol::records::{
+            Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+            NO_PARTITION_LEADER_EPOCH,
+        };
+        let records_out = (0..records)
+            .map(|index| Record {
+                transactional,
+                control: false,
+                delete_horizon: false,
+                partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                producer_id,
+                producer_epoch: 0,
+                sequence: sequence + index,
+                timestamp_type: TimestampType::Creation,
+                offset: 0,
+                timestamp: 9,
+                key: None,
+                value: Some(bytes::Bytes::from_static(b"v")),
+                headers: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let mut buf = bytes::BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            &records_out,
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(Command::Append(crate::Append {
+            topic: "orders".into(),
+            partition: 0,
+            topic_id: [7; 16],
+            epoch: 1,
+            raw: buf.freeze(),
+            records,
+            base_timestamp: 0,
+            max_timestamp: 0,
+            floor: 0,
+        }))
     }
 
     fn one_batch(value: &str) -> std::io::Result<bytes::Bytes> {

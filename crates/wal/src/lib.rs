@@ -166,6 +166,17 @@ pub enum Command {
         /// Identity of each dropped batch.
         drops: Vec<SealDrop>,
     },
+    /// Forget the open transaction span for one producer on one partition.
+    /// Missing spans are not an error. `EndTxn` sends this after metadata
+    /// has stored the span (ADR 0019).
+    CloseTxn {
+        /// Topic id.
+        topic_id: [u8; 16],
+        /// Partition.
+        partition: i32,
+        /// Producer whose span ends.
+        producer_id: i64,
+    },
 }
 
 /// One produce batch, before offsets are assigned.
@@ -862,6 +873,35 @@ impl Shard {
         // One here cost an fsync per upload pass. `purge_to` keeps every
         // entry an unsealed batch is still in.
         purge_to(&self.raft, &self.machine, index).await;
+        Ok(())
+    }
+
+    /// Open transaction span for one producer on one partition: inclusive
+    /// start and exclusive end. `None` when this producer has no open span.
+    pub fn txn_span(
+        &self,
+        topic_id: &[u8; 16],
+        partition: i32,
+        producer_id: i64,
+    ) -> Option<(i64, i64)> {
+        self.machine.txn_span(topic_id, partition, producer_id)
+    }
+
+    /// Forget that producer's open span. A second close is a no-op.
+    pub async fn close_txn(
+        &self,
+        topic_id: [u8; 16],
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<(), WriteError> {
+        self.raft
+            .client_write(Command::CloseTxn {
+                topic_id,
+                partition,
+                producer_id,
+            })
+            .await
+            .map_err(|err| self.classify(err))?;
         Ok(())
     }
 
