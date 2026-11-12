@@ -86,7 +86,7 @@ CAMUS_MINIO=1 cargo test -p camus-storage --test minio</code></pre>
       <h2>Three processes</h2>
       <p><code>cargo test -p camus-broker --test cluster</code> starts three broker processes, commits a metadata write, kills the leader, and checks that a new write commits. It is the same property as the <a href="brokers.html">brokers profile</a>, without Docker.</p>
       <h2>What CI publishes</h2>
-      <p>GitHub Actions runs <code>cargo test --workspace --locked</code> on pull requests and on <code>main</code>. A green <code>main</code> publishes <code>ghcr.io/nidheesh-m-vakharia/camus</code>, tagged <code>latest</code> and the commit. The package stays private until that is changed in the GitHub package settings. The workflow does not start MinIO, and it does not run the formatter.</p>
+      <p>GitHub Actions runs <code>cargo fmt --all --check</code> and <code>cargo test --workspace --locked</code> on pull requests and on <code>main</code>. That job does not start MinIO. A separate job starts MinIO and runs the broker tests with <code>CAMUS_MINIO=1</code>. A green <code>main</code> publishes <code>ghcr.io/nidheesh-m-vakharia/camus</code>, tagged <code>latest</code> and the commit. The package stays private until that is changed in the GitHub package settings.</p>
 
       <footer>
         <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>

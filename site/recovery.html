@@ -86,7 +86,14 @@
   --broker 127.0.0.1:18080 \
   --i-accept-data-loss</code></pre>
       <p>The broker flag is the HTTP admin address of a surviving voter, not the Kafka port. The command posts <code>/admin/truncate-to-sealed</code>. Without <code>--i-accept-data-loss</code> it will not do the work. There is no quieter flag that keeps the unsealed acknowledgements, because those bytes are what the lost majority was holding.</p>
-      <p>After it returns, producers can append again from the sealed end. Consumers should not expect the offsets that were acknowledged and then dropped. Those records are not in the bucket and not on the shard.</p>
+      <p>After it returns, producers can append again from the sealed end. Offsets that were acknowledged and then dropped are gone. Those records are neither in the bucket nor on the shard.</p>
+      <p>The survivor is then a one-voter shard. The other voters still hold the old membership. On the new leader, <code>POST /admin/add-wal-voter</code> names a broker id and its HTTP address. That broker moves its old shard directory aside, receives the new log, and joins as a voter. Sealed batches stay in the bucket; the new voters read them from there.</p>
+      <h2>Every disk is gone</h2>
+      <p>When the bucket is still there and the broker disks are not, <code>camus admin restore-cluster</code> loads the newest metadata snapshot and rebuilds sealed extents from object footers. The flag is the same <code>--i-accept-data-loss</code>. The broker flag is the HTTP address of a fresh metadata leader, a new process, not a member of the cluster whose disks are gone.</p>
+      <pre><code>camus admin restore-cluster \
+  --broker 127.0.0.1:18080 \
+  --i-accept-data-loss</code></pre>
+      <p>Unsealed write-ahead log entries are gone. Metadata newer than the snapshot, including group offsets, can move back by one snapshot interval. The default interval is 30 seconds. ADR 0008 is the bound.</p>
 
       <footer>
         <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
