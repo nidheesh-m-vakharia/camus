@@ -1456,6 +1456,9 @@ async fn vote_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::resp
         Ok(req) => req,
         Err(reply) => return reply,
     };
+    if !accepts_from(&shard, req.vote.leader_id().voted_for()) {
+        return outsider();
+    }
     rpc_reply(&shard.raft.vote(req).await)
 }
 
@@ -1468,6 +1471,9 @@ async fn append_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::re
         Ok(req) => req,
         Err(reply) => return reply,
     };
+    if !accepts_from(&shard, req.vote.leader_id().voted_for()) {
+        return outsider();
+    }
     if raft_http_blocked() && req.entries.is_empty() {
         return axum::response::IntoResponse::into_response((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1483,6 +1489,31 @@ async fn append_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::re
     rpc_reply(&result)
 }
 
+/// A shard that already has members ignores Raft RPC from anyone else.
+/// `truncate-to-sealed` leaves the removed brokers running the old shard at
+/// a higher term. Feeding that into the new leader steps it down and can
+/// panic the Raft core, which `add-wal-voter` then reports as 502.
+/// A shard with no members yet is waiting to be added and still accepts them.
+fn accepts_from(shard: &Shard, from: Option<NodeId>) -> bool {
+    let metrics_ref = shard.raft.metrics();
+    let metrics = metrics_ref.borrow();
+    let membership = metrics.membership_config.membership();
+    let no_voters = membership.voter_ids().next().is_none();
+    let no_learners = membership.learner_ids().next().is_none();
+    let open = no_voters && no_learners;
+    if open {
+        return true;
+    }
+    from.is_some_and(|id| membership.get_node(&id).is_some())
+}
+
+fn outsider() -> axum::response::Response {
+    axum::response::IntoResponse::into_response((
+        StatusCode::CONFLICT,
+        "not a member of this shard",
+    ))
+}
+
 async fn snapshot_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
     let shard = match open_shard(wal, id) {
         Ok(shard) => shard,
@@ -1492,6 +1523,9 @@ async fn snapshot_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::
         Ok(req) => req,
         Err(reply) => return reply,
     };
+    if !accepts_from(&shard, req.vote.leader_id().voted_for()) {
+        return outsider();
+    }
     rpc_reply(&shard.raft.install_snapshot(req).await)
 }
 
