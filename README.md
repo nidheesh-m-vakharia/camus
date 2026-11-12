@@ -206,7 +206,7 @@ lists each default next to Kafka's.
 | `CAMUS_CONSUMER_SESSION_MS`, `CAMUS_CONSUMER_HEARTBEAT_MS` | 45000, 5000 | KIP-848 session and heartbeat |
 | `CAMUS_AUTO_LEADER_REBALANCE` | `true` | `auto.leader.rebalance.enable` |
 | `CAMUS_LEADER_IMBALANCE_CHECK_MS` | 300000 | `leader.imbalance.check.interval.seconds` |
-| `CAMUS_QUIC` | off | Raft votes, empty heartbeats, and shard announcements. `on` sends them over QUIC |
+| `CAMUS_QUIC` | on | Raft votes, empty heartbeats, and shard announcements. `off` keeps them on HTTP |
 | `CAMUS_QUIC_PORT` | the HTTP port | UDP port for that traffic; set the same value on every broker |
 | `CAMUS_SHARD_ANNOUNCE_MS` | 200 | How often a shard leader writes its view to metadata |
 
