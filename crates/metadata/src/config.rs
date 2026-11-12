@@ -73,6 +73,32 @@ impl Spec {
             Kind::Only(_) => 2,
         }
     }
+
+    /// Why an accepted config does not change behavior, and what does.
+    /// `DescribeConfigs` returns this when the client asks for documentation.
+    pub fn note(&self) -> Option<&'static str> {
+        if self.effect != Effect::Accepted {
+            return None;
+        }
+        Some(match self.name {
+            "min.insync.replicas" => "Stored only. Every acknowledgement waits for a WAL majority, which supersedes this setting. In r2 mode it waits for the object put and the metadata commit.",
+            "flush.messages" | "flush.ms" => "Stored only. A WAL acknowledgement fsyncs the group commit. CAMUS_FLUSH_MS is the upload interval.",
+            "segment.bytes" | "segment.ms" | "segment.jitter.ms" | "segment.index.bytes" => "Stored only. There are no Kafka log segments. The write-ahead log and sealed objects are sized by the broker.",
+            "index.interval.bytes" => "Stored only. A fetch uses extent metadata, not a byte index.",
+            "file.delete.delay.ms" => "Stored only. Unreferenced objects are deleted by the orphan sweep after CAMUS_SWEEP_MIN_AGE_MS.",
+            "preallocate" => "Stored only. Raft segment files grow as they are written.",
+            "local.retention.ms" | "local.retention.bytes" => "Stored only. The unsealed tail is the write-ahead log. Sealed bytes follow retention.ms and retention.bytes.",
+            "max.compaction.lag.ms" => "Stored only. Compaction runs on CAMUS_COMPACT_MS and honors min.compaction.lag.ms.",
+            "min.cleanable.dirty.ratio" => "Stored only. Compaction is the CAMUS_COMPACT_MS timer, not a dirty ratio.",
+            "message.timestamp.before.max.ms" | "message.timestamp.after.max.ms" => "Stored only. Record timestamps are not checked against a window.",
+            "message.timestamp.type" => "Only CreateTime is accepted. The record timestamp is the one in the batch.",
+            "follower.replication.throttled.replicas" | "leader.replication.throttled.replicas" => "Stored only. Raft replicates each shard log with no per-replica throttle.",
+            "compression.type" => "Only producer is accepted. The broker leaves the codec the producer wrote.",
+            "remote.storage.enable" => "Only false is accepted. Sealed batches are objects either way.",
+            "unclean.leader.election.enable" => "Only false is accepted. A shard that has lost its majority stays offline until truncate-to-sealed.",
+            _ => return None,
+        })
+    }
 }
 
 const fn applied(name: &'static str, default: &'static str, kind: Kind) -> Spec {
@@ -335,8 +361,33 @@ pub fn edit(
             Some(check(spec, &joined)?)
         }
     };
+    if spec.effect == Effect::Accepted {
+        if let Some(value) = next.as_deref() {
+            if value != spec.default {
+                warn_ignored(spec);
+            }
+        }
+    }
     topic.set_config(name, next);
     Ok(())
+}
+
+/// One warning per config name, for the life of the process.
+fn warn_ignored(spec: &Spec) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.contains(&spec.name) {
+        return;
+    }
+    seen.push(spec.name);
+    tracing::warn!(
+        config = spec.name,
+        note = spec.note().unwrap_or(""),
+        "topic config is stored and has no effect"
+    );
 }
 
 fn join_list(current: &str, extra: &str, append: bool) -> String {
@@ -443,6 +494,18 @@ mod tests {
                 edit(&mut topic, name, Op::Set, Some(value), false).is_err(),
                 "{name}={value}"
             );
+        }
+    }
+
+    #[test]
+    fn every_accepted_config_names_the_setting_that_applies() {
+        for spec in SPECS {
+            let note = spec.note();
+            if spec.effect == Effect::Accepted {
+                assert!(note.is_some(), "{}", spec.name);
+            } else {
+                assert!(note.is_none(), "{}", spec.name);
+            }
         }
     }
 
