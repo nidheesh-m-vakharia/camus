@@ -4,7 +4,9 @@
 //! send `acks=all` batches of 16 × 1 KiB records to `P` partitions for a
 //! fixed time. Reports acked MB/s, ack latency, and from the shard leader's
 //! log counters: fsyncs per ack (does group commit happen?) and log bytes
-//! per payload byte (how much the entry encoding adds).
+//! per payload byte. A non-compacted batch is written once, into the buffer
+//! the durable write submits, so that ratio is framing and the entry around
+//! the batch, not a second copy of the batch.
 //!
 //! ```text
 //! CAMUS_MINIO=1 cargo test --release -p camus-broker --test throughput -- --ignored --nocapture

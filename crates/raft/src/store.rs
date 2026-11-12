@@ -60,15 +60,19 @@ where
     log: Arc<SegmentLog>,
     meta: Arc<Mutex<Meta<C>>>,
     stats: Arc<AppendStats>,
-    encode: fn(&C::Entry, &mut Vec<u8>) -> std::io::Result<()>,
+    encode_len: fn(&C::Entry) -> std::io::Result<usize>,
+    encode: fn(&C::Entry, &mut dyn std::io::Write) -> std::io::Result<()>,
     decode: fn(&[u8]) -> std::io::Result<C::Entry>,
 }
 
-fn postcard_encode<T: Serialize>(entry: &T, out: &mut Vec<u8>) -> std::io::Result<()> {
-    let bytes = crate::codec::encode(entry)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
-    out.extend_from_slice(&bytes);
-    Ok(())
+fn postcard_len<T: Serialize>(entry: &T) -> std::io::Result<usize> {
+    crate::codec::encoded_len(entry)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
+}
+
+fn postcard_encode<T: Serialize>(entry: &T, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    crate::codec::encode_into(entry, out)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
 }
 
 fn postcard_decode<T: DeserializeOwned>(bytes: &[u8]) -> std::io::Result<T> {
@@ -113,6 +117,7 @@ where
             log: Arc::new(log),
             meta: Arc::new(Mutex::new(Meta { dir, disk })),
             stats: Arc::new(AppendStats::default()),
+            encode_len: postcard_len::<C::Entry>,
             encode: postcard_encode::<C::Entry>,
             decode: postcard_decode::<C::Entry>,
         })
@@ -120,11 +125,15 @@ where
 
     /// Use these functions for records written from now on. A decode that
     /// does not recognize a record can still read the previous encoding.
+    /// `encode` must write exactly `encode_len` bytes, straight into the
+    /// buffer the durable write submits.
     pub fn set_codec(
         &mut self,
-        encode: fn(&C::Entry, &mut Vec<u8>) -> std::io::Result<()>,
+        encode_len: fn(&C::Entry) -> std::io::Result<usize>,
+        encode: fn(&C::Entry, &mut dyn std::io::Write) -> std::io::Result<()>,
         decode: fn(&[u8]) -> std::io::Result<C::Entry>,
     ) {
+        self.encode_len = encode_len;
         self.encode = encode;
         self.decode = decode;
     }
@@ -280,19 +289,22 @@ where
         I: IntoIterator<Item = C::Entry> + Send,
         I::IntoIter: Send,
     {
-        let mut payloads = Vec::new();
+        // Size every entry first so the log can reserve the durable buffer
+        // and write each batch into it once.
+        let mut prepared = Vec::new();
+        let mut total = 0u64;
         for entry in entries {
             let index = entry.get_log_id().index;
-            let mut bytes = Vec::new();
-            (self.encode)(&entry, &mut bytes)
+            let size = (self.encode_len)(&entry)
                 .map_err(|err| io_err::<C>(Some(entry.get_log_id().clone()), &err))?;
-            payloads.push((index, Arc::new(bytes)));
+            total += size as u64;
+            prepared.push((index, size, entry));
         }
-        let entries = payloads.len() as u64;
-        let bytes: u64 = payloads.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        let entries = prepared.len() as u64;
         let log = self.log.clone();
+        let encode = self.encode;
         tokio::task::spawn_blocking(move || {
-            log.append_shared(payloads)
+            log.append_encoded(&prepared, |entry, writer| encode(entry, writer))
                 .map_err(|err| io_err::<C>(None, &err))
         })
         .await
@@ -300,7 +312,7 @@ where
         use std::sync::atomic::Ordering::Relaxed;
         self.stats.fsyncs.fetch_add(1, Relaxed);
         self.stats.entries.fetch_add(entries, Relaxed);
-        self.stats.bytes.fetch_add(bytes, Relaxed);
+        self.stats.bytes.fetch_add(total, Relaxed);
         callback.log_io_completed(Ok(()));
         Ok(())
     }

@@ -170,10 +170,20 @@ fn fresh_voters_restore_a_quorum() -> std::io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let truncated = post_json(
-        &format!("http://{survivor_http}/admin/truncate-to-sealed"),
-        &serde_json::json!({ "i_accept_data_loss": true }),
-    )?;
+    let until = Instant::now() + Duration::from_secs(10);
+    let truncated = loop {
+        let response = post_json(
+            &format!("http://{survivor_http}/admin/truncate-to-sealed"),
+            &serde_json::json!({ "i_accept_data_loss": true }),
+        )?;
+        if response.status().is_success()
+            || response.status().as_u16() != 503
+            || Instant::now() > until
+        {
+            break response;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     if !truncated.status().is_success() {
         let status = truncated.status();
         let body = truncated

@@ -16,7 +16,7 @@ use camus_metadata::{
 };
 use camus_protocol::batch::{self, BatchError};
 use camus_protocol::error::ResponseError;
-use camus_protocol::frame::{self, encode_response};
+use camus_protocol::frame::{self, encode_response, encode_response_chunks};
 use camus_protocol::idempotence::{self, Class, ProducerSeq};
 use camus_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
 use camus_protocol::messages::create_topics_response::{
@@ -132,6 +132,9 @@ struct Item {
 
 enum Reply {
     Frame(Bytes),
+    /// Header and record bytes kept as separate chunks so a fetch does not
+    /// copy the records into the frame.
+    Chunks(Vec<Bytes>),
     Silent,
     Close,
 }
@@ -193,6 +196,18 @@ impl Socket {
         match self {
             Self::Plain(socket) => socket.write_all(buf).await,
             Self::Tls(socket) => socket.write_all(buf).await,
+        }
+    }
+
+    async fn write_chunks(&mut self, chunks: &[Bytes]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(socket) => write_vectored(socket, chunks).await,
+            Self::Tls(socket) => {
+                for chunk in chunks {
+                    socket.write_all(chunk).await?;
+                }
+                Ok(())
+            }
         }
     }
     /// `User:<subject>` from the client's TLS certificate, formatted as
@@ -1340,6 +1355,12 @@ impl Kafka {
         // Decoding, planning, and rebuilding run on the blocking pool, off
         // the threads that serve requests.
         let rebuilt = tokio::task::spawn_blocking(move || {
+            if std::env::var("CAMUS_FAILPOINT").ok().as_deref() == Some("slow-compact") {
+                if let Ok(path) = std::env::var("CAMUS_FAILPOINT_MARKER") {
+                    let _ = std::fs::write(path, b"held");
+                }
+                std::thread::sleep(Duration::from_secs(3600));
+            }
             let mut records = Vec::new();
             let mut base_timestamp = i64::MAX;
             let mut max_timestamp = i64::MIN;
@@ -1668,6 +1689,11 @@ impl Kafka {
                 match reply {
                     Reply::Frame(frame) => {
                         if socket.write_all(&frame).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Reply::Chunks(chunks) => {
+                        if socket.write_chunks(&chunks).await.is_err() {
                             return Ok(());
                         }
                     }
@@ -3585,7 +3611,19 @@ impl Kafka {
             }
         }
         drop(watching);
-        frame_of(header.request_api_version, header.correlation_id, &response)
+        let shared: Vec<Bytes> = response
+            .responses
+            .iter()
+            .flat_map(|topic| topic.partitions.iter())
+            .filter_map(|part| part.records.clone())
+            .filter(|records| !records.is_empty())
+            .collect();
+        frame_of_shared(
+            header.request_api_version,
+            header.correlation_id,
+            &response,
+            &shared,
+        )
     }
 
     async fn fetch_partition(
@@ -3637,7 +3675,7 @@ impl Kafka {
                 row.error_code = 1;
                 return row;
             }
-            let mut out = BytesMut::new();
+            let mut out = RecordOut::default();
             let mut stopped = false;
             let mut after = offset;
             'extents: loop {
@@ -3672,16 +3710,23 @@ impl Kafka {
                         return row;
                     };
                     let mut cursor = 0;
+                    let mut span: Option<usize> = None;
                     for batch in info {
                         let next = batch.last_offset + 1;
                         if isolation == 1 {
                             match txn_batch(batch.base_offset, batch.transactional, &state) {
                                 TxnView::Stop => {
+                                    if let Some(start) = span.take() {
+                                        out.push(bytes.slice(start..cursor));
+                                    }
                                     stable = stable.min(batch.base_offset);
                                     stopped = true;
                                     break 'extents;
                                 }
                                 TxnView::Skip => {
+                                    if let Some(start) = span.take() {
+                                        out.push(bytes.slice(start..cursor));
+                                    }
                                     cursor += batch.len;
                                     continue;
                                 }
@@ -3689,13 +3734,24 @@ impl Kafka {
                             }
                         }
                         if next > offset && batch.base_offset < stable {
-                            if !out.is_empty() && out.len() + batch.len > limit {
+                            let already = out.len() + span.map(|start| cursor - start).unwrap_or(0);
+                            if already > 0 && already + batch.len > limit {
+                                if let Some(start) = span.take() {
+                                    out.push(bytes.slice(start..cursor));
+                                }
                                 stopped = true;
                                 break 'extents;
                             }
-                            out.extend_from_slice(&bytes[cursor..cursor + batch.len]);
+                            if span.is_none() {
+                                span = Some(cursor);
+                            }
+                        } else if let Some(start) = span.take() {
+                            out.push(bytes.slice(start..cursor));
                         }
                         cursor += batch.len;
+                    }
+                    if let Some(start) = span.take() {
+                        out.push(bytes.slice(start..cursor));
                     }
                 }
                 if !full {
@@ -3735,7 +3791,7 @@ impl Kafka {
                     extra
                 };
                 if !extra.is_empty() && (out.is_empty() || out.len() + extra.len() <= limit) {
-                    out.extend_from_slice(&extra);
+                    out.push(Bytes::from(extra));
                 }
             }
             let moved = self
@@ -3745,8 +3801,8 @@ impl Kafka {
                 row.high_watermark = stable;
                 row.last_stable_offset = stable;
             }
-            if !out.is_empty() {
-                row.records = Some(out.freeze());
+            if let Some(records) = out.into_bytes() {
+                row.records = Some(records);
             }
             if !moved {
                 return row;
@@ -4297,6 +4353,74 @@ fn filter_txn(bytes: &[u8], state: &camus_metadata::Partition, stable: &mut i64)
         cursor += batch.len;
     }
     out
+}
+
+#[derive(Default)]
+struct RecordOut {
+    parts: Vec<Bytes>,
+    len: usize,
+}
+
+impl RecordOut {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push(&mut self, bytes: Bytes) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.len += bytes.len();
+        self.parts.push(bytes);
+    }
+
+    fn into_bytes(self) -> Option<Bytes> {
+        match self.parts.len() {
+            0 => None,
+            1 => self.parts.into_iter().next(),
+            _ => {
+                let mut buf = BytesMut::with_capacity(self.len);
+                for part in self.parts {
+                    buf.extend_from_slice(&part);
+                }
+                Some(buf.freeze())
+            }
+        }
+    }
+}
+
+async fn write_vectored(socket: &mut TcpStream, chunks: &[Bytes]) -> std::io::Result<()> {
+    use std::io::IoSlice;
+    let mut bufs: Vec<IoSlice<'_>> = chunks.iter().map(|chunk| IoSlice::new(chunk)).collect();
+    let mut rest = bufs.as_mut_slice();
+    while rest.iter().any(|slice| !slice.is_empty()) {
+        let n = tokio::io::AsyncWriteExt::write_vectored(socket, rest).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write closed",
+            ));
+        }
+        IoSlice::advance_slices(&mut rest, n);
+    }
+    Ok(())
+}
+
+fn frame_of_shared<M>(version: i16, correlation: i32, message: &M, shared: &[Bytes]) -> Reply
+where
+    M: camus_protocol::protocol::Encodable + camus_protocol::protocol::HeaderVersion,
+{
+    match encode_response_chunks(version, correlation, message, shared) {
+        Ok(chunks) => Reply::Chunks(chunks),
+        Err(err) => {
+            tracing::warn!(%err, version, "response encode failed");
+            Reply::Close
+        }
+    }
 }
 
 fn frame_of<M>(version: i16, correlation: i32, message: &M) -> Reply

@@ -107,7 +107,23 @@ fn fill_batches(entry: &mut openraft::Entry<TypeConfig>, raws: Vec<Vec<u8>>) {
     }
 }
 
-fn encode_log(entry: &openraft::Entry<TypeConfig>, out: &mut Vec<u8>) -> std::io::Result<()> {
+fn encode_log_len(entry: &openraft::Entry<TypeConfig>) -> std::io::Result<usize> {
+    let slices = batch_slices(entry);
+    let mut stripped = entry.clone();
+    clear_batches(&mut stripped);
+    let header = camus_raft::codec::encode(&stripped)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+    Ok(4 + 4
+        + slices.len() * 4
+        + 4
+        + header.len()
+        + slices.iter().map(|batch| batch.len()).sum::<usize>())
+}
+
+fn encode_log(
+    entry: &openraft::Entry<TypeConfig>,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     let slices = batch_slices(entry);
     let mut stripped = entry.clone();
     clear_batches(&mut stripped);
@@ -627,7 +643,7 @@ impl Shard {
         };
         let config = Arc::new(config.validate()?);
         let mut log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
-        log.set_codec(encode_log, decode_log);
+        log.set_codec(encode_log_len, encode_log, decode_log);
         let log_stats = log.stats();
         let machine = Arc::new(Machine::open(&dir.join("state.redb"), log.clone())?);
         let raft = Raft::new(node_id, config, network, log, machine.clone()).await?;
