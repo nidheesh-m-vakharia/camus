@@ -995,6 +995,26 @@ mod tests {
         panic!("no wal leader");
     }
 
+    /// Append on whichever shard leads, as a client would. Right after a
+    /// failover a new leader can step down before the write reaches it, so
+    /// `NotLeader` is retried until the deadline.
+    async fn append_on_leader(shards: &[&Shard], batch: Append) -> (NodeId, Response) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let leader = wait_leader(shards).await;
+            let Some(shard) = shards.iter().find(|shard| shard.node_id == leader) else {
+                panic!("leader {leader} is not a live shard");
+            };
+            match shard.append(batch.clone()).await {
+                Ok(response) => return (leader, response),
+                Err(WriteError::NotLeader) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(err) => panic!("append on {leader} failed: {err}"),
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_voters_keep_acked_batches_after_losing_the_leader() {
         let dir = tempfile::tempdir().unwrap();
@@ -1037,10 +1057,11 @@ mod tests {
         gone.raft.shutdown().await.unwrap();
         drop(gone);
         let live: Vec<&Shard> = shards.iter().flatten().collect();
-        let next = wait_leader(&live).await;
+        let (next, response) = append_on_leader(&live, append_of(b"d")).await;
         assert_ne!(next, leader);
-        let survivor = live.iter().find(|shard| shard.node_id == next).unwrap();
-        let response = survivor.append(append_of(b"d")).await.unwrap();
+        let Some(survivor) = live.iter().find(|shard| shard.node_id == next) else {
+            panic!("no survivor {next}");
+        };
         assert_eq!(response.base_offset, 3, "acked offsets 0..3 survive");
         assert_eq!(survivor.end_offset(&[1; 16], 0), 4);
         let tail = survivor.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
@@ -1134,18 +1155,19 @@ mod tests {
         gone.raft.shutdown().await.unwrap();
         drop(gone);
         let live: Vec<&Shard> = shards.iter().flatten().collect();
-        let next = wait_leader(&live).await;
+        let (next, after) = append_on_leader(&live, batch).await;
         assert_ne!(next, leader);
-        let survivor = live.iter().find(|shard| shard.node_id == next).unwrap();
-        let after = survivor.append(batch).await.unwrap();
         assert_eq!(after.error_code, 0);
         assert_eq!(
             after.base_offset, 0,
             "the new leader still has the sequence"
         );
-        assert_eq!(survivor.end_offset(&[1; 16], 0), 1);
-        let followed = survivor.append(idempotent(b"next", 7, 0, 1)).await.unwrap();
+        let (next, followed) = append_on_leader(&live, idempotent(b"next", 7, 0, 1)).await;
         assert_eq!(followed.base_offset, 1);
+        let Some(survivor) = live.iter().find(|shard| shard.node_id == next) else {
+            panic!("no survivor {next}");
+        };
+        assert_eq!(survivor.end_offset(&[1; 16], 0), 2);
         let tail = survivor.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
         assert_eq!(
             camus_protocol::batch::inspect(&tail, 1024 * 1024)
