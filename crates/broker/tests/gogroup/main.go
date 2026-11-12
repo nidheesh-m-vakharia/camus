@@ -103,6 +103,11 @@ func consumer(name, protocol string) *kgo.Client {
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.DisableAutoCommit(),
+		// Commit before a partition moves, so its next owner starts where
+		// this member stopped and the final commit covers every record read.
+		kgo.OnPartitionsRevoked(func(ctx context.Context, client *kgo.Client, _ map[string][]int32) {
+			must(client.CommitUncommittedOffsets(ctx))
+		}),
 	}
 	// The consumer protocol takes its session from the broker.
 	if protocol == "consumer" {
