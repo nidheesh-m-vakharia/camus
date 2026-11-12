@@ -2444,6 +2444,11 @@ impl Kafka {
                         out.read_only = row.spec.create_only;
                         out.config_source = row.source;
                         out.config_type = row.spec.config_type();
+                        if request.include_documentation {
+                            if let Some(note) = row.spec.note() {
+                                out.documentation = Some(StrBytes::from_static_str(note));
+                            }
+                        }
                         if request.include_synonyms {
                             let mut synonym = camus_protocol::messages::describe_configs_response::DescribeConfigsSynonym::default();
                             synonym.name = StrBytes::from_static_str(row.spec.name);

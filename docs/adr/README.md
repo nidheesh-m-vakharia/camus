@@ -21,5 +21,6 @@ amendments their files note. 0014 is proposed.
 | [0014](0014-multiple-wal-shards.md) | Multiple WAL shards and leadership balance (proposed) |
 | [0015](0015-transaction-spans.md) | Transaction spans without a metadata write per produce (proposed) |
 | [0016](0016-quic-control-plane.md) | QUIC for Raft control traffic (proposed) |
+| [0017](0017-ignored-topic-configs.md) | Accepted topic configs that do not change behavior |
 
 Read [../PLAN.md](../PLAN.md) for the summary.

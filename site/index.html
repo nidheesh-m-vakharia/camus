@@ -3,20 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Camus — a Kafka broker that stores the log in object storage</title>
-  <meta name="description" content="Camus is a Kafka-compatible broker in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
+  <title>Camus — compatible with Apache Kafka, log in object storage</title>
+  <meta name="description" content="Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
   <link rel="canonical" href="https://camus.nidheesh.dev/">
   <meta name="robots" content="index,follow">
   <meta property="og:site_name" content="Camus">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Camus — a Kafka broker that stores the log in object storage">
-  <meta property="og:description" content="Camus is a Kafka-compatible broker in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
+  <meta property="og:title" content="Camus — compatible with Apache Kafka, log in object storage">
+  <meta property="og:description" content="Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
   <meta property="og:url" content="https://camus.nidheesh.dev/">
   <meta property="og:image" content="https://camus.nidheesh.dev/banner.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:image" content="https://camus.nidheesh.dev/banner.png">
-  <meta name="twitter:title" content="Camus — a Kafka broker that stores the log in object storage">
-  <meta name="twitter:description" content="Camus is a Kafka-compatible broker in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
+  <meta name="twitter:title" content="Camus — compatible with Apache Kafka, log in object storage">
+  <meta name="twitter:description" content="Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
   <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -27,7 +27,7 @@
       "@context": "https://schema.org",
       "@type": "SoftwareSourceCode",
       "name": "Camus",
-      "description": "Camus is a Kafka-compatible broker in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.",
+      "description": "Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.",
       "url": "https://camus.nidheesh.dev/",
       "codeRepository": "https://github.com/nidheesh-m-vakharia/camus",
       "programmingLanguage": "Rust",
@@ -63,7 +63,7 @@
   <main id="content" class="home-main">
     <section class="home-hero entrance">
       <div class="home-hero-text">
-        <h1 style="--n: 0">A Kafka broker that keeps the log in object storage.</h1>
+        <h1 style="--n: 0">A broker compatible with Apache Kafka. The log stays in object storage.</h1>
         <p class="lede" style="--n: 1">Producers, consumers, and admin clients speak the Kafka wire protocol. The durable log lives in Cloudflare R2, or any S3-compatible bucket. A small set of Rust binaries replicates metadata, and a short write-ahead log, with Raft.</p>
         <p class="home-actions"><a class="button" href="run.html">Run one broker</a><a href="durability.html">How a produce is acknowledged</a></p>
       </div>
@@ -139,7 +139,7 @@
     <div class="site-footer-inner">
       <div class="site-footer-brand">
         <span class="mark-name">Camus</span>
-        <p>A Kafka broker in one Rust binary. The log lives in R2, or any S3-compatible bucket.</p>
+        <p>A broker compatible with Apache Kafka, in one Rust binary. The log lives in R2, or any S3-compatible bucket.</p>
       </div>
       <nav class="site-footer-links" aria-label="Footer">
         <div>
@@ -171,6 +171,7 @@
       </nav>
     </div>
     <p class="site-footer-legal">License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
+    <p class="site-footer-legal">Apache, Apache Kafka and Kafka are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Camus is not affiliated with or endorsed by the ASF.</p>
   </footer>
   <script src="site.js"></script>
 </body>

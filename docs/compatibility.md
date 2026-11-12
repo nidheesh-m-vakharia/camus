@@ -38,7 +38,7 @@ error rather than a partial imitation.
 | Compaction | Latest key, original offset, sealed extents only, on a timer rather than a dirty ratio. A tombstone's `delete.retention.ms` counts from its own timestamp | `LogCleaner` by dirty ratio; tombstone horizon counts from the first cleaning (KIP-534) | 0010 |
 | ACLs | A resource with no ACL is denied on an authenticated listener (SASL or mTLS) and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
 | Partition leadership | Leadership belongs to WAL shards, one per core by default (rounded so each broker leads the same number, capped at eight per broker), each with up to three voters; partitions are placed on shards round-robin at creation and never move. A shard's first voter is its preferred leader: the balancer and `ElectLeaders PREFERRED` move all of the shard's partitions together, by election, so the shard pauses briefly and its epoch rises | Leaders and preferred replicas per partition, reassignment | 0006, 0014 |
-| Topic configs | Segment, flush, and `min.insync.replicas` configs are accepted and stored with no effect; `LogAppendTime`, broker-side recompression, and tiered storage are rejected | All applied | — |
+| Topic configs | Segment, flush, and `min.insync.replicas` configs are accepted and stored. `DescribeConfigs` names the setting that applies. `LogAppendTime`, broker-side recompression, and tiered storage are rejected | All applied | 0017 |
 | Broker configs and quotas | Broker settings come from the environment at startup and are read-only in `DescribeConfigs`; client quotas are not implemented | Dynamic broker configs and quotas | — |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
@@ -206,8 +206,31 @@ source.
 | --- | --- |
 | `cleanup.policy`, `retention.ms`, `retention.bytes`, `max.message.bytes`, `delete.retention.ms`, `min.compaction.lag.ms` | Stored and applied |
 | `durability.mode` | Camus only. Set at creation, then read-only |
-| `segment.*`, `flush.*`, `min.insync.replicas`, `index.interval.bytes`, `file.delete.delay.ms`, `preallocate`, `local.retention.*`, `max.compaction.lag.ms`, `min.cleanable.dirty.ratio`, `message.timestamp.before.max.ms`, `message.timestamp.after.max.ms`, `*.replication.throttled.replicas` | Accepted and stored, with no effect |
 | `message.timestamp.type=LogAppendTime`, `compression.type` other than `producer`, `unclean.leader.election.enable=true`, `remote.storage.enable=true`, any other name | `INVALID_CONFIG` (40) with a message |
+
+The configs in the next table are accepted and stored so existing tools keep
+working, and then ignored. `DescribeConfigs` returns the stored value, and
+the documentation field (when the client asks for it) says what actually
+applies. The first time a topic sets one to something other than its default,
+the broker logs that config once. ADR 0017 records the decision.
+
+| Config | Why it is ignored | What applies |
+| --- | --- | --- |
+| `min.insync.replicas` | There is no ISR, and a produce is not acknowledged by one replica | A WAL majority. In `r2` mode, the object put and the metadata commit |
+| `flush.messages`, `flush.ms` | Acknowledgements are the group commit, not a message or time flush | The WAL fsync on commit. `CAMUS_FLUSH_MS` is the upload interval |
+| `segment.bytes`, `segment.ms`, `segment.jitter.ms`, `segment.index.bytes` | There are no Kafka log segments | The write-ahead log and sealed objects, sized by the broker |
+| `index.interval.bytes` | There is no byte index | Extent metadata |
+| `file.delete.delay.ms` | Object deletion is the orphan sweep | `CAMUS_SWEEP_MIN_AGE_MS` |
+| `preallocate` | Segment files are not preallocated | Raft segment files grow as they are written |
+| `local.retention.ms`, `local.retention.bytes` | There is no local retention tier | The unsealed tail is the write-ahead log. Sealed bytes follow `retention.ms` and `retention.bytes` |
+| `max.compaction.lag.ms` | Compaction has no maximum lag | `CAMUS_COMPACT_MS`, and `min.compaction.lag.ms` |
+| `min.cleanable.dirty.ratio` | Compaction is not triggered by a dirty ratio | `CAMUS_COMPACT_MS` |
+| `message.timestamp.before.max.ms`, `message.timestamp.after.max.ms` | Timestamps are not rejected against a window | The timestamp in the record batch |
+| `message.timestamp.type` | Only `CreateTime` is accepted | The timestamp in the record batch |
+| `leader.replication.throttled.replicas`, `follower.replication.throttled.replicas` | There is no per-replica throttle | Raft replication of the shard log |
+| `compression.type` | Only `producer` is accepted. The broker does not recompress | The codec the producer wrote |
+| `remote.storage.enable` | Only `false` is accepted | Sealed batches are objects either way |
+| `unclean.leader.election.enable` | Only `false` is accepted | A shard that has lost its majority stays offline until `truncate-to-sealed` |
 
 Legacy `AlterConfigs` replaces the topic's whole config set, so a config it
 does not name returns to its default, as in Kafka. `max.message.bytes`

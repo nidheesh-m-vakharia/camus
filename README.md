@@ -7,8 +7,9 @@
 [![Kafka 4.4.0](https://img.shields.io/badge/Kafka-4.4.0-171717)](docs/compatibility.md)
 [![Rust](https://img.shields.io/badge/rust-stable-934c1a)](rust-toolchain.toml)
 
-Camus is a Kafka broker in one Rust binary. Producers, consumers, and admin
-clients use the Kafka wire protocol. The log is stored in Cloudflare R2, or
+Camus is a broker compatible with Apache Kafka, in one Rust binary.
+Producers, consumers, and admin clients use the Apache Kafka wire protocol.
+The log is stored in Cloudflare R2, or
 any S3-compatible bucket. Brokers replicate metadata, and a short
 write-ahead log, with Raft. A deployment does not need a JVM, ZooKeeper,
 KRaft, or a separate database.
@@ -154,11 +155,15 @@ Set the mode at topic creation with `durability.mode`. The cluster default
 is `CAMUS_DEFAULT_DURABILITY`.
 
 `acks=1` waits for the same barrier as `acks=all`, so it costs what
-`acks=all` costs rather than a leader-local write: in
-[Benchmarks/](Benchmarks/README.md), one producer on three brokers sees a p50
-of about 7 ms and a p99 of about 17 ms in `wal` mode, and about 294 ms and
-576 ms in `r2` mode, where each ack waits for an object store write. In
-exchange, an acknowledged record survives the loss of the leader.
+`acks=all` costs rather than a leader-local write. One producer on three
+brokers, 1 KiB `acks=all`, measured:
+
+| Environment | `wal` p50 / p99 | `r2` p50 / p99 |
+| --- | --- | --- |
+| Linux 7.0 (aarch64), OrbStack VM on an Apple M4 Pro, 12 CPUs, 12 GiB, broker data on a Docker volume, MinIO on the Mac over host networking. The VM disk may not pass every `fsync` through to the SSD. [Table](Benchmarks/README.md#linux), [raw](Benchmarks/raw/linux-orbstack.md) | 7.10 / 16.55 ms | 293.81 / 576.16 ms |
+| Apple M4 Pro, macOS, APFS on the internal SSD, MinIO in Docker on that machine. [Table](Benchmarks/README.md#latency-3-brokers-one-producer-1-kib-acksall), [raw](Benchmarks/raw/latency-3-brokers.md) | 11.06 / 31.06 ms | 278.40 / 284.75 ms |
+
+An acknowledged record survives the loss of the leader.
 
 ## Configuration
 
@@ -242,3 +247,5 @@ has lost a majority, at its sealed end. That drops acknowledged data that
 was not sealed yet.
 
 License: Apache-2.0.
+
+Apache, Apache Kafka and Kafka are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Camus is not affiliated with or endorsed by the ASF.
