@@ -803,14 +803,6 @@ async fn init(
                 }
             }
         }
-        if layout.len() > 1 {
-            let first = &nodes[&members[0]].addr;
-            let _ = admin
-                .http
-                .post(format!("http://{first}/wal/{shard}/campaign"))
-                .send()
-                .await;
-        }
     }
     // A voter that granted a vote before its own initialize refuses it and
     // learns the membership from the leader instead. Return only once every
@@ -859,7 +851,54 @@ async fn init(
             }
         }
     }
+    // A campaign sent before the shard was open is dropped. Ask the
+    // preferred voter again, and wait out a leader lease between attempts,
+    // until that voter actually leads.
+    if layout.len() > 1 {
+        for (shard, members) in layout.iter().enumerate() {
+            let preferred = members[0];
+            let addr = &nodes[&preferred].addr;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if shard_leader_is(&admin, addr, shard as u64, preferred).await {
+                    break;
+                }
+                let _ = admin
+                    .http
+                    .post(format!("http://{addr}/wal/{shard}/campaign"))
+                    .send()
+                    .await;
+                if std::time::Instant::now() > deadline {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("wal shard {shard} never elected broker {preferred}"),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
+    }
     Ok(StatusCode::OK)
+}
+
+/// True when `addr` reports `leader` for `shard`.
+async fn shard_leader_is(admin: &Admin, addr: &str, shard: u64, leader: NodeId) -> bool {
+    let Ok(response) = admin
+        .http
+        .get(format!("http://{addr}/admin/metrics"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let Ok(metrics) = response.json::<serde_json::Value>().await else {
+        return false;
+    };
+    metrics["wal_shards"]
+        .as_array()
+        .and_then(|shards| shards.iter().find(|row| row["id"].as_u64() == Some(shard)))
+        .and_then(|row| row["leader"].as_u64())
+        == Some(leader)
 }
 
 async fn wal_init(
