@@ -67,8 +67,9 @@ AppendEntries and snapshots stay on HTTP.
   RPC. Datagrams for announcements (`max_datagram_frame_size` enabled).
 - The UDP port is the HTTP port by default, so peers need no new address:
   `BasicNode.addr` already names `host:port`. `CAMUS_QUIC_PORT` overrides it
-  on every broker. `CAMUS_QUIC=off` turns the endpoint off and restores the
-  50 ms heartbeat and 150–300 ms election timeout.
+  on every broker. The endpoint is off unless `CAMUS_QUIC=on`. Leaving it
+  on made the clients job and `wal_cluster` lose leaders on the GitHub
+  runner (2026-11-12).
 - Frame on a stream: `route u8` (metadata = 0, WAL = 1), `shard u32`,
   `kind u8` (vote, heartbeat), `len u32`, then the postcard body the HTTP route
   takes today. The reply is the postcard response, as now.
@@ -123,11 +124,15 @@ phase-0 baseline.
    50–100 ms while the endpoint is installed. `CAMUS_QUIC=off` keeps the
    previous 50 ms / 150–300 ms timings and sends every RPC over HTTP.
 
-Phases 1–4 are in the tree, and QUIC is on unless `CAMUS_QUIC=off`. Phase 5's
-shorter timings are not. On the GitHub runner, with 15 / 50–100, the
-three-process test's first metadata write did not commit within the client's
-30 second timeout. The heartbeat stays 50 ms and the election timeout stays
-150–300 ms until a phase-0 run shows the shorter window does not do that.
+Phases 1–4 are in the tree. QUIC stays off unless `CAMUS_QUIC=on`. It was
+on by default for one day. On the GitHub runner the clients job's group
+tests, `wal_shards`, and `wal_cluster` lost leaders while heartbeats waited
+on the handshake, including after a cold dial was moved off the RPC. Phase
+5's shorter timings are not applied either. On that runner, with 15 /
+50–100, the three-process test's first metadata write did not commit within
+the client's 30 second timeout. The heartbeat stays 50 ms and the election
+timeout stays 150–300 ms until a phase-0 run shows the shorter window does
+not do that.
 The phase-0 failover timings, heartbeat percentiles, and spurious-election
 count have not been recorded; this record does not invent them. The
 10-minute packet-loss soak is not part of the default test suite.

@@ -1,6 +1,6 @@
 //! QUIC endpoint for Raft control traffic (ADR 0016).
 //!
-//! On unless `CAMUS_QUIC=off`. Votes and empty heartbeats use one stream per
+//! Off unless `CAMUS_QUIC=on`. Votes and empty heartbeats use one stream per
 //! RPC. Shard announcements are datagrams. Data AppendEntries and snapshots
 //! stay on HTTP. The peer cache holds at most [`PEER_CAP`] connections. A
 //! frame body is at most [`MAX_BODY`] bytes. A datagram is at most
@@ -141,13 +141,13 @@ type DatagramHandler = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
 static CURRENT: std::sync::OnceLock<ControlEndpoint> = std::sync::OnceLock::new();
 
-/// `false` only when `CAMUS_QUIC` is `off`, `0`, or `false`. Unset is on.
+/// `true` only when `CAMUS_QUIC` is `on`, `1`, or `true`. Unset is off.
 pub fn enabled() -> bool {
     flag_enabled(std::env::var("CAMUS_QUIC").ok().as_deref())
 }
 
 pub fn flag_enabled(value: Option<&str>) -> bool {
-    !matches!(value, Some("off") | Some("0") | Some("false"))
+    matches!(value, Some("on") | Some("1") | Some("true"))
 }
 
 /// Heartbeat and election timeouts, in milliseconds: 50, then 150–300.
@@ -812,9 +812,11 @@ mod tests {
     }
 
     #[test]
-    fn quic_stays_on_unless_it_is_turned_off() {
-        assert!(super::flag_enabled(None));
+    fn quic_stays_off_unless_it_is_turned_on() {
+        assert!(!super::flag_enabled(None));
         assert!(super::flag_enabled(Some("on")));
+        assert!(super::flag_enabled(Some("1")));
+        assert!(super::flag_enabled(Some("true")));
         assert!(!super::flag_enabled(Some("off")));
         assert!(!super::flag_enabled(Some("0")));
         assert!(!super::flag_enabled(Some("false")));
