@@ -67,9 +67,16 @@ AppendEntries and snapshots stay on HTTP.
   RPC. Datagrams for announcements (`max_datagram_frame_size` enabled).
 - The UDP port is the HTTP port by default, so peers need no new address:
   `BasicNode.addr` already names `host:port`. `CAMUS_QUIC_PORT` overrides it
-  on every broker. The endpoint is off unless `CAMUS_QUIC=on`. Leaving it
-  on made the clients job and `wal_cluster` lose leaders on the GitHub
-  runner (2026-11-12).
+  on every broker. The endpoint stays off unless `CAMUS_QUIC=on`.
+  Amended 2026-11-12: it was turned off the same day because the clients
+  job, `wal_shards`, and `wal_cluster` lost leaders while the endpoint was
+  installed. One connection carries every group's votes and heartbeats, and
+  the accept loop handled one stream at a time. A slow or cancelled stream
+  stopped that loop while the connection still looked live, so each later
+  heartbeat sat until its 50 ms budget. openraft cancels the RPC at that
+  budget, so the HTTP fallback never ran. Streams on a connection are now
+  handled together, up to 64 at a time, and one stream's error leaves the
+  connection up.
 - Frame on a stream: `route u8` (metadata = 0, WAL = 1), `shard u32`,
   `kind u8` (vote, heartbeat), `len u32`, then the postcard body the HTTP route
   takes today. The reply is the postcard response, as now.
@@ -84,11 +91,11 @@ AppendEntries and snapshots stay on HTTP.
 
 `HttpConn::vote` and `HttpConn::append_entries` (both groups) try QUIC first
 when the RPC is a vote or carries no entries and the peer connection is
-already up, with the RPC's `hard_ttl` as the timeout. A missing connection
+already up. The QUIC attempt uses half of `hard_ttl`, so a failure still
+leaves time for HTTP before openraft cancels the RPC. A missing connection
 is dialed in the background and that RPC goes over HTTP. The heartbeat
-budget is 50 ms, and a handshake on a busy host does not fit in it
-(2026-11-12: the clients job's group tests and `wal_shards` lost leadership
-while every heartbeat waited on a new handshake). If the peer has no QUIC
+budget is 50 ms, and a handshake on a busy host does not fit in it, so a
+cold dial stays off the RPC (2026-11-12). If the peer has no QUIC
 endpoint, or the call fails, they fall back to HTTP for that RPC and retry
 QUIC after a backoff. A cluster in the middle of a rolling upgrade, or one
 where UDP is blocked, keeps working on HTTP.
@@ -124,11 +131,13 @@ phase-0 baseline.
    50–100 ms while the endpoint is installed. `CAMUS_QUIC=off` keeps the
    previous 50 ms / 150–300 ms timings and sends every RPC over HTTP.
 
-Phases 1–4 are in the tree. QUIC stays off unless `CAMUS_QUIC=on`. It was
-on by default for one day. On the GitHub runner the clients job's group
-tests, `wal_shards`, and `wal_cluster` lost leaders while heartbeats waited
-on the handshake, including after a cold dial was moved off the RPC. Phase
-5's shorter timings are not applied either. On that runner, with 15 /
+Phases 1–4 are in the tree. QUIC stays off unless `CAMUS_QUIC=on`. Handling
+streams together did not make the default safe: with the endpoint on, the
+clients job's Java group timed out waiting for a partition assignment
+(2026-11-12). Moving the handshake off the heartbeat was not enough either,
+because the accept loop still served one stream at a time. That loop now
+handles streams together, and the default remains off.
+Phase 5's shorter timings are not applied. On that runner, with 15 /
 50–100, the three-process test's first metadata write did not commit within
 the client's 30 second timeout. The heartbeat stays 50 ms and the election
 timeout stays 150–300 ms until a phase-0 run shows the shorter window does

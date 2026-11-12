@@ -1,10 +1,11 @@
 //! QUIC endpoint for Raft control traffic (ADR 0016).
 //!
-//! Off unless `CAMUS_QUIC=on`. Votes and empty heartbeats use one stream per
-//! RPC. Shard announcements are datagrams. Data AppendEntries and snapshots
-//! stay on HTTP. The peer cache holds at most [`PEER_CAP`] connections. A
-//! frame body is at most [`MAX_BODY`] bytes. A datagram is at most
-//! [`MAX_DATAGRAM`] bytes.
+//! Off unless `CAMUS_QUIC=on`. Votes and empty heartbeats use one stream
+//! per RPC, and one connection handles those streams together. Shard
+//! announcements are datagrams. Data AppendEntries and snapshots stay on
+//! HTTP. The peer cache holds at most [`PEER_CAP`] connections, and one
+//! connection handles at most [`STREAM_CAP`] RPCs at once. A frame body is
+//! at most [`MAX_BODY`] bytes. A datagram is at most [`MAX_DATAGRAM`] bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -29,6 +30,10 @@ pub const KIND_HEARTBEAT: u8 = 2;
 /// Cached connections. One per peer is enough; 64 covers a cluster with
 /// room for members that have not been evicted yet.
 const PEER_CAP: usize = 64;
+/// Control RPCs in flight on one connection. Every Raft group to a peer
+/// shares that connection, so a heartbeat must not wait behind another
+/// group's stream. 64 is one metadata group plus the shards one broker leads.
+const STREAM_CAP: usize = 64;
 /// Votes and empty heartbeats are small. A longer body is refused.
 pub const MAX_BODY: usize = 256 * 1024;
 /// Announcements stay under a typical path MTU.
@@ -245,13 +250,17 @@ impl ControlEndpoint {
         self.inner.endpoint.local_addr().map_err(QuicError::from)
     }
 
-    /// Send `frame` and read the reply. A dead cached connection is dropped
-    /// and dialed once more, which is how a restarted peer is reached.
+    /// Send `frame` and read the reply. A stream error is retried on the same
+    /// connection. The connection is dropped and dialed again only when it
+    /// has already closed, so one failed heartbeat does not tear down every
+    /// other group's RPC to that peer.
     pub async fn call(&self, peer: SocketAddr, frame: &Frame) -> Result<Vec<u8>, QuicError> {
         match self.call_once(peer, frame).await {
             Ok(body) => Ok(body),
             Err(first) => {
-                self.drop_peer(peer).await;
+                if !self.live(peer).await {
+                    self.drop_peer(peer).await;
+                }
                 self.call_once(peer, frame).await.map_err(|_| first)
             }
         }
@@ -435,12 +444,31 @@ type Handler = Arc<
 async fn answer(incoming: Incoming, handler: Handler, inner: Arc<Inner>) -> Result<(), QuicError> {
     let conn = incoming.await?;
     watch_datagrams(&inner, conn.clone()).await;
+    // One connection carries every Raft group. Handling streams one at a
+    // time made a slow vote or heartbeat hold the rest until openraft's
+    // 50 ms budget cancelled them, and a stream error stopped the loop
+    // while the connection still looked live.
+    let inflight = Arc::new(tokio::sync::Semaphore::new(STREAM_CAP));
     loop {
-        let Ok((send, recv)) = conn.accept_bi().await else {
+        let Ok((mut send, recv)) = conn.accept_bi().await else {
             break;
         };
+        let permit = match Arc::clone(&inflight).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                if let Err(err) = send.reset(quinn::VarInt::from_u32(1)) {
+                    tracing::debug!(%err, "could not refuse a control stream past the cap");
+                }
+                continue;
+            }
+        };
         let handler = Arc::clone(&handler);
-        answer_stream(send, recv, handler).await?;
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(err) = answer_stream(send, recv, handler).await {
+                tracing::debug!(%err, "control stream failed");
+            }
+        });
     }
     Ok(())
 }
@@ -820,6 +848,68 @@ mod tests {
         assert!(!super::flag_enabled(Some("off")));
         assert!(!super::flag_enabled(Some("0")));
         assert!(!super::flag_enabled(Some("false")));
+    }
+
+    #[tokio::test]
+    async fn a_slow_stream_does_not_block_the_next() -> Result<(), String> {
+        let shared = shared_pair()?;
+        let server =
+            ControlEndpoint::bind(loopback(), shared.server).map_err(|err| err.to_string())?;
+        let client =
+            ControlEndpoint::bind(loopback(), shared.client).map_err(|err| err.to_string())?;
+        let addr = server.local_addr().map_err(|err| err.to_string())?;
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serving = server.clone();
+        let entered_handler = std::sync::Arc::clone(&entered);
+        let task = tokio::spawn(async move {
+            serving
+                .serve(move |frame| {
+                    let entered_handler = std::sync::Arc::clone(&entered_handler);
+                    async move {
+                        if frame.body == b"slow" {
+                            entered_handler.store(true, std::sync::atomic::Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        }
+                        Ok(frame.body)
+                    }
+                })
+                .await;
+        });
+        let slow_client = client.clone();
+        let slow = tokio::spawn(async move { slow_client.call(addr, &vote(b"slow")).await });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            if tokio::time::Instant::now() > deadline {
+                client.close().await;
+                server.close().await;
+                let _ = task.await;
+                let _ = slow.await;
+                return Err("slow stream was not accepted".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let started = tokio::time::Instant::now();
+        let reply = client
+            .call(addr, &vote(b"fast"))
+            .await
+            .map_err(|err| err.to_string())?;
+        let waited = started.elapsed();
+        client.close().await;
+        server.close().await;
+        let _ = task.await;
+        let _ = slow.await;
+        if reply != b"fast" {
+            return Err(format!(
+                "fast reply was {}",
+                String::from_utf8_lossy(&reply)
+            ));
+        }
+        if waited > std::time::Duration::from_millis(200) {
+            return Err(format!(
+                "fast call waited {waited:?} behind the slow stream"
+            ));
+        }
+        Ok(())
     }
 
     #[tokio::test]
