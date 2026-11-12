@@ -22,7 +22,7 @@ Two kinds of traffic share that path:
 Control traffic decides how fast a failure is noticed and a new leader is in
 place, so it should not wait behind data, a full connection pool, or TCP
 connect and retransmit timeouts. Today both Raft groups use
-`heartbeat_interval: 50` and `election_timeout: 150–300 ms`, and a shard's
+`heartbeat_interval: 200` and `election_timeout: 400–800 ms`, and a shard's
 leadership reaches other brokers through `announce_shard`, a metadata write
 every 200 ms (`crates/broker/src/kafka.rs`).
 
@@ -139,9 +139,11 @@ because the accept loop still served one stream at a time. That loop now
 handles streams together, and the default remains off.
 Phase 5's shorter timings are not applied. On that runner, with 15 /
 50–100, the three-process test's first metadata write did not commit within
-the client's 30 second timeout. The heartbeat stays 50 ms and the election
-timeout stays 150–300 ms until a phase-0 run shows the shorter window does
-not do that.
+the client's 30 second timeout. The 50 ms heartbeat stayed in force after
+that, and it is also the timeout of every AppendEntries. On 2026-11-12 the
+runner cancelled those RPCs, leaders stepped down, and `wal_shards` saw
+`NOT_LEADER_OR_FOLLOWER` on CreateTopics. The heartbeat is 200 ms and the
+election timeout is 400–800 ms. A shorter window waits on a phase-0 run.
 The phase-0 failover timings, heartbeat percentiles, and spurious-election
 count have not been recorded; this record does not invent them. The
 10-minute packet-loss soak is not part of the default test suite.

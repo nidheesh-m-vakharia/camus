@@ -155,12 +155,13 @@ pub fn flag_enabled(value: Option<&str>) -> bool {
     matches!(value, Some("on") | Some("1") | Some("true"))
 }
 
-/// Heartbeat and election timeouts, in milliseconds: 50, then 150–300.
-/// ADR 0016 phase 5's 15 / 50–100 stayed off. With those values the
-/// three-process metadata write in `cluster.rs` did not commit within the
-/// client's 30 second timeout on the GitHub runner.
+/// Heartbeat and election timeouts, in milliseconds: 200, then 400–800.
+/// openraft uses `heartbeat_interval` as the timeout for every AppendEntries,
+/// including ones that carry entries. At 50 ms the GitHub runner cancelled
+/// those RPCs, the leader stepped down, and CreateTopics came back
+/// `NOT_LEADER_OR_FOLLOWER`. Election stays above the heartbeat.
 pub fn raft_timeouts() -> (u64, u64, u64) {
-    (50, 150, 300)
+    (200, 400, 800)
 }
 
 /// The process endpoint, after [`install`](ControlEndpoint::install).
@@ -211,7 +212,7 @@ impl ControlEndpoint {
 
     /// True when `peer` already has a connection that has not closed.
     /// A heartbeat must not wait for a handshake: openraft cancels the RPC
-    /// after the 50 ms heartbeat interval.
+    /// after `heartbeat_interval`.
     pub async fn live(&self, peer: SocketAddr) -> bool {
         let peers = self.inner.peers.lock().await;
         peers
