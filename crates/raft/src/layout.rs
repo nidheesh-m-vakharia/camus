@@ -153,7 +153,7 @@ fn split(bytes: &[u8]) -> Result<(&[u8], Vec<Vec<u8>>), io::Error> {
     if bytes.len() < 8 {
         return Err(invalid("short entry"));
     }
-    let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let count = read_u32(&bytes[4..8])?;
     let table = 8 + count * 4;
     if bytes.len() < table + 4 {
         return Err(invalid("short length table"));
@@ -161,9 +161,9 @@ fn split(bytes: &[u8]) -> Result<(&[u8], Vec<Vec<u8>>), io::Error> {
     let mut lens = Vec::with_capacity(count);
     for index in 0..count {
         let at = 8 + index * 4;
-        lens.push(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize);
+        lens.push(read_u32(&bytes[at..at + 4])?);
     }
-    let header_len = u32::from_le_bytes(bytes[table..table + 4].try_into().unwrap()) as usize;
+    let header_len = read_u32(&bytes[table..table + 4])?;
     let header_at = table + 4;
     let header_end = header_at
         .checked_add(header_len)
@@ -184,6 +184,11 @@ fn split(bytes: &[u8]) -> Result<(&[u8], Vec<Vec<u8>>), io::Error> {
         cursor = end;
     }
     Ok((&bytes[header_at..header_end], batches))
+}
+
+fn read_u32(bytes: &[u8]) -> io::Result<usize> {
+    let raw: [u8; 4] = bytes.try_into().map_err(|_| invalid("short length"))?;
+    Ok(u32::from_le_bytes(raw) as usize)
 }
 
 fn invalid(err: impl ToString) -> io::Error {
