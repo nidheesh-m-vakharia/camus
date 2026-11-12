@@ -227,7 +227,11 @@ impl HttpConn {
         let outcome = tokio::time::timeout(ttl, endpoint.call(peer, &frame)).await;
         let bytes = match outcome {
             Ok(Ok(bytes)) => bytes,
-            _ => {
+            // The peer is up but slow. Falling through to HTTP for this RPC
+            // is enough. A one-second QUIC blackout here is how a test that
+            // blocks HTTP raft never agrees on a leader.
+            Err(_) => return None,
+            Ok(Err(_)) => {
                 self.quic_after = std::time::Instant::now() + std::time::Duration::from_secs(1);
                 return None;
             }

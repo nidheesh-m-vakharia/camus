@@ -6,7 +6,7 @@ Date: 2026-11-12
 ## Context
 
 A Camus cluster is one region. Metadata and each WAL shard elect inside
-that region, on a 50 ms heartbeat and a 150–300 ms election timeout
+that region, on a 200 ms heartbeat and a 400–800 ms election timeout
 ([0016](0016-quic-control-plane.md)). A round trip into another region is
 the same size as that window, so a voter set that crosses regions stalls
 elections and every ack. [Issue 147](https://github.com/nidheesh-m-vakharia/camus/issues/147)
@@ -115,7 +115,7 @@ merge into one gap-free sequence.
 ## Alternatives
 
 - One Raft group stretched across regions. Set aside. The election window
-  is 150–300 ms, and every ack would wait on the far region. A blip there
+  is 400–800 ms, and every ack would wait on the far region. A blip there
   stops the metadata group.
 - Cassandra or ScyllaDB last-writer-wins on one partition. Set aside. Two
   regions would both append, and ADR 0009 forbids a gap, a reuse, or a
