@@ -268,6 +268,56 @@ fn shard_key(shard: u32) -> String {
     format!("wal/{shard}")
 }
 
+/// Highest-term shard announcement per shard. Capped at 256 shards.
+const HINT_CAP: usize = 256;
+
+#[derive(Clone, Default)]
+pub struct Hints {
+    inner: Arc<std::sync::Mutex<BTreeMap<u32, (u64, NodeId, i32)>>>,
+}
+
+impl Hints {
+    /// Keep `announcement` when its term is strictly higher than the one stored.
+    pub fn note(&self, shard: u32, term: u64, leader: NodeId, epoch: i32) {
+        let Ok(mut hints) = self.inner.lock() else {
+            return;
+        };
+        if hints
+            .get(&shard)
+            .is_some_and(|(stored, _, _)| *stored >= term)
+        {
+            return;
+        }
+        if hints.len() >= HINT_CAP && !hints.contains_key(&shard) {
+            if let Some(stale) = hints.keys().next().copied() {
+                hints.remove(&stale);
+            }
+        }
+        hints.insert(shard, (term, leader, epoch));
+    }
+
+    fn get(&self, shard: u32) -> Option<(u64, NodeId, i32)> {
+        self.inner.lock().ok()?.get(&shard).copied()
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::Hints;
+
+    #[test]
+    fn a_lower_term_is_ignored() -> Result<(), String> {
+        let hints = Hints::default();
+        hints.note(0, 2, 1, 2);
+        hints.note(0, 1, 9, 1);
+        let (_, leader, epoch) = hints.get(0).ok_or("missing hint")?;
+        if leader != 1 || epoch != 2 {
+            return Err(format!("hint {leader} epoch {epoch}"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
 struct ShardView {
     leader: Option<NodeId>,
@@ -350,6 +400,9 @@ pub struct Kafka {
     sasl_pass: String,
     tls: Option<TlsAcceptor>,
     wal: Arc<WalSlot>,
+    /// QUIC shard announcements. A hint never outranks a stored view with a
+    /// higher epoch (ADR 0016).
+    hints: Hints,
     http: reqwest::Client,
     /// Classic consumer groups, coordinated while this broker leads metadata.
     coordinator: Arc<camus_coordinator::Coordinator>,
@@ -507,6 +560,7 @@ impl Kafka {
             sasl_pass,
             tls,
             wal,
+            hints: Hints::default(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
@@ -636,6 +690,24 @@ impl Kafka {
             .is_some_and(|shard| shard.is_leader())
     }
 
+    /// The transaction already recorded a span for this partition, so a later
+    /// batch does not write metadata again (ADR 0015).
+    fn txn_span_open(&self, transactional_id: &str, topic: &str, partition: i32) -> bool {
+        let Some(raw) = self
+            .node
+            .read_local(&format!("txn/{transactional_id}"))
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        camus_metadata::txn_spans(&raw).ok().is_some_and(|spans| {
+            spans
+                .iter()
+                .any(|span| span.topic == topic && span.partition == partition)
+        })
+    }
+
     /// A partition's WAL end, or 0 when this broker does not have its shard.
     fn wal_end(&self, topic: &Topic, partition: i32) -> i64 {
         self.wal_of(topic, partition)
@@ -643,16 +715,88 @@ impl Kafka {
             .unwrap_or(0)
     }
 
+    /// The log end from the shard leader. A leader that cannot be reached
+    /// is `LEADER_NOT_AVAILABLE`, which the client retries (ADR 0015).
+    async fn shard_end(&self, topic: &Topic, partition: i32) -> Result<i64, i16> {
+        if self.leads_wal(topic, partition) {
+            return Ok(self.wal_end(topic, partition));
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/end-offset", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if !response.status().is_success() {
+            return Err(LEADER_NOT_AVAILABLE);
+        }
+        let body: serde_json::Value = response.json().await.map_err(|_| LEADER_NOT_AVAILABLE)?;
+        body.get("end")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or(LEADER_NOT_AVAILABLE)
+    }
+
+    /// One span per partition the transaction wrote, with the end taken from
+    /// the shard leader.
+    async fn txn_ends(&self, transactional_id: &str) -> Result<Vec<TxnSpan>, i16> {
+        let Some(raw) = self
+            .node
+            .read_local(&format!("txn/{transactional_id}"))
+            .ok()
+            .flatten()
+        else {
+            return Ok(Vec::new());
+        };
+        let spans = camus_metadata::txn_spans(&raw).map_err(|_| NOT_LEADER)?;
+        let mut ends = Vec::with_capacity(spans.len());
+        for span in spans {
+            let Some(topic) = self.topic(&span.topic) else {
+                return Err(UNKNOWN_TOPIC);
+            };
+            let end = self.shard_end(&topic, span.partition).await?;
+            ends.push(TxnSpan {
+                end,
+                producer_id: span.producer_id,
+                ..span
+            });
+        }
+        Ok(ends)
+    }
+
     /// Shard leader and voters as clients should see them. The shard leader
     /// records itself in metadata so brokers outside the shard can answer
     /// Metadata; until it has, this broker's own view is used.
     fn shard_view(&self, shard: u32) -> ShardView {
-        self.node
+        let stored = self
+            .node
             .read_local(&shard_key(shard))
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_else(|| self.local_shard_view(shard))
+            .unwrap_or_else(|| self.local_shard_view(shard));
+        let Some((_, leader, epoch)) = self.hints.get(shard) else {
+            return stored;
+        };
+        if epoch <= stored.epoch {
+            return stored;
+        }
+        ShardView {
+            leader: Some(leader),
+            voters: stored.voters,
+            epoch,
+        }
     }
 
     fn local_shard_view(&self, shard: u32) -> ShardView {
@@ -748,6 +892,36 @@ impl Kafka {
             }
             if let Ok(raw) = serde_json::to_string(&mine) {
                 let _ = self.meta_write(shard_key(id), raw).await;
+            }
+        }
+    }
+
+    /// Tell peers this broker leads `id`, without waiting for the metadata write.
+    async fn announce_quic(&self, endpoint: &camus_raft::quic::ControlEndpoint) {
+        for (id, wal) in self.wal.all() {
+            if !wal.is_leader() {
+                continue;
+            }
+            let announcement = camus_raft::quic::Announcement {
+                shard: id,
+                term: wal.term(),
+                leader: self.node_id as u64,
+                epoch: self.shard_epoch(id),
+            };
+            let Ok(bytes) = camus_raft::codec::encode(&announcement) else {
+                continue;
+            };
+            for voter in wal.voters() {
+                if voter == self.node_id as u64 {
+                    continue;
+                }
+                let Some(addr) = wal.voter_addr(voter) else {
+                    continue;
+                };
+                let Ok(peer) = camus_raft::quic::ControlEndpoint::peer_socket(&addr) else {
+                    continue;
+                };
+                let _ = endpoint.send_datagram(peer, &bytes).await;
             }
         }
     }
@@ -1373,7 +1547,7 @@ impl Kafka {
                         let covers = |spans: &[camus_metadata::Span]| {
                             spans
                                 .iter()
-                                .any(|span| span.start <= record.offset && record.offset < span.end)
+                                .any(|span| span.covers(record.offset, record.producer_id))
                         };
                         if record.transactional && !covers(&committed) && !covers(&aborted) {
                             return None;
@@ -1630,6 +1804,32 @@ impl Kafka {
             Arc::clone(&self),
             Arc::clone(&self.coordinator),
         ));
+        if let Some(endpoint) = camus_raft::quic::current() {
+            let hints = self.hints.clone();
+            endpoint
+                .set_datagram_handler(move |bytes| {
+                    let Ok(announcement) =
+                        camus_raft::codec::decode::<camus_raft::quic::Announcement>(&bytes)
+                    else {
+                        return;
+                    };
+                    hints.note(
+                        announcement.shard,
+                        announcement.term,
+                        announcement.leader,
+                        announcement.epoch,
+                    );
+                })
+                .await;
+            let announcing = Arc::clone(&self);
+            tokio::spawn(async move {
+                let (heartbeat_ms, _, _) = camus_raft::quic::raft_timeouts();
+                loop {
+                    announcing.announce_quic(&endpoint).await;
+                    tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
+                }
+            });
+        }
         let register = Arc::clone(&self);
         tokio::spawn(async move {
             let key = format!("broker/{}", register.node_id);
@@ -1640,7 +1840,11 @@ impl Kafka {
                     let _ = register.meta_write(key.clone(), addr.clone()).await;
                 }
                 register.announce_shard().await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                let announce_ms = std::env::var("CAMUS_SHARD_ANNOUNCE_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(200);
+                tokio::time::sleep(Duration::from_millis(announce_ms)).await;
             }
         });
         loop {
@@ -2756,6 +2960,9 @@ impl Kafka {
         }
         self.arrived(&produce.topic, produce.partition);
         if let Some((id, producer, epoch)) = produce.txn {
+            if self.txn_span_open(&id, &produce.topic, produce.partition) {
+                return Ok(response.base_offset);
+            }
             let noted = self
                 .meta_apply(Command::NoteTxn {
                     transactional_id: id,
@@ -2766,6 +2973,7 @@ impl Kafka {
                         partition: produce.partition,
                         start: response.base_offset,
                         end: response.base_offset + i64::from(produce.records),
+                        producer_id: Some(producer),
                     },
                 })
                 .await;
@@ -3512,6 +3720,9 @@ impl Kafka {
                 }
                 Plan::Error(_) => continue,
             };
+            if self.txn_span_open(&id, &item.topic, item.partition) {
+                continue;
+            }
             let applied = self
                 .meta_apply(Command::NoteTxn {
                     transactional_id: id,
@@ -3522,6 +3733,7 @@ impl Kafka {
                         partition: item.partition,
                         start,
                         end,
+                        producer_id: Some(item.producer_id),
                     },
                 })
                 .await;
@@ -3716,10 +3928,20 @@ impl Kafka {
                     };
                     let mut cursor = 0;
                     let mut span: Option<usize> = None;
-                    for batch in info {
+                    let producers = batch::producer_batches(&bytes, MAX_FRAME).unwrap_or_default();
+                    for (index, batch) in info.iter().enumerate() {
                         let next = batch.last_offset + 1;
+                        let producer = producers
+                            .get(index)
+                            .map(|row| row.producer_id)
+                            .unwrap_or(-1);
                         if isolation == 1 {
-                            match txn_batch(batch.base_offset, batch.transactional, &state) {
+                            match txn_batch(
+                                batch.base_offset,
+                                producer,
+                                batch.transactional,
+                                &state,
+                            ) {
                                 TxnView::Stop => {
                                     if let Some(start) = span.take() {
                                         out.push(bytes.slice(start..cursor));
@@ -4315,21 +4537,26 @@ enum TxnView {
     Stop,
 }
 
-fn txn_batch(offset: i64, transactional: bool, state: &camus_metadata::Partition) -> TxnView {
+fn txn_batch(
+    offset: i64,
+    producer_id: i64,
+    transactional: bool,
+    state: &camus_metadata::Partition,
+) -> TxnView {
     if !transactional {
         return TxnView::Take;
     }
     if state
         .txn_aborted
         .iter()
-        .any(|span| span.start <= offset && offset < span.end)
+        .any(|span| span.covers(offset, producer_id))
     {
         return TxnView::Skip;
     }
     if state
         .txn_committed
         .iter()
-        .any(|span| span.start <= offset && offset < span.end)
+        .any(|span| span.covers(offset, producer_id))
     {
         TxnView::Take
     } else {
@@ -4343,8 +4570,13 @@ fn filter_txn(bytes: &[u8], state: &camus_metadata::Partition, stable: &mut i64)
     };
     let mut out = Vec::new();
     let mut cursor = 0;
-    for batch in info {
-        match txn_batch(batch.base_offset, batch.transactional, state) {
+    let producers = batch::producer_batches(bytes, MAX_FRAME).unwrap_or_default();
+    for (index, batch) in info.iter().enumerate() {
+        let producer = producers
+            .get(index)
+            .map(|row| row.producer_id)
+            .unwrap_or(-1);
+        match txn_batch(batch.base_offset, producer, batch.transactional, state) {
             TxnView::Stop => {
                 *stable = (*stable).min(batch.base_offset);
                 break;

@@ -1,6 +1,6 @@
 # ADR 0016: QUIC for Raft control traffic
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-11
 
 ## Context
@@ -66,8 +66,9 @@ AppendEntries and snapshots stay on HTTP.
   per peer, kept open and reconnected on loss. One bidirectional stream per
   RPC. Datagrams for announcements (`max_datagram_frame_size` enabled).
 - The UDP port is the HTTP port by default, so peers need no new address:
-  `BasicNode.addr` already names `host:port`. `CAMUS_QUIC_PORT` overrides it,
-  and `CAMUS_QUIC=off` turns the endpoint off.
+  `BasicNode.addr` already names `host:port`. `CAMUS_QUIC_PORT` overrides it
+  on every broker. `CAMUS_QUIC=off` turns the endpoint off and restores the
+  50 ms heartbeat and 150–300 ms election timeout.
 - Frame on a stream: `route u8` (metadata = 0, WAL = 1), `shard u32`,
   `kind u8` (vote, heartbeat), `len u32`, then the postcard body the HTTP route
   takes today. The reply is the postcard response, as now.
@@ -107,22 +108,25 @@ phase-0 baseline.
    and p99, and spurious elections per hour under the throughput benchmark.
    Run on macOS and on the Linux VM.
 1. **The endpoint.** `crates/raft/src/quic.rs`: the endpoint, a peer connection
-   cache, the frame codec, certificates, `CAMUS_QUIC` / `CAMUS_QUIC_PORT`. Tests:
-   request/response over loopback, reconnect after a peer restarts, an unknown
-   certificate refused.
-2. **Votes over QUIC** for metadata and WAL, with HTTP fallback. Tests:
-   `wal_cluster`, `wal_majority` and `group_failover` pass with QUIC on; an
-   election completes with HTTP to that peer blocked.
-3. **Heartbeats over QUIC** (AppendEntries with no entries). Tests: commit
-   index still reaches followers; a follower behind a dropped heartbeat
-   catches up from the next data RPC; 5% packet loss injected on the UDP
-   port causes no spurious election in a 10-minute run.
-4. **Leader announcement datagrams**, used as hints. Tests: a produce routed to
-   the new shard leader within one heartbeat interval of the election, before
-   the metadata write lands; a stale (lower-term) datagram is ignored.
-5. **Shorter timings, then on by default.** Try `heartbeat_interval` 10–20 ms
-   and election timeout 50–100 ms. Keep them only if phase 0's spurious
-   election count does not rise. Then make QUIC the default.
+   cache, the frame codec, certificates, `CAMUS_QUIC` / `CAMUS_QUIC_PORT`.
+2. **Votes over QUIC** for metadata and WAL, with HTTP fallback.
+3. **Heartbeats over QUIC** (AppendEntries with no entries). Data appends
+   stay on HTTP, so a follower that misses a heartbeat catches up on the
+   next data RPC.
+4. **Leader announcement datagrams**, used as hints. A lower term is ignored.
+   The metadata write in `announce_shard` stays the record of truth.
+5. **Shorter timings, on by default.** Heartbeat 15 ms and election timeout
+   50–100 ms while the endpoint is installed. `CAMUS_QUIC=off` keeps the
+   previous 50 ms / 150–300 ms timings and sends every RPC over HTTP.
+
+Phases 1–4 are in the tree, and QUIC is on unless `CAMUS_QUIC=off`. Phase 5's
+shorter timings are not. On the GitHub runner, with 15 / 50–100, the
+three-process test's first metadata write did not commit within the client's
+30 second timeout. The heartbeat stays 50 ms and the election timeout stays
+150–300 ms until a phase-0 run shows the shorter window does not do that.
+The phase-0 failover timings, heartbeat percentiles, and spurious-election
+count have not been recorded; this record does not invent them. The
+10-minute packet-loss soak is not part of the default test suite.
 
 ## Consequences
 

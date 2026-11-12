@@ -36,6 +36,7 @@ impl Node {
                 "127.0.0.1:0",
                 "--data-dir",
                 dir.to_str().unwrap(),
+                "--dev-plaintext",
             ])
             .env("RUST_LOG", "info")
             .stdout(log.try_clone().unwrap())

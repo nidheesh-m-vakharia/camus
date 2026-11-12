@@ -1,6 +1,6 @@
 # ADR 0015: Transaction spans without a metadata write per produce
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-09
 
 ## Context
@@ -49,7 +49,7 @@ wider span would claim the other's.
    have to be raised to that span's end, which needs the previous end before
    `EndTxn` has it.
 
-## Decision (proposed)
+## Decision
 
 Option 2.
 

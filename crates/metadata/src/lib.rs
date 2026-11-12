@@ -223,6 +223,10 @@ pub enum Command {
         /// Proposer's clock. `0` in commands written before it was carried.
         #[serde(default)]
         now_ms: i64,
+        /// Partition ends from the shard leaders. Empty on commands written
+        /// before ADR 0015, which keep the spans `NoteTxn` stored.
+        #[serde(default)]
+        ends: Vec<txn::TxnSpan>,
     },
     /// Replace a sealed offset prefix with one object. The high watermark stays.
     Compact {
@@ -490,10 +494,12 @@ impl MetadataNode {
     where
         N: openraft::RaftNetworkFactory<TypeConfig>,
     {
+        let (heartbeat_interval, election_timeout_min, election_timeout_max) =
+            camus_raft::quic::raft_timeouts();
         let config = Config {
-            heartbeat_interval: 50,
-            election_timeout_min: 150,
-            election_timeout_max: 300,
+            heartbeat_interval,
+            election_timeout_min,
+            election_timeout_max,
             ..Default::default()
         };
         let config = Arc::new(config.validate()?);

@@ -8,6 +8,7 @@
 
 pub mod codec;
 pub mod layout;
+pub mod quic;
 mod segment;
 mod store;
 mod submit;

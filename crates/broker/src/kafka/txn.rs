@@ -302,6 +302,13 @@ impl Kafka {
             response.error_code = auth::TXN_ID_FAILED;
             return frame_of(header.request_api_version, header.correlation_id, &response);
         }
+        let ends = match self.txn_ends(request.transactional_id.0.as_str()).await {
+            Ok(ends) => ends,
+            Err(code) => {
+                response.error_code = code;
+                return frame_of(header.request_api_version, header.correlation_id, &response);
+            }
+        };
         let applied = self
             .node
             .apply(Command::EndTransaction {
@@ -310,6 +317,7 @@ impl Kafka {
                 producer_epoch: request.producer_epoch,
                 committed: request.committed,
                 now_ms: now_ms(),
+                ends,
             })
             .await;
         response.error_code = match applied {

@@ -547,6 +547,7 @@ fn apply_command(
                 producer_epoch,
                 committed,
                 now_ms,
+                ends,
             } => txn::outcome(txn::end(
                 &read,
                 &transactional_id,
@@ -554,6 +555,7 @@ fn apply_command(
                 producer_epoch,
                 committed,
                 now_ms,
+                &ends,
             )),
             Command::SaveGroup { .. }
             | Command::CommitOffsets { .. }
