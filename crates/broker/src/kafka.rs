@@ -948,7 +948,10 @@ impl Kafka {
     /// the stored view differs.
     async fn announce_shard(&self) {
         for (id, wal) in self.wal.all() {
-            if !wal.leads_quorum(Duration::from_millis(500)) {
+            // 2s, not one heartbeat: a loaded leader can be a few hundred
+            // milliseconds past its last quorum ack and still be the leader.
+            // A node that has never been acknowledged does not announce.
+            if !wal.leads_quorum(Duration::from_secs(2)) {
                 continue;
             }
             let mine = self.local_shard_view(id);
