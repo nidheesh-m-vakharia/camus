@@ -229,13 +229,18 @@ pub enum Command {
         #[serde(default)]
         ends: Vec<txn::TxnSpan>,
     },
-    /// Replace a sealed offset prefix with one object. The high watermark stays.
+    /// Replace a sealed offset range with one object. The high watermark stays.
+    /// Commands written before windows omit `covered_start` and replace the
+    /// whole prefix ending at `covered_end`.
     Compact {
         /// Topic name.
         topic: String,
         /// Partition.
         partition: i32,
-        /// Exclusive end of the prefix being replaced.
+        /// First offset of the range. `None` replaces the prefix.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        covered_start: Option<i64>,
+        /// Exclusive end of the range being replaced.
         covered_end: i64,
         /// New object key.
         object_key: String,

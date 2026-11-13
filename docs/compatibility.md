@@ -257,8 +257,10 @@ still waiting for its metadata commit is safe, and has been unreferenced for
 The sweep owns every `bundle/` object under the cluster's key prefix: give each
 cluster its own bucket or its own `CAMUS_S3_PREFIX`.
 
-Camus writes no transaction control records: `read_committed` filtering is
-done by the broker from the committed and aborted offset ranges. Kafka
+A transactional produce in `wal` mode is one WAL commit (ADR 0019). The
+open span stays in the WAL until `EndTxn`, which publishes it. Camus writes
+no transaction control records: `read_committed` filtering is done by the
+broker from the committed and aborted offset ranges. Kafka
 clients do not need the markers, and a `read_committed` consumer that seeks
 into an aborted range gets the next committed record at its own offset. A
 `read_uncommitted` consumer sees aborted records, as in Kafka. A tool that

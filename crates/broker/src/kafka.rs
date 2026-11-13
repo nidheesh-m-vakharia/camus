@@ -81,6 +81,22 @@ const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 /// Most unsealed bytes one upload pass takes: up to four objects of
 /// `FLUSH_BYTES`, put in parallel, then one publish and one seal for all.
 const UPLOAD_PASS_BYTES: usize = 4 * FLUSH_BYTES;
+/// Record bytes one compaction window holds. A larger prefix continues in
+/// the next window (one object may exceed this).
+const COMPACT_PASS_BYTES: u64 = 32 * 1024 * 1024;
+/// Extents in one window. Empty extents add no bytes, so the byte cap
+/// alone would not bound the window.
+const COMPACT_PASS_EXTENTS: usize = 1024;
+/// Objects read from one sweep listing before the next page.
+const SWEEP_PAGE: usize = 1024;
+
+/// Whether another compaction window remains after this one.
+enum CompactMore {
+    /// The eligible prefix is done, or this window failed.
+    Stop,
+    /// Compact again, starting after this offset.
+    Again(i64),
+}
 const BUFFER_LIMIT: usize = 256 * 1024 * 1024;
 /// Longest wait for a WAL seal or a metadata publish to commit. Past it the
 /// pass fails and is retried, so a shard or metadata group without quorum
@@ -1854,44 +1870,54 @@ impl Kafka {
         if !self.leader() {
             return Ok(());
         }
-        // List before reading references: an object published in between is
-        // then either referenced or too young to delete.
-        let listed: Vec<camus_compactor::sweep::Listed> = self
-            .bucket
-            .list("bundle/")
-            .await?
-            .into_iter()
-            .map(|(key, size, modified_ms)| camus_compactor::sweep::Listed {
-                key,
-                size,
-                modified_ms,
-            })
-            .collect();
+        // References are read before the listing. An object published after
+        // that read is absent from the set; its ULID is younger than
+        // `sweep_min_age_ms`, so this pass does not delete it. The listing
+        // is one page at a time, so the pass does not hold every key.
         let referenced = self.referenced_objects()?;
-        let plan = self.sweeper.lock().await.plan(
-            &listed,
-            &referenced,
-            txn::now_ms(),
-            self.sweep_min_age_ms,
-            self.sweep_delay_ms,
-        );
+        let mut listing = self.bucket.list_pages("bundle/");
+        let mut sweeper = self.sweeper.lock().await;
+        sweeper.begin();
         let stats = &camus_compactor::STATS;
-        for object in plan {
-            if !self.leader() {
+        loop {
+            let page = listing.next_page(SWEEP_PAGE).await?;
+            if page.is_empty() {
                 break;
             }
-            match self.bucket.delete(&object.key).await {
-                Ok(()) => {
-                    stats
-                        .objects_deleted
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    stats
-                        .bytes_deleted
-                        .fetch_add(object.size, std::sync::atomic::Ordering::Relaxed);
+            let listed: Vec<camus_compactor::sweep::Listed> = page
+                .into_iter()
+                .map(|(key, size, modified_ms)| camus_compactor::sweep::Listed {
+                    key,
+                    size,
+                    modified_ms,
+                })
+                .collect();
+            let plan = sweeper.observe(
+                &listed,
+                &referenced,
+                txn::now_ms(),
+                self.sweep_min_age_ms,
+                self.sweep_delay_ms,
+            );
+            for object in plan {
+                if !self.leader() {
+                    sweeper.finish();
+                    return Ok(());
                 }
-                Err(err) => tracing::warn!(key = %object.key, %err, "orphan delete failed"),
+                match self.bucket.delete(&object.key).await {
+                    Ok(()) => {
+                        stats
+                            .objects_deleted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        stats
+                            .bytes_deleted
+                            .fetch_add(object.size, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(err) => tracing::warn!(key = %object.key, %err, "orphan delete failed"),
+                }
             }
         }
+        sweeper.finish();
         stats
             .sweeps
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1917,37 +1943,63 @@ impl Kafka {
     }
 
     async fn compact_partition(&self, topic: &Topic, partition: i32) {
+        // Each pass rewrites at most `COMPACT_PASS_BYTES` of sealed records.
+        // A prefix larger than that continues on the next iteration, after
+        // the range just replaced.
+        let mut after = -1i64;
+        loop {
+            match self.compact_window(topic, partition, after).await {
+                CompactMore::Stop => return,
+                CompactMore::Again(end) => after = end,
+            }
+        }
+    }
+
+    /// Compact one byte-capped window starting after `after`.
+    async fn compact_window(&self, topic: &Topic, partition: i32, after: i64) -> CompactMore {
         let Some(state) = self.partition_state(topic, partition) else {
-            return;
+            return CompactMore::Stop;
         };
         // `min.compaction.lag.ms`: only the leading extents whose newest
         // record is at least that old are compacted.
         let now = txn::now_ms();
         let lag = topic.config_i64("min.compaction.lag.ms");
-        let mut eligible: Vec<camus_metadata::Extent> = Vec::new();
+        let mut window: Vec<camus_metadata::Extent> = Vec::new();
+        let mut bytes = 0u64;
+        let mut more = false;
         'scan: loop {
-            let after = eligible.last().map_or(-1, |extent| extent.end);
-            let Ok(page) = self.extents_after(topic, partition, &state, after, EXTENT_PAGE) else {
-                return;
+            let cursor = window.last().map_or(after, |extent| extent.end);
+            let Ok(page) = self.extents_after(topic, partition, &state, cursor, EXTENT_PAGE) else {
+                return CompactMore::Stop;
             };
             let full = page.len() == EXTENT_PAGE;
             for extent in page {
                 if now.saturating_sub(extent.max_timestamp) < lag {
                     break 'scan;
                 }
-                eligible.push(extent);
+                let len = u64::from(extent.length);
+                if !window.is_empty()
+                    && (window.len() >= COMPACT_PASS_EXTENTS
+                        || bytes.saturating_add(len) > COMPACT_PASS_BYTES)
+                {
+                    more = true;
+                    break 'scan;
+                }
+                bytes = bytes.saturating_add(len);
+                window.push(extent);
             }
             if !full {
                 break;
             }
         }
-        let Some(last) = eligible.last() else {
-            return;
+        let Some(last) = window.last() else {
+            return CompactMore::Stop;
         };
+        let covered_start = window[0].start;
         let covered_end = last.end;
         let tombstones_before = now.saturating_sub(topic.config_i64("delete.retention.ms"));
         let mut bodies = Vec::new();
-        for extent in &eligible {
+        for extent in &window {
             if extent.length == 0 {
                 continue;
             }
@@ -1957,7 +2009,7 @@ impl Kafka {
                 .get_range(&extent.key, extent.file_offset..end)
                 .await
             else {
-                return;
+                return CompactMore::Stop;
             };
             bodies.push(bytes);
         }
@@ -2008,7 +2060,7 @@ impl Kafka {
         })
         .await;
         let Ok(Some((mut base_timestamp, mut max_timestamp, rebuilt))) = rebuilt else {
-            return;
+            return CompactMore::Stop;
         };
         // When nothing survives, the prefix becomes an extent with no
         // object and no bytes. The log start stays where it is, as Kafka's
@@ -2017,11 +2069,11 @@ impl Kafka {
             None => (String::new(), 0),
             Some(body) => {
                 let Ok(length) = u32::try_from(body.len()) else {
-                    return;
+                    return CompactMore::Stop;
                 };
                 let object_key = camus_uploader::object_key();
                 if self.bucket.put_new(&object_key, body).await.is_err() {
-                    return;
+                    return CompactMore::Stop;
                 }
                 (object_key, length)
             }
@@ -2030,11 +2082,12 @@ impl Kafka {
             base_timestamp = 0;
             max_timestamp = 0;
         }
-        let _ = self
+        match self
             .node
             .apply(Command::Compact {
                 topic: topic.name.clone(),
                 partition,
+                covered_start: Some(covered_start),
                 covered_end,
                 object_key,
                 file_offset: 0,
@@ -2042,7 +2095,11 @@ impl Kafka {
                 base_timestamp,
                 max_timestamp,
             })
-            .await;
+            .await
+        {
+            Ok(response) if response.error_code == 0 && more => CompactMore::Again(covered_end),
+            _ => CompactMore::Stop,
+        }
     }
 
     /// Accept connections until the listener closes.

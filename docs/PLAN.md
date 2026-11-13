@@ -14,8 +14,9 @@ idempotent produce and its admin APIs are in. Phase 5 transactions,
 `read_committed`, log compaction, and ACLs are in.
 `kafka-clients` 4.4.0, librdkafka, and franz-go pass the transaction,
 compaction, and ACL checks, and exercise the implemented admin APIs
-their libraries expose. The ADRs under
-`docs/adr/` are accepted.
+their libraries expose. The ADRs under `docs/adr/` are accepted, except 0018, which is still
+proposed. 0019 is accepted: a transactional produce commits once, on the
+WAL, and metadata learns the span at `EndTxn`.
 This file is the map of those decisions and of what Phase 0 is allowed to touch.
 
 ## Product
