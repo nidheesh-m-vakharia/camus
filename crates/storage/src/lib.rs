@@ -218,6 +218,7 @@ impl Bucket {
         Listing {
             stream: self.store.list(Some(&self.path(prefix))),
             prefix: self.prefix.clone(),
+            done: false,
         }
     }
 
@@ -255,15 +256,21 @@ impl Bucket {
 pub struct Listing {
     stream: futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>,
     prefix: String,
+    /// The store's list stream panics if it is polled after it has ended.
+    done: bool,
 }
 
 impl Listing {
     /// The next `limit` objects, or fewer when the listing ends.
     pub async fn next_page(&mut self, limit: usize) -> anyhow::Result<Vec<(String, u64, i64)>> {
         use futures::StreamExt;
+        if self.done {
+            return Ok(Vec::new());
+        }
         let mut page = Vec::new();
         while page.len() < limit {
             let Some(meta) = self.stream.next().await else {
+                self.done = true;
                 break;
             };
             let meta = meta?;
@@ -447,6 +454,39 @@ mod stats_tests {
             .iter()
             .map(|(key, _, _)| key.as_str())
             .eq(["bundle/a", "bundle/b", "bundle/c"]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_finished_page_is_not_polled_again() -> anyhow::Result<()> {
+        use futures::StreamExt;
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let bucket = Bucket {
+            store: Arc::clone(&store),
+            prefix: String::new(),
+        };
+        bucket.put_new("k", Bytes::from_static(b"x")).await?;
+        let meta = store
+            .list(None)
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("empty"))??;
+        // The cloud list stream panics if polled after it ends. This one does too.
+        let stream = futures::stream::unfold(Some(meta), |state| async move {
+            let meta = state?;
+            Some((Ok::<_, object_store::Error>(meta), None))
+        })
+        .boxed();
+        let mut listing = Listing {
+            stream,
+            prefix: String::new(),
+            done: false,
+        };
+        let page = listing.next_page(8).await?;
+        anyhow::ensure!(page.len() == 1);
+        let again = listing.next_page(8).await?;
+        anyhow::ensure!(again.is_empty());
         Ok(())
     }
 }
