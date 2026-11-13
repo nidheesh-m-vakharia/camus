@@ -638,13 +638,17 @@ pub fn publish(
     }
 }
 
-/// Replace the sealed prefix ending at `covered_end` with one extent.
-/// `next_offset` stays put, so surviving records keep the offsets they had.
+/// Replace one sealed range with one extent.
+/// `covered_start` is the first offset of that range. `None` means the
+/// prefix ending at `covered_end`, which is what commands written before
+/// windows stored. `next_offset` stays put, so surviving records keep the
+/// offsets they had.
 pub fn compact_replace(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     scan: Scan,
     topic: &str,
     partition: i32,
+    covered_start: Option<i64>,
     covered_end: i64,
     object_key: &str,
     file_offset: u64,
@@ -664,15 +668,31 @@ pub fn compact_replace(
     let mut state: Partition = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
     let legacy = !state.extents.is_empty();
     let all = extents_after(scan, &stored.id, partition, &state, i64::MIN, usize::MAX)?;
-    let prefix: Vec<_> = all
-        .iter()
-        .take_while(|extent| extent.end <= covered_end)
-        .collect();
-    if prefix.is_empty() || prefix.last().is_none_or(|extent| extent.end != covered_end) {
+    let range: Vec<_> = match covered_start {
+        None => all
+            .iter()
+            .take_while(|extent| extent.end <= covered_end)
+            .collect(),
+        Some(start) => all
+            .iter()
+            .filter(|extent| extent.start >= start && extent.end <= covered_end)
+            .collect(),
+    };
+    if range.is_empty() || range.last().is_none_or(|extent| extent.end != covered_end) {
         return Ok(Outcome::Reject(1));
     }
+    if let Some(start) = covered_start {
+        if range[0].start != start {
+            return Ok(Outcome::Reject(1));
+        }
+        for pair in range.windows(2) {
+            if pair[1].start != pair[0].end {
+                return Ok(Outcome::Reject(1));
+            }
+        }
+    }
     let replacement = Extent {
-        start: prefix[0].start,
+        start: range[0].start,
         end: covered_end,
         key: object_key.to_string(),
         file_offset,
@@ -682,10 +702,13 @@ pub fn compact_replace(
     };
     let mut put = Vec::new();
     let mut del = Vec::new();
+    let window_start = range[0].start;
     if legacy {
         // Write the extents the compaction keeps; the row drops its list.
-        for extent in &all[prefix.len()..] {
-            put.push(extent_put(&stored.id, partition, extent)?);
+        for extent in &all {
+            if extent.end <= window_start || extent.start >= covered_end {
+                put.push(extent_put(&stored.id, partition, extent)?);
+            }
         }
         state.extents.clear();
         put.push((
@@ -694,9 +717,10 @@ pub fn compact_replace(
         ));
     } else {
         // The replacement ends where the last replaced extent did, so it takes
-        // that key; the others go.
+        // that key; the others in the window go. Extents outside the window
+        // stay.
         del.extend(
-            prefix
+            range
                 .iter()
                 .filter(|extent| extent.end != covered_end)
                 .map(|extent| extent_key(&stored.id, partition, extent.end)),
@@ -799,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_replace_keeps_the_high_watermark() {
+    fn compact_replace_keeps_the_high_watermark() -> Result<(), String> {
         let mut map = HashMap::new();
         let put = {
             let get = |key: &str| Ok(map.get(key).cloned());
@@ -842,7 +866,19 @@ mod tests {
         let replaced = {
             let get = |key: &str| Ok(map.get(key).cloned());
             let scan = |from: &str, to: &str, limit: usize| scan_map(&map, from, to, limit);
-            compact_replace(&get, &scan, "events", 0, 3, "bundle/new.seg", 0, 12, 1, 3).unwrap()
+            compact_replace(
+                &get,
+                &scan,
+                "events",
+                0,
+                None,
+                3,
+                "bundle/new.seg",
+                0,
+                12,
+                1,
+                3,
+            )?
         };
         let Outcome::Change { put, del, .. } = replaced else {
             panic!("compact");
@@ -858,6 +894,100 @@ mod tests {
         assert_eq!(extents.len(), 1);
         assert_eq!(extents[0].key, "bundle/new.seg");
         assert_eq!(extents[0].end, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_later_window_keeps_the_extent_before_it() -> Result<(), String> {
+        let mut map = HashMap::new();
+        let created = create_topic(
+            &|key| Ok(map.get(key).cloned()),
+            "events",
+            "topic-1",
+            1,
+            "r2",
+            &[],
+        )?;
+        let Outcome::Change { put, .. } = created else {
+            return Err("create".into());
+        };
+        for (key, value) in put {
+            map.insert(key, value);
+        }
+        let published = publish(
+            &|key| Ok(map.get(key).cloned()),
+            &[
+                PublishPart {
+                    epoch: -1,
+                    topic: "events".into(),
+                    partition: 0,
+                    start: 0,
+                    end: 2,
+                    object_key: "bundle/first.seg".into(),
+                    file_offset: 0,
+                    length: 10,
+                    base_timestamp: 1,
+                    max_timestamp: 1,
+                },
+                PublishPart {
+                    epoch: -1,
+                    topic: "events".into(),
+                    partition: 0,
+                    start: 2,
+                    end: 4,
+                    object_key: "bundle/second.seg".into(),
+                    file_offset: 0,
+                    length: 10,
+                    base_timestamp: 2,
+                    max_timestamp: 2,
+                },
+            ],
+            &[],
+        )?;
+        let Outcome::Change { put, .. } = published else {
+            return Err("publish".into());
+        };
+        for (key, value) in put {
+            map.insert(key, value);
+        }
+        let replaced = compact_replace(
+            &|key| Ok(map.get(key).cloned()),
+            &|from, to, limit| scan_map(&map, from, to, limit),
+            "events",
+            0,
+            Some(2),
+            4,
+            "bundle/second-new.seg",
+            0,
+            8,
+            2,
+            2,
+        )?;
+        let Outcome::Change { put, .. } = replaced else {
+            return Err("compact".into());
+        };
+        for (key, value) in put {
+            map.insert(key, value);
+        }
+        let state = parse_partition(map.get(&partition_storage_key("topic-1", 0)).ok_or("row")?)?;
+        let extents = extents_after(
+            &|from, to, limit| scan_map(&map, from, to, limit),
+            "topic-1",
+            0,
+            &state,
+            -1,
+            usize::MAX,
+        )?;
+        if extents.len() != 2 {
+            return Err(format!("extents {}", extents.len()));
+        }
+        if extents[0].key != "bundle/first.seg" || extents[0].end != 2 {
+            return Err("first extent changed".into());
+        }
+        if extents[1].key != "bundle/second-new.seg" || extents[1].start != 2 {
+            return Err("second window did not land on its own range".into());
+        }
+        Ok(())
     }
 
     #[test]

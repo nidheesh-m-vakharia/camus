@@ -211,24 +211,29 @@ impl Bucket {
         Ok(())
     }
 
+    /// A listing of `prefix`, read a page at a time. One list is counted
+    /// when this is created, not once per page.
+    pub fn list_pages(&self, prefix: &str) -> Listing {
+        STATS.lists.fetch_add(1, Relaxed);
+        Listing {
+            stream: self.store.list(Some(&self.path(prefix))),
+            prefix: self.prefix.clone(),
+        }
+    }
+
     /// Every object under `prefix`, as `(key, size, last-modified Unix ms)`.
     /// Keys are returned without the bucket's own prefix.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64, i64)>> {
-        use futures::TryStreamExt;
-        let result = self
-            .store
-            .list(Some(&self.path(prefix)))
-            .try_collect::<Vec<_>>()
-            .await;
-        let objects = counted(&STATS.lists, result)?;
-        Ok(objects
-            .into_iter()
-            .filter_map(|meta| {
-                let key = meta.location.to_string();
-                let key = key.strip_prefix(&self.prefix)?.to_string();
-                Some((key, meta.size, meta.last_modified.timestamp_millis()))
-            })
-            .collect())
+        let mut listing = self.list_pages(prefix);
+        let mut all = Vec::new();
+        loop {
+            let page = listing.next_page(1024).await?;
+            if page.is_empty() {
+                break;
+            }
+            all.extend(page);
+        }
+        Ok(all)
     }
 
     /// Whether `key` is absent. `true` means a get would not return bytes.
@@ -242,6 +247,37 @@ impl Bucket {
                 Err(err.into())
             }
         }
+    }
+}
+
+/// One object listing. [`Listing::next_page`] returns at most the requested
+/// number of keys, and an empty page means the listing is finished.
+pub struct Listing {
+    stream: futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>,
+    prefix: String,
+}
+
+impl Listing {
+    /// The next `limit` objects, or fewer when the listing ends.
+    pub async fn next_page(&mut self, limit: usize) -> anyhow::Result<Vec<(String, u64, i64)>> {
+        use futures::StreamExt;
+        let mut page = Vec::new();
+        while page.len() < limit {
+            let Some(meta) = self.stream.next().await else {
+                break;
+            };
+            let meta = meta?;
+            let key = meta.location.to_string();
+            let Some(key) = key.strip_prefix(&self.prefix) else {
+                continue;
+            };
+            page.push((
+                key.to_string(),
+                meta.size,
+                meta.last_modified.timestamp_millis(),
+            ));
+        }
+        Ok(page)
     }
 }
 
@@ -385,6 +421,32 @@ mod stats_tests {
         anyhow::ensure!(STATS.deletes.load(Relaxed) > deletes);
         anyhow::ensure!(STATS.put_bytes.load(Relaxed) >= put_bytes + 10);
         anyhow::ensure!(STATS.get_bytes.load(Relaxed) >= get_bytes + 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_listing_returns_a_page_and_then_the_rest() -> anyhow::Result<()> {
+        let bucket = Bucket {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            prefix: String::new(),
+        };
+        bucket.put_new("bundle/a", Bytes::from_static(b"a")).await?;
+        bucket.put_new("bundle/b", Bytes::from_static(b"b")).await?;
+        bucket.put_new("bundle/c", Bytes::from_static(b"c")).await?;
+        let mut listing = bucket.list_pages("bundle/");
+        let first = listing.next_page(2).await?;
+        let second = listing.next_page(2).await?;
+        let third = listing.next_page(2).await?;
+        anyhow::ensure!(first.len() == 2);
+        anyhow::ensure!(second.len() == 1);
+        anyhow::ensure!(third.is_empty());
+        let mut keys = first;
+        keys.extend(second);
+        keys.sort();
+        anyhow::ensure!(keys
+            .iter()
+            .map(|(key, _, _)| key.as_str())
+            .eq(["bundle/a", "bundle/b", "bundle/c"]));
         Ok(())
     }
 }

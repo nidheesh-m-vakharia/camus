@@ -1,6 +1,6 @@
 # ADR 0019: Transaction spans live in the WAL until EndTxn
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-12
 
 ## Context
@@ -48,6 +48,13 @@ aborted, as `NoteTxn` does today, so `read_committed` can move past it.
   overlaps an aborted range does not reveal those batches.
 - Commands written before this keep working: `EndTxn` with no ends still
   publishes the spans `NoteTxn` stored.
+
+## As built
+
+Accepted 2026-11-12. The WAL records the open span on apply, `EndTxn`
+finishes and reads it before the metadata commit, and seal and r2 produce
+carry the span in the metadata commit they already make. A transactional
+produce in `wal` mode is one WAL commit.
 
 ## Alternatives
 

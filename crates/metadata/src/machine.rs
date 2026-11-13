@@ -523,6 +523,7 @@ fn apply_command(
             Command::Compact {
                 topic,
                 partition,
+                covered_start,
                 covered_end,
                 object_key,
                 file_offset,
@@ -534,6 +535,7 @@ fn apply_command(
                 &scan,
                 &topic,
                 partition,
+                covered_start,
                 covered_end,
                 &object_key,
                 file_offset,
