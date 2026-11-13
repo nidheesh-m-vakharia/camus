@@ -5,6 +5,7 @@
 
 mod kafka;
 mod recover;
+mod settings;
 mod slot;
 
 use std::collections::BTreeMap;
@@ -75,6 +76,10 @@ struct Args {
     /// Require SASL (PLAIN or SCRAM) before any API other than ApiVersions and the SASL pair.
     #[arg(long, default_value_t = false)]
     require_sasl: bool,
+    /// `camus.toml`. When omitted, `camus.toml` in the working directory is
+    /// used if that file exists. Flags and `CAMUS_*` override the file.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 /// Largest Raft RPC body the HTTP routes accept.
@@ -127,6 +132,7 @@ struct Admin {
     wal_dir: PathBuf,
     http: reqwest::Client,
     truncating: tokio::sync::Mutex<()>,
+    settings: settings::Settings,
 }
 
 #[derive(Deserialize)]
@@ -151,11 +157,17 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+    let mut settings = settings::Settings::load(args.config.as_deref(), &flag_overrides(&args))?;
+    apply_listener_defaults(&mut settings, &args);
+    for line in settings.report_lines() {
+        eprintln!("config {line}");
+    }
     std::fs::create_dir_all(&args.data_dir)?;
     let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
     let http_bound = listener.local_addr()?;
     if camus_raft::quic::enabled() {
-        if let Some(identity) = quic_identity(&args, http_bound)? {
+        if let Some(identity) = quic_identity(&args, http_bound, settings.is_true("dev.plaintext"))?
+        {
             let mut quic_addr = http_bound;
             if let Some(port) = camus_raft::quic::port_override()? {
                 quic_addr.set_port(port);
@@ -164,7 +176,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let node = Arc::new(MetadataNode::open(args.node_id, &args.data_dir, &args.http_addr).await?);
-    let wal_dir = resolve_wal_dir(args.wal_dir.clone(), &args.data_dir);
+    let wal_explicit = {
+        let dir = settings.get("wal.dir");
+        if dir.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(dir))
+        }
+    };
+    let wal_dir = resolve_wal_dir(wal_explicit, &args.data_dir);
     std::fs::create_dir_all(&wal_dir)?;
     let wal = Arc::new(WalSlot::new(Shard::open(args.node_id, &wal_dir).await?));
     warn_if_rotating_wal(&wal_dir);
@@ -196,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
             .timeout(std::time::Duration::from_secs(10))
             .build()?,
         truncating: tokio::sync::Mutex::new(()),
+        settings: settings.clone(),
     });
 
     let app = Router::new()
@@ -213,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
             Router::new()
                 .route("/metrics", get(prometheus))
                 .route("/admin/metrics", get(admin_metrics))
+                .route("/admin/config", get(admin_config))
                 .route("/admin/init", post(init))
                 .route("/admin/truncate-to-sealed", post(truncate_to_sealed))
                 .route("/admin/join-wal", post(join_wal))
@@ -239,8 +261,17 @@ async fn main() -> anyhow::Result<()> {
                 .with_state(Arc::clone(&wal)),
         );
 
-    if let Some(kafka_addr) = &args.kafka_addr {
-        start_kafka(node.clone(), wal, args.node_id, kafka_addr, &args).await?;
+    let kafka_addr = settings.get("kafka.addr").to_string();
+    if !kafka_addr.is_empty() {
+        start_kafka(
+            node.clone(),
+            wal,
+            args.node_id,
+            &kafka_addr,
+            &args,
+            &settings,
+        )
+        .await?;
     }
 
     let bound = http_bound;
@@ -267,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
 fn quic_identity(
     args: &Args,
     addr: SocketAddr,
+    dev_plaintext: bool,
 ) -> anyhow::Result<Option<camus_raft::quic::Identity>> {
     if let (Some(cert), Some(key), Some(ca)) = (&args.tls_cert, &args.tls_key, &args.tls_client_ca)
     {
@@ -279,7 +311,7 @@ fn quic_identity(
         let trusted = rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
         return Ok(Some(camus_raft::quic::Identity::new(certs, key, trusted)?));
     }
-    if args.dev_plaintext && (addr.ip().is_loopback() || addr.ip().is_unspecified()) {
+    if dev_plaintext && (addr.ip().is_loopback() || addr.ip().is_unspecified()) {
         return Ok(Some(camus_raft::quic::Identity::loopback_dev()?));
     }
     tracing::warn!(
@@ -488,15 +520,14 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
 /// Shard count when init omits one. One shard per core of this process,
 /// rounded up to a multiple of the voter count so each voter is the preferred
 /// leader of the same number of shards, and capped at eight shards per voter.
-fn default_shard_count(voters: usize) -> u32 {
-    if let Ok(raw) = std::env::var("CAMUS_WAL_SHARDS") {
-        if raw == "voters" {
-            return u32::try_from(voters).unwrap_or(1).max(1);
-        }
-        if let Ok(count) = raw.parse::<u32>() {
-            if count >= 1 {
-                return count;
-            }
+fn default_shard_count(voters: usize, settings: &settings::Settings) -> u32 {
+    let raw = settings.get("wal.shards");
+    if raw == "voters" {
+        return u32::try_from(voters).unwrap_or(1).max(1);
+    }
+    if let Ok(count) = raw.parse::<u32>() {
+        if count >= 1 {
+            return count;
         }
     }
     shard_count_for(
@@ -518,14 +549,14 @@ fn shard_count_for(voters: usize, cores: u32) -> u32 {
 /// `CAMUS_READ_DISK_CACHE_BYTES` (4 GiB) in `CAMUS_READ_DISK_CACHE_ENTRIES`
 /// (65536) files. A size of 0 turns it off, and a cache that cannot be opened
 /// is left off with a warning.
-fn open_disk_cache(dir: &std::path::Path) -> Option<camus_storage::DiskCache> {
-    let env = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-    };
-    let bytes = env("CAMUS_READ_DISK_CACHE_BYTES").unwrap_or(4 * 1024 * 1024 * 1024);
-    let entries = env("CAMUS_READ_DISK_CACHE_ENTRIES").unwrap_or(65_536);
+fn open_disk_cache(
+    dir: &std::path::Path,
+    settings: &settings::Settings,
+) -> Option<camus_storage::DiskCache> {
+    let bytes = settings
+        .u64("read.disk.cache.bytes")
+        .unwrap_or(4 * 1024 * 1024 * 1024);
+    let entries = settings.u64("read.disk.cache.entries").unwrap_or(65_536);
     if bytes == 0 || entries == 0 {
         return None;
     }
@@ -744,13 +775,16 @@ async fn init(
         return Err((StatusCode::BAD_REQUEST, "no wal voter".into()));
     }
     voters.sort_unstable();
-    let count = shards.unwrap_or_else(|| default_shard_count(voters.len()));
+    let count = shards.unwrap_or_else(|| default_shard_count(voters.len(), &admin.settings));
     let layout = shard_voters(&voters, count);
-    admin
-        .node
-        .initialize(nodes.clone())
-        .await
-        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
+    // A second init of a group that already exists succeeds and changes
+    // nothing. openraft's NotAllowed means the log is already in motion.
+    if let Err(err) = admin.node.initialize(nodes.clone()).await {
+        if err.to_string().contains("not allowed to initialize") {
+            return Ok(StatusCode::OK);
+        }
+        return Err((StatusCode::CONFLICT, err.to_string()));
+    }
     if count > 1 {
         let raw = serde_json::json!({ "count": count, "voters": layout }).to_string();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1669,43 +1703,44 @@ async fn start_kafka(
     node_id: NodeId,
     kafka_addr: &str,
     args: &Args,
+    settings: &settings::Settings,
 ) -> anyhow::Result<()> {
     let tls = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => Some(load_tls(cert, key, args.tls_client_ca.as_deref())?),
         (None, None) => None,
         _ => anyhow::bail!("--tls-cert and --tls-key are set together"),
     };
-    if tls.is_none() && !args.dev_plaintext {
+    let dev_plaintext = settings.is_true("dev.plaintext");
+    if tls.is_none() && !dev_plaintext {
         anyhow::bail!("Kafka listener requires --dev-plaintext or a TLS certificate");
     }
     let bind: SocketAddr = kafka_addr.parse()?;
-    if tls.is_none() && !bind.ip().is_loopback() && !args.allow_non_loopback {
+    if tls.is_none() && !bind.ip().is_loopback() && !settings.is_true("allow.non.loopback") {
         anyhow::bail!("non-loopback PLAINTEXT requires --allow-non-loopback");
     }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let bound = listener.local_addr()?;
     std::fs::write(args.data_dir.join("kafka-addr"), bound.to_string())?;
-    let (host, port) = match &args.advertised_addr {
-        Some(advertised) => {
-            let (host, port) = advertised
-                .rsplit_once(':')
-                .ok_or_else(|| anyhow::anyhow!("--advertised-addr must be host:port"))?;
-            (host.to_string(), port.parse()?)
-        }
-        None => advertised_kafka(bind, bound.port()),
+    let advertised = settings.get("advertised.listeners");
+    let (host, port) = if advertised.is_empty() {
+        advertised_kafka(bind, bound.port())
+    } else {
+        let (host, port) = advertised
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("advertised.listeners must be host:port"))?;
+        (host.to_string(), port.parse()?)
     };
     // The MinIO fallbacks are for development. A broker serving TLS must be
     // told where its log lives instead of silently using a local stand-in.
-    if !args.dev_plaintext {
-        let missing: Vec<&str> = [
-            "CAMUS_S3_ENDPOINT",
-            "CAMUS_S3_BUCKET",
-            "CAMUS_S3_ACCESS_KEY",
-            "CAMUS_S3_SECRET_KEY",
-        ]
-        .into_iter()
-        .filter(|name| std::env::var(name).map_or(true, |value| value.is_empty()))
-        .collect();
+    if !dev_plaintext {
+        let names = ["s3.endpoint", "s3.bucket", "s3.access_key", "s3.secret_key"];
+        let missing: Vec<&str> = names
+            .into_iter()
+            .filter(|key| {
+                settings.source_of(key) == settings::Source::Default || settings.get(key).is_empty()
+            })
+            .map(|key| settings.env_name(key))
+            .collect();
         if !missing.is_empty() {
             anyhow::bail!(
                 "object storage is not configured; set {} (the MinIO defaults apply only with --dev-plaintext)",
@@ -1713,12 +1748,13 @@ async fn start_kafka(
             );
         }
     }
-    let bucket = open_bucket()?;
-    let user = std::env::var("CAMUS_SASL_USER").unwrap_or_default();
-    let password = std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default();
+    let bucket = open_bucket(settings)?;
+    let user = settings.get("sasl.username").to_string();
+    let password = settings.get("sasl.password").to_string();
     // TLS alone means SASL_SSL. With a client CA it is Kafka's SSL listener,
     // where the certificate is the identity.
-    let require_sasl = args.require_sasl || (tls.is_some() && args.tls_client_ca.is_none());
+    let require_sasl =
+        settings.is_true("require.sasl") || (tls.is_some() && args.tls_client_ca.is_none());
     if require_sasl && (user.is_empty() || password.is_empty()) {
         anyhow::bail!("SASL requires CAMUS_SASL_USER and CAMUS_SASL_PASSWORD");
     }
@@ -1733,27 +1769,28 @@ async fn start_kafka(
         password,
         tls,
         wal,
+        settings,
     );
-    let kafka = Arc::new(match open_disk_cache(&args.data_dir.join("read-cache")) {
-        Some(cache) => kafka.with_disk_cache(cache),
-        None => kafka,
-    });
+    let kafka = Arc::new(
+        match open_disk_cache(&args.data_dir.join("read-cache"), settings) {
+            Some(cache) => kafka.with_disk_cache(cache),
+            None => kafka,
+        },
+    );
     info!(%bound, sasl = require_sasl, "kafka listener");
     tokio::spawn(async move { kafka.run(listener).await });
     Ok(())
 }
 
-fn open_bucket() -> anyhow::Result<Bucket> {
+fn open_bucket(settings: &settings::Settings) -> anyhow::Result<Bucket> {
     Bucket::connect(&BucketConfig {
-        endpoint: std::env::var("CAMUS_S3_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),
-        bucket: std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into()),
-        region: std::env::var("CAMUS_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
-        access_key: std::env::var("CAMUS_S3_ACCESS_KEY").unwrap_or_else(|_| "camus".into()),
-        secret_key: std::env::var("CAMUS_S3_SECRET_KEY")
-            .unwrap_or_else(|_| "camus-dev-secret".into()),
-        prefix: std::env::var("CAMUS_S3_PREFIX").unwrap_or_default(),
-        virtual_hosted: env_flag("CAMUS_S3_VIRTUAL_HOST"),
+        endpoint: settings.get("s3.endpoint").to_string(),
+        bucket: settings.get("s3.bucket").to_string(),
+        region: settings.get("s3.region").to_string(),
+        access_key: settings.get("s3.access_key").to_string(),
+        secret_key: settings.get("s3.secret_key").to_string(),
+        prefix: settings.get("s3.prefix").to_string(),
+        virtual_hosted: settings.is_true("s3.virtual_host"),
     })
 }
 
@@ -1769,8 +1806,8 @@ async fn restore_cluster(
                 .into(),
         ));
     }
-    let bucket =
-        open_bucket().map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let bucket = open_bucket(&admin.settings)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     match recover::restore(&admin.node, &bucket).await {
         Ok(body) => Ok(Json(body)),
         Err(err) => {
@@ -1785,11 +1822,95 @@ async fn restore_cluster(
     }
 }
 
-fn env_flag(name: &str) -> bool {
-    matches!(
-        std::env::var(name).ok().as_deref().map(str::trim),
-        Some("1" | "true" | "TRUE" | "yes" | "YES")
-    )
+/// `allow.everyone.if.no.acl.found` follows the listener when nobody set it:
+/// open on dev PLAINTEXT, closed once SASL or TLS is on.
+fn apply_listener_defaults(settings: &mut settings::Settings, args: &Args) {
+    if !settings.get("allow.everyone.if.no.acl.found").is_empty() {
+        return;
+    }
+    let tls = args.tls_cert.is_some() && args.tls_key.is_some();
+    let require_sasl = settings.is_true("require.sasl") || (tls && args.tls_client_ca.is_none());
+    let open = !require_sasl && !tls;
+    settings.set(
+        "allow.everyone.if.no.acl.found",
+        if open { "true" } else { "false" },
+        settings::Source::Default,
+    );
+}
+
+/// Flags that were passed. A bool flag that stayed at its default does not
+/// override the file.
+fn flag_overrides(args: &Args) -> BTreeMap<String, String> {
+    let mut flags = BTreeMap::new();
+    flags.insert("node.id".to_string(), args.node_id.to_string());
+    flags.insert("http.addr".to_string(), args.http_addr.clone());
+    flags.insert("data.dir".to_string(), args.data_dir.display().to_string());
+    if let Some(dir) = &args.wal_dir {
+        flags.insert("wal.dir".to_string(), dir.display().to_string());
+    }
+    if let Some(addr) = &args.kafka_addr {
+        flags.insert("kafka.addr".to_string(), addr.clone());
+    }
+    if let Some(addr) = &args.advertised_addr {
+        flags.insert("advertised.listeners".to_string(), addr.clone());
+    }
+    if args.dev_plaintext {
+        flags.insert("dev.plaintext".to_string(), "true".to_string());
+    }
+    if args.allow_non_loopback {
+        flags.insert("allow.non.loopback".to_string(), "true".to_string());
+    }
+    if args.require_sasl {
+        flags.insert("require.sasl".to_string(), "true".to_string());
+    }
+    flags
+}
+
+#[derive(Deserialize)]
+struct ConfigQuery {
+    topic: Option<String>,
+}
+
+/// Effective broker settings, or one topic's stored config next to what is enforced.
+async fn admin_config(
+    State(admin): State<Arc<Admin>>,
+    Query(query): Query<ConfigQuery>,
+) -> Result<String, (StatusCode, String)> {
+    match query.topic {
+        Some(name) => topic_config(&admin, &name),
+        None => Ok(format!("{}\n", admin.settings.report_lines().join("\n"))),
+    }
+}
+
+fn topic_config(admin: &Admin, name: &str) -> Result<String, (StatusCode, String)> {
+    let raw = admin
+        .node
+        .read_local(&camus_metadata::topic_storage_key(name))
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    let Some(raw) = raw else {
+        return Err((StatusCode::NOT_FOUND, format!("unknown topic {name}")));
+    };
+    let topic = camus_metadata::parse_topic(&raw)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let mut lines = Vec::new();
+    for spec in camus_metadata::config::SPECS {
+        let stored = topic.overrides.get(spec.name).cloned().unwrap_or_else(|| {
+            if spec.name == "durability.mode" {
+                topic.durability.clone()
+            } else {
+                spec.default.to_string()
+            }
+        });
+        let line = match spec.effect {
+            camus_metadata::config::Effect::Applied => format!("{}={stored} enforced", spec.name),
+            camus_metadata::config::Effect::Accepted => {
+                let why = spec.note().unwrap_or("stored only");
+                format!("{}={stored} {why}", spec.name)
+            }
+        };
+        lines.push(line);
+    }
+    Ok(format!("{}\n", lines.join("\n")))
 }
 
 /// Host and port clients should dial. `CAMUS_ADVERTISED_HOST` wins. On

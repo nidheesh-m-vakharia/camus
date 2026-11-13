@@ -75,24 +75,19 @@ impl Store for MetadataStore {
 
 /// Coordinator settings from the environment, for tests. Kafka's defaults
 /// otherwise.
-pub fn coordinator_config() -> camus_coordinator::Config {
+pub fn coordinator_config(settings: &crate::settings::Settings) -> camus_coordinator::Config {
     let mut config = camus_coordinator::Config::default();
-    let ms = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(std::time::Duration::from_millis)
-    };
-    if let Some(delay) = ms("CAMUS_GROUP_INITIAL_DELAY_MS") {
+    let ms = |key: &str| settings.u64(key).map(std::time::Duration::from_millis);
+    if let Some(delay) = ms("group.initial.rebalance.delay.ms") {
         config.initial_rebalance_delay = delay;
     }
-    if let Some(min) = ms("CAMUS_GROUP_MIN_SESSION_MS") {
+    if let Some(min) = ms("group.min.session.timeout.ms") {
         config.min_session_timeout = min;
     }
-    if let Some(session) = ms("CAMUS_CONSUMER_SESSION_MS") {
+    if let Some(session) = ms("group.consumer.session.timeout.ms") {
         config.consumer_session_timeout = session;
     }
-    if let Some(interval) = ms("CAMUS_CONSUMER_HEARTBEAT_MS") {
+    if let Some(interval) = ms("group.consumer.heartbeat.interval.ms") {
         config.consumer_heartbeat_interval = interval;
     }
     config

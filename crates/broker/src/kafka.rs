@@ -339,6 +339,8 @@ pub fn epoch_base_key(shard: u32) -> String {
 pub struct Kafka {
     node: Arc<MetadataNode>,
     bucket: Bucket,
+    /// `s3://bucket/prefix`, the directory `DescribeLogDirs` names.
+    log_dir: String,
     node_id: i32,
     host: String,
     port: i32,
@@ -448,98 +450,92 @@ impl Kafka {
         sasl_pass: String,
         tls: Option<TlsAcceptor>,
         wal: Arc<WalSlot>,
+        settings: &crate::settings::Settings,
     ) -> Self {
-        let wal_limit = std::env::var("CAMUS_WAL_DISK_LIMIT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(WAL_DISK_LIMIT);
-        let flush_ms = std::env::var("CAMUS_FLUSH_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(250);
-        let quiet_ms = std::env::var("CAMUS_QUIET_FLUSH_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(30_000);
-        let rack = std::env::var("CAMUS_RACK")
-            .ok()
-            .filter(|rack| !rack.is_empty());
-        let env_ms = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(default)
+        let ms = |key: &str, default: u64| settings.u64(key).unwrap_or(default);
+        let wal_limit = settings.u64("wal.disk.limit").unwrap_or(WAL_DISK_LIMIT);
+        let flush_ms = ms("log.flush.interval.ms", 250);
+        let quiet_ms = ms("log.quiet.flush.ms", 30_000);
+        let rack = {
+            let rack = settings.get("broker.rack");
+            if rack.is_empty() {
+                None
+            } else {
+                Some(rack.to_string())
+            }
         };
-        let retention_check_ms = env_ms("CAMUS_RETENTION_CHECK_MS", 300_000);
-        let sweep_ms = env_ms("CAMUS_SWEEP_MS", 300_000);
-        let sweep_min_age_ms = env_ms("CAMUS_SWEEP_MIN_AGE_MS", 3_600_000) as i64;
-        let sweep_delay_ms = env_ms("CAMUS_FILE_DELETE_DELAY_MS", 60_000) as i64;
+        let retention_check_ms = ms("log.retention.check.interval.ms", 300_000);
+        let sweep_ms = ms("log.sweep.interval.ms", 300_000);
+        let sweep_min_age_ms = ms("log.sweep.min.age.ms", 3_600_000) as i64;
+        let sweep_delay_ms = ms("file.delete.delay.ms", 60_000) as i64;
         // Kafka's `super.users` is a semicolon-separated principal list.
-        let mut super_users: std::collections::BTreeSet<String> =
-            std::env::var("CAMUS_SUPER_USERS")
-                .unwrap_or_default()
-                .split(';')
-                .map(str::trim)
-                .filter(|principal| !principal.is_empty())
-                .map(str::to_string)
-                .collect();
+        let mut super_users: std::collections::BTreeSet<String> = settings
+            .get("super.users")
+            .split(';')
+            .map(str::trim)
+            .filter(|principal| !principal.is_empty())
+            .map(str::to_string)
+            .collect();
         if require_sasl && !sasl_user.is_empty() {
             super_users.insert(format!("User:{sasl_user}"));
         }
         // On the dev PLAINTEXT listener every client is `User:ANONYMOUS`, as
         // on a Kafka listener with no authorizer, so a resource no ACL names
         // stays open. An authenticated listener (SASL or mTLS) denies it.
-        let allow_if_no_acl = match std::env::var("CAMUS_ACL_ALLOW_IF_NO_ACL").ok().as_deref() {
-            Some("true") => true,
-            Some("false") => false,
+        // An explicit file or env value wins over that listener default.
+        let allow_if_no_acl = match settings.get("allow.everyone.if.no.acl.found") {
+            "true" => true,
+            "false" => false,
             _ => !require_sasl && tls.is_none(),
         };
-        let txn_max_timeout_ms = env_ms("CAMUS_TXN_MAX_TIMEOUT_MS", 900_000) as i64;
-        let txn_abort_interval_ms = env_ms("CAMUS_TXN_ABORT_INTERVAL_MS", 10_000);
-        let txn_id_expiration_ms =
-            env_ms("CAMUS_TRANSACTIONAL_ID_EXPIRATION_MS", 604_800_000) as i64;
-        let txn_cleanup_interval_ms = env_ms("CAMUS_TXN_CLEANUP_INTERVAL_MS", 3_600_000);
-        let producer_id_expiration_ms =
-            env_ms("CAMUS_PRODUCER_ID_EXPIRATION_MS", 86_400_000) as i64;
-        let producer_id_check_ms = env_ms("CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS", 600_000);
-        let leader_balance_ms =
-            if std::env::var("CAMUS_AUTO_LEADER_REBALANCE").as_deref() == Ok("false") {
-                0
-            } else {
-                env_ms("CAMUS_LEADER_IMBALANCE_CHECK_MS", 300_000)
-            };
-        // Kafka's setting is in minutes; `CAMUS_OFFSETS_RETENTION_MS`
-        // overrides it for tests that cannot wait a minute.
-        let offsets_retention_ms = std::env::var("CAMUS_OFFSETS_RETENTION_MS")
+        let txn_max_timeout_ms = ms("transaction.max.timeout.ms", 900_000) as i64;
+        let txn_abort_interval_ms = ms("transaction.abort.interval.ms", 10_000);
+        let txn_id_expiration_ms = ms("transactional.id.expiration.ms", 604_800_000) as i64;
+        let txn_cleanup_interval_ms = ms("transaction.cleanup.interval.ms", 3_600_000);
+        let producer_id_expiration_ms = ms("producer.id.expiration.ms", 86_400_000) as i64;
+        let producer_id_check_ms = ms("producer.id.check.interval.ms", 600_000);
+        let leader_balance_ms = if settings.get("auto.leader.rebalance.enable") == "false" {
+            0
+        } else {
+            ms("leader.imbalance.check.interval.ms", 300_000)
+        };
+        // Kafka's setting is in minutes; `offsets.retention.ms`
+        // (`CAMUS_OFFSETS_RETENTION_MS`) overrides it for tests that cannot
+        // wait a minute.
+        let offsets_retention_ms = settings
+            .get("offsets.retention.ms")
+            .parse::<i64>()
             .ok()
-            .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or_else(|| {
-                env_ms("CAMUS_OFFSETS_RETENTION_MINUTES", 10_080).saturating_mul(60_000) as i64
+                ms("offsets.retention.minutes", 10_080).saturating_mul(60_000) as i64
             });
-        let offsets_check_ms = env_ms("CAMUS_OFFSETS_RETENTION_CHECK_INTERVAL_MS", 600_000);
-        let auto_create_topics = std::env::var("CAMUS_AUTO_CREATE_TOPICS")
-            .map(|value| value != "false")
-            .unwrap_or(true);
-        let default_partitions = std::env::var("CAMUS_NUM_PARTITIONS")
+        let offsets_check_ms = ms("offsets.retention.check.interval.ms", 600_000);
+        let auto_create_topics = settings.get("auto.create.topics.enable") != "false";
+        let default_partitions = settings
+            .get("num.partitions")
+            .parse::<i32>()
             .ok()
-            .and_then(|value| value.parse::<i32>().ok())
             .filter(|count| *count > 0)
             .unwrap_or(1);
-        let message_max_bytes = std::env::var("CAMUS_MESSAGE_MAX_BYTES")
+        let message_max_bytes = settings
+            .get("message.max.bytes")
+            .parse::<usize>()
             .ok()
-            .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(camus_metadata::config::DEFAULT_MESSAGE_MAX_BYTES as usize)
             .min(batch::MAX_BATCH_CEILING);
-        let compact_ms = std::env::var("CAMUS_COMPACT_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(300_000);
+        let compact_ms = ms("log.cleaner.backoff.ms", 300_000);
         let store = Arc::new(groups::MetadataStore {
             node: Arc::clone(&node),
         });
+        let log_dir = format!(
+            "s3://{}/{}",
+            settings.get("s3.bucket"),
+            settings.get("s3.prefix")
+        );
         Self {
             node,
             bucket,
+            log_dir,
             node_id,
             host,
             port,
@@ -565,8 +561,14 @@ impl Kafka {
             offsets_retention_ms,
             offsets_check_ms,
             wal_limit,
-            default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
-                .unwrap_or_else(|_| "wal".into()),
+            default_durability: {
+                let mode = settings.get("durability.mode");
+                if mode.is_empty() {
+                    "wal".to_string()
+                } else {
+                    mode.to_string()
+                }
+            },
             require_sasl,
             super_users,
             allow_if_no_acl,
@@ -580,7 +582,10 @@ impl Kafka {
                 .build()
                 .expect("http client"),
             unknown: std::sync::Mutex::new(BTreeMap::new()),
-            coordinator: camus_coordinator::Coordinator::new(store, groups::coordinator_config()),
+            coordinator: camus_coordinator::Coordinator::new(
+                store,
+                groups::coordinator_config(settings),
+            ),
             coordinator_term: Mutex::new(None),
             buf: Mutex::new(Vec::new()),
             buffered: std::sync::atomic::AtomicUsize::new(0),
@@ -589,9 +594,9 @@ impl Kafka {
             arrivals: std::sync::Mutex::new(Arrivals::new()),
             acl_cache: std::sync::RwLock::new(None),
             read_cache: camus_storage::ReadCache::new(
-                std::env::var("CAMUS_READ_CACHE_BYTES")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
+                settings
+                    .u64("read.cache.bytes")
+                    .and_then(|bytes| usize::try_from(bytes).ok())
                     .unwrap_or(READ_CACHE_BYTES),
             ),
             disk_cache: None,
@@ -1529,9 +1534,7 @@ impl Kafka {
 
     /// The log directory DescribeLogDirs names: the bucket and key prefix.
     fn log_dir(&self) -> String {
-        let bucket = std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into());
-        let prefix = std::env::var("CAMUS_S3_PREFIX").unwrap_or_default();
-        format!("s3://{bucket}/{prefix}")
+        self.log_dir.clone()
     }
 
     /// The partition's high watermark: the sealed end, or the WAL end for a

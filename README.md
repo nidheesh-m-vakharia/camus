@@ -67,7 +67,10 @@ the address clients should dial. On Railway those fall back to
 object-store calls by operation and bytes moved, for checking R2 cost
 against ADR 0007.
 
-Three brokers plus MinIO: `docker compose --profile brokers up`. The image
+Three brokers plus MinIO: `docker compose --profile brokers up`. Broker 1
+listens on 9092. `init` runs `camus admin init` and retries until the
+brokers answer, so a Kafka client can use `localhost:9092` without a
+manual curl. The image
 is published from `main` to `ghcr.io/<owner>/camus`, tagged `latest` and
 the commit sha, after the test workflow passes. The GitHub package stays
 private until you change that in the package settings.
@@ -169,9 +172,14 @@ An acknowledged record survives the loss of the leader.
 
 ## Configuration
 
-Broker settings come from the environment at startup. Kafka's name is in
-parentheses where there is one; [docs/compatibility.md](docs/compatibility.md#defaults)
-lists each default next to Kafka's.
+Broker settings come from `camus.toml` at startup (Kafka's name, or
+`durability.mode`, `wal.disk.limit`, and `[s3]`). Pass `--config` to use
+another path. A variable below overrides the file, and a flag overrides
+both. The process prints `key=value source` as it starts. Kafka's name is
+in parentheses where there is one;
+[docs/compatibility.md](docs/compatibility.md#defaults) lists each default
+next to Kafka's. `camus admin config` prints the same list from a running
+broker.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
