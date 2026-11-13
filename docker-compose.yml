@@ -5,7 +5,7 @@ name: camus
 # the archived release in deploy/minio.
 # `docker compose up -d minio create-bucket` is enough for the storage test.
 # The broker services build the release binary. They do not form the Raft
-# group until `init` runs.
+# group until `init` runs `camus admin init`.
 
 services:
   minio:
@@ -34,38 +34,93 @@ services:
   broker-1:
     build: .
     profiles: ["brokers"]
-    command: ["--node-id", "1", "--http-addr", "0.0.0.0:18001", "--data-dir", "/data"]
-    ports: ["18001:18001"]
+    command:
+      - --node-id
+      - "1"
+      - --http-addr
+      - 0.0.0.0:18001
+      - --kafka-addr
+      - 0.0.0.0:9092
+      - --advertised-addr
+      - 127.0.0.1:9092
+      - --data-dir
+      - /data
+      - --dev-plaintext
+      - --allow-non-loopback
+    environment: &s3
+      CAMUS_S3_ENDPOINT: http://minio:9000
+      CAMUS_S3_BUCKET: camus
+      CAMUS_S3_ACCESS_KEY: camus
+      CAMUS_S3_SECRET_KEY: camus-dev-secret
+    ports:
+      - "18001:18001"
+      - "9092:9092"
     volumes: ["broker1:/data"]
-    depends_on: [minio]
+    depends_on: [minio, create-bucket]
 
   broker-2:
     build: .
     profiles: ["brokers"]
-    command: ["--node-id", "2", "--http-addr", "0.0.0.0:18002", "--data-dir", "/data"]
-    ports: ["18002:18002"]
+    command:
+      - --node-id
+      - "2"
+      - --http-addr
+      - 0.0.0.0:18002
+      - --kafka-addr
+      - 0.0.0.0:9092
+      - --advertised-addr
+      - 127.0.0.1:9093
+      - --data-dir
+      - /data
+      - --dev-plaintext
+      - --allow-non-loopback
+    environment: *s3
+    ports:
+      - "18002:18002"
+      - "9093:9092"
     volumes: ["broker2:/data"]
-    depends_on: [minio]
+    depends_on: [minio, create-bucket]
 
   broker-3:
     build: .
     profiles: ["brokers"]
-    command: ["--node-id", "3", "--http-addr", "0.0.0.0:18003", "--data-dir", "/data"]
-    ports: ["18003:18003"]
+    command:
+      - --node-id
+      - "3"
+      - --http-addr
+      - 0.0.0.0:18003
+      - --kafka-addr
+      - 0.0.0.0:9092
+      - --advertised-addr
+      - 127.0.0.1:9094
+      - --data-dir
+      - /data
+      - --dev-plaintext
+      - --allow-non-loopback
+    environment: *s3
+    ports:
+      - "18003:18003"
+      - "9094:9092"
     volumes: ["broker3:/data"]
-    depends_on: [minio]
+    depends_on: [minio, create-bucket]
 
   init:
-    image: curlimages/curl:8.16.0
+    build: .
     profiles: ["brokers"]
     depends_on: [broker-1, broker-2, broker-3]
-    entrypoint: ["/bin/sh", "-c"]
+    entrypoint: ["camus"]
     command:
-      - |
-        sleep 2
-        curl -sf -X POST http://broker-1:18001/admin/init \
-          -H 'content-type: application/json' \
-          -d '[{"id":1,"addr":"broker-1:18001"},{"id":2,"addr":"broker-2:18002"},{"id":3,"addr":"broker-3:18003"}]'
+      - admin
+      - init
+      - --broker
+      - broker-1:18001
+      - --peer
+      - 1=broker-1:18001
+      - --peer
+      - 2=broker-2:18002
+      - --peer
+      - 3=broker-3:18003
+    restart: "no"
 
 volumes:
   minio:

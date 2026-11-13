@@ -39,7 +39,7 @@ error rather than a partial imitation.
 | ACLs | A resource with no ACL is denied on an authenticated listener (SASL or mTLS) and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
 | Partition leadership | Leadership belongs to WAL shards, one per core by default (rounded so each broker leads the same number, capped at eight per broker), each with up to three voters; partitions are placed on shards round-robin at creation and never move. A shard's first voter is its preferred leader: the balancer and `ElectLeaders PREFERRED` move all of the shard's partitions together, by election, so the shard pauses briefly and its epoch rises | Leaders and preferred replicas per partition, reassignment | 0006, 0014 |
 | Topic configs | Segment, flush, and `min.insync.replicas` configs are accepted and stored. `DescribeConfigs` names the setting that applies. `LogAppendTime`, broker-side recompression, and tiered storage are rejected | All applied | 0017 |
-| Broker configs and quotas | Broker settings come from the environment at startup and are read-only in `DescribeConfigs`; client quotas are not implemented | Dynamic broker configs and quotas | — |
+| Broker configs and quotas | Broker settings come from `camus.toml`, then `CAMUS_*`, then flags, all read at startup, and are read-only in `DescribeConfigs`; client quotas are not implemented | Dynamic broker configs and quotas | — |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
 
@@ -47,7 +47,7 @@ error rather than a partial imitation.
 
 Camus matches Kafka 4.4.0's default unless Kafka's can lose acknowledged
 data or weaken security; then the safer value is used and listed above. Each
-is set by an environment variable.
+is set in `camus.toml` (Kafka's name, or `durability.mode`, `wal.disk.limit`, and `[s3]`). A `CAMUS_*` variable overrides the file, and a flag overrides both. The process prints `key=value source` at startup. Restart to change one. `camus admin config` prints the same list. `camus admin config --topic NAME` prints each stored topic config next to the value that is enforced: `min.insync.replicas` is stored, and an acknowledgement still waits for a WAL majority, or for the object put and the metadata commit when the topic's `durability.mode` is `r2`.
 
 | Setting | Kafka 4.4.0 | Camus | Variable |
 | --- | --- | --- | --- |
