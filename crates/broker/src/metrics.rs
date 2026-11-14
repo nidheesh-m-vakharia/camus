@@ -130,6 +130,9 @@ pub const STATIC_BYTES: usize =
 /// Most `(group, partition)` lag series one broker reports per scrape. Pairs
 /// past it are counted in `camus_consumer_group_lag_series_dropped`.
 pub const LAG_SERIES: usize = 2_000;
+/// Most bytes of consumer-lag text one scrape builds, so long group ids
+/// cannot make a scrape large. Pairs past it are counted as dropped.
+pub const LAG_BYTES: usize = 1 << 20;
 /// Most committed-offset rows one scrape reads from metadata, so a cluster
 /// with many groups cannot make a scrape slow or large.
 pub const LAG_SCAN_ROWS: usize = 100_000;

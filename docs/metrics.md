@@ -26,11 +26,14 @@ Shard ids at or past 256 share the `shard="overflow"` histogram series.
 Shard counts are fixed at `init` and follow the core count, so this cap is
 not expected to bind.
 
-The lag cap is `LAG_SERIES` (2,000 pairs) and the scan cap is
-`LAG_SCAN_ROWS` (100,000 rows), both in `crates/broker/src/metrics.rs`.
-Past the pair cap, `camus_consumer_group_lag_series_dropped` counts what
-was left out. A scrape at the caps writes roughly 2,000 × 3 lines of about
-120 bytes, under 1 MiB, and frees it when the response is sent.
+The lag caps are `LAG_SERIES` (2,000 pairs), `LAG_BYTES` (1 MiB of lag
+text) and `LAG_SCAN_ROWS` (100,000 rows), all in
+`crates/broker/src/metrics.rs`. The scan reads 256 rows a page, and runs on
+a blocking thread so it does not hold a worker that serves produce and
+fetch. Past the pair or byte cap, `camus_consumer_group_lag_series_dropped`
+counts what was left out, and those pairs cost no high-watermark read. A
+scrape at the caps builds at most 1 MiB of lag text plus one page of keys,
+and frees it when the response is sent.
 
 ## Consumer groups
 
@@ -43,7 +46,7 @@ an `r2` topic. Summing across brokers does not double count.
 | `camus_consumer_group_committed_offset{group,topic,partition}` | gauge | Next offset the group will read. |
 | `camus_consumer_group_log_end_offset{group,topic,partition}` | gauge | The partition's high watermark: the sealed end, or the WAL end for a `wal` topic when that is further. |
 | `camus_consumer_group_lag{group,topic,partition}` | gauge | Log end minus committed, at least 0. |
-| `camus_consumer_group_lag_series_dropped` | gauge | Pairs this broker leads that were left out past the 2,000 cap. |
+| `camus_consumer_group_lag_series_dropped` | gauge | Pairs this broker leads that were left out past the 2,000-pair or 1 MiB cap. |
 
 Offsets of a deleted topic are not reported. A group with no committed
 offset for a partition has no series for it.

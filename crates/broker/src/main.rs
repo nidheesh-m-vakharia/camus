@@ -541,7 +541,18 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
     );
     metrics::FETCH_LATENCY.render(&mut text, "camus_fetch_request_seconds", "");
     if let Some(kafka) = admin.kafka.get() {
-        kafka.render_group_lag(&mut text);
+        // The lag scan reads metadata synchronously; keep it off the workers
+        // that serve produce and fetch.
+        let kafka = Arc::clone(kafka);
+        let lag = tokio::task::spawn_blocking(move || {
+            let mut lag = String::new();
+            kafka.render_group_lag(&mut lag);
+            lag
+        })
+        .await;
+        if let Ok(lag) = lag {
+            text.push_str(&lag);
+        }
     }
     text
 }

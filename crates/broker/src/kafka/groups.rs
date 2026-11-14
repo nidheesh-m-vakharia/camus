@@ -537,12 +537,17 @@ impl Kafka {
     /// Prometheus lines for the committed offset, log end offset and lag of
     /// each `(group, partition)` whose partition this broker leads, so each
     /// pair comes from one broker. Reads at most `LAG_SCAN_ROWS` committed
-    /// offsets and writes at most `LAG_SERIES` pairs; the pairs it leaves
-    /// out are counted in `camus_consumer_group_lag_series_dropped`.
+    /// offsets and writes at most `LAG_SERIES` pairs in `LAG_BYTES` of
+    /// text; the pairs it leaves out are counted in
+    /// `camus_consumer_group_lag_series_dropped`. It reads metadata
+    /// synchronously, so call it off the async workers.
     pub(crate) fn render_group_lag(&self, out: &mut String) {
-        use crate::metrics::{label, LAG_SCAN_ROWS, LAG_SERIES};
+        use crate::metrics::{label, LAG_BYTES, LAG_SCAN_ROWS, LAG_SERIES};
         use std::fmt::Write as _;
-        const PAGE: usize = 1_024;
+        // A row's key holds its group id, so a page is at most this many ids.
+        const PAGE: usize = 256;
+        // Metric names and values on the three lines of one pair.
+        const LINE_OVERHEAD: usize = 3 * 64;
         let prefix = groups::all_offsets_prefix();
         // Every key under `offset/` sorts before `offset0`.
         let end = "offset0";
@@ -585,19 +590,22 @@ impl Kafka {
                 if !self.leads_partition(topic, partition) {
                     continue;
                 }
-                let Some(end) = self.high_watermark(topic, partition) else {
-                    continue;
-                };
-                if written >= LAG_SERIES {
-                    dropped += 1;
-                    continue;
-                }
-                written += 1;
                 let labels = format!(
                     "group=\"{}\",topic=\"{}\",partition=\"{partition}\"",
                     label(&group),
                     label(&topic.name)
                 );
+                let used = committed.len() + ends.len() + lags.len();
+                // Check the caps before reading the high watermark, so pairs
+                // past them cost no further reads.
+                if written >= LAG_SERIES || used + 3 * labels.len() + LINE_OVERHEAD > LAG_BYTES {
+                    dropped += 1;
+                    continue;
+                }
+                let Some(end) = self.high_watermark(topic, partition) else {
+                    continue;
+                };
+                written += 1;
                 let lag = (end - record.offset).max(0);
                 let _ = writeln!(
                     committed,
