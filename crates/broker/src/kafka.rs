@@ -1474,6 +1474,13 @@ impl Kafka {
                 INT,
             ),
             (
+                "default.replication.factor",
+                self.replication_factor(&self.default_durability)
+                    .to_string(),
+                "1",
+                INT,
+            ),
+            (
                 "message.max.bytes",
                 self.message_max_bytes.to_string(),
                 "1048588",
