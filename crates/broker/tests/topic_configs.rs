@@ -626,7 +626,7 @@ fn auto_create_can_be_turned_off() {
 }
 
 #[test]
-fn describe_configs_reports_the_broker() {
+fn describe_configs_reports_the_broker() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir().unwrap();
     let node = single(dir.path(), Opts::default());
     let addr = kafka_addr(&node);
@@ -660,5 +660,18 @@ fn describe_configs_reports_the_broker() {
         .configs
         .iter()
         .any(|row| row.name.as_str() == "auto.create.topics.enable"));
+    // Debezium reads this when it creates its schema history topic, and
+    // fails on a broker that leaves it out. A single broker is one voter.
+    let replication = mine
+        .configs
+        .iter()
+        .find(|row| row.name.as_str() == "default.replication.factor")
+        .ok_or("default.replication.factor missing")?;
+    assert_eq!(
+        replication.value.as_ref().map(|v| v.to_string()).as_deref(),
+        Some("1")
+    );
+    assert!(replication.read_only);
     assert_eq!(response.results[1].error_code, 42, "another broker's id");
+    Ok(())
 }
