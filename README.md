@@ -254,7 +254,7 @@ on `main`.
 The fit is a log with several consumers and replay, without a full disk replica on every broker. These want something else. The longer list is [site/limits.html](site/limits.html#when-not).
 
 - A p99 under 10 ms on the object-storage path. Measured `r2` p99 is 576.16 ms (Linux OrbStack) and 284.75 ms (macOS). `wal` on that Linux run is 16.55 ms p99. Those are the rows in the durability section above and in [Benchmarks/](Benchmarks/README.md).
-- One cluster across regions. Election waits 400–800 ms. MirrorMaker 2 is tested from Apache Kafka 4.4.0 into Camus, not the other way, in [docs/compatibility.md](docs/compatibility.md).
+- One cluster across regions. Election waits 400–800 ms. Run a cluster per region and copy between them with MirrorMaker 2, tested nightly from Kafka into Camus, Camus into Camus, and Camus into Kafka. The setup is in [docs/compatibility.md](docs/compatibility.md#regions) and [ADR 0020](docs/adr/0020-one-region-per-cluster.md).
 - A consensus group per tiny partition. Partitions share a shard log ([ADR 0006](docs/adr/0006-wal-shards.md)). The default count follows CPU cores and stops at eight shards per voter.
 - A queue that acknowledges one message. Consumers commit an offset. Share groups are not in the API matrix.
 - A Kafka deployment whose disk and JVM cost is already fine.

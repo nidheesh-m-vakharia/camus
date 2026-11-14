@@ -1,6 +1,6 @@
 //! The Kafka ecosystem against Camus: the Apache Kafka 4.4.0 CLI tools, Kafka
-//! Connect, Kafka Streams with `exactly_once_v2`, MirrorMaker 2 from a real
-//! Apache Kafka broker, KafkaJS, confluent-kafka-go, confluent-kafka-dotnet,
+//! Connect, Kafka Streams with `exactly_once_v2`, MirrorMaker 2 between Camus
+//! and a real Apache Kafka broker in both directions and from Camus to Camus, KafkaJS, confluent-kafka-go, confluent-kafka-dotnet,
 //! and Schema Registry.
 //!
 //! Opt-in with `CAMUS_ECOSYSTEM=1`; the first run downloads the Kafka
@@ -638,65 +638,129 @@ fn streams_counts_words_exactly_once() {
     assert_eq!(counts.get("dog").map(String::as_str), Some("1"));
 }
 
-#[test]
-fn mirror_maker_copies_from_apache_kafka() {
-    if !enabled() {
-        return;
+type Res<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+fn path_str(path: &Path) -> Res<&str> {
+    path.to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", path.display()).into())
+}
+
+/// Like [`wait_for`], for a check that can fail.
+fn wait_until(what: &str, within: Duration, mut done: impl FnMut() -> Res<bool>) -> Res {
+    let deadline = Instant::now() + within;
+    while !done()? {
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {what}").into());
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
-    let dir = tempfile::tempdir().unwrap();
-    let (_node, bootstrap) = broker(dir.path());
+    Ok(())
+}
+
+/// A single-node Apache Kafka 4.4.0 in KRaft mode, and its bootstrap address.
+fn apache_kafka(dir: &Path) -> Res<(Background, String)> {
     let (client, controller) = (free_port(), free_port());
-    let source = format!("127.0.0.1:{client}");
-    let properties = dir.path().join("server.properties");
+    let bootstrap = format!("127.0.0.1:{client}");
+    let properties = dir.join("server.properties");
     std::fs::write(
         &properties,
         format!(
             "process.roles=broker,controller\n\
              node.id=1\n\
              controller.quorum.voters=1@127.0.0.1:{controller}\n\
-             listeners=PLAINTEXT://{source},CONTROLLER://127.0.0.1:{controller}\n\
-             advertised.listeners=PLAINTEXT://{source}\n\
+             listeners=PLAINTEXT://{bootstrap},CONTROLLER://127.0.0.1:{controller}\n\
+             advertised.listeners=PLAINTEXT://{bootstrap}\n\
              controller.listener.names=CONTROLLER\n\
              listener.security.protocol.map=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT\n\
              log.dirs={}\n\
              offsets.topic.replication.factor=1\n\
              transaction.state.log.replication.factor=1\n\
              transaction.state.log.min.isr=1\n",
-            dir.path().join("apache-data").display()
+            dir.join("apache-data").display()
         ),
-    )
-    .unwrap();
+    )?;
+    let properties = path_str(&properties)?;
     let cluster = tool("kafka-storage.sh", &["random-uuid"], None, false);
-    let cluster = cluster.lines().last().unwrap().trim().to_string();
+    let cluster = cluster
+        .lines()
+        .last()
+        .ok_or("kafka-storage.sh printed no cluster id")?
+        .trim()
+        .to_string();
     tool(
         "kafka-storage.sh",
-        &["format", "-t", &cluster, "-c", properties.to_str().unwrap()],
+        &["format", "-t", &cluster, "-c", properties],
         None,
         false,
     );
-    let _apache = Background::start(
-        "kafka-server-start.sh",
-        &[properties.to_str().unwrap()],
-        dir.path(),
-        "apache",
-    );
+    let apache = Background::start("kafka-server-start.sh", &[properties], dir, "apache");
     wait_for("Apache Kafka", Duration::from_secs(60), || {
         !tool(
             "kafka-topics.sh",
-            &["--bootstrap-server", &source, "--list"],
+            &["--bootstrap-server", &bootstrap, "--list"],
             None,
             true,
         )
         .contains("Exception")
     });
+    Ok((apache, bootstrap))
+}
+
+/// The records `o1`, `o2`, ... that a console consumer printed.
+fn records(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.strip_prefix('o')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The sum of `group`'s committed offsets on `topic`, from
+/// `kafka-consumer-groups.sh --describe`.
+fn committed(bootstrap: &str, group: &str, topic: &str) -> Res<i64> {
+    let out = tool(
+        "kafka-consumer-groups.sh",
+        &[
+            "--bootstrap-server",
+            bootstrap,
+            "--describe",
+            "--group",
+            group,
+        ],
+        None,
+        true,
+    );
+    let mut sum = 0;
+    for line in out.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if let [g, t, _partition, current, ..] = fields.as_slice() {
+            if *g == group && *t == topic && *current != "-" {
+                sum += current.parse::<i64>()?;
+            }
+        }
+    }
+    Ok(sum)
+}
+
+/// Copy `invoices` from `source` to `target` with MirrorMaker 2 in dedicated
+/// mode, each given as `(alias, bootstrap)`. Checks that the records arrive,
+/// that the checkpoint connector translates group `billing`'s committed
+/// offsets onto the target, and that the group, failed over to the target,
+/// reads only what it had not read on the source.
+fn mirror_and_fail_over(dir: &Path, source: (&str, &str), target: (&str, &str)) -> Res {
+    let (from, source_addr) = source;
+    let (to, target_addr) = target;
     tool(
         "kafka-topics.sh",
         &[
             "--bootstrap-server",
-            &source,
+            source_addr,
             "--create",
             "--topic",
-            "orders",
+            "invoices",
             "--partitions",
             "2",
         ],
@@ -705,19 +769,41 @@ fn mirror_maker_copies_from_apache_kafka() {
     );
     tool(
         "kafka-console-producer.sh",
-        &["--bootstrap-server", &source, "--topic", "orders"],
-        Some("o1\no2\no3\n"),
+        &["--bootstrap-server", source_addr, "--topic", "invoices"],
+        Some("o1\no2\no3\no4\no5\no6\n"),
         false,
     );
-    let config = dir.path().join("mm2.properties");
+    let read = tool(
+        "kafka-console-consumer.sh",
+        &[
+            "--bootstrap-server",
+            source_addr,
+            "--topic",
+            "invoices",
+            "--group",
+            "billing",
+            "--from-beginning",
+            "--max-messages",
+            "6",
+            "--timeout-ms",
+            "30000",
+        ],
+        None,
+        false,
+    );
+    assert_eq!(records(&read).len(), 6, "{read}");
+    assert_eq!(committed(source_addr, "billing", "invoices")?, 6);
+
+    let config = dir.join("mm2.properties");
     std::fs::write(
         &config,
         format!(
-            "clusters=apache, camus\n\
-             apache.bootstrap.servers={source}\n\
-             camus.bootstrap.servers={bootstrap}\n\
-             apache->camus.enabled=true\n\
-             apache->camus.topics=orders\n\
+            "clusters={from}, {to}\n\
+             {from}.bootstrap.servers={source_addr}\n\
+             {to}.bootstrap.servers={target_addr}\n\
+             {from}->{to}.enabled=true\n\
+             {from}->{to}.topics=invoices\n\
+             {from}->{to}.groups=billing\n\
              replication.factor=1\n\
              checkpoints.topic.replication.factor=1\n\
              heartbeats.topic.replication.factor=1\n\
@@ -725,25 +811,31 @@ fn mirror_maker_copies_from_apache_kafka() {
              offset.storage.replication.factor=1\n\
              status.storage.replication.factor=1\n\
              config.storage.replication.factor=1\n\
-             sync.topic.acls.enabled=false\n"
+             sync.topic.acls.enabled=false\n\
+             offset.lag.max=0\n\
+             emit.checkpoints.interval.seconds=1\n\
+             sync.group.offsets.enabled=true\n\
+             sync.group.offsets.interval.seconds=1\n\
+             refresh.groups.interval.seconds=1\n\
+             refresh.topics.interval.seconds=1\n"
         ),
-    )
-    .unwrap();
+    )?;
     let _mirror = Background::start(
         "connect-mirror-maker.sh",
-        &[config.to_str().unwrap()],
-        dir.path(),
+        &[path_str(&config)?],
+        dir,
         "mirror",
     );
+    let mirrored = format!("{from}.invoices");
     let mut seen = Vec::new();
-    wait_for("mirrored records", Duration::from_secs(120), || {
+    wait_until("mirrored records", Duration::from_secs(120), || {
         let out = tool(
             "kafka-console-consumer.sh",
             &[
                 "--bootstrap-server",
-                &bootstrap,
+                target_addr,
                 "--topic",
-                "apache.orders",
+                &mirrored,
                 "--from-beginning",
                 "--timeout-ms",
                 "5000",
@@ -751,15 +843,94 @@ fn mirror_maker_copies_from_apache_kafka() {
             None,
             true,
         );
-        seen = out
-            .lines()
-            .filter(|line| line.starts_with('o') && line.len() == 2)
-            .map(str::to_string)
-            .collect();
-        seen.len() >= 3
-    });
+        seen = records(&out);
+        Ok(seen.len() >= 6)
+    })?;
     seen.sort();
-    assert_eq!(seen, vec!["o1", "o2", "o3"]);
+    assert_eq!(seen, ["o1", "o2", "o3", "o4", "o5", "o6"]);
+
+    wait_until("translated group offsets", Duration::from_secs(120), || {
+        Ok(committed(target_addr, "billing", &mirrored)? == 6)
+    })?;
+    let topics = tool(
+        "kafka-topics.sh",
+        &["--bootstrap-server", target_addr, "--list"],
+        None,
+        false,
+    );
+    let checkpoints = format!("{from}.checkpoints.internal");
+    assert!(topics.lines().any(|t| t.trim() == checkpoints), "{topics}");
+    assert!(topics.lines().any(|t| t.trim() == "heartbeats"), "{topics}");
+
+    // Records produced after the failover point reach the target, and the
+    // group resumes there at the translated offsets.
+    tool(
+        "kafka-console-producer.sh",
+        &["--bootstrap-server", source_addr, "--topic", "invoices"],
+        Some("o7\no8\n"),
+        false,
+    );
+    let mut resumed = Vec::new();
+    wait_until("records after failover", Duration::from_secs(120), || {
+        let out = tool(
+            "kafka-console-consumer.sh",
+            &[
+                "--bootstrap-server",
+                target_addr,
+                "--topic",
+                &mirrored,
+                "--group",
+                "billing",
+                "--consumer-property",
+                "auto.offset.reset=earliest",
+                "--timeout-ms",
+                "5000",
+            ],
+            None,
+            true,
+        );
+        resumed.extend(records(&out));
+        Ok(resumed.len() >= 2)
+    })?;
+    resumed.sort();
+    assert_eq!(resumed, ["o7", "o8"]);
+    Ok(())
+}
+
+#[test]
+fn mirror_maker_copies_from_apache_kafka() -> Res {
+    if !enabled() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let (_node, camus) = broker(dir.path());
+    let (_apache, apache) = apache_kafka(dir.path())?;
+    mirror_and_fail_over(dir.path(), ("apache", &apache), ("camus", &camus))
+}
+
+#[test]
+fn mirror_maker_copies_from_camus_to_camus() -> Res {
+    if !enabled() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let (primary_dir, backup_dir) = (dir.path().join("primary"), dir.path().join("backup"));
+    std::fs::create_dir_all(&primary_dir)?;
+    std::fs::create_dir_all(&backup_dir)?;
+    let (_primary, primary) = broker(&primary_dir);
+    let (_backup, backup) = broker(&backup_dir);
+    mirror_and_fail_over(dir.path(), ("primary", &primary), ("backup", &backup))
+}
+
+#[test]
+fn mirror_maker_copies_from_camus_to_apache_kafka() -> Res {
+    if !enabled() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let (_node, camus) = broker(dir.path());
+    let (_apache, apache) = apache_kafka(dir.path())?;
+    mirror_and_fail_over(dir.path(), ("camus", &camus), ("apache", &apache))
 }
 
 #[test]

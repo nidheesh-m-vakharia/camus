@@ -39,6 +39,7 @@ error rather than a partial imitation.
 | ACLs | A resource with no ACL is denied on an authenticated listener (SASL or mTLS) and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
 | Partition leadership | Leadership belongs to WAL shards, one per core by default (rounded so each broker leads the same number, capped at eight per broker), each with up to three voters; partitions are placed on shards round-robin at creation and never move. A shard's first voter is its preferred leader: the balancer and `ElectLeaders PREFERRED` move all of the shard's partitions together, by election, so the shard pauses briefly and its epoch rises | Leaders and preferred replicas per partition, reassignment | 0006, 0014 |
 | Topic configs | Segment, flush, and `min.insync.replicas` configs are accepted and stored. `DescribeConfigs` names the setting that applies. `LogAppendTime`, broker-side recompression, and tiered storage are rejected | All applied | 0017 |
+| Regions | One cluster per region. Two regions are two clusters joined by MirrorMaker 2 (see [Regions](#regions)) | A stretched cluster across regions is possible with rack-aware replicas | 0020 |
 | Broker configs and quotas | Broker settings come from `camus.toml`, then `CAMUS_*`, then flags, all read at startup, and are read-only in `DescribeConfigs`; client quotas are not implemented | Dynamic broker configs and quotas | — |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
@@ -392,7 +393,7 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 | Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, describe-producers, preferred leader election, API versions | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Kafka Connect 4.4.0, distributed | FileStream source and sink, compacted internal topics, resume after restart | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
-| MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, Camus to Camus, and Camus to Apache Kafka 4.4.0, each with heartbeats, checkpoints, and a consumer group's offsets translated and resumed on the target | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Schema Registry | in the harness behind `CAMUS_ECOSYSTEM_DOCKER=1` | not run here |
 | kafka-python | tracked; not in the harness | - |
 
@@ -402,6 +403,63 @@ ListOffsets v1-3 response carried a leader epoch those versions cannot
 encode, closing the connection. DescribeConfigs for a broker returns that
 broker's settings under Kafka's names, read-only; dynamic broker configs
 are not supported. `--advertised-addr` sets what Metadata hands out.
+
+## Regions
+
+A Camus cluster lives in one region ([ADR 0020](adr/0020-one-region-per-cluster.md)).
+Every ack waits on a Raft majority, and Raft elects after 400–800 ms
+without a heartbeat. A voter in another region adds its round trip
+(60–90 ms between US coasts or across the Atlantic) to every produce, and
+a slow link starts elections that pause whole shards. Spread a cluster's
+brokers across zones of one region instead.
+
+Two regions are two clusters, each with its own bucket, joined by
+MirrorMaker 2 from Apache Kafka 4.4.0. A dedicated MirrorMaker 2 process,
+run near the target, copies `east` to `west`:
+
+```properties
+clusters = east, west
+east.bootstrap.servers = camus-east-1:9092,camus-east-2:9092,camus-east-3:9092
+west.bootstrap.servers = camus-west-1:9092,camus-west-2:9092,camus-west-3:9092
+# plus each cluster's SASL and TLS settings, as east.security.protocol=...
+
+east->west.enabled = true
+east->west.topics = orders, payments
+east->west.groups = billing, fulfilment
+sync.group.offsets.enabled = true
+sync.topic.acls.enabled = false
+
+# Camus accepts a replication factor up to its broker count. Its WAL
+# shard voters, not this number, decide how many copies there are.
+replication.factor = 3
+```
+
+Start it with `bin/connect-mirror-maker.sh mm2.properties`. In `west` it
+creates `east.orders` and `east.payments`, `east.checkpoints.internal`, and
+`heartbeats`, plus its own `mm2-*` Connect topics. In `east` it writes
+`mm2-offset-syncs.west.internal`.
+
+To fail a consumer group over from `east` to `west`:
+
+1. Stop the group's consumers in `east`. MirrorMaker writes translated
+   offsets only for a group with no active members in the target.
+2. Wait one `sync.group.offsets.interval.seconds` (60 by default).
+   `kafka-consumer-groups.sh --describe --group billing` against `west`
+   shows offsets on `east.orders`.
+3. Start the consumers against `west`, subscribed to `east.orders`. They
+   resume at the translated offsets.
+
+Translation is as fine as MirrorMaker's offset syncs. With the default
+`offset.lag.max=100`, a group can re-read up to 100 records per partition
+after failing over. Records acked in `east` and not yet copied are not in
+`west` if `east` is lost: the copy is asynchronous, and its lag is
+MirrorMaker's, not a Camus ack barrier. To fail back, run a second flow,
+`west->east`.
+
+The ecosystem suite runs this failover in three directions every night:
+Apache Kafka to Camus, Camus to Camus, and Camus to Apache Kafka. Camus
+writes no transaction control batches, so a copy from Camus carries none
+either.
 
 ## Compression
 
