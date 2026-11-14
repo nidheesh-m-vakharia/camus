@@ -1013,3 +1013,243 @@ fn schema_registry_stores_a_schema() {
     assert_eq!(loaded["schema"].as_str(), Some("\"string\""), "{loaded}");
     assert_eq!(loaded["schemaType"].as_str(), Some("AVRO"), "{loaded}");
 }
+
+type Fallible = Result<(), Box<dyn std::error::Error>>;
+
+/// The values a `read_committed` reader sees in a topic [`write_txn_topic`]
+/// wrote, in order.
+const COMMITTED: [&str; 5] = ["c1", "c2", "c3", "c4", "o1"];
+
+/// Every value [`write_txn_topic`] writes, committed or aborted.
+const WRITTEN: [&str; 9] = ["c1", "c2", "c3", "a1", "a2", "c4", "a3", "o1", "a4"];
+
+/// Create `topic` with one partition and write commit, abort, commit, abort,
+/// commit, abort to it with `TxnMarkers.java`, which also checks the Java
+/// consumer against it (ADR 0021).
+fn write_txn_topic(dir: &Path, bootstrap: &str, topic: &str) -> Fallible {
+    tool(
+        "kafka-topics.sh",
+        &[
+            "--bootstrap-server",
+            bootstrap,
+            "--create",
+            "--topic",
+            topic,
+            "--partitions",
+            "1",
+        ],
+        None,
+        false,
+    );
+    let classes = dir.join("txn-classes");
+    std::fs::create_dir_all(&classes)?;
+    let classpath = format!("{}/*", dist().join("libs").display());
+    let compiled = Command::new(format!("{}/bin/javac", java_home()))
+        .args(["-proc:none", "-cp", &classpath, "-d"])
+        .arg(&classes)
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/ecosystem/TxnMarkers.java"))
+        .status()?;
+    if !compiled.success() {
+        return Err("javac TxnMarkers failed".into());
+    }
+    let ran = Command::new(format!("{}/bin/java", java_home()))
+        .arg("-cp")
+        .arg(format!("{}:{classpath}", classes.display()))
+        .args(["TxnMarkers", bootstrap, topic, &format!("{topic}-java")])
+        .output()?;
+    let text = String::from_utf8_lossy(&ran.stdout);
+    if !ran.status.success() || !text.contains("txn markers ok") {
+        return Err(format!("{text}{}", String::from_utf8_lossy(&ran.stderr)).into());
+    }
+    Ok(())
+}
+
+/// Camus stores no transaction markers. A `read_committed` fetch puts an
+/// abort marker in place of each aborted batch, so kafka-clients,
+/// librdkafka, and KafkaJS skip aborted ranges and reach the end offset as
+/// they do on Kafka.
+#[test]
+fn clients_read_a_transactional_topic_without_stored_markers() -> Fallible {
+    if !enabled() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let (_node, bootstrap) = broker(dir.path());
+    write_txn_topic(dir.path(), &bootstrap, "txn-markers")?;
+    let committed = COMMITTED.join(",");
+
+    let printed = tool(
+        "kafka-console-consumer.sh",
+        &[
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            "txn-markers",
+            "--from-beginning",
+            "--isolation-level",
+            "read_committed",
+            "--formatter-property",
+            "print.offset=true",
+            "--max-messages",
+            "5",
+            "--timeout-ms",
+            "20000",
+        ],
+        None,
+        false,
+    );
+    let records: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.starts_with("Offset:"))
+        .collect();
+    // Kafka would put each record one offset later per marker before it.
+    assert_eq!(
+        records,
+        [
+            "Offset:0\tc1",
+            "Offset:1\tc2",
+            "Offset:2\tc3",
+            "Offset:5\tc4",
+            "Offset:7\to1"
+        ],
+        "{printed}"
+    );
+
+    match program("go", &["/opt/homebrew/bin/go"]) {
+        Some(go) => {
+            let mut command = Command::new(go);
+            command
+                .args(["run", "-tags", "dynamic", "./txnmarkers"])
+                .args([bootstrap.as_str(), "txn-markers", committed.as_str()])
+                .current_dir(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/ecosystem/confluent_kafka_go"),
+                )
+                .env("CGO_ENABLED", "1");
+            let pkg = Command::new("pkg-config")
+                .args(["--variable=pcfiledir", "rdkafka"])
+                .output()?;
+            let pc_dir = String::from_utf8_lossy(&pkg.stdout).trim().to_string();
+            if pkg.status.success() && !pc_dir.is_empty() {
+                let joined = match std::env::var("PKG_CONFIG_PATH") {
+                    Ok(existing) if !existing.is_empty() => format!("{pc_dir}:{existing}"),
+                    _ => pc_dir,
+                };
+                command.env("PKG_CONFIG_PATH", joined);
+            }
+            let ran = command.output()?;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+            assert!(
+                ran.status.success() && text.contains("librdkafka txn markers ok"),
+                "{text}"
+            );
+        }
+        None => support::skipped("librdkafka transaction reader; go is not installed"),
+    }
+
+    if Command::new("npm").arg("--version").output().is_err() {
+        support::skipped("KafkaJS transaction reader; npm is not installed");
+        return Ok(());
+    }
+    let modules = target().join("kafkajs");
+    if !modules.join("node_modules/kafkajs").is_dir() {
+        std::fs::create_dir_all(&modules)?;
+        let installed = Command::new("npm")
+            .args(["install", "--silent", "--prefix"])
+            .arg(&modules)
+            .arg("kafkajs@2")
+            .status()?;
+        if !installed.success() {
+            return Err("npm install kafkajs failed".into());
+        }
+    }
+    let ran = Command::new("node")
+        .arg(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/ecosystem/kafkajs_txn_markers.js"),
+        )
+        .args([bootstrap.as_str(), "txn-markers", committed.as_str()])
+        .env("NODE_PATH", modules.join("node_modules"))
+        .output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        ran.status.success() && text.contains("kafkajs txn markers ok"),
+        "{text}"
+    );
+    Ok(())
+}
+
+/// MirrorMaker 2 reading a transactional topic from Camus with a
+/// `read_committed` source consumer copies the committed records only.
+#[test]
+fn mirror_maker_copies_only_committed_records_from_camus() -> Fallible {
+    if !enabled() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    std::fs::create_dir_all(&source_dir)?;
+    std::fs::create_dir_all(&target_dir)?;
+    let (_source, source) = broker(&source_dir);
+    let (_target, downstream) = broker(&target_dir);
+    write_txn_topic(&source_dir, &source, "payments")?;
+    let config = dir.path().join("mm2-txn.properties");
+    std::fs::write(
+        &config,
+        format!(
+            "clusters=upstream, downstream\n\
+             upstream.bootstrap.servers={source}\n\
+             downstream.bootstrap.servers={downstream}\n\
+             upstream->downstream.enabled=true\n\
+             upstream->downstream.topics=payments\n\
+             upstream.consumer.isolation.level=read_committed\n\
+             replication.factor=1\n\
+             checkpoints.topic.replication.factor=1\n\
+             heartbeats.topic.replication.factor=1\n\
+             offset-syncs.topic.replication.factor=1\n\
+             offset.storage.replication.factor=1\n\
+             status.storage.replication.factor=1\n\
+             config.storage.replication.factor=1\n\
+             sync.topic.acls.enabled=false\n"
+        ),
+    )?;
+    let config = config.to_str().ok_or("config path")?;
+    let _mirror = Background::start("connect-mirror-maker.sh", &[config], dir.path(), "mirror");
+    let mut seen = Vec::new();
+    wait_for("mirrored transaction", Duration::from_secs(120), || {
+        let out = tool(
+            "kafka-console-consumer.sh",
+            &[
+                "--bootstrap-server",
+                &downstream,
+                "--topic",
+                "upstream.payments",
+                "--from-beginning",
+                "--timeout-ms",
+                "5000",
+            ],
+            None,
+            true,
+        );
+        seen = out
+            .lines()
+            .filter(|line| WRITTEN.contains(line))
+            .map(str::to_string)
+            .collect();
+        seen.len() >= COMMITTED.len()
+    });
+    seen.sort();
+    let mut want: Vec<String> = COMMITTED.iter().map(|value| value.to_string()).collect();
+    want.sort();
+    assert_eq!(seen, want, "MirrorMaker copied an aborted record");
+    Ok(())
+}

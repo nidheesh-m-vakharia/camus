@@ -143,6 +143,20 @@ fn partition_row(
     Ok(Some((key, catalog::parse_partition(&raw)?)))
 }
 
+/// `EndTxn` already committed or aborted a range that starts this span, for
+/// the same producer.
+fn published(get: Get<'_>, span: &TxnSpan, producer_id: i64) -> Result<bool, String> {
+    let Some((_, partition)) = partition_row(get, &span.topic, span.partition)? else {
+        return Ok(false);
+    };
+    let producer = span.producer_id.unwrap_or(producer_id);
+    Ok(partition
+        .txn_committed
+        .iter()
+        .chain(&partition.txn_aborted)
+        .any(|range| range.producer_id == Some(producer) && range.covers(span.start, producer)))
+}
+
 fn mark(
     get: Get<'_>,
     put: &mut Vec<(String, String)>,
@@ -295,6 +309,13 @@ pub fn note(
     epoch: i16,
     span: TxnSpan,
 ) -> Result<Issued, String> {
+    // A seal reads the open span from the WAL and carries it in its own
+    // commit. When `EndTxn` applies first, the range is already published.
+    // Recording it again would abort a committed range, which hides it, or
+    // add it to the producer's next transaction.
+    if published(get, &span, producer_id)? {
+        return Ok(applied(Vec::new(), String::new()));
+    }
     let Some(mut txn) = load(get, transactional_id)? else {
         return Ok(Issued::Reject(INVALID_TXN));
     };
@@ -746,6 +767,86 @@ mod tests {
     ) -> Issued {
         let get = |key: &str| Ok(store.get(key).cloned());
         body(&get).expect("txn command")
+    }
+
+    /// A seal that carries a span `EndTxn` already committed must not abort
+    /// it, or add it to the next transaction (ADR 0021).
+    #[test]
+    fn a_late_seal_note_leaves_a_committed_range_visible() -> Result<(), String> {
+        let mut store = memory();
+        let get = |store: &HashMap<String, String>, key: &str| Ok(store.get(key).cloned());
+        let issued = init(&|key| get(&store, key), "late", -1, -1, 60_000, 0)?;
+        let Issued::Applied { value, .. } = &issued else {
+            return Err("init rejected".into());
+        };
+        let (id, epoch) = value.split_once(',').ok_or("init value")?;
+        let id: i64 = id.parse().map_err(|_| "producer id")?;
+        let epoch: i16 = epoch.parse().map_err(|_| "epoch")?;
+        apply(&mut store, issued);
+        let span = |start, end| TxnSpan {
+            topic: "orders".into(),
+            partition: 0,
+            start,
+            end,
+            producer_id: Some(id),
+        };
+        let partitions = [("orders".to_string(), 0)];
+        let issued = add_partitions(&|key| get(&store, key), "late", id, epoch, &partitions, 1)?;
+        apply(&mut store, issued);
+        let issued = end(
+            &|key| get(&store, key),
+            "late",
+            id,
+            epoch,
+            true,
+            2,
+            &[span(7, 8)],
+        )?;
+        apply(&mut store, issued);
+        // The seal's note lands after the commit, then after the next
+        // transaction starts.
+        let issued = note(&|key| get(&store, key), "late", id, epoch, span(7, 8))?;
+        apply(&mut store, issued);
+        let issued = add_partitions(&|key| get(&store, key), "late", id, epoch, &partitions, 3)?;
+        apply(&mut store, issued);
+        let issued = note(&|key| get(&store, key), "late", id, epoch, span(7, 8))?;
+        apply(&mut store, issued);
+        let issued = end(
+            &|key| get(&store, key),
+            "late",
+            id,
+            epoch,
+            false,
+            4,
+            &[span(8, 9)],
+        )?;
+        apply(&mut store, issued);
+        let Some((_, partition)) = partition_row(&|key| get(&store, key), "orders", 0)? else {
+            return Err("partition".into());
+        };
+        assert!(partition
+            .txn_committed
+            .iter()
+            .any(|range| range.covers(7, id)));
+        assert!(!partition
+            .txn_aborted
+            .iter()
+            .any(|range| range.covers(7, id)));
+        assert!(partition
+            .txn_aborted
+            .iter()
+            .any(|range| range.covers(8, id)));
+        // A batch past the committed end is still a late write, and aborts.
+        let issued = note(&|key| get(&store, key), "late", id, epoch, span(9, 10))?;
+        apply(&mut store, issued);
+        let Some((_, partition)) = partition_row(&|key| get(&store, key), "orders", 0)? else {
+            return Err("partition".into());
+        };
+        assert!(partition
+            .txn_aborted
+            .iter()
+            .any(|range| range.covers(9, id)));
+        Ok(())
     }
 
     #[test]

@@ -370,6 +370,20 @@ impl Machine {
         })
     }
 
+    /// First offset of the earliest open transaction span on a partition,
+    /// from any producer. `None` when no transaction is open there.
+    pub fn first_open_txn(&self, topic_id: &[u8; 16], partition: i32) -> Option<i64> {
+        let prefix = format!("{}/", part_key(topic_id, partition));
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state
+            .txn_spans
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .filter(|(_, span)| span.start >= 0)
+            .map(|(_, span)| span.start)
+            .min()
+    }
+
     pub fn end_offset(&self, topic_id: &[u8; 16], partition: i32) -> i64 {
         let state = self.state.lock().expect("wal state");
         state

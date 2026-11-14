@@ -18,6 +18,7 @@ use camus_protocol::messages::create_topics_response::CreateTopicsResponse;
 use camus_protocol::messages::end_txn_response::EndTxnResponse;
 use camus_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use camus_protocol::messages::fetch_response::{FetchResponse, PartitionData};
+use camus_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
 use camus_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
 use camus_protocol::messages::offset_fetch_response::OffsetFetchResponse;
 use camus_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
@@ -29,8 +30,9 @@ use camus_protocol::messages::txn_offset_commit_response::TxnOffsetCommitRespons
 use camus_protocol::messages::{
     AddPartitionsToTxnRequest, ApiKey, CreateTopicsRequest, DescribeTransactionsRequest,
     DescribeTransactionsResponse, EndTxnRequest, FetchRequest, GroupId, InitProducerIdRequest,
-    InitProducerIdResponse, ListTransactionsRequest, ListTransactionsResponse, OffsetFetchRequest,
-    ProduceRequest, RequestHeader, TopicName, TransactionalId, TxnOffsetCommitRequest,
+    InitProducerIdResponse, ListOffsetsRequest, ListOffsetsResponse, ListTransactionsRequest,
+    ListTransactionsResponse, OffsetFetchRequest, ProduceRequest, RequestHeader, TopicName,
+    TransactionalId, TxnOffsetCommitRequest,
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 use camus_protocol::records::{
@@ -755,7 +757,8 @@ fn end(stream: &mut TcpStream, correlation: i32, producer: i64, epoch: i16, comm
     assert_eq!(recv::<EndTxnResponse>(stream, 3).error_code, 0);
 }
 
-/// Offsets and values a fetch from `offset` returns.
+/// Offsets and values a fetch from `offset` returns. Control records are
+/// skipped, as a client skips them.
 fn read_from(stream: &mut TcpStream, isolation: i8, offset: i64) -> Vec<(i64, String)> {
     let mut part = FetchPartition::default();
     part.partition = 0;
@@ -786,7 +789,7 @@ fn read_from(stream: &mut TcpStream, isolation: i8, offset: i64) -> Vec<(i64, St
         .unwrap()
         .into_iter()
         .flat_map(|set| set.records)
-        .filter(|record| record.offset >= offset)
+        .filter(|record| record.offset >= offset && !record.control)
         .map(|record| {
             (
                 record.offset,
@@ -796,7 +799,7 @@ fn read_from(stream: &mut TcpStream, isolation: i8, offset: i64) -> Vec<(i64, St
         .collect()
 }
 
-/// Camus writes no control records, so a `read_committed` consumer that
+/// Camus stores no control records, so a `read_committed` consumer that
 /// seeks into or past an aborted range must still get the committed records
 /// at their own offsets, as with Kafka.
 #[test]
@@ -832,4 +835,156 @@ fn a_read_committed_seek_skips_an_aborted_range_and_keeps_offsets() {
     assert_eq!(committed(2), vec![(2, "c".into())]);
     // read_uncommitted sees the aborted record too, as in Kafka.
     assert_eq!(read_from(&mut stream, 0, 0).len(), 3);
+}
+
+/// The latest offset ListOffsets returns for partition 0 at `isolation`.
+fn latest(stream: &mut TcpStream, correlation: i32, isolation: i8) -> i64 {
+    let topic = ListOffsetsTopic::default()
+        .with_name(TopicName(StrBytes::from_static_str("orders")))
+        .with_partitions(vec![ListOffsetsPartition::default()
+            .with_partition_index(0)
+            .with_timestamp(-1)]);
+    send(
+        stream,
+        ApiKey::ListOffsets,
+        7,
+        correlation,
+        &ListOffsetsRequest::default()
+            .with_replica_id((-1).into())
+            .with_isolation_level(isolation)
+            .with_topics(vec![topic]),
+    );
+    let response = recv::<ListOffsetsResponse>(stream, 7);
+    response
+        .topics
+        .first()
+        .and_then(|topic| topic.partitions.first())
+        .map_or(-2, |row| row.offset)
+}
+
+/// Kafka writes a marker after each transaction; Camus stores none (ADR
+/// 0021). A `read_committed` fetch puts an abort marker at the last offset
+/// of an aborted batch, so a consumer moves past an abort at the end of the
+/// log. ListOffsets for the latest offset at `read_committed` is the last
+/// stable offset, which stops at an open transaction.
+#[test]
+fn read_committed_marks_an_abort_and_stops_list_offsets_at_an_open_transaction(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let (_node, mut stream) = start(root.path(), &[]);
+    let started = init_producer(&mut stream, 1, 60_000, None);
+    assert_eq!(started.error_code, 0);
+    let (producer, epoch) = (started.producer_id.0, started.producer_epoch);
+    for (round, (value, commit)) in [("a", true), ("b", false)].into_iter().enumerate() {
+        let base = 10 * (round as i32 + 1);
+        add_partition(&mut stream, base, producer, epoch);
+        produce(
+            &mut stream,
+            base + 1,
+            batch(value.as_bytes(), producer, epoch, round as i32),
+            producer,
+        );
+        end(&mut stream, base + 2, producer, epoch, commit);
+    }
+
+    let mut part = FetchPartition::default();
+    part.partition = 0;
+    part.fetch_offset = 0;
+    part.partition_max_bytes = 1024 * 1024;
+    let mut topic = FetchTopic::default();
+    topic.topic = TopicName(StrBytes::from_static_str("orders"));
+    topic.partitions = vec![part];
+    send(
+        &mut stream,
+        ApiKey::Fetch,
+        11,
+        40,
+        &FetchRequest::default()
+            .with_max_wait_ms(50)
+            .with_isolation_level(1)
+            .with_topics(vec![topic]),
+    );
+    let fetched = recv::<FetchResponse>(&mut stream, 11);
+    let mut bytes = fetched
+        .responses
+        .first()
+        .and_then(|topic| topic.partitions.first())
+        .and_then(|row| row.records.clone())
+        .ok_or("no records")?;
+    let records: Vec<(i64, bool)> =
+        camus_protocol::records::RecordBatchDecoder::decode_all(&mut bytes)?
+            .into_iter()
+            .flat_map(|set| set.records)
+            .map(|record| (record.offset, record.control))
+            .collect();
+    assert_eq!(
+        records,
+        vec![(0, false), (1, true)],
+        "the abort is a marker"
+    );
+    assert_eq!(read_from(&mut stream, 0, 0).len(), 2, "read_uncommitted");
+
+    add_partition(&mut stream, 50, producer, epoch);
+    produce(&mut stream, 51, batch(b"c", producer, epoch, 2), producer);
+    assert_eq!(latest(&mut stream, 52, 0), 3, "high watermark");
+    assert_eq!(latest(&mut stream, 53, 1), 2, "stops at the open batch");
+    end(&mut stream, 54, producer, epoch, true);
+    assert_eq!(latest(&mut stream, 55, 1), 3, "stable after commit");
+    assert_eq!(read_from(&mut stream, 1, 2), vec![(2, "c".to_string())]);
+    Ok(())
+}
+
+/// In `r2` mode the stored span starts at a transaction's first batch on the
+/// partition. `EndTxn` must end it at the log end, so every later batch of
+/// the transaction commits or aborts with it. The last stable offset comes
+/// from the open span in metadata. Needs MinIO.
+#[test]
+fn an_r2_transaction_of_several_batches_commits_them_all() -> Result<(), Box<dyn std::error::Error>>
+{
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("r2 transaction test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (_node, mut stream) = start(root.path(), &[("CAMUS_DEFAULT_DURABILITY", "r2")]);
+    let started = init_producer(&mut stream, 1, 60_000, None);
+    assert_eq!(started.error_code, 0);
+    let (producer, epoch) = (started.producer_id.0, started.producer_epoch);
+    let mut sequence = 0;
+    for (round, (values, commit)) in [(["a1", "a2"], true), (["b1", "b2"], false)]
+        .into_iter()
+        .enumerate()
+    {
+        let base = 10 * (round as i32 + 1);
+        add_partition(&mut stream, base, producer, epoch);
+        for (index, value) in values.into_iter().enumerate() {
+            produce(
+                &mut stream,
+                base + 1 + index as i32,
+                batch(value.as_bytes(), producer, epoch, sequence),
+                producer,
+            );
+            sequence += 1;
+        }
+        end(&mut stream, base + 5, producer, epoch, commit);
+    }
+    add_partition(&mut stream, 40, producer, epoch);
+    produce(
+        &mut stream,
+        41,
+        batch(b"c", producer, epoch, sequence),
+        producer,
+    );
+    assert_eq!(latest(&mut stream, 42, 1), 4, "stops at the open batch");
+    end(&mut stream, 43, producer, epoch, true);
+    assert_eq!(
+        read_from(&mut stream, 1, 0),
+        vec![
+            (0, "a1".to_string()),
+            (1, "a2".to_string()),
+            (4, "c".to_string())
+        ]
+    );
+    assert_eq!(latest(&mut stream, 44, 1), 5);
+    Ok(())
 }
