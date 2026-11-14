@@ -167,6 +167,20 @@ pub fn offset_key(group: &str, topic_id: &str, partition: i32) -> String {
     format!("{}{topic_id}/{partition}", offset_prefix(group))
 }
 
+/// Prefix of every committed offset key, of every group.
+pub fn all_offsets_prefix() -> &'static str {
+    "offset/"
+}
+
+/// `(group, topic_id, partition)` from a key under [`all_offsets_prefix`].
+pub fn offset_parts(key: &str) -> Option<(String, String, i32)> {
+    let rest = key.strip_prefix(all_offsets_prefix())?;
+    let (encoded, rest) = rest.split_once('/')?;
+    let group = group_from_key(&format!("{}{encoded}", group_prefix()))?;
+    let (topic, partition) = rest.rsplit_once('/')?;
+    Some((group, topic.to_string(), partition.parse().ok()?))
+}
+
 /// `(topic_id, partition)` from a key under [`offset_prefix`].
 pub fn offset_from_key(group: &str, key: &str) -> Option<(String, i32)> {
     let rest = key.strip_prefix(&offset_prefix(group))?;
@@ -279,6 +293,17 @@ mod tests {
             offset_from_key("g", &offset_key("g", "1234-abcd", 7)),
             Some(("1234-abcd".to_string(), 7))
         );
+    }
+
+    #[test]
+    fn an_offset_key_names_its_group_topic_and_partition() {
+        let key = offset_key("orders/eu", "1234-abcd", 7);
+        assert!(key.starts_with(all_offsets_prefix()));
+        assert_eq!(
+            offset_parts(&key),
+            Some(("orders/eu".to_string(), "1234-abcd".to_string(), 7))
+        );
+        assert_eq!(offset_parts("offset/zz/t/0"), None);
     }
 
     #[test]

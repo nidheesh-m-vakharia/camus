@@ -63,9 +63,11 @@ the address clients should dial. On Railway those fall back to
 `RAILWAY_TCP_PROXY_DOMAIN` and `RAILWAY_TCP_PROXY_PORT`.
 
 `GET /admin/metrics` returns JSON, including `current_leader` and
-`wal_leader`. `GET /metrics` is Prometheus. `camus_object_store_*` counts
-object-store calls by operation and bytes moved, for checking R2 cost
-against ADR 0007.
+`wal_leader`. `GET /metrics` is Prometheus: consumer lag, WAL upload lag,
+object-store calls by operation, and produce and fetch latency.
+[docs/metrics.md](docs/metrics.md) lists every series and its memory cost,
+and [deploy/grafana/camus.json](deploy/grafana/camus.json) is a Grafana
+dashboard for lag, upload lag, and estimated R2 spend.
 
 Three brokers plus MinIO: `docker compose --profile brokers up`. Broker 1
 listens on 9092. `init` runs `camus admin init` and retries until the
