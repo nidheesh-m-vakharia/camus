@@ -23,7 +23,9 @@ US East and Europe about 80–90 ms. With voters split across regions:
   before any queueing. A slow link starts elections, and each election
   pauses every partition on the shard.
 - Losing the region that holds a majority stops every shard that has one
-  there. Three voters cannot be spread so that any one region can go.
+  there. With two regions, three voters cannot be spread so that either
+  region can go. A third region keeps quorum, but puts every ack and
+  heartbeat on a cross-region round trip.
 
 [ADR 0018](0018-multi-region-leaderless.md) proposes a native copy of
 sealed objects between regions. It is not built.
@@ -57,10 +59,11 @@ it had not read on the source.
   With the default `offset.lag.max=100`, a failed-over group can re-read
   up to that many records per partition. Consumers must tolerate
   duplicates on failover, as they do with Kafka.
-- Transactions are not atomic across the copy. A `read_committed`
-  consumer on the target sees only what MirrorMaker's consumer read as
-  committed on the source. Camus as a source has no control batches, so
-  the target has none from Camus either
+- Transactions are not atomic across the copy. MirrorMaker's source
+  consumer reads `read_uncommitted` unless the operator sets
+  `<source>.consumer.isolation.level = read_committed`; without it,
+  aborted records reach the target as plain records. Camus as a source
+  has no control batches, so the target has none from Camus either
   ([issue 140](https://github.com/nidheesh-m-vakharia/camus/issues/140)).
 - Topic names differ between regions unless the operator configures
   `IdentityReplicationPolicy`. Clients that fail over must know the

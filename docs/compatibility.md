@@ -426,6 +426,8 @@ west.bootstrap.servers = camus-west-1:9092,camus-west-2:9092,camus-west-3:9092
 east->west.enabled = true
 east->west.topics = orders, payments
 east->west.groups = billing, fulfilment
+# Copy only committed transactional records.
+east.consumer.isolation.level = read_committed
 sync.group.offsets.enabled = true
 sync.topic.acls.enabled = false
 
@@ -441,13 +443,15 @@ creates `east.orders` and `east.payments`, `east.checkpoints.internal`, and
 
 To fail a consumer group over from `east` to `west`:
 
-1. Stop the group's consumers in `east`. MirrorMaker writes translated
-   offsets only for a group with no active members in the target.
+1. Stop the group's consumers in `east`, so its committed offsets stop
+   moving before they are translated.
 2. Wait one `sync.group.offsets.interval.seconds` (60 by default).
    `kafka-consumer-groups.sh --describe --group billing` against `west`
    shows offsets on `east.orders`.
-3. Start the consumers against `west`, subscribed to `east.orders`. They
-   resume at the translated offsets.
+3. Only then start the consumers against `west`, subscribed to
+   `east.orders`. MirrorMaker writes translated offsets only for a group
+   with no active members in the target, so starting them earlier stops
+   the sync. They resume at the translated offsets.
 
 Translation is as fine as MirrorMaker's offset syncs. With the default
 `offset.lag.max=100`, a group can re-read up to 100 records per partition
