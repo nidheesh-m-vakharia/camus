@@ -73,6 +73,9 @@ const EXTENT_PAGE: usize = 256;
 /// Transaction records read at a time when a `read_committed` ListOffsets
 /// looks for open spans.
 const TXN_PAGE: usize = 256;
+/// Most transaction records one `read_committed` ListOffsets reads, so its
+/// cost stops growing with the number of transactional ids.
+const TXN_SCAN_ROWS: usize = 16_384;
 /// Sealed ranges one partition's fetch reads from object storage at once.
 const EXTENT_READS: usize = 4;
 /// Partitions one fetch reads at once.
@@ -814,6 +817,7 @@ impl Kafka {
                         end,
                         producer_id: Some(identity.producer_id),
                     },
+                    skip_published: true,
                 });
             }
         }
@@ -950,13 +954,19 @@ impl Kafka {
         }
         // `r2` topics, and spans a seal or `NoteTxn` stored: ongoing
         // transactions in metadata, read a page at a time.
+        // Past `TXN_SCAN_ROWS` the rest is not read, and an open span there
+        // does not hold the offset back.
         let mut from = "txn/".to_string();
-        loop {
-            let Ok(rows) = self.node.scan_range_local(&from, "txn0", TXN_PAGE) else {
+        let mut scanned = 0;
+        while scanned < TXN_SCAN_ROWS {
+            let want = TXN_PAGE.min(TXN_SCAN_ROWS - scanned);
+            let Ok(rows) = self.node.scan_range_local(&from, "txn0", want) else {
                 break;
             };
-            let full = rows.len() == TXN_PAGE;
+            scanned += rows.len();
+            let full = rows.len() == want;
             for (key, raw) in &rows {
+                from = format!("{key}\0");
                 let Ok(Some(open)) = camus_metadata::txn_open(raw) else {
                     continue;
                 };
@@ -965,12 +975,16 @@ impl Kafka {
                         stable = stable.min(span.start);
                     }
                 }
-                from = format!("{key}\0");
             }
             if !full {
-                break;
+                return stable;
             }
         }
+        tracing::warn!(
+            topic = %topic.name,
+            partition,
+            "read_committed ListOffsets stopped after {TXN_SCAN_ROWS} transaction records"
+        );
         stable
     }
 
@@ -1745,6 +1759,7 @@ impl Kafka {
                         producer_id: clock.producer_id,
                         producer_epoch: clock.epoch,
                         span: span.clone(),
+                        skip_published: true,
                     });
                 }
             }
@@ -3532,6 +3547,7 @@ impl Kafka {
                         end,
                         producer_id: Some(producer),
                     },
+                    skip_published: true,
                 })
                 .await;
             if let Some(code) = noted_error(&noted) {
@@ -4260,6 +4276,7 @@ impl Kafka {
                     end,
                     producer_id: Some(item.producer_id),
                 },
+                skip_published: true,
             });
         }
         let mut parts = Vec::new();
@@ -4737,8 +4754,8 @@ impl Kafka {
             row.offset = state.log_start;
             return row;
         }
+        let high_watermark = state.next_offset.max(self.wal_end(topic, partition));
         if timestamp == -1 {
-            let high_watermark = state.next_offset.max(self.wal_end(topic, partition));
             row.offset = if isolation == 1 {
                 self.last_stable(topic, partition, high_watermark)
             } else {
@@ -4776,8 +4793,19 @@ impl Kafka {
                 let mut batch_offset = extent.start;
                 for batch in info {
                     if batch.max_timestamp >= timestamp {
-                        row.offset = batch_offset;
-                        row.timestamp = batch.max_timestamp;
+                        // Kafka keeps a timestamp lookup only below the last
+                        // offset the isolation level may read.
+                        let fetchable = if isolation == 1 {
+                            self.last_stable(topic, partition, high_watermark)
+                        } else {
+                            high_watermark
+                        };
+                        if batch_offset < fetchable {
+                            row.offset = batch_offset;
+                            row.timestamp = batch.max_timestamp;
+                        } else {
+                            row.offset = -1;
+                        }
                         return row;
                     }
                     batch_offset += i64::from(batch.records);

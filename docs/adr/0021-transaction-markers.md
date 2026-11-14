@@ -61,10 +61,16 @@ added to the WAL, the objects, or `EndTxn`.
   That is the first offset of the earliest open span: on the WAL shard for
   `wal` topics, and in the open transaction's metadata record for `r2`
   topics and spans a seal stored. With nothing open, it is the high
-  watermark.
+  watermark. A timestamp lookup at `read_committed` keeps its offset only
+  below the LSO and answers -1 past it, as Kafka 4.4.0's
+  `Partition.fetchOffsetForTimestamp` does.
 - `NoteTxn` for a range that `EndTxn` already committed or aborted for the
   same producer changes nothing. A batch past the committed end is still a
-  late write and is aborted.
+  late write and is aborted. The rule applies only to `NoteTxn` commands
+  that carry `skip_published: true`, which this binary always sets. A
+  command in the log from an older binary has no field, reads as `false`,
+  and applies the old rule, so replaying the log gives the state the
+  cluster had when it applied it.
 - In `r2` mode, `EndTxn` ends each span at the partition's committed next
   offset, as [0015](0015-transaction-spans.md) describes. An `r2` produce is
   acked after its metadata commit, so that offset is past every batch the
@@ -81,13 +87,22 @@ added to the WAL, the objects, or `EndTxn`.
   the harness does this.
 - A synthesized marker is under 80 bytes per aborted batch in a response.
   Nothing is cached or stored.
-- `read_committed` ListOffsets on an `r2` topic reads the transaction
-  records a page of 256 at a time. It is called when a consumer resets,
-  not per fetch.
-- The `NoteTxn` change alters how one command applies. A voter on the old
-  binary would still abort a late-sealed committed range during a rolling
-  upgrade, so the voters' states can differ for that one range until every
-  voter runs the new binary.
+- `read_committed` ListOffsets reads the transaction records a page of 256
+  at a time, at most 16,384 records per call (`TXN_SCAN_ROWS`). It is
+  called when a consumer resets or looks up a timestamp, not per fetch.
+  Past the cap the rest is not read: an open span stored only in metadata
+  for a transactional id past the first 16,384 does not hold the offset
+  back, and the broker logs a warning. `wal` topics also get the LSO from
+  the shard, which has no cap.
+- During a rolling upgrade, a voter still on the old binary ignores
+  `skip_published` and applies the old rule to a late-sealed `NoteTxn`.
+  It stores that committed range as aborted, and new voters do not. The
+  difference does not heal: nothing later removes the abort range from the
+  old voter's state, and it stays after that voter is upgraded and in any
+  snapshot it builds, so if it becomes leader the range stays hidden from
+  `read_committed`. It needs a seal to land after `EndTxn` on a committed
+  transaction while voters run mixed binaries. To avoid it, upgrade while
+  no transactional producer is writing.
 - A COMMIT marker is not synthesized. A committed batch's own records move
   the position past it.
 
@@ -106,7 +121,15 @@ added to the WAL, the objects, or `EndTxn`.
 - `crates/broker/tests/txn.rs`: a raw fetch shows the marker, and
   ListOffsets returns the LSO. `an_r2_transaction_of_several_batches_commits_them_all`
   needs MinIO.
-- `camus-metadata` `a_late_seal_note_leaves_a_committed_range_visible`.
+- `crates/broker/tests/txn.rs`
+  `read_committed_list_offsets_reads_past_finished_transactions`: 300
+  finished transactional ids, more than a page, then ListOffsets answers.
+  `a_read_committed_timestamp_lookup_stops_at_an_open_transaction` (MinIO):
+  the open span is only in metadata past that page, the latest offset stops
+  at it, and a timestamp lookup answers -1 until the commit.
+- `camus-metadata` `a_late_seal_note_leaves_a_committed_range_visible`, and
+  `an_old_note_keeps_the_old_rule` for a `NoteTxn` written without
+  `skip_published`.
 
 ## Alternatives
 

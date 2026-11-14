@@ -934,6 +934,110 @@ fn read_committed_marks_an_abort_and_stops_list_offsets_at_an_open_transaction(
     Ok(())
 }
 
+/// Offset and timestamp ListOffsets returns for `timestamp`.
+fn list_at(stream: &mut TcpStream, correlation: i32, timestamp: i64, isolation: i8) -> (i64, i64) {
+    let topic = ListOffsetsTopic::default()
+        .with_name(TopicName(StrBytes::from_static_str("orders")))
+        .with_partitions(vec![ListOffsetsPartition::default()
+            .with_partition_index(0)
+            .with_timestamp(timestamp)]);
+    send(
+        stream,
+        ApiKey::ListOffsets,
+        7,
+        correlation,
+        &ListOffsetsRequest::default()
+            .with_replica_id((-1).into())
+            .with_isolation_level(isolation)
+            .with_topics(vec![topic]),
+    );
+    let response = recv::<ListOffsetsResponse>(stream, 7);
+    response
+        .topics
+        .first()
+        .and_then(|topic| topic.partitions.first())
+        .map_or((-2, -2), |row| (row.offset, row.timestamp))
+}
+
+/// 300 transactional ids with no open transaction: more than one page of
+/// the last-stable scan. `a-…` sorts before `checkout`, so an open
+/// `checkout` is past the first page.
+fn finished_ids(stream: &mut TcpStream) {
+    for index in 0..300 {
+        let id = format!("a-{index:03}");
+        send(
+            stream,
+            ApiKey::InitProducerId,
+            4,
+            100 + index,
+            &InitProducerIdRequest::default()
+                .with_transactional_id(Some(TransactionalId(StrBytes::from_string(id))))
+                .with_transaction_timeout_ms(60_000)
+                .with_producer_id((-1).into())
+                .with_producer_epoch(-1),
+        );
+        let init = recv::<InitProducerIdResponse>(stream, 4);
+        assert_eq!(init.error_code, 0, "{init:?}");
+    }
+}
+
+/// More finished transactional ids than one page of the last-stable scan,
+/// then an open one after them. `read_committed` ListOffsets must read past
+/// the finished page and answer.
+#[test]
+fn read_committed_list_offsets_reads_past_finished_transactions(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let (_node, mut stream) = start(root.path(), &[]);
+    finished_ids(&mut stream);
+    let started = init_producer(&mut stream, 1, 60_000, None);
+    assert_eq!(started.error_code, 0);
+    let (producer, epoch) = (started.producer_id.0, started.producer_epoch);
+    add_partition(&mut stream, 2, producer, epoch);
+    produce(&mut stream, 3, batch(b"open", producer, epoch, 0), producer);
+
+    let asked = Instant::now();
+    assert_eq!(latest(&mut stream, 4, 1), 0, "stops at the open batch");
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        asked.elapsed()
+    );
+    Ok(())
+}
+
+/// Kafka 4.4.0 keeps a `read_committed` timestamp lookup only below the
+/// last stable offset, and answers -1 past it. Needs MinIO: in `r2` mode the
+/// batch is sealed when it is acknowledged, so the lookup can find it, and
+/// the open span is only in metadata, past a page of finished ids.
+#[test]
+fn a_read_committed_timestamp_lookup_stops_at_an_open_transaction(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("r2 timestamp lookup test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let (_node, mut stream) = start(root.path(), &[("CAMUS_DEFAULT_DURABILITY", "r2")]);
+    finished_ids(&mut stream);
+    let started = init_producer(&mut stream, 1, 60_000, None);
+    assert_eq!(started.error_code, 0);
+    let (producer, epoch) = (started.producer_id.0, started.producer_epoch);
+    add_partition(&mut stream, 2, producer, epoch);
+    produce(&mut stream, 3, batch(b"open", producer, epoch, 0), producer);
+
+    assert_eq!(latest(&mut stream, 8, 1), 0, "stops at the open batch");
+    assert_eq!(list_at(&mut stream, 4, 0, 0), (0, 9), "read_uncommitted");
+    assert_eq!(
+        list_at(&mut stream, 5, 0, 1),
+        (-1, -1),
+        "read_committed stops below the open batch"
+    );
+    end(&mut stream, 6, producer, epoch, true);
+    assert_eq!(list_at(&mut stream, 7, 0, 1), (0, 9), "stable after commit");
+    Ok(())
+}
+
 /// In `r2` mode the stored span starts at a transaction's first batch on the
 /// partition. `EndTxn` must end it at the log end, so every later batch of
 /// the transaction commits or aborts with it. The last stable offset comes

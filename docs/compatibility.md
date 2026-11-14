@@ -269,7 +269,10 @@ at the end of the log, and lag reaches zero as on Kafka. A
 committed record at its own offset. A `read_uncommitted` consumer sees
 aborted records, as in Kafka. ListOffsets for the latest offset at
 `read_committed` returns the last stable offset, which stops at the first
-open transaction. Because no marker takes an offset, a committed
+open transaction, and a `read_committed` timestamp lookup answers -1 at or
+past it, as Kafka does. Unlike Kafka, the last stable offset reads at most
+16,384 transaction records from metadata; an open `r2` transaction past
+them does not hold it back (ADR 0021). Because no marker takes an offset, a committed
 transaction's records are numbered without gaps, and offset arithmetic
 equals the record count; on Kafka each transaction adds one offset per
 partition. `kafka-dump-log.sh` reads a broker's segment files and has

@@ -438,12 +438,14 @@ fn apply_command(
                 producer_id,
                 producer_epoch,
                 span,
+                skip_published,
             } => txn::outcome(txn::note(
                 &read,
                 &transactional_id,
                 producer_id,
                 producer_epoch,
                 span,
+                skip_published,
             )),
             Command::StageTxnOffsets {
                 transactional_id,

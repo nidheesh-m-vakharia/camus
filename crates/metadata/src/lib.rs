@@ -197,6 +197,11 @@ pub enum Command {
         producer_epoch: i16,
         /// The range just appended.
         span: txn::TxnSpan,
+        /// `true` skips a span `EndTxn` already committed or aborted
+        /// (ADR 0021). `false` on commands written before it, which apply
+        /// as they did when they were written.
+        #[serde(default)]
+        skip_published: bool,
     },
     /// Stage offsets that commit only with the transaction.
     StageTxnOffsets {
