@@ -2489,8 +2489,26 @@ impl Kafka {
             ApiKey::CreateTopics => self.create_topics(&header, &mut buf, &caller).await,
             ApiKey::DeleteTopics => self.delete_topics(&header, &mut buf, &caller).await,
             ApiKey::DescribeConfigs => self.describe_configs(&header, &mut buf, &caller),
-            ApiKey::Produce => return self.produce(&header, &mut buf, &caller).await,
-            ApiKey::Fetch => self.fetch(&header, &mut buf, &caller).await,
+            ApiKey::Produce => {
+                let started = Instant::now();
+                return match self.produce(&header, &mut buf, &caller).await {
+                    Handled::Now(reply) => {
+                        crate::metrics::PRODUCE_LATENCY.record(started.elapsed());
+                        Handled::Now(reply)
+                    }
+                    Handled::Later(rest) => Handled::Later(Box::pin(async move {
+                        let reply = rest.await;
+                        crate::metrics::PRODUCE_LATENCY.record(started.elapsed());
+                        reply
+                    })),
+                };
+            }
+            ApiKey::Fetch => {
+                let started = Instant::now();
+                let reply = self.fetch(&header, &mut buf, &caller).await;
+                crate::metrics::FETCH_LATENCY.record(started.elapsed());
+                reply
+            }
             ApiKey::ListOffsets => self.list_offsets(&header, &mut buf, &caller).await,
             ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf, session),
             ApiKey::SaslAuthenticate => self.sasl_authenticate(&header, &mut buf, session),
@@ -3949,7 +3967,9 @@ impl Kafka {
                 return Upload::Hold;
             }
         }
+        let times = crate::metrics::shard_times(id);
         if !upload.is_empty() {
+            let started = Instant::now();
             let span_notes = self.seal_span_notes(&upload);
             let (parts, producers, seals, all_put) = self.put_objects(upload).await;
             if !all_put {
@@ -3975,6 +3995,9 @@ impl Kafka {
                     drops.extend(seals);
                 }
             }
+            if ok {
+                times.upload.record(started.elapsed());
+            }
         }
         let done = if !ok {
             Upload::Failed
@@ -3991,8 +4014,10 @@ impl Kafka {
         }
         // A shard without quorum never finishes the seal. Fail the pass so
         // this shard backs off instead of retrying on every flush interval.
+        let started = Instant::now();
         match tokio::time::timeout(COMMIT_TIMEOUT, wal.seal(drops)).await {
             Ok(Ok(index)) => {
+                times.seal.record(started.elapsed());
                 let _ = wal.purge(index).await;
                 done
             }

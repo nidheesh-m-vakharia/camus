@@ -956,6 +956,12 @@ impl Shard {
         self.machine.unsealed_bytes()
     }
 
+    /// Unix milliseconds this broker applied, or loaded at open, the oldest
+    /// batch not yet sealed. `None` when nothing is unsealed.
+    pub fn oldest_unsealed_ms(&self) -> Option<u64> {
+        self.machine.oldest_unsealed_ms()
+    }
+
     /// The oldest committed batches not yet sealed, up to about `limit`
     /// bytes, with their bytes read from the log.
     pub async fn pending(&self, limit: u64) -> anyhow::Result<Vec<Batch>> {

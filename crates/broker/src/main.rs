@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod kafka;
+mod metrics;
 mod recover;
 mod settings;
 mod slot;
@@ -133,6 +134,8 @@ struct Admin {
     http: reqwest::Client,
     truncating: tokio::sync::Mutex<()>,
     settings: settings::Settings,
+    /// The Kafka listener, once it starts, for consumer lag in `/metrics`.
+    kafka: std::sync::OnceLock<Arc<kafka::Kafka>>,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +220,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         truncating: tokio::sync::Mutex::new(()),
         settings: settings.clone(),
+        kafka: std::sync::OnceLock::new(),
     });
 
     let app = Router::new()
@@ -263,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
 
     let kafka_addr = settings.get("kafka.addr").to_string();
     if !kafka_addr.is_empty() {
-        start_kafka(
+        let kafka = start_kafka(
             node.clone(),
             wal,
             args.node_id,
@@ -272,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
             &settings,
         )
         .await?;
+        let _ = admin.kafka.set(kafka);
     }
 
     let bound = http_bound;
@@ -414,9 +419,16 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          camus_object_store_requests_total{{op=\"head\"}} {}\n\
          camus_object_store_requests_total{{op=\"list\"}} {}\n\
          camus_object_store_requests_total{{op=\"delete\"}} {}\n\
-         # HELP camus_object_store_errors_total Object-store calls that returned an error.\n\
+         # HELP camus_object_store_errors_total Object-store calls that returned an error, by operation.\n\
          # TYPE camus_object_store_errors_total counter\n\
-         camus_object_store_errors_total {}\n\
+         camus_object_store_errors_total{{op=\"put\"}} {}\n\
+         camus_object_store_errors_total{{op=\"get\"}} {}\n\
+         camus_object_store_errors_total{{op=\"head\"}} {}\n\
+         camus_object_store_errors_total{{op=\"list\"}} {}\n\
+         camus_object_store_errors_total{{op=\"delete\"}} {}\n\
+         # HELP camus_object_store_listed_keys_total Keys returned by lists. The store reads 1,000 per page.\n\
+         # TYPE camus_object_store_listed_keys_total counter\n\
+         camus_object_store_listed_keys_total {}\n\
          # HELP camus_object_store_put_bytes_total Bytes written to object storage.\n\
          # TYPE camus_object_store_put_bytes_total counter\n\
          camus_object_store_put_bytes_total {}\n\
@@ -436,42 +448,110 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         kafka::PRODUCE_HOLD_MS.load(Relaxed),
         kafka::META_SNAPSHOT_INDEX.load(Relaxed),
         kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
-        store.puts.load(Relaxed),
-        store.gets.load(Relaxed),
-        store.heads.load(Relaxed),
-        store.lists.load(Relaxed),
-        store.deletes.load(Relaxed),
-        store.errors.load(Relaxed),
+        store.puts.calls.load(Relaxed),
+        store.gets.calls.load(Relaxed),
+        store.heads.calls.load(Relaxed),
+        store.lists.calls.load(Relaxed),
+        store.deletes.calls.load(Relaxed),
+        store.puts.errors.load(Relaxed),
+        store.gets.errors.load(Relaxed),
+        store.heads.errors.load(Relaxed),
+        store.lists.errors.load(Relaxed),
+        store.deletes.errors.load(Relaxed),
+        store.listed.load(Relaxed),
         store.put_bytes.load(Relaxed),
         store.get_bytes.load(Relaxed),
     );
     // One series per open shard. The shard count is fixed at init.
     let shards = admin.wal.all();
-    let families: [(&str, &str, &str, fn(&camus_wal::Shard, NodeId) -> u64); 3] = [
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let families: [(&str, &str, &str, fn(&camus_wal::Shard, NodeId, u64) -> u64); 4] = [
         (
             "camus_wal_unsealed_bytes",
             "Committed WAL bytes not yet sealed into object storage.",
             "gauge",
-            |shard, _| shard.unsealed_bytes(),
+            |shard, _, _| shard.unsealed_bytes(),
+        ),
+        (
+            "camus_wal_oldest_unsealed_age_seconds",
+            "Seconds since this broker applied the oldest batch not yet sealed, or 0. After a restart it counts from when the shard opened.",
+            "gauge",
+            |shard, _, now| {
+                shard
+                    .oldest_unsealed_ms()
+                    .map_or(0, |at| now.saturating_sub(at) / 1000)
+            },
         ),
         (
             "camus_wal_leader",
             "1 when this broker leads the WAL shard.",
             "gauge",
-            |shard, me| u64::from(shard.leader() == Some(me)),
+            |shard, me, _| u64::from(shard.leader() == Some(me)),
         ),
         (
             "camus_wal_storage_failed",
             "1 when a WAL write failed and the shard stopped.",
             "gauge",
-            |shard, _| u64::from(shard.storage_failed()),
+            |shard, _, _| u64::from(shard.storage_failed()),
         ),
     ];
     for (name, help, kind, value) in families {
         text.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
         for (id, shard) in &shards {
-            let value = value(shard, admin.node_id);
+            let value = value(shard, admin.node_id, now_ms);
             text.push_str(&format!("{name}{{shard=\"{id}\"}} {value}\n"));
+        }
+    }
+    // Seal and upload times, recorded only where this broker led the shard.
+    let timings: [(&str, &str, fn(&metrics::ShardTimes) -> &metrics::Histogram); 2] = [
+        (
+            "camus_wal_upload_seconds",
+            "Time to put one upload pass's objects and publish their extents.",
+            |times| &times.upload,
+        ),
+        (
+            "camus_wal_seal_seconds",
+            "Time to commit the Seal that drops uploaded batches from the WAL.",
+            |times| &times.seal,
+        ),
+    ];
+    for (name, help, pick) in timings {
+        text.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+        for (id, _) in &shards {
+            if usize::try_from(*id).is_ok_and(|id| id < metrics::SHARD_SERIES) {
+                let labels = format!("shard=\"{id}\"");
+                pick(metrics::shard_times(*id)).render(&mut text, name, &labels);
+            }
+        }
+        if let Some(times) = metrics::overflow_times() {
+            pick(times).render(&mut text, name, "shard=\"overflow\"");
+        }
+    }
+    text.push_str(
+        "# HELP camus_produce_request_seconds Time from reading a Produce request to its response.\n\
+         # TYPE camus_produce_request_seconds histogram\n",
+    );
+    metrics::PRODUCE_LATENCY.render(&mut text, "camus_produce_request_seconds", "");
+    text.push_str(
+        "# HELP camus_fetch_request_seconds Time to answer a Fetch request, including its long poll.\n\
+         # TYPE camus_fetch_request_seconds histogram\n",
+    );
+    metrics::FETCH_LATENCY.render(&mut text, "camus_fetch_request_seconds", "");
+    if let Some(kafka) = admin.kafka.get() {
+        // The lag scan reads metadata synchronously; keep it off the workers
+        // that serve produce and fetch.
+        let kafka = Arc::clone(kafka);
+        let lag = tokio::task::spawn_blocking(move || {
+            let mut lag = String::new();
+            kafka.render_group_lag(&mut lag);
+            lag
+        })
+        .await;
+        if let Ok(lag) = lag {
+            text.push_str(&lag);
         }
     }
     text
@@ -1704,7 +1784,7 @@ async fn start_kafka(
     kafka_addr: &str,
     args: &Args,
     settings: &settings::Settings,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<kafka::Kafka>> {
     let tls = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => Some(load_tls(cert, key, args.tls_client_ca.as_deref())?),
         (None, None) => None,
@@ -1778,8 +1858,8 @@ async fn start_kafka(
         },
     );
     info!(%bound, sasl = require_sasl, "kafka listener");
-    tokio::spawn(async move { kafka.run(listener).await });
-    Ok(())
+    tokio::spawn(Arc::clone(&kafka).run(listener));
+    Ok(kafka)
 }
 
 fn open_bucket(settings: &settings::Settings) -> anyhow::Result<Bucket> {
