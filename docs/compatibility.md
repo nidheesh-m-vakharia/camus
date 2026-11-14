@@ -34,7 +34,7 @@ error rather than a partial imitation.
 | `acks=1` | Same barrier as `acks=all`: WAL quorum fsync, or R2 put plus metadata commit | Leader-local ack | 0005 |
 | Unclean leader election | Never automatic. Operator truncate only | Default off, can be enabled | 0008 |
 | Idempotence | `InitProducerId` allocates a producer id. A retried sequence returns the original offset and is not appended | Supported | 0009 |
-| Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. There is no control-batch marker | Control batches plus `read_committed` | 0013 |
+| Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. No control batch is stored, so a transaction takes no extra offset; a `read_committed` fetch sends an ABORT marker at an aborted batch's last offset instead | Control batches plus `read_committed`; each marker takes an offset | 0013, 0021 |
 | Compaction | Latest key, original offset, sealed extents only, on a timer rather than a dirty ratio. A tombstone's `delete.retention.ms` counts from its own timestamp | `LogCleaner` by dirty ratio; tombstone horizon counts from the first cleaning (KIP-534) | 0010 |
 | ACLs | A resource with no ACL is denied on an authenticated listener (SASL or mTLS) and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
 | Partition leadership | Leadership belongs to WAL shards, one per core by default (rounded so each broker leads the same number, capped at eight per broker), each with up to three voters; partitions are placed on shards round-robin at creation and never move. A shard's first voter is its preferred leader: the balancer and `ElectLeaders PREFERRED` move all of the shard's partitions together, by election, so the shard pauses briefly and its epoch rises | Leaders and preferred replicas per partition, reassignment | 0006, 0014 |
@@ -258,14 +258,25 @@ The sweep owns every `bundle/` object under the cluster's key prefix: give each
 cluster its own bucket or its own `CAMUS_S3_PREFIX`.
 
 A transactional produce in `wal` mode is one WAL commit (ADR 0019). The
-open span stays in the WAL until `EndTxn`, which publishes it. Camus writes
-no transaction control records: `read_committed` filtering is done by the
-broker from the committed and aborted offset ranges. Kafka
-clients do not need the markers, and a `read_committed` consumer that seeks
-into an aborted range gets the next committed record at its own offset. A
-`read_uncommitted` consumer sees aborted records, as in Kafka. A tool that
-reads the raw log expecting control batches, or counts them, will not find
-any.
+open span stays in the WAL until `EndTxn`, which publishes it. Camus stores
+no transaction control records (ADR 0021): `read_committed` filtering is
+done by the broker from the committed and aborted offset ranges. In place
+of each aborted batch, a `read_committed` fetch sends an ABORT control
+batch with one record at that batch's last offset, so kafka-clients,
+librdkafka and KafkaJS move their position past an abort, including one
+at the end of the log, and lag reaches zero as on Kafka. A
+`read_committed` consumer that seeks into an aborted range gets the next
+committed record at its own offset. A `read_uncommitted` consumer sees
+aborted records, as in Kafka. ListOffsets for the latest offset at
+`read_committed` returns the last stable offset, which stops at the first
+open transaction. Because no marker takes an offset, a committed
+transaction's records are numbered without gaps, and offset arithmetic
+equals the record count; on Kafka each transaction adds one offset per
+partition. `kafka-dump-log.sh` reads a broker's segment files and has
+nothing to read on Camus. The nightly ecosystem harness checks
+kafka-clients, the console consumer, librdkafka (confluent-kafka-go),
+KafkaJS, and MirrorMaker 2 with a `read_committed` source against a
+partition that ends in an abort.
 
 Transactions follow Kafka's coordinator timers. `InitProducerId` with a
 `transaction_timeout_ms` of 0 or less, or above `CAMUS_TXN_MAX_TIMEOUT_MS`
@@ -393,13 +404,18 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 | Kafka Connect 4.4.0, distributed | FileStream source and sink, compacted internal topics, resume after restart | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| Transactional readers | kafka-clients, console consumer, librdkafka, and KafkaJS at `read_committed` on a partition ending in an abort; MirrorMaker 2 from Camus to Camus with a `read_committed` source copies committed records only (ADR 0021) | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Schema Registry | in the harness behind `CAMUS_ECOSYSTEM_DOCKER=1` | not run here |
 | kafka-python | tracked; not in the harness | - |
 
 The ecosystem harness (`crates/broker/tests/ecosystem.rs`) found and fixed
 two gaps: DescribeConfigs did not answer for the broker resource, and a
 ListOffsets v1-3 response carried a leader epoch those versions cannot
-encode, closing the connection. DescribeConfigs for a broker returns that
+encode, closing the connection. The transactional readers found four more,
+fixed under ADR 0021: no position move past an abort at the end of the log,
+ListOffsets ignoring `read_committed`, a late seal hiding a committed range
+(and, in `r2` mode, a span ending at the first batch), and a null record set
+on an empty fetch, which librdkafka rejects. DescribeConfigs for a broker returns that
 broker's settings under Kafka's names, read-only; dynamic broker configs
 are not supported. `--advertised-addr` sets what Metadata hands out.
 
