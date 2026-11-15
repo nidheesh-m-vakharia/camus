@@ -3,7 +3,7 @@
 Records 0001–0013 were accepted on 2026-11-05 and are implemented, with the
 amendments their files note. 0014, 0015, 0016, and 0017 are accepted. 0016
 sends votes, empty heartbeats, and shard announcements over QUIC unless
-`CAMUS_QUIC` is `off`. 0018 is proposed. 0019 is accepted.
+`CAMUS_QUIC` is `off`. 0018 is proposed. 0019 and 0021 are accepted.
 
 | ADR | Title |
 | --- | --- |
@@ -26,5 +26,6 @@ sends votes, empty heartbeats, and shard announcements over QUIC unless
 | [0017](0017-ignored-topic-configs.md) | Accepted topic configs that do not change behavior |
 | [0018](0018-multi-region-leaderless.md) | Multi-region replication, one home per partition, TrueTime commit-wait |
 | [0019](0019-txn-span-in-the-wal.md) | Transaction spans live in the WAL until `EndTxn` |
+| [0021](0021-transaction-markers.md) | Transaction markers are made at fetch, not stored |
 
 Read [../PLAN.md](../PLAN.md) for the summary.

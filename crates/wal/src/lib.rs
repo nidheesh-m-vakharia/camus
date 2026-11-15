@@ -899,6 +899,12 @@ impl Shard {
         self.machine.txn_span(topic_id, partition, producer_id)
     }
 
+    /// First offset of the earliest open transaction span on a partition.
+    /// `None` when no transaction is open there.
+    pub fn first_open_txn(&self, topic_id: &[u8; 16], partition: i32) -> Option<i64> {
+        self.machine.first_open_txn(topic_id, partition)
+    }
+
     /// Freeze this producer's span. A later transactional batch from the
     /// producer is refused and is not appended.
     pub async fn finish_txn(

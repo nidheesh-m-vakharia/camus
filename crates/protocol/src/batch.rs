@@ -7,7 +7,9 @@
 
 use bytes::{Bytes, BytesMut};
 
-use crate::records::crc32c;
+use crate::records::{
+    crc32c, Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
 
 const HEADER: usize = 12;
 
@@ -256,6 +258,69 @@ fn read_ivar(buf: &[u8], at: usize, max_bytes: usize) -> Result<(i64, usize), Ba
     Err(BatchError::Corrupt)
 }
 
+/// A control batch holding one ABORT marker at the last offset of the batch
+/// at the front of `batch`, with that batch's producer, epoch and timestamp.
+/// Camus stores no markers. A `read_committed` fetch sends this in place of
+/// an aborted batch, so a client moves its position past the aborted range
+/// as it would past Kafka's marker (ADR 0021). The marker takes no offset of
+/// its own.
+pub fn abort_marker(batch: &[u8]) -> Result<Bytes, BatchError> {
+    let header = batch.get(..PREFIX).ok_or(BatchError::Corrupt)?;
+    if header[MAGIC_AT] != 2 {
+        return Err(BatchError::Corrupt);
+    }
+    let at = |from: usize, to: usize| header.get(from..to).ok_or(BatchError::Corrupt);
+    let int = |from: usize| -> Result<[u8; 4], BatchError> {
+        at(from, from + 4)?
+            .try_into()
+            .map_err(|_| BatchError::Corrupt)
+    };
+    let long = |from: usize| -> Result<[u8; 8], BatchError> {
+        at(from, from + 8)?
+            .try_into()
+            .map_err(|_| BatchError::Corrupt)
+    };
+    let short = |from: usize| -> Result<[u8; 2], BatchError> {
+        at(from, from + 2)?
+            .try_into()
+            .map_err(|_| BatchError::Corrupt)
+    };
+    let attributes = i16::from_be_bytes(short(ATTR_AT)?);
+    let last = i64::from_be_bytes(long(0)?) + i64::from(i32::from_be_bytes(int(LAST_DELTA_AT)?));
+    let marker = Record {
+        transactional: true,
+        control: true,
+        delete_horizon: false,
+        partition_leader_epoch: i32::from_be_bytes(int(EPOCH_AT)?),
+        producer_id: i64::from_be_bytes(long(PRODUCER_ID_AT)?),
+        producer_epoch: i16::from_be_bytes(short(PRODUCER_EPOCH_AT)?),
+        timestamp_type: if attributes & (1 << 3) != 0 {
+            TimestampType::LogAppend
+        } else {
+            TimestampType::Creation
+        },
+        offset: last,
+        sequence: -1,
+        timestamp: i64::from_be_bytes(long(MAX_TS_AT)?),
+        // EndTransactionMarker: key version 0, type ABORT (0); value
+        // version 0, coordinator epoch 0.
+        key: Some(Bytes::from_static(&[0, 0, 0, 0])),
+        value: Some(Bytes::from_static(&[0, 0, 0, 0, 0, 0])),
+        headers: Default::default(),
+    };
+    let mut out = BytesMut::with_capacity(PREFIX + 32);
+    RecordBatchEncoder::encode(
+        &mut out,
+        [&marker],
+        &RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        },
+    )
+    .map_err(|_| BatchError::Corrupt)?;
+    Ok(out.freeze())
+}
+
 /// Copy `bytes` and write `base_offset` into the first batch, then continue
 /// by each batch's record count. `epoch` is written into every batch.
 ///
@@ -283,8 +348,8 @@ pub fn seal(
 mod tests {
     use super::*;
     use crate::records::{
-        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-        NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+        Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions,
+        TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
     };
     use bytes::BytesMut;
 
@@ -336,6 +401,26 @@ mod tests {
             );
             inspect(&sealed, 1024 * 1024).unwrap();
         }
+    }
+
+    #[test]
+    fn an_abort_marker_is_a_control_record_at_the_batch_last_offset() -> anyhow::Result<()> {
+        let sealed = seal(&sample(Compression::Gzip), 40, 7, 1024 * 1024)
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let marker = abort_marker(&sealed).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let decoded = RecordBatchDecoder::decode(&mut marker.clone())?;
+        let [record] = decoded.records.as_slice() else {
+            anyhow::bail!("want one record, got {}", decoded.records.len());
+        };
+        assert!(record.control && record.transactional);
+        assert_eq!(record.offset, 40);
+        assert_eq!(record.partition_leader_epoch, 7);
+        assert_eq!(record.key.as_deref(), Some(&[0u8, 0, 0, 0][..]));
+        assert_eq!(
+            abort_marker(&sealed[..PREFIX - 1]),
+            Err(BatchError::Corrupt)
+        );
+        Ok(())
     }
 
     #[test]
