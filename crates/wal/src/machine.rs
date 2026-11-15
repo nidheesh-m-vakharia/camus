@@ -114,7 +114,10 @@ impl Head {
 #[derive(Default, Clone)]
 struct Heads {
     by_part: BTreeMap<([u8; 16], i32), BTreeMap<i64, Head>>,
-    by_key: BTreeMap<u64, ([u8; 16], i32, i64)>,
+    /// Each value ends with the unix milliseconds this replica applied or
+    /// loaded the head. It lives only in memory and drives the oldest
+    /// unsealed age metric, never state.
+    by_key: BTreeMap<u64, ([u8; 16], i32, i64, u64)>,
     /// Sum of every head's `len`.
     bytes: u64,
 }
@@ -122,8 +125,10 @@ struct Heads {
 impl Heads {
     fn insert(&mut self, head: Head) {
         self.bytes += head.len;
-        self.by_key
-            .insert(head.key(), (head.topic_id, head.partition, head.start));
+        self.by_key.insert(
+            head.key(),
+            (head.topic_id, head.partition, head.start, unix_ms()),
+        );
         self.by_part
             .entry((head.topic_id, head.partition))
             .or_default()
@@ -145,7 +150,7 @@ impl Heads {
     fn in_commit_order(&self) -> impl Iterator<Item = &Head> {
         self.by_key
             .values()
-            .filter_map(|(topic_id, partition, start)| {
+            .filter_map(|(topic_id, partition, start, _)| {
                 self.by_part.get(&(*topic_id, *partition))?.get(start)
             })
     }
@@ -170,6 +175,14 @@ impl Heads {
             .flat_map(move |part| part.range(holding.max(sealed_end)..))
             .map(|(_, head)| head)
     }
+}
+
+/// Unix milliseconds now, or 0 before the epoch.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 impl FromIterator<Head> for Heads {
@@ -437,6 +450,13 @@ impl Machine {
 
     pub fn unsealed_bytes(&self) -> u64 {
         self.state.lock().expect("wal state").heads.bytes
+    }
+
+    /// Unix milliseconds this replica applied or loaded its oldest unsealed
+    /// batch, or `None` when nothing is unsealed.
+    pub fn oldest_unsealed_ms(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        state.heads.by_key.values().next().map(|value| value.3)
     }
 
     /// The oldest unsealed batches in commit order, with their bytes, up to

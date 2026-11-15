@@ -534,6 +534,108 @@ impl Kafka {
             .collect()
     }
 
+    /// Prometheus lines for the committed offset, log end offset and lag of
+    /// each `(group, partition)` whose partition this broker leads, so each
+    /// pair comes from one broker. Reads at most `LAG_SCAN_ROWS` committed
+    /// offsets and writes at most `LAG_SERIES` pairs in `LAG_BYTES` of
+    /// text; the pairs it leaves out are counted in
+    /// `camus_consumer_group_lag_series_dropped`. It reads metadata
+    /// synchronously, so call it off the async workers.
+    pub(crate) fn render_group_lag(&self, out: &mut String) {
+        use crate::metrics::{label, LAG_BYTES, LAG_SCAN_ROWS, LAG_SERIES};
+        use std::fmt::Write as _;
+        // A row's key holds its group id, so a page is at most this many ids.
+        const PAGE: usize = 256;
+        // Metric names and values on the three lines of one pair.
+        const LINE_OVERHEAD: usize = 3 * 64;
+        let prefix = groups::all_offsets_prefix();
+        // Every key under `offset/` sorts before `offset0`.
+        let end = "offset0";
+        let mut from = prefix.to_string();
+        let mut scanned = 0usize;
+        let mut dropped = 0u64;
+        let (mut committed, mut ends, mut lags) = (String::new(), String::new(), String::new());
+        let mut written = 0usize;
+        // Keys sort by group, then topic, so one cached topic covers a run.
+        let mut cached: Option<(String, Option<camus_metadata::Topic>)> = None;
+        'scan: while scanned < LAG_SCAN_ROWS {
+            let want = PAGE.min(LAG_SCAN_ROWS - scanned);
+            let Ok(rows) = self.node.scan_range_local(&from, end, want) else {
+                break;
+            };
+            let Some((last, _)) = rows.last() else {
+                break;
+            };
+            from = format!("{last}\0");
+            scanned += rows.len();
+            let short = rows.len() < want;
+            for (key, value) in rows {
+                let Some((group, topic_id, partition)) = groups::offset_parts(&key) else {
+                    continue;
+                };
+                let Ok(record) = serde_json::from_str::<OffsetRecord>(&value) else {
+                    continue;
+                };
+                if cached.as_ref().is_none_or(|(id, _)| *id != topic_id) {
+                    let topic = Uuid::parse_str(&topic_id)
+                        .ok()
+                        .and_then(|id| self.topic_name_by_id(&id))
+                        .and_then(|name| self.topic(&name));
+                    cached = Some((topic_id, topic));
+                }
+                // A deleted topic's offsets are not reported.
+                let Some((_, Some(topic))) = &cached else {
+                    continue;
+                };
+                if !self.leads_partition(topic, partition) {
+                    continue;
+                }
+                let labels = format!(
+                    "group=\"{}\",topic=\"{}\",partition=\"{partition}\"",
+                    label(&group),
+                    label(&topic.name)
+                );
+                let used = committed.len() + ends.len() + lags.len();
+                // Check the caps before reading the high watermark, so pairs
+                // past them cost no further reads.
+                if written >= LAG_SERIES || used + 3 * labels.len() + LINE_OVERHEAD > LAG_BYTES {
+                    dropped += 1;
+                    continue;
+                }
+                let Some(end) = self.high_watermark(topic, partition) else {
+                    continue;
+                };
+                written += 1;
+                let lag = (end - record.offset).max(0);
+                let _ = writeln!(
+                    committed,
+                    "camus_consumer_group_committed_offset{{{labels}}} {}",
+                    record.offset
+                );
+                let _ = writeln!(
+                    ends,
+                    "camus_consumer_group_log_end_offset{{{labels}}} {end}"
+                );
+                let _ = writeln!(lags, "camus_consumer_group_lag{{{labels}}} {lag}");
+            }
+            if short {
+                break 'scan;
+            }
+        }
+        let _ = write!(
+            out,
+            "# HELP camus_consumer_group_committed_offset Next offset the group will read, for partitions this broker leads.\n\
+             # TYPE camus_consumer_group_committed_offset gauge\n{committed}\
+             # HELP camus_consumer_group_log_end_offset High watermark of the partition the group reads.\n\
+             # TYPE camus_consumer_group_log_end_offset gauge\n{ends}\
+             # HELP camus_consumer_group_lag Log end offset minus the committed offset, at least 0.\n\
+             # TYPE camus_consumer_group_lag gauge\n{lags}\
+             # HELP camus_consumer_group_lag_series_dropped Group partitions this broker leads but left out past the series cap.\n\
+             # TYPE camus_consumer_group_lag_series_dropped gauge\n\
+             camus_consumer_group_lag_series_dropped {dropped}\n"
+        );
+    }
+
     pub(super) async fn offset_fetch(
         &self,
         header: &RequestHeader,
