@@ -48,44 +48,62 @@ fn virtual_host_endpoint(endpoint: &str, bucket: &str) -> anyhow::Result<String>
 
 /// Object-store calls made through [`Bucket`], for `/metrics`. One count per
 /// call: `object_store` may retry a call, and a list may fetch several pages.
+/// A fixed set of atomics, so the memory cost is constant.
 #[derive(Default)]
 pub struct Stats {
     /// Puts, conditional or not (R2 Class A).
-    pub puts: AtomicU64,
+    pub puts: Op,
     /// Ranged gets (R2 Class B).
-    pub gets: AtomicU64,
+    pub gets: Op,
     /// Heads (R2 Class B).
-    pub heads: AtomicU64,
+    pub heads: Op,
     /// Lists (R2 Class A).
-    pub lists: AtomicU64,
+    pub lists: Op,
     /// Deletes (free on R2).
-    pub deletes: AtomicU64,
-    /// Calls that returned an error, including a conditional put that lost.
-    /// A head that finds nothing is not one.
-    pub errors: AtomicU64,
+    pub deletes: Op,
     /// Bytes written by puts.
     pub put_bytes: AtomicU64,
     /// Bytes returned by gets.
     pub get_bytes: AtomicU64,
+    /// Keys returned by lists. The store fetches 1,000 keys per page, so
+    /// `lists + listed / 1000` approximates the Class A list requests.
+    pub listed: AtomicU64,
+}
+
+/// Calls of one operation, and how many returned an error. A conditional
+/// put that lost is an error; a head that finds nothing is not.
+#[derive(Default)]
+pub struct Op {
+    pub calls: AtomicU64,
+    pub errors: AtomicU64,
+}
+
+impl Op {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+        }
+    }
 }
 
 /// Process-wide counters.
 pub static STATS: Stats = Stats {
-    puts: AtomicU64::new(0),
-    gets: AtomicU64::new(0),
-    heads: AtomicU64::new(0),
-    lists: AtomicU64::new(0),
-    deletes: AtomicU64::new(0),
-    errors: AtomicU64::new(0),
+    puts: Op::new(),
+    gets: Op::new(),
+    heads: Op::new(),
+    lists: Op::new(),
+    deletes: Op::new(),
     put_bytes: AtomicU64::new(0),
     get_bytes: AtomicU64::new(0),
+    listed: AtomicU64::new(0),
 };
 
 /// Count one call to `op`, and an error if it failed.
-fn counted<T, E>(op: &AtomicU64, result: Result<T, E>) -> Result<T, E> {
-    op.fetch_add(1, Relaxed);
+fn counted<T, E>(op: &Op, result: Result<T, E>) -> Result<T, E> {
+    op.calls.fetch_add(1, Relaxed);
     if result.is_err() {
-        STATS.errors.fetch_add(1, Relaxed);
+        op.errors.fetch_add(1, Relaxed);
     }
     result
 }
@@ -214,7 +232,7 @@ impl Bucket {
     /// A listing of `prefix`, read a page at a time. One list is counted
     /// when this is created, not once per page.
     pub fn list_pages(&self, prefix: &str) -> Listing {
-        STATS.lists.fetch_add(1, Relaxed);
+        STATS.lists.calls.fetch_add(1, Relaxed);
         Listing {
             stream: self.store.list(Some(&self.path(prefix))),
             prefix: self.prefix.clone(),
@@ -239,12 +257,12 @@ impl Bucket {
 
     /// Whether `key` is absent. `true` means a get would not return bytes.
     pub async fn is_missing(&self, key: &str) -> anyhow::Result<bool> {
-        STATS.heads.fetch_add(1, Relaxed);
+        STATS.heads.calls.fetch_add(1, Relaxed);
         match self.store.head(&self.path(key)).await {
             Ok(_) => Ok(false),
             Err(object_store::Error::NotFound { .. }) => Ok(true),
             Err(err) => {
-                STATS.errors.fetch_add(1, Relaxed);
+                STATS.heads.errors.fetch_add(1, Relaxed);
                 Err(err.into())
             }
         }
@@ -273,7 +291,14 @@ impl Listing {
                 self.done = true;
                 break;
             };
-            let meta = meta?;
+            let meta = match meta {
+                Ok(meta) => meta,
+                Err(err) => {
+                    STATS.lists.errors.fetch_add(1, Relaxed);
+                    return Err(err.into());
+                }
+            };
+            STATS.listed.fetch_add(1, Relaxed);
             let key = meta.location.to_string();
             let Some(key) = key.strip_prefix(&self.prefix) else {
                 continue;
@@ -404,28 +429,33 @@ mod stats_tests {
         };
         let before = |counter: &AtomicU64| counter.load(Relaxed);
         let (puts, gets, heads, lists, deletes) = (
-            before(&STATS.puts),
-            before(&STATS.gets),
-            before(&STATS.heads),
-            before(&STATS.lists),
-            before(&STATS.deletes),
+            before(&STATS.puts.calls),
+            before(&STATS.gets.calls),
+            before(&STATS.heads.calls),
+            before(&STATS.lists.calls),
+            before(&STATS.deletes.calls),
         );
         let (put_bytes, get_bytes) = (before(&STATS.put_bytes), before(&STATS.get_bytes));
+        let (put_errors, listed) = (before(&STATS.puts.errors), before(&STATS.listed));
 
         bucket
             .put_new("a", Bytes::from_static(b"0123456789"))
             .await?;
         bucket.get_range("a", 2..6).await?;
         bucket.list("").await?;
+        // A second create of the same key loses, and counts as a put error.
+        anyhow::ensure!(bucket.put_new("a", Bytes::from_static(b"x")).await.is_err());
         bucket.delete("a").await?;
         anyhow::ensure!(bucket.is_missing("a").await?);
 
         // Other tests may run in parallel, so check at least this test's calls.
-        anyhow::ensure!(STATS.puts.load(Relaxed) > puts);
-        anyhow::ensure!(STATS.gets.load(Relaxed) > gets);
-        anyhow::ensure!(STATS.heads.load(Relaxed) > heads);
-        anyhow::ensure!(STATS.lists.load(Relaxed) > lists);
-        anyhow::ensure!(STATS.deletes.load(Relaxed) > deletes);
+        anyhow::ensure!(STATS.puts.calls.load(Relaxed) > puts);
+        anyhow::ensure!(STATS.puts.errors.load(Relaxed) > put_errors);
+        anyhow::ensure!(STATS.gets.calls.load(Relaxed) > gets);
+        anyhow::ensure!(STATS.heads.calls.load(Relaxed) > heads);
+        anyhow::ensure!(STATS.lists.calls.load(Relaxed) > lists);
+        anyhow::ensure!(STATS.listed.load(Relaxed) > listed);
+        anyhow::ensure!(STATS.deletes.calls.load(Relaxed) > deletes);
         anyhow::ensure!(STATS.put_bytes.load(Relaxed) >= put_bytes + 10);
         anyhow::ensure!(STATS.get_bytes.load(Relaxed) >= get_bytes + 4);
         Ok(())
