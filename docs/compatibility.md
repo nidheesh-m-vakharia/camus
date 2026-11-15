@@ -409,6 +409,7 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 | MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Transactional readers | kafka-clients, console consumer, librdkafka, and KafkaJS at `read_committed` on a partition ending in an abort; MirrorMaker 2 from Camus to Camus with a `read_committed` source copies committed records only (ADR 0021) | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Schema Registry | in the harness behind `CAMUS_ECOSYSTEM_DOCKER=1` | not run here |
+| Debezium 3.7.1, Postgres and MySQL connectors | snapshot; insert, update, delete, and tombstone; MySQL schema history topic with unlimited retention and a schema change; resume after a worker restart; Postgres with exactly-once source tasks. Behind `CAMUS_ECOSYSTEM_DOCKER=1` | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | kafka-python | tracked; not in the harness | - |
 
 The ecosystem harness (`crates/broker/tests/ecosystem.rs`) found and fixed
@@ -419,7 +420,9 @@ fixed under ADR 0021: no position move past an abort at the end of the log,
 ListOffsets ignoring `read_committed`, a late seal hiding a committed range
 (and, in `r2` mode, a span ending at the first batch), and a null record set
 on an empty fetch, which librdkafka rejects. DescribeConfigs for a broker returns that
-broker's settings under Kafka's names, read-only; dynamic broker configs
+broker's settings under Kafka's names, read-only, including
+`default.replication.factor`, the replica count a topic created with `-1`
+gets, which Debezium reads to create its schema history topic; dynamic broker configs
 are not supported. `--advertised-addr` sets what Metadata hands out.
 
 ## Compression
