@@ -394,13 +394,16 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 | Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Schema Registry | in the harness behind `CAMUS_ECOSYSTEM_DOCKER=1` | not run here |
+| Debezium 3.7.1, Postgres and MySQL connectors | snapshot; insert, update, delete, and tombstone; MySQL schema history topic with unlimited retention and a schema change; resume after a worker restart; Postgres with exactly-once source tasks. Behind `CAMUS_ECOSYSTEM_DOCKER=1` | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | kafka-python | tracked; not in the harness | - |
 
 The ecosystem harness (`crates/broker/tests/ecosystem.rs`) found and fixed
 two gaps: DescribeConfigs did not answer for the broker resource, and a
 ListOffsets v1-3 response carried a leader epoch those versions cannot
 encode, closing the connection. DescribeConfigs for a broker returns that
-broker's settings under Kafka's names, read-only; dynamic broker configs
+broker's settings under Kafka's names, read-only, including
+`default.replication.factor`, the replica count a topic created with `-1`
+gets, which Debezium reads to create its schema history topic; dynamic broker configs
 are not supported. `--advertised-addr` sets what Metadata hands out.
 
 ## Compression
