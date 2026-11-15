@@ -99,7 +99,7 @@ impl Encodable for ComponentData {
         }
         if version >= 1 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -126,7 +126,7 @@ impl Encodable for ComponentData {
         }
         if version >= 1 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -255,7 +255,7 @@ impl Encodable for DescribeClientQuotasRequest {
         types::Boolean.encode(buf, &self.strict)?;
         if version >= 1 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -278,7 +278,7 @@ impl Encodable for DescribeClientQuotasRequest {
         total_size += types::Boolean.compute_size(&self.strict)?;
         if version >= 1 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields

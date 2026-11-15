@@ -9,6 +9,7 @@ from confluent_kafka import Consumer, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
 bootstrap = sys.argv[1]
+protocol = sys.argv[2] if len(sys.argv) > 2 else "classic"
 topic = "g" + uuid.uuid4().hex[:8]
 group = "group-" + uuid.uuid4().hex[:8]
 common = {"bootstrap.servers": bootstrap, "socket.timeout.ms": 10000}
@@ -25,17 +26,21 @@ def produce(first, count):
 
 
 def consumer(name):
-    member = Consumer(
-        {
-            **common,
-            "group.id": group,
-            "client.id": name,
-            "auto.offset.reset": "earliest",
-            "enable.auto.commit": False,
-            "session.timeout.ms": 10000,
-            "heartbeat.interval.ms": 1000,
-        }
-    )
+    config = {
+        **common,
+        "group.id": group,
+        "client.id": name,
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": False,
+    }
+    # The consumer protocol takes its session from the broker. Classic
+    # members still send these.
+    if protocol == "consumer":
+        config["group.protocol"] = "consumer"
+    else:
+        config["session.timeout.ms"] = 10000
+        config["heartbeat.interval.ms"] = 1000
+    member = Consumer(config)
     member.subscribe([topic])
     return member
 
@@ -81,4 +86,4 @@ assert any(row.group_id == group for row in listed.valid), listed
 described = admin.describe_consumer_groups([group])[group].result()
 assert described.group_id == group, described
 admin.delete_consumer_groups([group])[group].result()
-print(f"librdkafka group ok: 40 shared by two members, 20 resumed by a third")
+print(f"librdkafka group ok ({protocol}): 40 shared by two members, 20 resumed by a third")

@@ -1,7 +1,9 @@
 # Architecture decision records
 
 Records 0001–0013 were accepted on 2026-11-05 and are implemented, with the
-amendments their files note. 0014–0016 are proposed.
+amendments their files note. 0014, 0015, 0016, and 0017 are accepted. 0016
+sends votes, empty heartbeats, and shard announcements over QUIC unless
+`CAMUS_QUIC` is `off`. 0018 and 0022 are proposed. 0019 and 0021 are accepted.
 
 | ADR | Title |
 | --- | --- |
@@ -18,8 +20,13 @@ amendments their files note. 0014–0016 are proposed.
 | [0011](0011-local-log-storage.md) | Segment-file Raft log, `redb` state machine |
 | [0012](0012-auth.md) | SASL/PLAIN + TLS, and opt-in dev PLAINTEXT |
 | [0013](0013-delivery-phases.md) | Phases 0–5 and their acceptance tests |
-| [0014](0014-multiple-wal-shards.md) | Multiple WAL shards and leadership balance (proposed) |
-| [0015](0015-transaction-spans.md) | Transaction spans without a metadata write per produce (proposed) |
-| [0016](0016-derived-views.md) | Derived views over the log: tables, graph, vectors (proposed) |
+| [0014](0014-multiple-wal-shards.md) | Multiple WAL shards and leadership balance |
+| [0015](0015-transaction-spans.md) | Transaction spans without a metadata write per produce |
+| [0016](0016-quic-control-plane.md) | QUIC for Raft control traffic |
+| [0017](0017-ignored-topic-configs.md) | Accepted topic configs that do not change behavior |
+| [0018](0018-multi-region-leaderless.md) | Multi-region replication, one home per partition, TrueTime commit-wait |
+| [0019](0019-txn-span-in-the-wal.md) | Transaction spans live in the WAL until `EndTxn` |
+| [0021](0021-transaction-markers.md) | Transaction markers are made at fetch, not stored |
+| [0022](0022-derived-views.md) | Derived views over the log: tables, graph, vectors (proposed) |
 
 Read [../PLAN.md](../PLAN.md) for the summary.

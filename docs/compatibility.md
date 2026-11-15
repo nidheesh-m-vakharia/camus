@@ -34,12 +34,12 @@ error rather than a partial imitation.
 | `acks=1` | Same barrier as `acks=all`: WAL quorum fsync, or R2 put plus metadata commit | Leader-local ack | 0005 |
 | Unclean leader election | Never automatic. Operator truncate only | Default off, can be enabled | 0008 |
 | Idempotence | `InitProducerId` allocates a producer id. A retried sequence returns the original offset and is not appended | Supported | 0009 |
-| Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. There is no control-batch marker | Control batches plus `read_committed` | 0013 |
+| Transactions | `read_committed` hides a batch until `EndTxn` commits its offset range. No control batch is stored, so a transaction takes no extra offset; a `read_committed` fetch sends an ABORT marker at an aborted batch's last offset instead | Control batches plus `read_committed`; each marker takes an offset | 0013, 0021 |
 | Compaction | Latest key, original offset, sealed extents only, on a timer rather than a dirty ratio. A tombstone's `delete.retention.ms` counts from its own timestamp | `LogCleaner` by dirty ratio; tombstone horizon counts from the first cleaning (KIP-534) | 0010 |
 | ACLs | A resource with no ACL is denied on an authenticated listener (SASL or mTLS) and allowed on the dev PLAINTEXT listener, unless `CAMUS_ACL_ALLOW_IF_NO_ACL` says otherwise | `allow.everyone.if.no.acl.found`, default false | 0012 |
 | Partition leadership | Leadership belongs to WAL shards, one per core by default (rounded so each broker leads the same number, capped at eight per broker), each with up to three voters; partitions are placed on shards round-robin at creation and never move. A shard's first voter is its preferred leader: the balancer and `ElectLeaders PREFERRED` move all of the shard's partitions together, by election, so the shard pauses briefly and its epoch rises | Leaders and preferred replicas per partition, reassignment | 0006, 0014 |
-| Topic configs | Segment, flush, and `min.insync.replicas` configs are accepted and stored with no effect; `LogAppendTime`, broker-side recompression, and tiered storage are rejected | All applied | — |
-| Broker configs and quotas | Broker settings come from the environment at startup and are read-only in `DescribeConfigs`; client quotas are not implemented | Dynamic broker configs and quotas | — |
+| Topic configs | Segment, flush, and `min.insync.replicas` configs are accepted and stored. `DescribeConfigs` names the setting that applies. `LogAppendTime`, broker-side recompression, and tiered storage are rejected | All applied | 0017 |
+| Broker configs and quotas | Broker settings come from `camus.toml`, then `CAMUS_*`, then flags, all read at startup, and are read-only in `DescribeConfigs`; client quotas are not implemented | Dynamic broker configs and quotas | — |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
 
@@ -47,7 +47,7 @@ error rather than a partial imitation.
 
 Camus matches Kafka 4.4.0's default unless Kafka's can lose acknowledged
 data or weaken security; then the safer value is used and listed above. Each
-is set by an environment variable.
+is set in `camus.toml` (Kafka's name, or `durability.mode`, `wal.disk.limit`, and `[s3]`). A `CAMUS_*` variable overrides the file, and a flag overrides both. The process prints `key=value source` at startup. Restart to change one. `camus admin config` prints the same list. `camus admin config --topic NAME` prints each stored topic config next to the value that is enforced: `min.insync.replicas` is stored, and an acknowledgement still waits for a WAL majority, or for the object put and the metadata commit when the topic's `durability.mode` is `r2`.
 
 | Setting | Kafka 4.4.0 | Camus | Variable |
 | --- | --- | --- | --- |
@@ -87,12 +87,21 @@ Produce acks in `r2` mode after the object is stored and the extent is
 committed. `wal` produce acks after the WAL shard commits, which means a
 majority of its voters has fsynced the batch. Every broker is a voter.
 Metadata reports the shard leader as the leader of each `wal` partition and
-the voters as replicas and ISR. A broker that is not the shard leader
-answers produce, fetch, and list-offsets with `NOT_LEADER_OR_FOLLOWER` (6).
-A produce that cannot commit within `timeout_ms`, for example with no
+the voters as replicas and ISR. Produce on a broker that is not the shard
+leader returns `NOT_LEADER_OR_FOLLOWER` (6). Fetch and list-offsets are
+served by any broker that holds the shard. On Fetch v11 and later, a leader
+whose `broker.rack` (`CAMUS_RACK`) differs from the client's `rack_id`
+returns `preferred_read_replica` set to a voter in the client's zone, and
+the client reads there. A produce that cannot commit within `timeout_ms`, for example with no
 quorum, gets `REQUEST_TIMED_OUT` (7); the entry may still commit later, so a
-client without idempotence can duplicate on retry. The upload to object
-storage follows the ack. A `wal` partition's leader epoch is the WAL shard's
+client without idempotence can duplicate on retry. Producers should set
+`enable.idempotence=true`. The Java client has done so by default since
+Kafka 3.0, and franz-go does unless the application calls
+`DisableIdempotentWrite`. librdkafka, including confluent-kafka, leaves
+`enable.idempotence` off until the application sets it. With idempotence
+the retry carries the same producer id and sequence, and the broker returns
+the original offset instead of appending a second copy. Without it, the
+retry is a new batch. The upload to object storage follows the ack. A `wal` partition's leader epoch is the WAL shard's
 Raft term plus a base kept in metadata; `truncate-to-sealed` raises the
 base, so the epoch only grows. An `r2` partition's epoch is the metadata
 group's term. Batches are sealed with that epoch, publish records where each
@@ -200,8 +209,31 @@ source.
 | --- | --- |
 | `cleanup.policy`, `retention.ms`, `retention.bytes`, `max.message.bytes`, `delete.retention.ms`, `min.compaction.lag.ms` | Stored and applied |
 | `durability.mode` | Camus only. Set at creation, then read-only |
-| `segment.*`, `flush.*`, `min.insync.replicas`, `index.interval.bytes`, `file.delete.delay.ms`, `preallocate`, `local.retention.*`, `max.compaction.lag.ms`, `min.cleanable.dirty.ratio`, `message.timestamp.before.max.ms`, `message.timestamp.after.max.ms`, `*.replication.throttled.replicas` | Accepted and stored, with no effect |
 | `message.timestamp.type=LogAppendTime`, `compression.type` other than `producer`, `unclean.leader.election.enable=true`, `remote.storage.enable=true`, any other name | `INVALID_CONFIG` (40) with a message |
+
+The configs in the next table are accepted and stored so existing tools keep
+working, and then ignored. `DescribeConfigs` returns the stored value, and
+the documentation field (when the client asks for it) says what actually
+applies. The first time a topic sets one to something other than its default,
+the broker logs that config once. ADR 0017 records the decision.
+
+| Config | Why it is ignored | What applies |
+| --- | --- | --- |
+| `min.insync.replicas` | There is no ISR, and a produce is not acknowledged by one replica | A WAL majority. In `r2` mode, the object put and the metadata commit |
+| `flush.messages`, `flush.ms` | Acknowledgements are the group commit, not a message or time flush | The WAL fsync on commit. `CAMUS_FLUSH_MS` is the busy upload interval. `CAMUS_QUIET_FLUSH_MS` (30s) holds a prefix under 4 MiB |
+| `segment.bytes`, `segment.ms`, `segment.jitter.ms`, `segment.index.bytes` | There are no Kafka log segments | The write-ahead log and sealed objects, sized by the broker |
+| `index.interval.bytes` | There is no byte index | Extent metadata |
+| `file.delete.delay.ms` | Object deletion is the orphan sweep | `CAMUS_SWEEP_MIN_AGE_MS` |
+| `preallocate` | Segment files are not preallocated | Raft segment files grow as they are written |
+| `local.retention.ms`, `local.retention.bytes` | There is no local retention tier | The unsealed tail is the write-ahead log. Sealed bytes follow `retention.ms` and `retention.bytes` |
+| `max.compaction.lag.ms` | Compaction has no maximum lag | `CAMUS_COMPACT_MS`, and `min.compaction.lag.ms` |
+| `min.cleanable.dirty.ratio` | Compaction is not triggered by a dirty ratio | `CAMUS_COMPACT_MS` |
+| `message.timestamp.before.max.ms`, `message.timestamp.after.max.ms` | Timestamps are not rejected against a window | The timestamp in the record batch |
+| `message.timestamp.type` | Only `CreateTime` is accepted | The timestamp in the record batch |
+| `leader.replication.throttled.replicas`, `follower.replication.throttled.replicas` | There is no per-replica throttle | Raft replication of the shard log |
+| `compression.type` | Only `producer` is accepted. The broker does not recompress | The codec the producer wrote |
+| `remote.storage.enable` | Only `false` is accepted | Sealed batches are objects either way |
+| `unclean.leader.election.enable` | Only `false` is accepted | A shard that has lost its majority stays offline until `truncate-to-sealed` |
 
 Legacy `AlterConfigs` replaces the topic's whole config set, so a config it
 does not name returns to its default, as in Kafka. `max.message.bytes`
@@ -225,13 +257,29 @@ still waiting for its metadata commit is safe, and has been unreferenced for
 The sweep owns every `bundle/` object under the cluster's key prefix: give each
 cluster its own bucket or its own `CAMUS_S3_PREFIX`.
 
-Camus writes no transaction control records: `read_committed` filtering is
-done by the broker from the committed and aborted offset ranges. Kafka
-clients do not need the markers, and a `read_committed` consumer that seeks
-into an aborted range gets the next committed record at its own offset. A
-`read_uncommitted` consumer sees aborted records, as in Kafka. A tool that
-reads the raw log expecting control batches, or counts them, will not find
-any.
+A transactional produce in `wal` mode is one WAL commit (ADR 0019). The
+open span stays in the WAL until `EndTxn`, which publishes it. Camus stores
+no transaction control records (ADR 0021): `read_committed` filtering is
+done by the broker from the committed and aborted offset ranges. In place
+of each aborted batch, a `read_committed` fetch sends an ABORT control
+batch with one record at that batch's last offset, so kafka-clients,
+librdkafka and KafkaJS move their position past an abort, including one
+at the end of the log, and lag reaches zero as on Kafka. A
+`read_committed` consumer that seeks into an aborted range gets the next
+committed record at its own offset. A `read_uncommitted` consumer sees
+aborted records, as in Kafka. ListOffsets for the latest offset at
+`read_committed` returns the last stable offset, which stops at the first
+open transaction, and a `read_committed` timestamp lookup answers -1 at or
+past it, as Kafka does. Unlike Kafka, the last stable offset reads at most
+16,384 transaction records from metadata; an open `r2` transaction past
+them does not hold it back (ADR 0021). Because no marker takes an offset, a committed
+transaction's records are numbered without gaps, and offset arithmetic
+equals the record count; on Kafka each transaction adds one offset per
+partition. `kafka-dump-log.sh` reads a broker's segment files and has
+nothing to read on Camus. The nightly ecosystem harness checks
+kafka-clients, the console consumer, librdkafka (confluent-kafka-go),
+KafkaJS, and MirrorMaker 2 with a `read_committed` source against a
+partition that ends in an abort.
 
 Transactions follow Kafka's coordinator timers. `InitProducerId` with a
 `transaction_timeout_ms` of 0 or less, or above `CAMUS_TXN_MAX_TIMEOUT_MS`
@@ -329,7 +377,7 @@ acceptance test. `-` means not run.
 | DescribeTransactions | 65 | 5 | 0 | implemented | pass | - | pass |
 | ListTransactions | 66 | 5 | 0-2 | implemented | pass | - | pass |
 | AllocateProducerIds | 67 | | broker-internal | unimplemented | - | - | - |
-| ConsumerGroupHeartbeat | 68 | 3 | 0-1 | implemented | pass | - | - |
+| ConsumerGroupHeartbeat | 68 | 3 | 0-1 | implemented | pass | pass | pass |
 | ConsumerGroupDescribe | 69 | 3 | 0-1 | implemented | pass | - | - |
 | GetTelemetrySubscriptions | 71 | | not planned | unimplemented | - | - | - |
 | PushTelemetry | 72 | | not planned | unimplemented | - | - | - |
@@ -348,25 +396,33 @@ misses a key that 4.4.0 advertises, Phase 0 adds the row as unimplemented.
 
 | Client | Library | Phase first required |
 | --- | --- | --- |
-| Java | `kafka-clients` 4.4.0, SASL_SSL, passed | 1 |
-| Python / librdkafka | `confluent-kafka` 2.16.1, SASL_SSL, passed | 1 |
-| Go | `franz-go` v1.22.0, SASL_SSL, passed | 1 |
+| Java | `kafka-clients` 4.4.0, SASL_SSL, [CI `test`](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml) | 1 |
+| Python / librdkafka | `confluent-kafka` 2.16.1, SASL_SSL, [CI `test`](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml) | 1 |
+| Go | `franz-go` v1.22.0, SASL_SSL, [CI `test`](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ci.yml) | 1 |
 | kcat | CLI against the dev listener | 1, smoke |
-| KafkaJS 2 | round trip with a consumer group, in the ecosystem harness | passed |
-| confluent-kafka-go 2.11.1 | round trip with a consumer group, in the ecosystem harness | passed |
-| confluent-kafka-dotnet 2.11.1 | round trip with a consumer group, in the ecosystem harness | passed |
-| Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, describe-producers, preferred leader election, API versions | passed |
-| Kafka Connect 4.4.0, distributed | FileStream source and sink, compacted internal topics, resume after restart | passed |
-| Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | passed |
-| MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | passed |
+| KafkaJS 2 | round trip with a consumer group, in the ecosystem harness | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| confluent-kafka-go 2.11.1 | round trip with a consumer group, in the ecosystem harness | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| confluent-kafka-dotnet 2.11.1 | round trip with a consumer group, in the ecosystem harness | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| Apache Kafka 4.4.0 CLI tools | topics, configs (topic and broker), console clients, consumer groups, offsets, delete-records, log dirs, ACLs, transactions, describe-producers, preferred leader election, API versions | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| Kafka Connect 4.4.0, distributed | FileStream source and sink, compacted internal topics, resume after restart | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| Kafka Streams 4.4.0 | word count with `exactly_once_v2`, repartition and changelog topics | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| MirrorMaker 2 4.4.0 | Apache Kafka 4.4.0 to Camus, with checkpoints and heartbeats | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
+| Transactional readers | kafka-clients, console consumer, librdkafka, and KafkaJS at `read_committed` on a partition ending in an abort; MirrorMaker 2 from Camus to Camus with a `read_committed` source copies committed records only (ADR 0021) | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | Schema Registry | in the harness behind `CAMUS_ECOSYSTEM_DOCKER=1` | not run here |
+| Debezium 3.7.1, Postgres and MySQL connectors | snapshot; insert, update, delete, and tombstone; MySQL schema history topic with unlimited retention and a schema change; resume after a worker restart; Postgres with exactly-once source tasks. Behind `CAMUS_ECOSYSTEM_DOCKER=1` | [nightly](https://github.com/nidheesh-m-vakharia/camus/actions/workflows/ecosystem.yml) |
 | kafka-python | tracked; not in the harness | - |
 
 The ecosystem harness (`crates/broker/tests/ecosystem.rs`) found and fixed
 two gaps: DescribeConfigs did not answer for the broker resource, and a
 ListOffsets v1-3 response carried a leader epoch those versions cannot
-encode, closing the connection. DescribeConfigs for a broker returns that
-broker's settings under Kafka's names, read-only; dynamic broker configs
+encode, closing the connection. The transactional readers found four more,
+fixed under ADR 0021: no position move past an abort at the end of the log,
+ListOffsets ignoring `read_committed`, a late seal hiding a committed range
+(and, in `r2` mode, a span ending at the first batch), and a null record set
+on an empty fetch, which librdkafka rejects. DescribeConfigs for a broker returns that
+broker's settings under Kafka's names, read-only, including
+`default.replication.factor`, the replica count a topic created with `-1`
+gets, which Debezium reads to create its schema history topic; dynamic broker configs
 are not supported. `--advertised-addr` sets what Metadata hands out.
 
 ## Compression

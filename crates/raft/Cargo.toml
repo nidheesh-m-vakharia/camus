@@ -10,10 +10,13 @@ description = "Segment-file Raft log and openraft helpers."
 crc = "3"
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 postcard = { version = "1", features = ["use-std"] }
+rcgen = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "sync"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
 tracing = "0.1"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"

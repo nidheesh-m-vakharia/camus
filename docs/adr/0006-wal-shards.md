@@ -69,9 +69,12 @@ survives (ADR 0008).
 A background task on the shard leader reads the committed prefix that is
 not yet sealed:
 
-- Flush when the buffered committed bytes reach 8 MiB, or 250ms after the
-  first unsealed byte, whichever comes first. Both values are config
-  (`upload.flush.bytes`, `upload.flush.ms`).
+- A full 8 MiB object is uploaded immediately. A prefix of at least 4 MiB
+  is uploaded on `CAMUS_FLUSH_MS` (250 ms). A smaller prefix waits until
+  `CAMUS_QUIET_FLUSH_MS` (30 s), so a trickle does not put on every timer
+  tick. The acknowledgement in `wal` mode does not wait for any of these.
+  `r2` mode still flushes on `CAMUS_FLUSH_MS`, because that acknowledgement
+  waits for the put.
 - Write one R2 object covering many partitions (ADR 0007).
 - Commit the extent list to the metadata group.
 - Truncate the shard log up to the last index included in that metadata
@@ -86,11 +89,11 @@ compactor's orphan sweep.
 
 ### Tail reads
 
-Fetches with `fetch_offset >= sealed_end` are read from the shard state
-machine on the leader (and from followers only if `replica_id` is a
-follower fetch and they have the commit). Fetches below `sealed_end` go to
-R2 via `storage`. A fetch that spans the seal point is stitched: R2 bytes,
-then WAL bytes, in offset order.
+Fetches with `fetch_offset >= sealed_end` are read from the shard on any
+broker that holds it. The leader answers a zoned client with
+`preferred_read_replica` so the client reads a voter in its own rack.
+Fetches below `sealed_end` go to R2 via `storage`. A fetch that spans the
+seal point is stitched: R2 bytes, then WAL bytes, in offset order.
 
 ### Restart
 

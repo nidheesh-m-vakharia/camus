@@ -90,7 +90,7 @@ impl Encodable for EnvelopeRequest {
         types::CompactBytes.encode(buf, &self.request_principal)?;
         types::CompactBytes.encode(buf, &self.client_host_address)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -107,7 +107,7 @@ impl Encodable for EnvelopeRequest {
         total_size += types::CompactBytes.compute_size(&self.request_principal)?;
         total_size += types::CompactBytes.compute_size(&self.client_host_address)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

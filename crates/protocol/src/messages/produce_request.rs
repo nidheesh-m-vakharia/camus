@@ -80,7 +80,7 @@ impl Encodable for PartitionProduceData {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -102,7 +102,7 @@ impl Encodable for PartitionProduceData {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -258,7 +258,7 @@ impl Encodable for ProduceRequest {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -287,7 +287,7 @@ impl Encodable for ProduceRequest {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -442,7 +442,7 @@ impl Encodable for TopicProduceData {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -475,7 +475,7 @@ impl Encodable for TopicProduceData {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields

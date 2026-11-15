@@ -165,7 +165,7 @@ fn leave(addr: &str, member: &str) -> i16 {
 #[test]
 fn coordinator_failover_keeps_the_generation_and_fences_the_old_one() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping; set CAMUS_MINIO=1");
+        support::skipped("group failover; set CAMUS_MINIO=1");
         return;
     }
     let root = tempfile::tempdir().unwrap();

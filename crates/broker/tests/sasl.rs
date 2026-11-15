@@ -1,5 +1,7 @@
 //! SASL_SSL: TLS plus SASL/PLAIN, then a produce when MinIO is up.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -273,6 +275,7 @@ fn sasl_ssl_rejects_bad_credentials_and_accepts_plain() {
     assert_eq!(auth.error_code, 0, "{auth:?}");
 
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("SASL produce; set CAMUS_MINIO=1");
         return;
     }
     let client = reqwest::blocking::Client::new();
@@ -438,7 +441,7 @@ fn wait_registered(http: &str) {
 #[test]
 fn java_kafka_clients_round_trip() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping java client; set CAMUS_MINIO=1");
+        support::skipped("java client; set CAMUS_MINIO=1");
         return;
     }
     let jars = kafka_jars();
@@ -541,12 +544,12 @@ fn boot() -> (tempfile::TempDir, Node, PathBuf) {
 #[test]
 fn librdkafka_round_trip() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping librdkafka; set CAMUS_MINIO=1");
+        support::skipped("librdkafka; set CAMUS_MINIO=1");
         return;
     }
     let python = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pykafka/bin/python");
     if !python.is_file() {
-        eprintln!("skipping librdkafka; missing {}", python.display());
+        support::skipped(&format!("librdkafka; missing {}", python.display()));
         return;
     }
     let (dir, node, cert) = boot();
@@ -563,12 +566,12 @@ fn librdkafka_round_trip() {
 #[test]
 fn franz_go_round_trip() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping franz-go; set CAMUS_MINIO=1");
+        support::skipped("franz-go; set CAMUS_MINIO=1");
         return;
     }
     let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
     if !go.is_file() {
-        eprintln!("skipping franz-go; missing {}", go.display());
+        support::skipped(&format!("franz-go; missing {}", go.display()));
         return;
     }
     let (dir, node, cert) = boot();

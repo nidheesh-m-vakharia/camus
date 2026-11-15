@@ -26,11 +26,20 @@ use camus_protocol::messages::{
 };
 use camus_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 use camus_protocol::records::{
-    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-    NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions,
+    TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
 };
 
 pub const TOPIC: &str = "orders";
+
+/// A test is leaving early. CI sets `CAMUS_REQUIRE_CLIENTS=1` so a skip
+/// fails the job instead of counting as a pass.
+pub fn skipped(reason: &str) {
+    if std::env::var("CAMUS_REQUIRE_CLIENTS").ok().as_deref() == Some("1") {
+        panic!("required test skipped: {reason}");
+    }
+    eprintln!("skipping {reason}");
+}
 
 /// Resident set size of a process in KiB, from `ps`. `None` once it exits.
 pub fn rss_kib(pid: u32) -> Option<u64> {
@@ -338,6 +347,57 @@ pub fn fetch_code(addr: &str, offset: i64) -> i16 {
     recv::<FetchResponse>(&mut stream, 11).responses[0].partitions[0].error_code
 }
 
+/// One fetch at `offset`. The error code and the record values in the
+/// response. An error leaves the values empty when the broker attached none,
+/// so a consumer that stops on the code does not advance.
+pub fn fetch_at(addr: &str, offset: i64) -> (i16, Vec<String>) {
+    let mut stream = connect(addr);
+    let mut part = FetchPartition::default();
+    part.partition = 0;
+    part.fetch_offset = offset;
+    part.partition_max_bytes = 1024 * 1024;
+    let mut topic = FetchTopic::default();
+    topic.topic = TopicName(StrBytes::from_static_str(TOPIC));
+    topic.partitions = vec![part];
+    send(
+        &mut stream,
+        ApiKey::Fetch,
+        11,
+        &FetchRequest::default()
+            .with_max_wait_ms(0)
+            .with_topics(vec![topic]),
+    );
+    let fetched = recv::<FetchResponse>(&mut stream, 11);
+    let row = &fetched.responses[0].partitions[0];
+    let code = row.error_code;
+    let Some(bytes) = row.records.clone() else {
+        return (code, Vec::new());
+    };
+    let Ok(info) = camus_protocol::batch::inspect(&bytes, 1024 * 1024) else {
+        return (code, Vec::new());
+    };
+    let mut values = Vec::new();
+    let mut cursor = 0;
+    for batch in info {
+        let raw = &bytes[cursor..cursor + batch.len];
+        cursor += batch.len;
+        let mut buf = Bytes::copy_from_slice(raw);
+        let Ok(set) = RecordBatchDecoder::decode(&mut buf) else {
+            continue;
+        };
+        for record in set.records {
+            let Some(value) = record.value else {
+                continue;
+            };
+            let Ok(text) = String::from_utf8(value.to_vec()) else {
+                continue;
+            };
+            values.push(text);
+        }
+    }
+    (code, values)
+}
+
 /// How to start a broker. Kept on the node so a restart uses the same.
 #[derive(Clone, Default)]
 pub struct Opts {
@@ -436,12 +496,30 @@ impl Node {
             ])
             .args(&opts.args)
             .env("CAMUS_FLUSH_MS", "40")
+            .env("CAMUS_QUIET_FLUSH_MS", "40")
             .env("RUST_LOG", "info");
         if let Some(s3) = &opts.s3 {
             command.env("CAMUS_S3_ENDPOINT", s3);
         }
         for (key, value) in &opts.env {
             command.env(key, value);
+        }
+        // A test that lengthens the upload interval wants the quiet hold to
+        // follow it. Otherwise a 40ms quiet hold would upload before the
+        // longer flush the test asked for.
+        if let Some(flush) = opts
+            .env
+            .iter()
+            .find(|(key, _)| key == "CAMUS_FLUSH_MS")
+            .map(|(_, value)| value.clone())
+        {
+            if !opts
+                .env
+                .iter()
+                .any(|(key, _)| key == "CAMUS_QUIET_FLUSH_MS")
+            {
+                command.env("CAMUS_QUIET_FLUSH_MS", flush);
+            }
         }
         let child = command
             .stdout(log.try_clone().unwrap())
@@ -638,17 +716,45 @@ pub fn produce(addr: &str, value: &str) -> (i16, i64) {
 /// Produce one batch with `acks=all` and `timeout_ms`. Returns the partition
 /// error, the base offset, and the response's `throttle_time_ms`.
 pub fn produce_full(addr: &str, value: &str, timeout_ms: i32) -> (i16, i64, i32) {
-    produce_raw(addr, batch(value), timeout_ms)
+    produce_raw(addr, 0, batch(value), timeout_ms)
+}
+
+/// Produce one batch to `partition` with `acks=all`.
+pub fn produce_partition(addr: &str, partition: i32, value: &str) -> (i16, i64) {
+    let (code, offset, _) = produce_raw(addr, partition, batch(value), 5_000);
+    (code, offset)
 }
 
 /// Produce `records` as one batch with `acks=all`. Returns the partition
 /// error and offset.
 pub fn produce_batch(addr: &str, records: Bytes) -> (i16, i64) {
-    let (code, offset, _) = produce_raw(addr, records, 5_000);
+    let (code, offset, _) = produce_raw(addr, 0, records, 5_000);
     (code, offset)
 }
 
-fn produce_raw(addr: &str, records: Bytes, timeout_ms: i32) -> (i16, i64, i32) {
+/// Produce `records` as one batch with `acks=all` and `timeout_ms`.
+pub fn produce_batch_timeout(addr: &str, records: Bytes, timeout_ms: i32) -> (i16, i64) {
+    let (code, offset, _) = produce_raw(addr, 0, records, timeout_ms);
+    (code, offset)
+}
+
+/// Produce one batch with the given `acks` and `timeout_ms`.
+pub fn produce_acks(addr: &str, value: &str, acks: i16, timeout_ms: i32) -> (i16, i64) {
+    let (code, offset, _) = produce_raw_acks(addr, 0, batch(value), timeout_ms, acks);
+    (code, offset)
+}
+
+fn produce_raw(addr: &str, partition: i32, records: Bytes, timeout_ms: i32) -> (i16, i64, i32) {
+    produce_raw_acks(addr, partition, records, timeout_ms, -1)
+}
+
+fn produce_raw_acks(
+    addr: &str,
+    partition: i32,
+    records: Bytes,
+    timeout_ms: i32,
+    acks: i16,
+) -> (i16, i64, i32) {
     let mut stream = connect(addr);
     stream
         .set_read_timeout(Some(Duration::from_millis(timeout_ms as u64 + 15_000)))
@@ -656,14 +762,14 @@ fn produce_raw(addr: &str, records: Bytes, timeout_ms: i32) -> (i16, i64, i32) {
     let mut topic = TopicProduceData::default();
     topic.name = TopicName(StrBytes::from_static_str(TOPIC));
     topic.partition_data = vec![PartitionProduceData::default()
-        .with_index(0)
+        .with_index(partition)
         .with_records(Some(records))];
     send(
         &mut stream,
         ApiKey::Produce,
         9,
         &ProduceRequest::default()
-            .with_acks(-1)
+            .with_acks(acks)
             .with_timeout_ms(timeout_ms)
             .with_topic_data(vec![topic]),
     );

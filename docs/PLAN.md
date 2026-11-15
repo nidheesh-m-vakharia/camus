@@ -14,8 +14,11 @@ idempotent produce and its admin APIs are in. Phase 5 transactions,
 `read_committed`, log compaction, and ACLs are in.
 `kafka-clients` 4.4.0, librdkafka, and franz-go pass the transaction,
 compaction, and ACL checks, and exercise the implemented admin APIs
-their libraries expose. The ADRs under
-`docs/adr/` are accepted.
+their libraries expose. The ADRs under `docs/adr/` are accepted, except 0018, which is still
+proposed. 0019 is accepted: a transactional produce commits once, on the
+WAL, and metadata learns the span at `EndTxn`. 0021 is accepted: Camus
+stores no transaction markers, and a `read_committed` fetch sends an ABORT
+marker in place of an aborted batch so clients move past it.
 This file is the map of those decisions and of what Phase 0 is allowed to touch.
 
 ## Product
@@ -127,11 +130,11 @@ Steps, in order:
 1. **Throughput benchmark.** Done. `broker/tests/throughput.rs`, with fsync
    and byte counters on the shard log (`wal_log_*` in `/admin/metrics`).
 2. **Group commit.** Done. A committer task packs batches that arrive
-   while an entry commits into the next entry (up to 1 MiB). Two entries
-   may be in flight. The group is packed before a slot is taken, so the
-   second slot overlaps the next disk flush with the previous quorum
-   (`IN_FLIGHT` in `crates/wal`). Four slots, taken before the pack, split
-   groups and cost throughput (measured). The 32-producer failure was not load: the
+   while an entry commits into the next entry (up to 1 MiB). A second entry
+   starts only when a full group is already waiting, so the overlap does not
+   cut a short group in half (`IN_FLIGHT` in `crates/wal`, [#129](https://github.com/nidheesh-m-vakharia/camus/issues/129)).
+   Four slots, taken before the pack, split groups and cost throughput
+   (measured). The 32-producer failure was not load: the
    follower's HTTP route refused bodies over axum's 2 MB default, which one
    1 MiB client batch already exceeded once JSON-encoded. The Raft routes
    now take 64 MB and an AppendEntries carries at most 8 entries.

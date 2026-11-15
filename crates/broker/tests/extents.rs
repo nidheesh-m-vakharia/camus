@@ -18,7 +18,7 @@ fn topic_id(http: &str) -> String {
 fn minio() -> bool {
     let on = std::env::var("CAMUS_MINIO").ok().as_deref() == Some("1");
     if !on {
-        eprintln!("skipping extent test; set CAMUS_MINIO=1");
+        support::skipped("extent test; set CAMUS_MINIO=1");
     }
     on
 }

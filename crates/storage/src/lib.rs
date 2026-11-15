@@ -12,6 +12,7 @@ mod disk_cache;
 pub use disk_cache::DiskCache;
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -43,6 +44,68 @@ fn virtual_host_endpoint(endpoint: &str, bucket: &str) -> anyhow::Result<String>
     url.set_query(None);
     url.set_fragment(None);
     Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+/// Object-store calls made through [`Bucket`], for `/metrics`. One count per
+/// call: `object_store` may retry a call, and a list may fetch several pages.
+/// A fixed set of atomics, so the memory cost is constant.
+#[derive(Default)]
+pub struct Stats {
+    /// Puts, conditional or not (R2 Class A).
+    pub puts: Op,
+    /// Ranged gets (R2 Class B).
+    pub gets: Op,
+    /// Heads (R2 Class B).
+    pub heads: Op,
+    /// Lists (R2 Class A).
+    pub lists: Op,
+    /// Deletes (free on R2).
+    pub deletes: Op,
+    /// Bytes written by puts.
+    pub put_bytes: AtomicU64,
+    /// Bytes returned by gets.
+    pub get_bytes: AtomicU64,
+    /// Keys returned by lists. The store fetches 1,000 keys per page, so
+    /// `lists + listed / 1000` approximates the Class A list requests.
+    pub listed: AtomicU64,
+}
+
+/// Calls of one operation, and how many returned an error. A conditional
+/// put that lost is an error; a head that finds nothing is not.
+#[derive(Default)]
+pub struct Op {
+    pub calls: AtomicU64,
+    pub errors: AtomicU64,
+}
+
+impl Op {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Process-wide counters.
+pub static STATS: Stats = Stats {
+    puts: Op::new(),
+    gets: Op::new(),
+    heads: Op::new(),
+    lists: Op::new(),
+    deletes: Op::new(),
+    put_bytes: AtomicU64::new(0),
+    get_bytes: AtomicU64::new(0),
+    listed: AtomicU64::new(0),
+};
+
+/// Count one call to `op`, and an error if it failed.
+fn counted<T, E>(op: &Op, result: Result<T, E>) -> Result<T, E> {
+    op.calls.fetch_add(1, Relaxed);
+    if result.is_err() {
+        op.errors.fetch_add(1, Relaxed);
+    }
+    result
 }
 
 /// An S3-compatible bucket.
@@ -123,56 +186,130 @@ impl Bucket {
         Path::from(format!("{}{key}", self.prefix))
     }
 
+    /// Write `bytes` to `key`, replacing an object that is already there.
+    pub async fn put(&self, key: &str, bytes: Bytes) -> anyhow::Result<()> {
+        let len = bytes.len() as u64;
+        let result = self
+            .store
+            .put(&self.path(key), PutPayload::from_bytes(bytes))
+            .await;
+        counted(&STATS.puts, result)?;
+        STATS.put_bytes.fetch_add(len, Relaxed);
+        Ok(())
+    }
+
     /// Write `bytes` to `key`. A second create of the same key fails.
     pub async fn put_new(&self, key: &str, bytes: Bytes) -> anyhow::Result<()> {
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
         };
-        self.store
+        let len = bytes.len() as u64;
+        let result = self
+            .store
             .put_opts(&self.path(key), PutPayload::from_bytes(bytes), opts)
-            .await?;
+            .await;
+        counted(&STATS.puts, result)?;
+        STATS.put_bytes.fetch_add(len, Relaxed);
         Ok(())
     }
 
     /// Read `range` of an object. `range` is half-open.
     pub async fn get_range(&self, key: &str, range: Range<u64>) -> anyhow::Result<Bytes> {
-        let bytes = self.store.get_range(&self.path(key), range).await?;
+        let result = self.store.get_range(&self.path(key), range).await;
+        let bytes = counted(&STATS.gets, result)?;
+        STATS.get_bytes.fetch_add(bytes.len() as u64, Relaxed);
         Ok(bytes)
     }
 
     /// Delete `key`. Missing keys are an error from the store, not a success.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.store.delete(&self.path(key)).await?;
+        let result = self.store.delete(&self.path(key)).await;
+        counted(&STATS.deletes, result)?;
         Ok(())
+    }
+
+    /// A listing of `prefix`, read a page at a time. One list is counted
+    /// when this is created, not once per page.
+    pub fn list_pages(&self, prefix: &str) -> Listing {
+        STATS.lists.calls.fetch_add(1, Relaxed);
+        Listing {
+            stream: self.store.list(Some(&self.path(prefix))),
+            prefix: self.prefix.clone(),
+            done: false,
+        }
     }
 
     /// Every object under `prefix`, as `(key, size, last-modified Unix ms)`.
     /// Keys are returned without the bucket's own prefix.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64, i64)>> {
-        use futures::TryStreamExt;
-        let objects: Vec<_> = self
-            .store
-            .list(Some(&self.path(prefix)))
-            .try_collect()
-            .await?;
-        Ok(objects
-            .into_iter()
-            .filter_map(|meta| {
-                let key = meta.location.to_string();
-                let key = key.strip_prefix(&self.prefix)?.to_string();
-                Some((key, meta.size, meta.last_modified.timestamp_millis()))
-            })
-            .collect())
+        let mut listing = self.list_pages(prefix);
+        let mut all = Vec::new();
+        loop {
+            let page = listing.next_page(1024).await?;
+            if page.is_empty() {
+                break;
+            }
+            all.extend(page);
+        }
+        Ok(all)
     }
 
     /// Whether `key` is absent. `true` means a get would not return bytes.
     pub async fn is_missing(&self, key: &str) -> anyhow::Result<bool> {
+        STATS.heads.calls.fetch_add(1, Relaxed);
         match self.store.head(&self.path(key)).await {
             Ok(_) => Ok(false),
             Err(object_store::Error::NotFound { .. }) => Ok(true),
-            Err(err) => Err(err.into()),
+            Err(err) => {
+                STATS.heads.errors.fetch_add(1, Relaxed);
+                Err(err.into())
+            }
         }
+    }
+}
+
+/// One object listing. [`Listing::next_page`] returns at most the requested
+/// number of keys, and an empty page means the listing is finished.
+pub struct Listing {
+    stream: futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>,
+    prefix: String,
+    /// The store's list stream panics if it is polled after it has ended.
+    done: bool,
+}
+
+impl Listing {
+    /// The next `limit` objects, or fewer when the listing ends.
+    pub async fn next_page(&mut self, limit: usize) -> anyhow::Result<Vec<(String, u64, i64)>> {
+        use futures::StreamExt;
+        if self.done {
+            return Ok(Vec::new());
+        }
+        let mut page = Vec::new();
+        while page.len() < limit {
+            let Some(meta) = self.stream.next().await else {
+                self.done = true;
+                break;
+            };
+            let meta = match meta {
+                Ok(meta) => meta,
+                Err(err) => {
+                    STATS.lists.errors.fetch_add(1, Relaxed);
+                    return Err(err.into());
+                }
+            };
+            STATS.listed.fetch_add(1, Relaxed);
+            let key = meta.location.to_string();
+            let Some(key) = key.strip_prefix(&self.prefix) else {
+                continue;
+            };
+            page.push((
+                key.to_string(),
+                meta.size,
+                meta.last_modified.timestamp_millis(),
+            ));
+        }
+        Ok(page)
     }
 }
 
@@ -277,6 +414,110 @@ mod tests {
             virtual_host_endpoint("https://camus-abc.t3.storageapi.dev/extra", "camus-abc")
                 .unwrap();
         assert_eq!(endpoint, "https://camus-abc.t3.storageapi.dev");
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn each_call_counts_its_operation_and_bytes() -> anyhow::Result<()> {
+        let bucket = Bucket {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            prefix: String::new(),
+        };
+        let before = |counter: &AtomicU64| counter.load(Relaxed);
+        let (puts, gets, heads, lists, deletes) = (
+            before(&STATS.puts.calls),
+            before(&STATS.gets.calls),
+            before(&STATS.heads.calls),
+            before(&STATS.lists.calls),
+            before(&STATS.deletes.calls),
+        );
+        let (put_bytes, get_bytes) = (before(&STATS.put_bytes), before(&STATS.get_bytes));
+        let (put_errors, listed) = (before(&STATS.puts.errors), before(&STATS.listed));
+
+        bucket
+            .put_new("a", Bytes::from_static(b"0123456789"))
+            .await?;
+        bucket.get_range("a", 2..6).await?;
+        bucket.list("").await?;
+        // A second create of the same key loses, and counts as a put error.
+        anyhow::ensure!(bucket.put_new("a", Bytes::from_static(b"x")).await.is_err());
+        bucket.delete("a").await?;
+        anyhow::ensure!(bucket.is_missing("a").await?);
+
+        // Other tests may run in parallel, so check at least this test's calls.
+        anyhow::ensure!(STATS.puts.calls.load(Relaxed) > puts);
+        anyhow::ensure!(STATS.puts.errors.load(Relaxed) > put_errors);
+        anyhow::ensure!(STATS.gets.calls.load(Relaxed) > gets);
+        anyhow::ensure!(STATS.heads.calls.load(Relaxed) > heads);
+        anyhow::ensure!(STATS.lists.calls.load(Relaxed) > lists);
+        anyhow::ensure!(STATS.listed.load(Relaxed) > listed);
+        anyhow::ensure!(STATS.deletes.calls.load(Relaxed) > deletes);
+        anyhow::ensure!(STATS.put_bytes.load(Relaxed) >= put_bytes + 10);
+        anyhow::ensure!(STATS.get_bytes.load(Relaxed) >= get_bytes + 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_listing_returns_a_page_and_then_the_rest() -> anyhow::Result<()> {
+        let bucket = Bucket {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            prefix: String::new(),
+        };
+        bucket.put_new("bundle/a", Bytes::from_static(b"a")).await?;
+        bucket.put_new("bundle/b", Bytes::from_static(b"b")).await?;
+        bucket.put_new("bundle/c", Bytes::from_static(b"c")).await?;
+        let mut listing = bucket.list_pages("bundle/");
+        let first = listing.next_page(2).await?;
+        let second = listing.next_page(2).await?;
+        let third = listing.next_page(2).await?;
+        anyhow::ensure!(first.len() == 2);
+        anyhow::ensure!(second.len() == 1);
+        anyhow::ensure!(third.is_empty());
+        let mut keys = first;
+        keys.extend(second);
+        keys.sort();
+        anyhow::ensure!(keys
+            .iter()
+            .map(|(key, _, _)| key.as_str())
+            .eq(["bundle/a", "bundle/b", "bundle/c"]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_finished_page_is_not_polled_again() -> anyhow::Result<()> {
+        use futures::StreamExt;
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let bucket = Bucket {
+            store: Arc::clone(&store),
+            prefix: String::new(),
+        };
+        bucket.put_new("k", Bytes::from_static(b"x")).await?;
+        let meta = store
+            .list(None)
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("empty"))??;
+        // The cloud list stream panics if polled after it ends. This one does too.
+        let stream = futures::stream::unfold(Some(meta), |state| async move {
+            let meta = state?;
+            Some((Ok::<_, object_store::Error>(meta), None))
+        })
+        .boxed();
+        let mut listing = Listing {
+            stream,
+            prefix: String::new(),
+            done: false,
+        };
+        let page = listing.next_page(8).await?;
+        anyhow::ensure!(page.len() == 1);
+        let again = listing.next_page(8).await?;
+        anyhow::ensure!(again.is_empty());
+        Ok(())
     }
 }
 

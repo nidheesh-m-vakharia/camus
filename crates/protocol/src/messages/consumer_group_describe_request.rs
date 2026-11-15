@@ -75,7 +75,7 @@ impl Encodable for ConsumerGroupDescribeRequest {
         types::CompactArray(types::CompactString).encode(buf, &self.group_ids)?;
         types::Boolean.encode(buf, &self.include_authorized_operations)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -91,7 +91,7 @@ impl Encodable for ConsumerGroupDescribeRequest {
         total_size += types::CompactArray(types::CompactString).compute_size(&self.group_ids)?;
         total_size += types::Boolean.compute_size(&self.include_authorized_operations)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

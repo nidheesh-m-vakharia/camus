@@ -189,7 +189,7 @@ fn idempotent_batch(producer_id: i64) -> bytes::Bytes {
 #[test]
 fn describe_producers_lists_a_sealed_idempotent_producer() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping DescribeProducers test; set CAMUS_MINIO=1");
+        support::skipped("DescribeProducers test; set CAMUS_MINIO=1");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -254,7 +254,7 @@ fn describe_producers_lists_a_sealed_idempotent_producer() {
 fn java_admin_describes_a_consumer_protocol_group() {
     let jars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-jars");
     if !jars.join("kafka-clients-4.4.0.jar").is_file() {
-        eprintln!("skipping java describe; missing {}", jars.display());
+        support::skipped(&format!("java describe; missing {}", jars.display()));
         return;
     }
     let root = tempfile::tempdir().unwrap();

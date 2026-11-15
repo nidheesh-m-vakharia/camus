@@ -105,7 +105,7 @@ impl Encodable for AllocateProducerIdsResponse {
         types::Int64.encode(buf, &self.producer_id_start)?;
         types::Int32.encode(buf, &self.producer_id_len)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -123,7 +123,7 @@ impl Encodable for AllocateProducerIdsResponse {
         total_size += types::Int64.compute_size(&self.producer_id_start)?;
         total_size += types::Int32.compute_size(&self.producer_id_len)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

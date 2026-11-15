@@ -34,7 +34,13 @@ each benchmark run once. Output in `raw/2026-11-10-macos.md`.
 baseline. Main just before #117 (commit `9687151`) measured the same:
 8.9 and 9.4 MiB/s at 8 producers, 27.2 and 28.6 MiB/s at 32, on 1 broker,
 with the same fsyncs/ack. The drop came in between the baseline and #93.
-It is being bisected in [#129](https://github.com/nidheesh-m-vakharia/camus/issues/129).
+The fsync ratio doubled with the second in-flight commit from #93
+([#129](https://github.com/nidheesh-m-vakharia/camus/issues/129)).
+
+A follow-up on 2026-11-11, one broker only, same machine and MinIO, holds
+that second commit until a full group is already waiting. One release run:
+8 producers 14.5 MiB/s and 0.25 fsyncs/ack, 32 producers 47.9 MiB/s and
+0.06 fsyncs/ack. The 3-broker cases were not rerun.
 
 ### Memory, MiB, broker serving produce
 

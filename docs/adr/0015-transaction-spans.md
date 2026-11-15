@@ -1,6 +1,6 @@
 # ADR 0015: Transaction spans without a metadata write per produce
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-09
 
 ## Context
@@ -49,7 +49,7 @@ wider span would claim the other's.
    have to be raised to that span's end, which needs the previous end before
    `EndTxn` has it.
 
-## Decision (proposed)
+## Decision
 
 Option 2.
 
@@ -81,3 +81,9 @@ A transaction then costs one metadata write per partition it touches, plus
 
 - Whether `TxnOffsetCommit` and `AddOffsetsToTxn` should batch into
   `EndTxn` as well.
+
+## Amendment (2026-11-12)
+
+The one `NoteTxn` per partition is still a metadata Raft write on the
+produce path. [0019](0019-txn-span-in-the-wal.md) moves that span into the
+WAL and publishes it at `EndTxn`.

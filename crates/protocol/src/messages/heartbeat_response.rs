@@ -78,7 +78,7 @@ impl Encodable for HeartbeatResponse {
         types::Int16.encode(buf, &self.error_code)?;
         if version >= 4 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -98,7 +98,7 @@ impl Encodable for HeartbeatResponse {
         total_size += types::Int16.compute_size(&self.error_code)?;
         if version >= 4 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields

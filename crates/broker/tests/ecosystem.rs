@@ -1,14 +1,14 @@
 //! The Kafka ecosystem against Camus: the Apache Kafka 4.4.0 CLI tools, Kafka
 //! Connect, Kafka Streams with `exactly_once_v2`, MirrorMaker 2 from a real
 //! Apache Kafka broker, KafkaJS, confluent-kafka-go, confluent-kafka-dotnet,
-//! and Schema Registry.
+//! Schema Registry, and Debezium.
 //!
 //! Opt-in with `CAMUS_ECOSYSTEM=1`; the first run downloads the Kafka
 //! distribution into `target/kafka-dist`. A JDK is required (`JAVA_HOME`, or
 //! Homebrew's `openjdk@21`), `node`/`npm` for KafkaJS, Go and librdkafka for
 //! confluent-kafka-go, and the .NET SDK for confluent-kafka-dotnet. Schema
-//! Registry runs in Docker and needs the broker on a non-loopback address, so
-//! it is a further opt-in: `CAMUS_ECOSYSTEM_DOCKER=1`.
+//! Registry and Debezium run in Docker and need the broker on a non-loopback
+//! address, so they are a further opt-in: `CAMUS_ECOSYSTEM_DOCKER=1`.
 
 mod support;
 
@@ -62,7 +62,23 @@ fn dist() -> PathBuf {
 }
 
 fn java_home() -> String {
-    std::env::var("JAVA_HOME").unwrap_or_else(|_| "/opt/homebrew/opt/openjdk@21".into())
+    if let Ok(home) = std::env::var("JAVA_HOME") {
+        if !home.is_empty() {
+            return home;
+        }
+    }
+    if let Ok(output) = Command::new("java")
+        .args(["-XshowSettings:properties", "-version"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stderr);
+        for line in text.lines() {
+            if let Some(home) = line.trim().strip_prefix("java.home = ") {
+                return home.to_string();
+            }
+        }
+    }
+    "/opt/homebrew/opt/openjdk@21".into()
 }
 
 fn free_port() -> u16 {
@@ -752,7 +768,7 @@ fn kafkajs_round_trips() {
         return;
     }
     if Command::new("npm").arg("--version").output().is_err() {
-        eprintln!("skipping KafkaJS; npm is not installed");
+        support::skipped("KafkaJS; npm is not installed");
         return;
     }
     let modules = target().join("kafkajs");
@@ -806,7 +822,7 @@ fn confluent_kafka_go_round_trips() {
         return;
     }
     let Some(go) = program("go", &["/opt/homebrew/bin/go"]) else {
-        eprintln!("skipping confluent-kafka-go; go is not installed");
+        support::skipped("confluent-kafka-go; go is not installed");
         return;
     };
     let source =
@@ -853,7 +869,7 @@ fn confluent_kafka_dotnet_round_trips() {
     let home = std::env::var("HOME").unwrap_or_default();
     let fallback = format!("{home}/.dotnet/dotnet");
     let Some(dotnet) = program("dotnet", &["/opt/homebrew/bin/dotnet", &fallback]) else {
-        eprintln!("skipping confluent-kafka-dotnet; dotnet is not installed");
+        support::skipped("confluent-kafka-dotnet; dotnet is not installed");
         return;
     };
     let source =
@@ -946,8 +962,11 @@ fn schema_registry_ready(http: &reqwest::blocking::Client, base: &str) {
 /// load the same schema id from `_schemas`. Opt-in: `CAMUS_ECOSYSTEM_DOCKER=1`.
 #[test]
 fn schema_registry_stores_a_schema() {
-    if !enabled() || std::env::var("CAMUS_ECOSYSTEM_DOCKER").ok().as_deref() != Some("1") {
-        eprintln!("skipping Schema Registry; set CAMUS_ECOSYSTEM_DOCKER=1");
+    if !enabled() {
+        return;
+    }
+    if std::env::var("CAMUS_ECOSYSTEM_DOCKER").ok().as_deref() != Some("1") {
+        support::skipped("Schema Registry; set CAMUS_ECOSYSTEM_DOCKER=1");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -993,4 +1012,853 @@ fn schema_registry_stores_a_schema() {
     // Schema Registry stores the canonical Avro form, not the object we posted.
     assert_eq!(loaded["schema"].as_str(), Some("\"string\""), "{loaded}");
     assert_eq!(loaded["schemaType"].as_str(), Some("AVRO"), "{loaded}");
+}
+
+type Fallible = Result<(), Box<dyn std::error::Error>>;
+
+/// The values a `read_committed` reader sees in a topic [`write_txn_topic`]
+/// wrote, in order.
+const COMMITTED: [&str; 5] = ["c1", "c2", "c3", "c4", "o1"];
+
+/// Every value [`write_txn_topic`] writes, committed or aborted.
+const WRITTEN: [&str; 9] = ["c1", "c2", "c3", "a1", "a2", "c4", "a3", "o1", "a4"];
+
+/// Create `topic` with one partition and write commit, abort, commit, abort,
+/// commit, abort to it with `TxnMarkers.java`, which also checks the Java
+/// consumer against it (ADR 0021).
+fn write_txn_topic(dir: &Path, bootstrap: &str, topic: &str) -> Fallible {
+    tool(
+        "kafka-topics.sh",
+        &[
+            "--bootstrap-server",
+            bootstrap,
+            "--create",
+            "--topic",
+            topic,
+            "--partitions",
+            "1",
+        ],
+        None,
+        false,
+    );
+    let classes = dir.join("txn-classes");
+    std::fs::create_dir_all(&classes)?;
+    let classpath = format!("{}/*", dist().join("libs").display());
+    let compiled = Command::new(format!("{}/bin/javac", java_home()))
+        .args(["-proc:none", "-cp", &classpath, "-d"])
+        .arg(&classes)
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/ecosystem/TxnMarkers.java"))
+        .status()?;
+    if !compiled.success() {
+        return Err("javac TxnMarkers failed".into());
+    }
+    let ran = Command::new(format!("{}/bin/java", java_home()))
+        .arg("-cp")
+        .arg(format!("{}:{classpath}", classes.display()))
+        .args(["TxnMarkers", bootstrap, topic, &format!("{topic}-java")])
+        .output()?;
+    let text = String::from_utf8_lossy(&ran.stdout);
+    if !ran.status.success() || !text.contains("txn markers ok") {
+        return Err(format!("{text}{}", String::from_utf8_lossy(&ran.stderr)).into());
+    }
+    Ok(())
+}
+
+/// Camus stores no transaction markers. A `read_committed` fetch puts an
+/// abort marker in place of each aborted batch, so kafka-clients,
+/// librdkafka, and KafkaJS skip aborted ranges and reach the end offset as
+/// they do on Kafka.
+#[test]
+fn clients_read_a_transactional_topic_without_stored_markers() -> Fallible {
+    if !enabled() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let (_node, bootstrap) = broker(dir.path());
+    write_txn_topic(dir.path(), &bootstrap, "txn-markers")?;
+    let committed = COMMITTED.join(",");
+
+    let printed = tool(
+        "kafka-console-consumer.sh",
+        &[
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            "txn-markers",
+            "--from-beginning",
+            "--isolation-level",
+            "read_committed",
+            "--formatter-property",
+            "print.offset=true",
+            "--max-messages",
+            "5",
+            "--timeout-ms",
+            "20000",
+        ],
+        None,
+        false,
+    );
+    let records: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.starts_with("Offset:"))
+        .collect();
+    // Kafka would put each record one offset later per marker before it.
+    assert_eq!(
+        records,
+        [
+            "Offset:0\tc1",
+            "Offset:1\tc2",
+            "Offset:2\tc3",
+            "Offset:5\tc4",
+            "Offset:7\to1"
+        ],
+        "{printed}"
+    );
+
+    match program("go", &["/opt/homebrew/bin/go"]) {
+        Some(go) => {
+            let mut command = Command::new(go);
+            command
+                .args(["run", "-tags", "dynamic", "./txnmarkers"])
+                .args([bootstrap.as_str(), "txn-markers", committed.as_str()])
+                .current_dir(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/ecosystem/confluent_kafka_go"),
+                )
+                .env("CGO_ENABLED", "1");
+            let pkg = Command::new("pkg-config")
+                .args(["--variable=pcfiledir", "rdkafka"])
+                .output()?;
+            let pc_dir = String::from_utf8_lossy(&pkg.stdout).trim().to_string();
+            if pkg.status.success() && !pc_dir.is_empty() {
+                let joined = match std::env::var("PKG_CONFIG_PATH") {
+                    Ok(existing) if !existing.is_empty() => format!("{pc_dir}:{existing}"),
+                    _ => pc_dir,
+                };
+                command.env("PKG_CONFIG_PATH", joined);
+            }
+            let ran = command.output()?;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+            assert!(
+                ran.status.success() && text.contains("librdkafka txn markers ok"),
+                "{text}"
+            );
+        }
+        None => support::skipped("librdkafka transaction reader; go is not installed"),
+    }
+
+    if Command::new("npm").arg("--version").output().is_err() {
+        support::skipped("KafkaJS transaction reader; npm is not installed");
+        return Ok(());
+    }
+    let modules = target().join("kafkajs");
+    if !modules.join("node_modules/kafkajs").is_dir() {
+        std::fs::create_dir_all(&modules)?;
+        let installed = Command::new("npm")
+            .args(["install", "--silent", "--prefix"])
+            .arg(&modules)
+            .arg("kafkajs@2")
+            .status()?;
+        if !installed.success() {
+            return Err("npm install kafkajs failed".into());
+        }
+    }
+    let ran = Command::new("node")
+        .arg(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/ecosystem/kafkajs_txn_markers.js"),
+        )
+        .args([bootstrap.as_str(), "txn-markers", committed.as_str()])
+        .env("NODE_PATH", modules.join("node_modules"))
+        .output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        ran.status.success() && text.contains("kafkajs txn markers ok"),
+        "{text}"
+    );
+    Ok(())
+}
+
+/// MirrorMaker 2 reading a transactional topic from Camus with a
+/// `read_committed` source consumer copies the committed records only.
+#[test]
+fn mirror_maker_copies_only_committed_records_from_camus() -> Fallible {
+    if !enabled() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let source_dir = dir.path().join("source");
+    let target_dir = dir.path().join("target");
+    std::fs::create_dir_all(&source_dir)?;
+    std::fs::create_dir_all(&target_dir)?;
+    let (_source, source) = broker(&source_dir);
+    let (_target, downstream) = broker(&target_dir);
+    write_txn_topic(&source_dir, &source, "payments")?;
+    let config = dir.path().join("mm2-txn.properties");
+    std::fs::write(
+        &config,
+        format!(
+            "clusters=upstream, downstream\n\
+             upstream.bootstrap.servers={source}\n\
+             downstream.bootstrap.servers={downstream}\n\
+             upstream->downstream.enabled=true\n\
+             upstream->downstream.topics=payments\n\
+             upstream.consumer.isolation.level=read_committed\n\
+             replication.factor=1\n\
+             checkpoints.topic.replication.factor=1\n\
+             heartbeats.topic.replication.factor=1\n\
+             offset-syncs.topic.replication.factor=1\n\
+             offset.storage.replication.factor=1\n\
+             status.storage.replication.factor=1\n\
+             config.storage.replication.factor=1\n\
+             sync.topic.acls.enabled=false\n"
+        ),
+    )?;
+    let config = config.to_str().ok_or("config path")?;
+    let _mirror = Background::start("connect-mirror-maker.sh", &[config], dir.path(), "mirror");
+    let mut seen = Vec::new();
+    wait_for("mirrored transaction", Duration::from_secs(120), || {
+        let out = tool(
+            "kafka-console-consumer.sh",
+            &[
+                "--bootstrap-server",
+                &downstream,
+                "--topic",
+                "upstream.payments",
+                "--from-beginning",
+                "--timeout-ms",
+                "5000",
+            ],
+            None,
+            true,
+        );
+        seen = out
+            .lines()
+            .filter(|line| WRITTEN.contains(line))
+            .map(str::to_string)
+            .collect();
+        seen.len() >= COMMITTED.len()
+    });
+    seen.sort();
+    let mut want: Vec<String> = COMMITTED.iter().map(|value| value.to_string()).collect();
+    want.sort();
+    assert_eq!(seen, want, "MirrorMaker copied an aborted record");
+    Ok(())
+}
+
+type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// Debezium release whose Connect worker and sample databases the tests use.
+const DEBEZIUM: &str = "3.7.1.Final";
+
+/// Run `docker` and return its stdout, or an error carrying its stderr.
+fn docker(args: &[&str]) -> Res<String> {
+    let output = Command::new("docker").args(args).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "docker {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Poll `done` every half second until it holds or `within` runs out.
+fn poll(what: &str, within: Duration, mut done: impl FnMut() -> Res<bool>) -> Res<()> {
+    let deadline = Instant::now() + within;
+    while !done()? {
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {what}").into());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+/// A Docker network, removed when dropped. Declare it before the containers
+/// on it so they are dropped first.
+struct Network(String);
+
+impl Drop for Network {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["network", "rm", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// A Camus broker for containers, initialised, plus the network the
+/// databases and the Connect worker share.
+struct DebeziumSetup {
+    _dir: tempfile::TempDir,
+    _broker: Background,
+    port: u16,
+    network: Network,
+}
+
+impl DebeziumSetup {
+    fn start() -> Res<Self> {
+        let dir = tempfile::tempdir()?;
+        let port = free_port();
+        let http_port = free_port();
+        let broker = Background::broker(dir.path(), port, http_port);
+        let init = reqwest::blocking::Client::new()
+            .post(format!("http://127.0.0.1:{http_port}/admin/init"))
+            .json(&serde_json::json!([{"id": 1, "addr": format!("127.0.0.1:{http_port}")}]))
+            .send()?;
+        if !init.status().is_success() {
+            return Err(format!("init failed: {}", init.text()?).into());
+        }
+        let name = format!("camus-dbz-{port}");
+        docker(&["network", "create", &name])?;
+        Ok(Self {
+            _dir: dir,
+            _broker: broker,
+            port,
+            network: Network(name),
+        })
+    }
+
+    fn bootstrap(&self) -> String {
+        format!("host.docker.internal:{}", self.port)
+    }
+
+    /// The Debezium sample Postgres (`inventory` schema, `wal_level=logical`).
+    fn postgres(&self) -> Res<Container> {
+        let name = format!("{}-postgres", self.network.0);
+        docker(&[
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &name,
+            "--network",
+            &self.network.0,
+            "--network-alias",
+            "postgres",
+            "-e",
+            "POSTGRES_USER=postgres",
+            "-e",
+            "POSTGRES_PASSWORD=postgres",
+            &format!("quay.io/debezium/example-postgres:{DEBEZIUM}"),
+        ])?;
+        let container = Container(name);
+        poll("Postgres", Duration::from_secs(120), || {
+            Ok(Command::new("docker")
+                .args(["exec", &container.0, "pg_isready", "-U", "postgres"])
+                .output()?
+                .status
+                .success())
+        })?;
+        Ok(container)
+    }
+
+    /// The Debezium sample MySQL (`inventory` database, binlog in row mode).
+    fn mysql(&self) -> Res<Container> {
+        let name = format!("{}-mysql", self.network.0);
+        docker(&[
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &name,
+            "--network",
+            &self.network.0,
+            "--network-alias",
+            "mysql",
+            "-e",
+            "MYSQL_ROOT_PASSWORD=debezium",
+            "-e",
+            "MYSQL_USER=mysqluser",
+            "-e",
+            "MYSQL_PASSWORD=mysqlpw",
+            &format!("quay.io/debezium/example-mysql:{DEBEZIUM}"),
+        ])?;
+        let container = Container(name);
+        // The image restarts mysqld once after loading `inventory`, so wait
+        // for a query against it rather than for the port.
+        poll("MySQL", Duration::from_secs(180), || {
+            Ok(Command::new("docker")
+                .args([
+                    "exec",
+                    &container.0,
+                    "mysql",
+                    "-uroot",
+                    "-pdebezium",
+                    "-e",
+                    "SELECT COUNT(*) FROM inventory.customers",
+                ])
+                .output()?
+                .status
+                .success())
+        })?;
+        Ok(container)
+    }
+
+    /// A Debezium Connect worker on the shared network that reaches the
+    /// broker through `host.docker.internal`. Returns the container and its
+    /// REST base URL once REST answers.
+    fn worker(&self, name: &str, exactly_once: bool) -> Res<(Worker, String)> {
+        let rest = free_port();
+        let container = format!("{}-{name}", self.network.0);
+        let bootstrap = format!("BOOTSTRAP_SERVERS={}", self.bootstrap());
+        let published = format!("{rest}:8083");
+        let image = format!("quay.io/debezium/connect:{DEBEZIUM}");
+        let mut args = vec![
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &container,
+            "--network",
+            &self.network.0,
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "-p",
+            &published,
+            "-e",
+            &bootstrap,
+            "-e",
+            "GROUP_ID=camus-debezium",
+            "-e",
+            "CONFIG_STORAGE_TOPIC=dbz-configs",
+            "-e",
+            "OFFSET_STORAGE_TOPIC=dbz-offsets",
+            "-e",
+            "STATUS_STORAGE_TOPIC=dbz-status",
+            "-e",
+            "OFFSET_FLUSH_INTERVAL_MS=500",
+            "-e",
+            "CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE=false",
+            "-e",
+            "CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=false",
+        ];
+        if exactly_once {
+            args.extend(["-e", "CONNECT_EXACTLY_ONCE_SOURCE_SUPPORT=enabled"]);
+        }
+        args.push(&image);
+        docker(&args)?;
+        let worker = Worker(Container(container));
+        let base = format!("http://127.0.0.1:{rest}");
+        let http = reqwest::blocking::Client::new();
+        poll("Connect REST", Duration::from_secs(120), || {
+            Ok(http
+                .get(format!("{base}/connectors"))
+                .send()
+                .is_ok_and(|response| response.status().is_success()))
+        })?;
+        Ok((worker, base))
+    }
+}
+
+/// A Connect worker container. Its log is copied to
+/// `target/debezium-logs/<name>.log` before the container is removed.
+struct Worker(Container);
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let dir = target().join("debezium-logs");
+        let Ok(output) = Command::new("docker").args(["logs", &self.0 .0]).output() else {
+            return;
+        };
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let mut log = output.stdout;
+            log.extend_from_slice(&output.stderr);
+            let _ = std::fs::write(dir.join(format!("{}.log", self.0 .0)), log);
+        }
+    }
+}
+
+/// Stop a worker with SIGTERM so it commits its source offsets on the way out.
+fn stop_worker(worker: Worker) -> Res<()> {
+    docker(&["stop", "-t", "30", &worker.0 .0])?;
+    drop(worker);
+    Ok(())
+}
+
+fn put_connector(base: &str, name: &str, config: serde_json::Value) -> Res<()> {
+    let response = reqwest::blocking::Client::new()
+        .put(format!("{base}/connectors/{name}/config"))
+        .json(&config)
+        .send()?;
+    if !response.status().is_success() {
+        return Err(format!("connector {name}: {}", response.text()?).into());
+    }
+    Ok(())
+}
+
+/// The console consumer's output for every record on `topic`, read from the
+/// beginning inside `worker`: one `key<TAB>value` per record, except that a
+/// pretty-printed value (Debezium's schema history) spans several lines.
+fn consume(worker: &Worker, bootstrap: &str, topic: &str, read_committed: bool) -> Res<String> {
+    let mut args = vec![
+        "exec",
+        &worker.0 .0,
+        "/kafka/bin/kafka-console-consumer.sh",
+        "--bootstrap-server",
+        bootstrap,
+        "--topic",
+        topic,
+        "--from-beginning",
+        "--timeout-ms",
+        "8000",
+        "--formatter-property",
+        "print.key=true",
+        "--formatter-property",
+        "key.separator=\t",
+    ];
+    if read_committed {
+        args.extend(["--isolation-level", "read_committed"]);
+    }
+    // The consumer exits non-zero when it times out on a topic that does not
+    // exist yet; that reads as no events.
+    let output = Command::new("docker").args(&args).output()?;
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Every record on a Debezium change topic as `(key, value)`. A tombstone's
+/// value is `None`.
+fn change_events(
+    worker: &Worker,
+    bootstrap: &str,
+    topic: &str,
+    read_committed: bool,
+) -> Res<Vec<(String, Option<serde_json::Value>)>> {
+    let mut events = Vec::new();
+    for line in consume(worker, bootstrap, topic, read_committed)?.lines() {
+        let Some((key, value)) = line.split_once('\t') else {
+            continue;
+        };
+        let value = match value {
+            "null" => None,
+            json => Some(
+                serde_json::from_str(json)
+                    .map_err(|e| format!("{topic}: {e} in record {line:?}"))?,
+            ),
+        };
+        events.push((key.to_string(), value));
+    }
+    Ok(events)
+}
+
+fn ops(events: &[(String, Option<serde_json::Value>)], op: &str) -> usize {
+    events
+        .iter()
+        .filter(|(_, value)| value.as_ref().is_some_and(|v| v["op"] == op))
+        .count()
+}
+
+/// Created rows whose `after` column `column` equals `value`.
+fn created(events: &[(String, Option<serde_json::Value>)], column: &str, value: &str) -> usize {
+    events
+        .iter()
+        .filter(|(_, event)| {
+            event
+                .as_ref()
+                .is_some_and(|v| v["op"] == "c" && v["after"][column] == value)
+        })
+        .count()
+}
+
+fn tombstones(events: &[(String, Option<serde_json::Value>)]) -> usize {
+    events.iter().filter(|(_, value)| value.is_none()).count()
+}
+
+fn psql(postgres: &Container, sql: &str) -> Res<()> {
+    docker(&[
+        "exec",
+        &postgres.0,
+        "psql",
+        "-U",
+        "postgres",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-c",
+        sql,
+    ])?;
+    Ok(())
+}
+
+fn mysql_exec(mysql: &Container, sql: &str) -> Res<()> {
+    docker(&[
+        "exec",
+        &mysql.0,
+        "mysql",
+        "-uroot",
+        "-pdebezium",
+        "inventory",
+        "-e",
+        sql,
+    ])?;
+    Ok(())
+}
+
+fn postgres_connector() -> serde_json::Value {
+    serde_json::json!({
+        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+        "database.hostname": "postgres",
+        "database.port": "5432",
+        "database.user": "postgres",
+        "database.password": "postgres",
+        "database.dbname": "postgres",
+        "topic.prefix": "pg",
+        "table.include.list": "inventory.customers",
+        "plugin.name": "pgoutput",
+        "slot.name": "camus",
+        "tasks.max": "1",
+    })
+}
+
+fn docker_ecosystem() -> bool {
+    if !enabled() {
+        return false;
+    }
+    if std::env::var("CAMUS_ECOSYSTEM_DOCKER").ok().as_deref() != Some("1") {
+        support::skipped("Debezium; set CAMUS_ECOSYSTEM_DOCKER=1");
+        return false;
+    }
+    true
+}
+
+/// Debezium's Postgres and MySQL connectors on one Connect worker: snapshot,
+/// streamed insert, update, delete and tombstone, a MySQL schema change kept
+/// in the schema history topic, and a worker restart that resumes from the
+/// committed offsets without a second snapshot. Opt-in:
+/// `CAMUS_ECOSYSTEM_DOCKER=1`.
+#[test]
+fn debezium_captures_postgres_and_mysql_and_resumes() -> Res<()> {
+    if !docker_ecosystem() {
+        return Ok(());
+    }
+    let setup = DebeziumSetup::start()?;
+    let bootstrap = setup.bootstrap();
+    let postgres = setup.postgres()?;
+    let mysql = setup.mysql()?;
+    let (worker, base) = setup.worker("connect", false)?;
+    put_connector(&base, "pg", postgres_connector())?;
+    put_connector(
+        &base,
+        "my",
+        serde_json::json!({
+            "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+            "database.hostname": "mysql",
+            "database.port": "3306",
+            "database.user": "debezium",
+            "database.password": "dbz",
+            "database.server.id": "184054",
+            "topic.prefix": "my",
+            "database.include.list": "inventory",
+            "table.include.list": "inventory.customers",
+            "schema.history.internal.kafka.bootstrap.servers": bootstrap,
+            "schema.history.internal.kafka.topic": "my-schema-history",
+            "tasks.max": "1",
+        }),
+    )?;
+
+    let pg_topic = "pg.inventory.customers";
+    let my_topic = "my.inventory.customers";
+    for topic in [pg_topic, my_topic] {
+        poll(
+            &format!("the {topic} snapshot"),
+            Duration::from_secs(120),
+            || Ok(ops(&change_events(&worker, &bootstrap, topic, false)?, "r") >= 4),
+        )?;
+    }
+
+    psql(
+        &postgres,
+        "INSERT INTO inventory.customers (first_name, last_name, email) \
+         VALUES ('Ada', 'Lovelace', 'ada@example.com'); \
+         UPDATE inventory.customers SET last_name = 'Byron' WHERE email = 'ada@example.com'; \
+         DELETE FROM inventory.customers WHERE email = 'ada@example.com';",
+    )?;
+    mysql_exec(
+        &mysql,
+        "INSERT INTO customers (first_name, last_name, email) \
+         VALUES ('Ada', 'Lovelace', 'ada@example.com'); \
+         UPDATE customers SET last_name = 'Byron' WHERE email = 'ada@example.com'; \
+         DELETE FROM customers WHERE email = 'ada@example.com'; \
+         ALTER TABLE customers ADD COLUMN tier VARCHAR(16) DEFAULT 'basic'; \
+         INSERT INTO customers (first_name, last_name, email, tier) \
+         VALUES ('Alan', 'Turing', 'alan@example.com', 'gold');",
+    )?;
+    for topic in [pg_topic, my_topic] {
+        poll(&format!("{topic} changes"), Duration::from_secs(60), || {
+            let events = change_events(&worker, &bootstrap, topic, false)?;
+            Ok(ops(&events, "d") >= 1 && tombstones(&events) >= 1)
+        })?;
+        let events = change_events(&worker, &bootstrap, topic, false)?;
+        assert_eq!(created(&events, "email", "ada@example.com"), 1, "{topic}");
+        assert_eq!(ops(&events, "u"), 1, "{topic}");
+        assert_eq!(ops(&events, "d"), 1, "{topic}");
+        assert_eq!(tombstones(&events), 1, "{topic}");
+        // The tombstone follows the delete event, under the same key.
+        let delete = events
+            .iter()
+            .position(|(_, v)| v.as_ref().is_some_and(|v| v["op"] == "d"))
+            .ok_or("no delete event")?;
+        let (key, value) = events.get(delete + 1).ok_or("no record after delete")?;
+        assert!(value.is_none(), "{topic}: {value:?}");
+        assert_eq!(key, &events[delete].0, "{topic}");
+    }
+    poll("the gold tier row", Duration::from_secs(60), || {
+        Ok(created(
+            &change_events(&worker, &bootstrap, my_topic, false)?,
+            "tier",
+            "gold",
+        ) == 1)
+    })?;
+
+    // Debezium created its schema history topic: one partition, nothing
+    // ever deleted, and the ALTER is in it.
+    let topics = docker(&[
+        "exec",
+        &worker.0 .0,
+        "/kafka/bin/kafka-topics.sh",
+        "--bootstrap-server",
+        &bootstrap,
+        "--describe",
+        "--topic",
+        "my-schema-history",
+    ])?;
+    assert!(topics.contains("PartitionCount: 1"), "{topics}");
+    let configs = docker(&[
+        "exec",
+        &worker.0 .0,
+        "/kafka/bin/kafka-configs.sh",
+        "--bootstrap-server",
+        &bootstrap,
+        "--entity-type",
+        "topics",
+        "--entity-name",
+        "my-schema-history",
+        "--describe",
+        "--all",
+    ])?;
+    for expected in [
+        "cleanup.policy=delete",
+        "retention.ms=9223372036854775807",
+        "retention.bytes=-1",
+    ] {
+        assert!(configs.contains(expected), "{expected}:\n{configs}");
+    }
+    // History records are pretty-printed JSON over several lines.
+    let history = consume(&worker, &bootstrap, "my-schema-history", false)?;
+    assert!(
+        history.contains("ADD COLUMN tier"),
+        "no ALTER in the schema history:\n{history}"
+    );
+
+    // Change both databases while no worker runs. The next worker resumes
+    // from the committed offsets, recovers MySQL's schema (with `tier`) from
+    // the history topic, and does not snapshot again.
+    std::thread::sleep(Duration::from_secs(3));
+    stop_worker(worker)?;
+    psql(
+        &postgres,
+        "INSERT INTO inventory.customers (first_name, last_name, email) \
+         VALUES ('Grace', 'Hopper', 'grace@example.com');",
+    )?;
+    mysql_exec(
+        &mysql,
+        "INSERT INTO customers (first_name, last_name, email, tier) \
+         VALUES ('Grace', 'Hopper', 'grace@example.com', 'silver');",
+    )?;
+    let (worker, _base) = setup.worker("connect-again", false)?;
+    poll(
+        "the changes made while stopped",
+        Duration::from_secs(120),
+        || {
+            Ok(created(
+                &change_events(&worker, &bootstrap, pg_topic, false)?,
+                "email",
+                "grace@example.com",
+            ) >= 1
+                && created(
+                    &change_events(&worker, &bootstrap, my_topic, false)?,
+                    "tier",
+                    "silver",
+                ) >= 1)
+        },
+    )?;
+    std::thread::sleep(Duration::from_secs(3));
+    for topic in [pg_topic, my_topic] {
+        let events = change_events(&worker, &bootstrap, topic, false)?;
+        assert_eq!(ops(&events, "r"), 4, "{topic} was snapshotted again");
+        assert_eq!(created(&events, "email", "grace@example.com"), 1, "{topic}");
+        assert_eq!(created(&events, "email", "ada@example.com"), 1, "{topic}");
+    }
+    Ok(())
+}
+
+/// Debezium Postgres with exactly-once source tasks (KIP-618): the worker
+/// writes records and source offsets in one transaction, and a
+/// `read_committed` reader sees each change once across a restart. Opt-in:
+/// `CAMUS_ECOSYSTEM_DOCKER=1`.
+#[test]
+fn debezium_postgres_exactly_once() -> Res<()> {
+    if !docker_ecosystem() {
+        return Ok(());
+    }
+    let setup = DebeziumSetup::start()?;
+    let bootstrap = setup.bootstrap();
+    let postgres = setup.postgres()?;
+    let (worker, base) = setup.worker("connect-eos", true)?;
+    let mut config = postgres_connector();
+    config["exactly.once.support"] = "required".into();
+    put_connector(&base, "pg", config)?;
+
+    let topic = "pg.inventory.customers";
+    poll("the snapshot", Duration::from_secs(120), || {
+        Ok(ops(&change_events(&worker, &bootstrap, topic, true)?, "r") >= 4)
+    })?;
+    psql(
+        &postgres,
+        "INSERT INTO inventory.customers (first_name, last_name, email) \
+         VALUES ('Ada', 'Lovelace', 'ada@example.com');",
+    )?;
+    poll("the streamed insert", Duration::from_secs(60), || {
+        Ok(created(
+            &change_events(&worker, &bootstrap, topic, true)?,
+            "email",
+            "ada@example.com",
+        ) >= 1)
+    })?;
+
+    std::thread::sleep(Duration::from_secs(3));
+    stop_worker(worker)?;
+    psql(
+        &postgres,
+        "INSERT INTO inventory.customers (first_name, last_name, email) \
+         VALUES ('Grace', 'Hopper', 'grace@example.com');",
+    )?;
+    let (worker, _base) = setup.worker("connect-eos-again", true)?;
+    poll(
+        "the insert made while stopped",
+        Duration::from_secs(120),
+        || {
+            Ok(created(
+                &change_events(&worker, &bootstrap, topic, true)?,
+                "email",
+                "grace@example.com",
+            ) >= 1)
+        },
+    )?;
+    std::thread::sleep(Duration::from_secs(3));
+    let events = change_events(&worker, &bootstrap, topic, true)?;
+    assert_eq!(ops(&events, "r"), 4, "snapshotted again");
+    assert_eq!(created(&events, "email", "ada@example.com"), 1);
+    assert_eq!(created(&events, "email", "grace@example.com"), 1);
+    Ok(())
 }

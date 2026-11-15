@@ -180,7 +180,7 @@ impl Encodable for GetTelemetrySubscriptionsResponse {
         types::Boolean.encode(buf, &self.delta_temporality)?;
         types::CompactArray(types::CompactString).encode(buf, &self.requested_metrics)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -205,7 +205,7 @@ impl Encodable for GetTelemetrySubscriptionsResponse {
         total_size +=
             types::CompactArray(types::CompactString).compute_size(&self.requested_metrics)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

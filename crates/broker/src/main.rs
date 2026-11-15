@@ -4,6 +4,9 @@
 #![forbid(unsafe_code)]
 
 mod kafka;
+mod metrics;
+mod recover;
+mod settings;
 mod slot;
 
 use std::collections::BTreeMap;
@@ -74,6 +77,10 @@ struct Args {
     /// Require SASL (PLAIN or SCRAM) before any API other than ApiVersions and the SASL pair.
     #[arg(long, default_value_t = false)]
     require_sasl: bool,
+    /// `camus.toml`. When omitted, `camus.toml` in the working directory is
+    /// used if that file exists. Flags and `CAMUS_*` override the file.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 /// Largest Raft RPC body the HTTP routes accept.
@@ -126,6 +133,9 @@ struct Admin {
     wal_dir: PathBuf,
     http: reqwest::Client,
     truncating: tokio::sync::Mutex<()>,
+    settings: settings::Settings,
+    /// The Kafka listener, once it starts, for consumer lag in `/metrics`.
+    kafka: std::sync::OnceLock<Arc<kafka::Kafka>>,
 }
 
 #[derive(Deserialize)]
@@ -150,12 +160,50 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+    let mut settings = settings::Settings::load(args.config.as_deref(), &flag_overrides(&args))?;
+    apply_listener_defaults(&mut settings, &args);
+    for line in settings.report_lines() {
+        eprintln!("config {line}");
+    }
     std::fs::create_dir_all(&args.data_dir)?;
+    let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
+    let http_bound = listener.local_addr()?;
+    if camus_raft::quic::enabled() {
+        if let Some(identity) = quic_identity(&args, http_bound, settings.is_true("dev.plaintext"))?
+        {
+            let mut quic_addr = http_bound;
+            if let Some(port) = camus_raft::quic::port_override()? {
+                quic_addr.set_port(port);
+            }
+            camus_raft::quic::ControlEndpoint::bind(quic_addr, identity)?.install()?;
+        }
+    }
     let node = Arc::new(MetadataNode::open(args.node_id, &args.data_dir, &args.http_addr).await?);
-    let wal_dir = resolve_wal_dir(args.wal_dir.clone(), &args.data_dir);
+    let wal_explicit = {
+        let dir = settings.get("wal.dir");
+        if dir.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(dir))
+        }
+    };
+    let wal_dir = resolve_wal_dir(wal_explicit, &args.data_dir);
     std::fs::create_dir_all(&wal_dir)?;
     let wal = Arc::new(WalSlot::new(Shard::open(args.node_id, &wal_dir).await?));
     warn_if_rotating_wal(&wal_dir);
+    if let Some(endpoint) = camus_raft::quic::current() {
+        let node_q = Arc::clone(&node);
+        let wal_q = Arc::clone(&wal);
+        tokio::spawn(async move {
+            endpoint
+                .serve(move |frame| {
+                    let node_q = Arc::clone(&node_q);
+                    let wal_q = Arc::clone(&wal_q);
+                    async move { quic_dispatch(node_q, wal_q, frame).await }
+                })
+                .await;
+        });
+    }
     tokio::spawn(open_shards(
         Arc::clone(&node),
         Arc::clone(&wal),
@@ -171,11 +219,12 @@ async fn main() -> anyhow::Result<()> {
             .timeout(std::time::Duration::from_secs(10))
             .build()?,
         truncating: tokio::sync::Mutex::new(()),
+        settings: settings.clone(),
+        kafka: std::sync::OnceLock::new(),
     });
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(prometheus))
         .route("/admin/write", post(write))
         .route("/admin/publish", post(publish))
         .route("/admin/apply", post(apply_command))
@@ -187,10 +236,19 @@ async fn main() -> anyhow::Result<()> {
         .with_state(Arc::clone(&node))
         .merge(
             Router::new()
+                .route("/metrics", get(prometheus))
                 .route("/admin/metrics", get(admin_metrics))
+                .route("/admin/config", get(admin_config))
                 .route("/admin/init", post(init))
                 .route("/admin/truncate-to-sealed", post(truncate_to_sealed))
+                .route("/admin/join-wal", post(join_wal))
+                .route("/admin/add-wal-voter", post(add_wal_voter))
+                .route("/admin/restore-cluster", post(restore_cluster))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
+                .route("/wal/{shard}/end-offset", post(shard_end_offset))
+                .route("/wal/{shard}/txn-span", post(shard_txn_span))
+                .route("/wal/{shard}/finish-txn", post(shard_finish_txn))
+                .route("/wal/{shard}/close-txn", post(shard_close_txn))
                 .with_state(Arc::clone(&admin)),
         )
         .merge(
@@ -207,12 +265,21 @@ async fn main() -> anyhow::Result<()> {
                 .with_state(Arc::clone(&wal)),
         );
 
-    if let Some(kafka_addr) = &args.kafka_addr {
-        start_kafka(node.clone(), wal, args.node_id, kafka_addr, &args).await?;
+    let kafka_addr = settings.get("kafka.addr").to_string();
+    if !kafka_addr.is_empty() {
+        let kafka = start_kafka(
+            node.clone(),
+            wal,
+            args.node_id,
+            &kafka_addr,
+            &args,
+            &settings,
+        )
+        .await?;
+        let _ = admin.kafka.set(kafka);
     }
 
-    let listener = tokio::net::TcpListener::bind(&args.http_addr).await?;
-    let bound = listener.local_addr()?;
+    let bound = http_bound;
     std::fs::write(args.data_dir.join("listen-addr"), bound.to_string())?;
     info!(node_id = args.node_id, %bound, "metadata broker listening");
     // AppendEntries carries produce batches. axum's default 2 MB body limit
@@ -228,19 +295,90 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Cluster CA when all three PEM files are set. `--dev-plaintext` on loopback
+/// (or an unspecified bind) gets a per-process certificate. Anything else
+/// leaves the endpoint off, and votes and heartbeats stay on HTTP. A TLS
+/// Kafka listener without a client CA is that case: it must still reach the
+/// object-storage check instead of dying here.
+fn quic_identity(
+    args: &Args,
+    addr: SocketAddr,
+    dev_plaintext: bool,
+) -> anyhow::Result<Option<camus_raft::quic::Identity>> {
+    if let (Some(cert), Some(key), Some(ca)) = (&args.tls_cert, &args.tls_key, &args.tls_client_ca)
+    {
+        let mut cert_reader = std::io::BufReader::new(std::fs::File::open(cert)?);
+        let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+        let mut key_reader = std::io::BufReader::new(std::fs::File::open(key)?);
+        let key = rustls_pemfile::private_key(&mut key_reader)?
+            .ok_or_else(|| anyhow::anyhow!("no private key in {key:?}"))?;
+        let mut ca_reader = std::io::BufReader::new(std::fs::File::open(ca)?);
+        let trusted = rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+        return Ok(Some(camus_raft::quic::Identity::new(certs, key, trusted)?));
+    }
+    if dev_plaintext && (addr.ip().is_loopback() || addr.ip().is_unspecified()) {
+        return Ok(Some(camus_raft::quic::Identity::loopback_dev()?));
+    }
+    tracing::warn!(
+        "QUIC control plane is off; set --dev-plaintext on loopback, or --tls-cert, --tls-key, and --tls-client-ca"
+    );
+    Ok(None)
+}
+
+fn qerr(err: impl std::fmt::Display) -> camus_raft::quic::QuicError {
+    std::io::Error::other(err.to_string()).into()
+}
+
+async fn quic_dispatch(
+    node: Arc<MetadataNode>,
+    wal: Arc<WalSlot>,
+    frame: camus_raft::quic::Frame,
+) -> Result<Vec<u8>, camus_raft::quic::QuicError> {
+    use camus_raft::quic::{KIND_HEARTBEAT, KIND_VOTE, ROUTE_METADATA, ROUTE_WAL};
+    match (frame.route, frame.kind) {
+        (ROUTE_METADATA, KIND_VOTE) => {
+            let req: VoteRequest<NodeId> = camus_raft::codec::decode(&frame.body).map_err(qerr)?;
+            camus_raft::codec::encode(&node.raft.vote(req).await).map_err(qerr)
+        }
+        (ROUTE_METADATA, KIND_HEARTBEAT) => {
+            let req: AppendEntriesRequest<camus_metadata::TypeConfig> =
+                camus_raft::codec::decode(&frame.body).map_err(qerr)?;
+            camus_raft::codec::encode(&node.raft.append_entries(req).await).map_err(qerr)
+        }
+        (ROUTE_WAL, KIND_VOTE) => {
+            let shard = wal
+                .shard(frame.shard)
+                .ok_or_else(|| qerr(format!("no wal shard {}", frame.shard)))?;
+            let req: VoteRequest<NodeId> = camus_raft::codec::decode(&frame.body).map_err(qerr)?;
+            camus_raft::codec::encode(&shard.raft.vote(req).await).map_err(qerr)
+        }
+        (ROUTE_WAL, KIND_HEARTBEAT) => {
+            let shard = wal
+                .shard(frame.shard)
+                .ok_or_else(|| qerr(format!("no wal shard {}", frame.shard)))?;
+            let req: AppendEntriesRequest<camus_wal::TypeConfig> =
+                camus_raft::codec::decode(&frame.body).map_err(qerr)?;
+            camus_raft::codec::encode(&shard.raft.append_entries(req).await).map_err(qerr)
+        }
+        _ => Err(qerr("unknown quic frame")),
+    }
+}
+
 async fn health() -> &'static str {
     "ok"
 }
 
-async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
+async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
     use std::sync::atomic::Ordering::Relaxed;
+    let node = &admin.node;
     let stats = &camus_compactor::STATS;
+    let store = &camus_storage::STATS;
     let metrics = node.raft.metrics().borrow().clone();
     let leader = metrics
         .current_leader
         .map(|id| id.to_string())
         .unwrap_or_else(|| "NaN".into());
-    format!(
+    let mut text = format!(
         "# HELP camus_up Broker process is running.\n\
          # TYPE camus_up gauge\n\
          camus_up 1\n\
@@ -267,7 +405,36 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
          camus_sweep_bytes_deleted_total {}\n\
          # HELP camus_produce_hold_ms_total Milliseconds produce requests were held at the WAL disk limit.\n\
          # TYPE camus_produce_hold_ms_total counter\n\
-         camus_produce_hold_ms_total {}\n",
+         camus_produce_hold_ms_total {}\n\
+         # HELP camus_meta_snapshot_index Log index of the newest metadata snapshot in object storage.\n\
+         # TYPE camus_meta_snapshot_index gauge\n\
+         camus_meta_snapshot_index {}\n\
+         # HELP camus_meta_snapshot_unix_ms Unix milliseconds of that snapshot, or 0.\n\
+         # TYPE camus_meta_snapshot_unix_ms gauge\n\
+         camus_meta_snapshot_unix_ms {}\n\
+         # HELP camus_object_store_requests_total Object-store calls by operation. A retried call or a paged list counts once.\n\
+         # TYPE camus_object_store_requests_total counter\n\
+         camus_object_store_requests_total{{op=\"put\"}} {}\n\
+         camus_object_store_requests_total{{op=\"get\"}} {}\n\
+         camus_object_store_requests_total{{op=\"head\"}} {}\n\
+         camus_object_store_requests_total{{op=\"list\"}} {}\n\
+         camus_object_store_requests_total{{op=\"delete\"}} {}\n\
+         # HELP camus_object_store_errors_total Object-store calls that returned an error, by operation.\n\
+         # TYPE camus_object_store_errors_total counter\n\
+         camus_object_store_errors_total{{op=\"put\"}} {}\n\
+         camus_object_store_errors_total{{op=\"get\"}} {}\n\
+         camus_object_store_errors_total{{op=\"head\"}} {}\n\
+         camus_object_store_errors_total{{op=\"list\"}} {}\n\
+         camus_object_store_errors_total{{op=\"delete\"}} {}\n\
+         # HELP camus_object_store_listed_keys_total Keys returned by lists. The store reads 1,000 per page.\n\
+         # TYPE camus_object_store_listed_keys_total counter\n\
+         camus_object_store_listed_keys_total {}\n\
+         # HELP camus_object_store_put_bytes_total Bytes written to object storage.\n\
+         # TYPE camus_object_store_put_bytes_total counter\n\
+         camus_object_store_put_bytes_total {}\n\
+         # HELP camus_object_store_get_bytes_total Bytes read from object storage.\n\
+         # TYPE camus_object_store_get_bytes_total counter\n\
+         camus_object_store_get_bytes_total {}\n",
         metrics.current_term,
         if metrics.current_leader == Some(metrics.id) {
             1
@@ -279,7 +446,115 @@ async fn prometheus(State(node): State<Arc<MetadataNode>>) -> String {
         stats.objects_deleted.load(Relaxed),
         stats.bytes_deleted.load(Relaxed),
         kafka::PRODUCE_HOLD_MS.load(Relaxed),
-    )
+        kafka::META_SNAPSHOT_INDEX.load(Relaxed),
+        kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
+        store.puts.calls.load(Relaxed),
+        store.gets.calls.load(Relaxed),
+        store.heads.calls.load(Relaxed),
+        store.lists.calls.load(Relaxed),
+        store.deletes.calls.load(Relaxed),
+        store.puts.errors.load(Relaxed),
+        store.gets.errors.load(Relaxed),
+        store.heads.errors.load(Relaxed),
+        store.lists.errors.load(Relaxed),
+        store.deletes.errors.load(Relaxed),
+        store.listed.load(Relaxed),
+        store.put_bytes.load(Relaxed),
+        store.get_bytes.load(Relaxed),
+    );
+    // One series per open shard. The shard count is fixed at init.
+    let shards = admin.wal.all();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let families: [(&str, &str, &str, fn(&camus_wal::Shard, NodeId, u64) -> u64); 4] = [
+        (
+            "camus_wal_unsealed_bytes",
+            "Committed WAL bytes not yet sealed into object storage.",
+            "gauge",
+            |shard, _, _| shard.unsealed_bytes(),
+        ),
+        (
+            "camus_wal_oldest_unsealed_age_seconds",
+            "Seconds since this broker applied the oldest batch not yet sealed, or 0. After a restart it counts from when the shard opened.",
+            "gauge",
+            |shard, _, now| {
+                shard
+                    .oldest_unsealed_ms()
+                    .map_or(0, |at| now.saturating_sub(at) / 1000)
+            },
+        ),
+        (
+            "camus_wal_leader",
+            "1 when this broker leads the WAL shard.",
+            "gauge",
+            |shard, me, _| u64::from(shard.leader() == Some(me)),
+        ),
+        (
+            "camus_wal_storage_failed",
+            "1 when a WAL write failed and the shard stopped.",
+            "gauge",
+            |shard, _, _| u64::from(shard.storage_failed()),
+        ),
+    ];
+    for (name, help, kind, value) in families {
+        text.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+        for (id, shard) in &shards {
+            let value = value(shard, admin.node_id, now_ms);
+            text.push_str(&format!("{name}{{shard=\"{id}\"}} {value}\n"));
+        }
+    }
+    // Seal and upload times, recorded only where this broker led the shard.
+    let timings: [(&str, &str, fn(&metrics::ShardTimes) -> &metrics::Histogram); 2] = [
+        (
+            "camus_wal_upload_seconds",
+            "Time to put one upload pass's objects and publish their extents.",
+            |times| &times.upload,
+        ),
+        (
+            "camus_wal_seal_seconds",
+            "Time to commit the Seal that drops uploaded batches from the WAL.",
+            |times| &times.seal,
+        ),
+    ];
+    for (name, help, pick) in timings {
+        text.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+        for (id, _) in &shards {
+            if usize::try_from(*id).is_ok_and(|id| id < metrics::SHARD_SERIES) {
+                let labels = format!("shard=\"{id}\"");
+                pick(metrics::shard_times(*id)).render(&mut text, name, &labels);
+            }
+        }
+        if let Some(times) = metrics::overflow_times() {
+            pick(times).render(&mut text, name, "shard=\"overflow\"");
+        }
+    }
+    text.push_str(
+        "# HELP camus_produce_request_seconds Time from reading a Produce request to its response.\n\
+         # TYPE camus_produce_request_seconds histogram\n",
+    );
+    metrics::PRODUCE_LATENCY.render(&mut text, "camus_produce_request_seconds", "");
+    text.push_str(
+        "# HELP camus_fetch_request_seconds Time to answer a Fetch request, including its long poll.\n\
+         # TYPE camus_fetch_request_seconds histogram\n",
+    );
+    metrics::FETCH_LATENCY.render(&mut text, "camus_fetch_request_seconds", "");
+    if let Some(kafka) = admin.kafka.get() {
+        // The lag scan reads metadata synchronously; keep it off the workers
+        // that serve produce and fetch.
+        let kafka = Arc::clone(kafka);
+        let lag = tokio::task::spawn_blocking(move || {
+            let mut lag = String::new();
+            kafka.render_group_lag(&mut lag);
+            lag
+        })
+        .await;
+        if let Ok(lag) = lag {
+            text.push_str(&lag);
+        }
+    }
+    text
 }
 
 async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Value> {
@@ -306,6 +581,8 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "sweep_objects_deleted": camus_compactor::STATS.objects_deleted.load(std::sync::atomic::Ordering::Relaxed),
         "sweep_bytes_deleted": camus_compactor::STATS.bytes_deleted.load(std::sync::atomic::Ordering::Relaxed),
         "produce_hold_ms": kafka::PRODUCE_HOLD_MS.load(std::sync::atomic::Ordering::Relaxed),
+        "meta_snapshot_index": kafka::META_SNAPSHOT_INDEX.load(std::sync::atomic::Ordering::Relaxed),
+        "meta_snapshot_unix_ms": kafka::META_SNAPSHOT_AT_MS.load(std::sync::atomic::Ordering::Relaxed),
         "wal_shards": admin
             .wal
             .all()
@@ -323,15 +600,14 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
 /// Shard count when init omits one. One shard per core of this process,
 /// rounded up to a multiple of the voter count so each voter is the preferred
 /// leader of the same number of shards, and capped at eight shards per voter.
-fn default_shard_count(voters: usize) -> u32 {
-    if let Ok(raw) = std::env::var("CAMUS_WAL_SHARDS") {
-        if raw == "voters" {
-            return u32::try_from(voters).unwrap_or(1).max(1);
-        }
-        if let Ok(count) = raw.parse::<u32>() {
-            if count >= 1 {
-                return count;
-            }
+fn default_shard_count(voters: usize, settings: &settings::Settings) -> u32 {
+    let raw = settings.get("wal.shards");
+    if raw == "voters" {
+        return u32::try_from(voters).unwrap_or(1).max(1);
+    }
+    if let Ok(count) = raw.parse::<u32>() {
+        if count >= 1 {
+            return count;
         }
     }
     shard_count_for(
@@ -353,14 +629,14 @@ fn shard_count_for(voters: usize, cores: u32) -> u32 {
 /// `CAMUS_READ_DISK_CACHE_BYTES` (4 GiB) in `CAMUS_READ_DISK_CACHE_ENTRIES`
 /// (65536) files. A size of 0 turns it off, and a cache that cannot be opened
 /// is left off with a warning.
-fn open_disk_cache(dir: &std::path::Path) -> Option<camus_storage::DiskCache> {
-    let env = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-    };
-    let bytes = env("CAMUS_READ_DISK_CACHE_BYTES").unwrap_or(4 * 1024 * 1024 * 1024);
-    let entries = env("CAMUS_READ_DISK_CACHE_ENTRIES").unwrap_or(65_536);
+fn open_disk_cache(
+    dir: &std::path::Path,
+    settings: &settings::Settings,
+) -> Option<camus_storage::DiskCache> {
+    let bytes = settings
+        .u64("read.disk.cache.bytes")
+        .unwrap_or(4 * 1024 * 1024 * 1024);
+    let entries = settings.u64("read.disk.cache.entries").unwrap_or(65_536);
     if bytes == 0 || entries == 0 {
         return None;
     }
@@ -579,13 +855,16 @@ async fn init(
         return Err((StatusCode::BAD_REQUEST, "no wal voter".into()));
     }
     voters.sort_unstable();
-    let count = shards.unwrap_or_else(|| default_shard_count(voters.len()));
+    let count = shards.unwrap_or_else(|| default_shard_count(voters.len(), &admin.settings));
     let layout = shard_voters(&voters, count);
-    admin
-        .node
-        .initialize(nodes.clone())
-        .await
-        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
+    // A second init of a group that already exists succeeds and changes
+    // nothing. openraft's NotAllowed means the log is already in motion.
+    if let Err(err) = admin.node.initialize(nodes.clone()).await {
+        if err.to_string().contains("not allowed to initialize") {
+            return Ok(StatusCode::OK);
+        }
+        return Err((StatusCode::CONFLICT, err.to_string()));
+    }
     if count > 1 {
         let raw = serde_json::json!({ "count": count, "voters": layout }).to_string();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -641,14 +920,6 @@ async fn init(
                 }
             }
         }
-        if layout.len() > 1 {
-            let first = &nodes[&members[0]].addr;
-            let _ = admin
-                .http
-                .post(format!("http://{first}/wal/{shard}/campaign"))
-                .send()
-                .await;
-        }
     }
     // A voter that granted a vote before its own initialize refuses it and
     // learns the membership from the leader instead. Return only once every
@@ -697,7 +968,54 @@ async fn init(
             }
         }
     }
+    // A campaign sent before the shard was open is dropped. Ask the
+    // preferred voter again, and wait out a leader lease between attempts,
+    // until that voter actually leads.
+    if layout.len() > 1 {
+        for (shard, members) in layout.iter().enumerate() {
+            let preferred = members[0];
+            let addr = &nodes[&preferred].addr;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if shard_leader_is(&admin, addr, shard as u64, preferred).await {
+                    break;
+                }
+                let _ = admin
+                    .http
+                    .post(format!("http://{addr}/wal/{shard}/campaign"))
+                    .send()
+                    .await;
+                if std::time::Instant::now() > deadline {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("wal shard {shard} never elected broker {preferred}"),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
+    }
     Ok(StatusCode::OK)
+}
+
+/// True when `addr` reports `leader` for `shard`.
+async fn shard_leader_is(admin: &Admin, addr: &str, shard: u64, leader: NodeId) -> bool {
+    let Ok(response) = admin
+        .http
+        .get(format!("http://{addr}/admin/metrics"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let Ok(metrics) = response.json::<serde_json::Value>().await else {
+        return false;
+    };
+    metrics["wal_shards"]
+        .as_array()
+        .and_then(|shards| shards.iter().find(|row| row["id"].as_u64() == Some(shard)))
+        .and_then(|row| row["leader"].as_u64())
+        == Some(leader)
 }
 
 async fn wal_init(
@@ -747,14 +1065,23 @@ async fn shard_hand_over(
     let Some(opened) = admin.wal.shard(shard) else {
         return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
     };
-    if !opened.is_leader() {
-        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
-    }
     if body.to == admin.node_id {
         return Ok(StatusCode::OK);
     }
-    if !opened.follower_caught_up(body.to) {
-        return Err((StatusCode::CONFLICT, format!("voter {} is behind", body.to)));
+    // Replication metrics lag the moment leadership is won. Give the target
+    // a moment to match the log before refusing.
+    let caught_up = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if !opened.is_leader() {
+            return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+        }
+        if opened.follower_caught_up(body.to) {
+            break;
+        }
+        if tokio::time::Instant::now() >= caught_up {
+            return Err((StatusCode::CONFLICT, format!("voter {} is behind", body.to)));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let addr = opened
         .voter_addr(body.to)
@@ -782,6 +1109,121 @@ async fn shard_hand_over(
             format!("voter {} did not take shard {shard}", body.to),
         ))
     }
+}
+
+#[derive(Deserialize)]
+struct EndOffset {
+    topic: String,
+    partition: i32,
+}
+
+/// On a shard's leader: the next offset of one partition, which `EndTxn`
+/// uses as the exclusive end of that partition's span (ADR 0015).
+async fn shard_end_offset(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<EndOffset>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let Some(raw) = admin
+        .node
+        .read_local(&camus_metadata::topic_storage_key(&body.topic))
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+    else {
+        return Err((StatusCode::NOT_FOUND, format!("no topic {}", body.topic)));
+    };
+    let topic = camus_metadata::parse_topic(&raw)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let id = uuid::Uuid::parse_str(&topic.id)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let end = opened.end_offset(id.as_bytes(), body.partition);
+    Ok(Json(serde_json::json!({ "end": end })))
+}
+
+#[derive(Deserialize)]
+struct TxnSpanQuery {
+    topic: String,
+    partition: i32,
+    producer_id: i64,
+}
+
+fn topic_id_of(admin: &Admin, topic: &str) -> Result<uuid::Uuid, (StatusCode, String)> {
+    let Some(raw) = admin
+        .node
+        .read_local(&camus_metadata::topic_storage_key(topic))
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+    else {
+        return Err((StatusCode::NOT_FOUND, format!("no topic {topic}")));
+    };
+    let topic = camus_metadata::parse_topic(&raw)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    uuid::Uuid::parse_str(&topic.id)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+/// On a shard's leader: the open transaction span for one producer.
+async fn shard_txn_span(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<TxnSpanQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let id = topic_id_of(&admin, &body.topic)?;
+    let Some((start, end)) = opened.txn_span(id.as_bytes(), body.partition, body.producer_id)
+    else {
+        return Err((StatusCode::NOT_FOUND, "no open span".into()));
+    };
+    Ok(Json(serde_json::json!({ "start": start, "end": end })))
+}
+
+/// On a shard's leader: freeze the span so a later batch is not part of it.
+async fn shard_finish_txn(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<TxnSpanQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let id = topic_id_of(&admin, &body.topic)?;
+    opened
+        .finish_txn(*id.as_bytes(), body.partition, body.producer_id)
+        .await
+        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// On a shard's leader: forget the open span after metadata has stored it.
+async fn shard_close_txn(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(shard): axum::extract::Path<u32>,
+    Json(body): Json<TxnSpanQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(opened) = admin.wal.shard(shard) else {
+        return Err((StatusCode::NOT_FOUND, format!("no wal shard {shard}")));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let id = topic_id_of(&admin, &body.topic)?;
+    opened
+        .close_txn(*id.as_bytes(), body.partition, body.producer_id)
+        .await
+        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn initialize_shard(
@@ -901,6 +1343,129 @@ async fn truncate_to_sealed(
     })))
 }
 
+#[derive(Deserialize)]
+struct JoinWal {
+    /// The old shard directory is moved aside only when this is set. A fresh
+    /// node waits to be added; it does not initialize a membership of its own.
+    #[serde(default)]
+    replace: bool,
+    #[serde(default)]
+    shard: u32,
+}
+
+/// Drop this broker's copy of a shard and open an empty one that can be
+/// added to a membership. Used after `truncate-to-sealed`, when this broker
+/// still holds the old membership.
+async fn join_wal(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<JoinWal>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !body.replace {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "join-wal replaces this broker's shard; pass replace".into(),
+        ));
+    }
+    let _held = admin.truncating.lock().await;
+    let Some(old) = admin.wal.shard(body.shard) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no wal shard {}", body.shard),
+        ));
+    };
+    let internal = |err: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    let _ = old.raft.shutdown().await;
+    let dir = shard_dir(&admin.wal_dir, body.shard);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wal".into());
+    let aside = dir.with_file_name(format!("{name}.joined-{stamp}"));
+    std::fs::rename(&dir, &aside).map_err(|err| internal(err.into()))?;
+    let fresh = Shard::open_shard(admin.node_id, &dir, body.shard)
+        .await
+        .map_err(internal)?;
+    admin.wal.replace(body.shard, fresh);
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct AddWalVoter {
+    id: NodeId,
+    /// `host:port` of the broker being added, as stored in a membership.
+    addr: String,
+    #[serde(default)]
+    shard: u32,
+}
+
+/// On the shard leader: wipe `id`'s old shard, replicate this shard's log to
+/// it, and make it a voter.
+async fn add_wal_voter(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<AddWalVoter>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if body.id == admin.node_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a broker does not add itself".into(),
+        ));
+    }
+    let Some(opened) = admin.wal.shard(body.shard) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no wal shard {}", body.shard),
+        ));
+    };
+    if !opened.is_leader() {
+        return Err((StatusCode::CONFLICT, "not the shard leader".into()));
+    }
+    let join = admin
+        .http
+        .post(format!("http://{}/admin/join-wal", body.addr))
+        .json(&serde_json::json!({ "replace": true, "shard": body.shard }))
+        .send()
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    if !join.status().is_success() {
+        let status =
+            StatusCode::from_u16(join.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Err((status, join.text().await.unwrap_or_default()));
+    }
+    // The fresh shard is listening before join returns, and the first
+    // append can still arrive before it is ready to take a learner.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut last = String::new();
+    loop {
+        if opened.voters().contains(&body.id) {
+            break;
+        }
+        match opened
+            .add_voter(
+                body.id,
+                BasicNode {
+                    addr: body.addr.clone(),
+                },
+            )
+            .await
+        {
+            Ok(()) => break,
+            Err(err) if std::time::Instant::now() < deadline => {
+                last = err.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(err) => return Err((StatusCode::BAD_GATEWAY, err.to_string())),
+        }
+    }
+    if !opened.voters().contains(&body.id) {
+        return Err((StatusCode::BAD_GATEWAY, last));
+    }
+    Ok(Json(serde_json::json!({ "voters": opened.voters() })))
+}
+
 /// Write one metadata key here when this node leads the group, otherwise
 /// through the leader's `/admin/write`.
 async fn metadata_write(admin: &Admin, key: &str, value: &str) -> anyhow::Result<()> {
@@ -944,6 +1509,9 @@ struct PublishBody {
     parts: Vec<PublishPart>,
     #[serde(default)]
     producers: Vec<ProducerNote>,
+    /// Transaction spans stored in the same commit as the extents.
+    #[serde(default)]
+    notes: Vec<Command>,
 }
 
 /// Commit a metadata command for a broker that does not lead the group.
@@ -962,7 +1530,7 @@ async fn publish(
     State(node): State<Arc<MetadataNode>>,
     Json(body): Json<PublishBody>,
 ) -> Result<Json<camus_metadata::Response>, (StatusCode, String)> {
-    node.publish(body.parts, body.producers)
+    node.publish_with(body.parts, body.producers, body.notes)
         .await
         .map(Json)
         .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))
@@ -1015,10 +1583,23 @@ fn rpc_reply<T: serde::Serialize>(value: &T) -> axum::response::Response {
     }
 }
 
+fn raft_http_blocked() -> bool {
+    matches!(
+        std::env::var("CAMUS_BLOCK_RAFT_HTTP").as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    )
+}
+
 async fn vote(
     State(node): State<Arc<MetadataNode>>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
+    if raft_http_blocked() {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft http blocked",
+        ));
+    }
     let req: VoteRequest<NodeId> = match rpc_body(&body) {
         Ok(req) => req,
         Err(reply) => return reply,
@@ -1034,6 +1615,12 @@ async fn append(
         Ok(req) => req,
         Err(reply) => return reply,
     };
+    if raft_http_blocked() && req.entries.is_empty() {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft http blocked",
+        ));
+    }
     rpc_reply(&node.raft.append_entries(req).await)
 }
 
@@ -1056,6 +1643,12 @@ fn open_shard(wal: &WalSlot, id: u32) -> Result<Arc<Shard>, axum::response::Resp
 }
 
 async fn vote_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
+    if raft_http_blocked() {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft http blocked",
+        ));
+    }
     let shard = match open_shard(wal, id) {
         Ok(shard) => shard,
         Err(reply) => return reply,
@@ -1064,6 +1657,9 @@ async fn vote_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::resp
         Ok(req) => req,
         Err(reply) => return reply,
     };
+    if !accepts_from(&shard, req.vote.leader_id().voted_for()) {
+        return outsider();
+    }
     rpc_reply(&shard.raft.vote(req).await)
 }
 
@@ -1076,6 +1672,15 @@ async fn append_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::re
         Ok(req) => req,
         Err(reply) => return reply,
     };
+    if !accepts_from(&shard, req.vote.leader_id().voted_for()) {
+        return outsider();
+    }
+    if raft_http_blocked() && req.entries.is_empty() {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft http blocked",
+        ));
+    }
     let carries = !req.entries.is_empty();
     let started = std::time::Instant::now();
     let result = shard.raft.append_entries(req).await;
@@ -1083,6 +1688,31 @@ async fn append_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::re
         camus_wal::RPC_TIMES.handled(started.elapsed());
     }
     rpc_reply(&result)
+}
+
+/// A shard that already has members ignores Raft RPC from anyone else.
+/// `truncate-to-sealed` leaves the removed brokers running the old shard at
+/// a higher term. Feeding that into the new leader steps it down and can
+/// panic the Raft core, which `add-wal-voter` then reports as 502.
+/// A shard with no members yet is waiting to be added and still accepts them.
+fn accepts_from(shard: &Shard, from: Option<NodeId>) -> bool {
+    let metrics_ref = shard.raft.metrics();
+    let metrics = metrics_ref.borrow();
+    let membership = metrics.membership_config.membership();
+    let no_voters = membership.voter_ids().next().is_none();
+    let no_learners = membership.learner_ids().next().is_none();
+    let open = no_voters && no_learners;
+    if open {
+        return true;
+    }
+    from.is_some_and(|id| membership.get_node(&id).is_some())
+}
+
+fn outsider() -> axum::response::Response {
+    axum::response::IntoResponse::into_response((
+        StatusCode::CONFLICT,
+        "not a member of this shard",
+    ))
 }
 
 async fn snapshot_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::response::Response {
@@ -1094,6 +1724,9 @@ async fn snapshot_on(wal: &WalSlot, id: u32, body: &axum::body::Bytes) -> axum::
         Ok(req) => req,
         Err(reply) => return reply,
     };
+    if !accepts_from(&shard, req.vote.leader_id().voted_for()) {
+        return outsider();
+    }
     rpc_reply(&shard.raft.install_snapshot(req).await)
 }
 
@@ -1150,43 +1783,44 @@ async fn start_kafka(
     node_id: NodeId,
     kafka_addr: &str,
     args: &Args,
-) -> anyhow::Result<()> {
+    settings: &settings::Settings,
+) -> anyhow::Result<Arc<kafka::Kafka>> {
     let tls = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => Some(load_tls(cert, key, args.tls_client_ca.as_deref())?),
         (None, None) => None,
         _ => anyhow::bail!("--tls-cert and --tls-key are set together"),
     };
-    if tls.is_none() && !args.dev_plaintext {
+    let dev_plaintext = settings.is_true("dev.plaintext");
+    if tls.is_none() && !dev_plaintext {
         anyhow::bail!("Kafka listener requires --dev-plaintext or a TLS certificate");
     }
     let bind: SocketAddr = kafka_addr.parse()?;
-    if tls.is_none() && !bind.ip().is_loopback() && !args.allow_non_loopback {
+    if tls.is_none() && !bind.ip().is_loopback() && !settings.is_true("allow.non.loopback") {
         anyhow::bail!("non-loopback PLAINTEXT requires --allow-non-loopback");
     }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let bound = listener.local_addr()?;
     std::fs::write(args.data_dir.join("kafka-addr"), bound.to_string())?;
-    let (host, port) = match &args.advertised_addr {
-        Some(advertised) => {
-            let (host, port) = advertised
-                .rsplit_once(':')
-                .ok_or_else(|| anyhow::anyhow!("--advertised-addr must be host:port"))?;
-            (host.to_string(), port.parse()?)
-        }
-        None => advertised_kafka(bind, bound.port()),
+    let advertised = settings.get("advertised.listeners");
+    let (host, port) = if advertised.is_empty() {
+        advertised_kafka(bind, bound.port())
+    } else {
+        let (host, port) = advertised
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("advertised.listeners must be host:port"))?;
+        (host.to_string(), port.parse()?)
     };
     // The MinIO fallbacks are for development. A broker serving TLS must be
     // told where its log lives instead of silently using a local stand-in.
-    if !args.dev_plaintext {
-        let missing: Vec<&str> = [
-            "CAMUS_S3_ENDPOINT",
-            "CAMUS_S3_BUCKET",
-            "CAMUS_S3_ACCESS_KEY",
-            "CAMUS_S3_SECRET_KEY",
-        ]
-        .into_iter()
-        .filter(|name| std::env::var(name).map_or(true, |value| value.is_empty()))
-        .collect();
+    if !dev_plaintext {
+        let names = ["s3.endpoint", "s3.bucket", "s3.access_key", "s3.secret_key"];
+        let missing: Vec<&str> = names
+            .into_iter()
+            .filter(|key| {
+                settings.source_of(key) == settings::Source::Default || settings.get(key).is_empty()
+            })
+            .map(|key| settings.env_name(key))
+            .collect();
         if !missing.is_empty() {
             anyhow::bail!(
                 "object storage is not configured; set {} (the MinIO defaults apply only with --dev-plaintext)",
@@ -1194,22 +1828,13 @@ async fn start_kafka(
             );
         }
     }
-    let bucket = Bucket::connect(&BucketConfig {
-        endpoint: std::env::var("CAMUS_S3_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),
-        bucket: std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into()),
-        region: std::env::var("CAMUS_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
-        access_key: std::env::var("CAMUS_S3_ACCESS_KEY").unwrap_or_else(|_| "camus".into()),
-        secret_key: std::env::var("CAMUS_S3_SECRET_KEY")
-            .unwrap_or_else(|_| "camus-dev-secret".into()),
-        prefix: std::env::var("CAMUS_S3_PREFIX").unwrap_or_default(),
-        virtual_hosted: env_flag("CAMUS_S3_VIRTUAL_HOST"),
-    })?;
-    let user = std::env::var("CAMUS_SASL_USER").unwrap_or_default();
-    let password = std::env::var("CAMUS_SASL_PASSWORD").unwrap_or_default();
+    let bucket = open_bucket(settings)?;
+    let user = settings.get("sasl.username").to_string();
+    let password = settings.get("sasl.password").to_string();
     // TLS alone means SASL_SSL. With a client CA it is Kafka's SSL listener,
     // where the certificate is the identity.
-    let require_sasl = args.require_sasl || (tls.is_some() && args.tls_client_ca.is_none());
+    let require_sasl =
+        settings.is_true("require.sasl") || (tls.is_some() && args.tls_client_ca.is_none());
     if require_sasl && (user.is_empty() || password.is_empty()) {
         anyhow::bail!("SASL requires CAMUS_SASL_USER and CAMUS_SASL_PASSWORD");
     }
@@ -1224,21 +1849,148 @@ async fn start_kafka(
         password,
         tls,
         wal,
+        settings,
     );
-    let kafka = Arc::new(match open_disk_cache(&args.data_dir.join("read-cache")) {
-        Some(cache) => kafka.with_disk_cache(cache),
-        None => kafka,
-    });
+    let kafka = Arc::new(
+        match open_disk_cache(&args.data_dir.join("read-cache"), settings) {
+            Some(cache) => kafka.with_disk_cache(cache),
+            None => kafka,
+        },
+    );
     info!(%bound, sasl = require_sasl, "kafka listener");
-    tokio::spawn(async move { kafka.run(listener).await });
-    Ok(())
+    tokio::spawn(Arc::clone(&kafka).run(listener));
+    Ok(kafka)
 }
 
-fn env_flag(name: &str) -> bool {
-    matches!(
-        std::env::var(name).ok().as_deref().map(str::trim),
-        Some("1" | "true" | "TRUE" | "yes" | "YES")
-    )
+fn open_bucket(settings: &settings::Settings) -> anyhow::Result<Bucket> {
+    Bucket::connect(&BucketConfig {
+        endpoint: settings.get("s3.endpoint").to_string(),
+        bucket: settings.get("s3.bucket").to_string(),
+        region: settings.get("s3.region").to_string(),
+        access_key: settings.get("s3.access_key").to_string(),
+        secret_key: settings.get("s3.secret_key").to_string(),
+        prefix: settings.get("s3.prefix").to_string(),
+        virtual_hosted: settings.is_true("s3.virtual_host"),
+    })
+}
+
+async fn restore_cluster(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<Truncate>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !body.i_accept_data_loss {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "restore-cluster drops the unsealed WAL and metadata newer than the snapshot. \
+             Pass i_accept_data_loss."
+                .into(),
+        ));
+    }
+    let bucket = open_bucket(&admin.settings)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    match recover::restore(&admin.node, &bucket).await {
+        Ok(body) => Ok(Json(body)),
+        Err(err) => {
+            let text = err.to_string();
+            let status = if text.contains("does not lead") || text.contains("already has topics") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            Err((status, text))
+        }
+    }
+}
+
+/// `allow.everyone.if.no.acl.found` follows the listener when nobody set it:
+/// open on dev PLAINTEXT, closed once SASL or TLS is on.
+fn apply_listener_defaults(settings: &mut settings::Settings, args: &Args) {
+    if !settings.get("allow.everyone.if.no.acl.found").is_empty() {
+        return;
+    }
+    let tls = args.tls_cert.is_some() && args.tls_key.is_some();
+    let require_sasl = settings.is_true("require.sasl") || (tls && args.tls_client_ca.is_none());
+    let open = !require_sasl && !tls;
+    settings.set(
+        "allow.everyone.if.no.acl.found",
+        if open { "true" } else { "false" },
+        settings::Source::Default,
+    );
+}
+
+/// Flags that were passed. A bool flag that stayed at its default does not
+/// override the file.
+fn flag_overrides(args: &Args) -> BTreeMap<String, String> {
+    let mut flags = BTreeMap::new();
+    flags.insert("node.id".to_string(), args.node_id.to_string());
+    flags.insert("http.addr".to_string(), args.http_addr.clone());
+    flags.insert("data.dir".to_string(), args.data_dir.display().to_string());
+    if let Some(dir) = &args.wal_dir {
+        flags.insert("wal.dir".to_string(), dir.display().to_string());
+    }
+    if let Some(addr) = &args.kafka_addr {
+        flags.insert("kafka.addr".to_string(), addr.clone());
+    }
+    if let Some(addr) = &args.advertised_addr {
+        flags.insert("advertised.listeners".to_string(), addr.clone());
+    }
+    if args.dev_plaintext {
+        flags.insert("dev.plaintext".to_string(), "true".to_string());
+    }
+    if args.allow_non_loopback {
+        flags.insert("allow.non.loopback".to_string(), "true".to_string());
+    }
+    if args.require_sasl {
+        flags.insert("require.sasl".to_string(), "true".to_string());
+    }
+    flags
+}
+
+#[derive(Deserialize)]
+struct ConfigQuery {
+    topic: Option<String>,
+}
+
+/// Effective broker settings, or one topic's stored config next to what is enforced.
+async fn admin_config(
+    State(admin): State<Arc<Admin>>,
+    Query(query): Query<ConfigQuery>,
+) -> Result<String, (StatusCode, String)> {
+    match query.topic {
+        Some(name) => topic_config(&admin, &name),
+        None => Ok(format!("{}\n", admin.settings.report_lines().join("\n"))),
+    }
+}
+
+fn topic_config(admin: &Admin, name: &str) -> Result<String, (StatusCode, String)> {
+    let raw = admin
+        .node
+        .read_local(&camus_metadata::topic_storage_key(name))
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    let Some(raw) = raw else {
+        return Err((StatusCode::NOT_FOUND, format!("unknown topic {name}")));
+    };
+    let topic = camus_metadata::parse_topic(&raw)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let mut lines = Vec::new();
+    for spec in camus_metadata::config::SPECS {
+        let stored = topic.overrides.get(spec.name).cloned().unwrap_or_else(|| {
+            if spec.name == "durability.mode" {
+                topic.durability.clone()
+            } else {
+                spec.default.to_string()
+            }
+        });
+        let line = match spec.effect {
+            camus_metadata::config::Effect::Applied => format!("{}={stored} enforced", spec.name),
+            camus_metadata::config::Effect::Accepted => {
+                let why = spec.note().unwrap_or("stored only");
+                format!("{}={stored} {why}", spec.name)
+            }
+        };
+        lines.push(line);
+    }
+    Ok(format!("{}\n", lines.join("\n")))
 }
 
 /// Host and port clients should dial. `CAMUS_ADVERTISED_HOST` wins. On

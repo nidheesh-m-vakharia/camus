@@ -69,6 +69,83 @@ pub fn encode(pieces: &[Piece]) -> (Vec<(u64, u32)>, Bytes) {
     (index, body.freeze())
 }
 
+/// One slice recorded in a bundle footer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FooterEntry {
+    /// Topic id, 16 bytes.
+    pub topic_id: [u8; 16],
+    /// Partition index.
+    pub partition: i32,
+    /// Inclusive base offset.
+    pub start: i64,
+    /// Exclusive end offset.
+    pub end: i64,
+    /// Byte offset of the batches inside the object.
+    pub file_offset: u64,
+    /// Byte length of the batches.
+    pub length: u32,
+    /// First timestamp.
+    pub base_timestamp: i64,
+    /// Last timestamp.
+    pub max_timestamp: i64,
+}
+
+/// Read the footer `encode` appends. The last valid footer wins, so batch
+/// bytes that happen to contain the magic are ignored.
+pub fn decode_footer(body: &[u8]) -> Result<Vec<FooterEntry>, String> {
+    let mut found = None;
+    let mut from = 0;
+    while let Some(rel) = body[from..]
+        .windows(MAGIC.len())
+        .position(|window| window == MAGIC)
+    {
+        let at = from + rel;
+        if let Some(entries) = footer_at(body, at) {
+            found = Some(entries);
+        }
+        from = at + MAGIC.len();
+    }
+    found.ok_or_else(|| "object has no camus footer".to_string())
+}
+
+fn footer_at(body: &[u8], at: usize) -> Option<Vec<FooterEntry>> {
+    let rest = body.get(at..)?;
+    if rest.len() < 18 {
+        return None;
+    }
+    let version = u16::from_le_bytes(rest.get(8..10)?.try_into().ok()?);
+    if version != 1 {
+        return None;
+    }
+    let count = u32::from_le_bytes(rest.get(10..14)?.try_into().ok()?) as usize;
+    let need = 14 + count * 64 + 4;
+    if rest.len() != need {
+        return None;
+    }
+    let expect = CRC32C.checksum(&rest[..need - 4]);
+    let got = u32::from_le_bytes(rest[need - 4..].try_into().ok()?);
+    if expect != got {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(count);
+    for index in 0..count {
+        let base = 14 + index * 64;
+        let mut topic_id = [0u8; 16];
+        topic_id.copy_from_slice(rest.get(base..base + 16)?);
+        entries.push(FooterEntry {
+            topic_id,
+            partition: i32::from_le_bytes(rest.get(base + 16..base + 20)?.try_into().ok()?),
+            start: i64::from_le_bytes(rest.get(base + 20..base + 28)?.try_into().ok()?),
+            end: i64::from_le_bytes(rest.get(base + 28..base + 36)?.try_into().ok()?),
+            file_offset: u64::from_le_bytes(rest.get(base + 36..base + 44)?.try_into().ok()?),
+            length: u32::from_le_bytes(rest.get(base + 44..base + 48)?.try_into().ok()?),
+            base_timestamp: i64::from_le_bytes(rest.get(base + 48..base + 56)?.try_into().ok()?),
+            max_timestamp: i64::from_le_bytes(rest.get(base + 56..base + 64)?.try_into().ok()?),
+        });
+    }
+    Some(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +164,18 @@ mod tests {
         let (index, body) = encode(&[piece]);
         assert_eq!(index, vec![(0, 5)]);
         assert!(body.starts_with(b"batch"));
-        assert!(body.windows(MAGIC.len()).any(|window| window == MAGIC));
+        assert_eq!(
+            decode_footer(&body).unwrap(),
+            vec![FooterEntry {
+                topic_id: [9; 16],
+                partition: 0,
+                start: 0,
+                end: 1,
+                file_offset: 0,
+                length: 5,
+                base_timestamp: 1,
+                max_timestamp: 2,
+            }]
+        );
     }
 }

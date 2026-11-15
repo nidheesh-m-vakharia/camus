@@ -90,9 +90,11 @@ calls `POST /admin/truncate-to-sealed` on one surviving shard voter.
 - Each append carries the partition's sealed end from metadata as a floor
   for its base offset, so the empty shard resumes at the sealed end and
   never reissues a sealed offset.
-- Other surviving voters and any lost voter that comes back must have their
-  `wal/` directory removed before they start; they still hold the old
-  membership. Adding voters back to the new shard is not built yet.
+- Other surviving voters and any lost voter that comes back still hold the
+  old membership. `POST /admin/add-wal-voter` on the new leader tells each
+  one to move that directory aside, then replicates the new shard's log and
+  adds it as a voter. Sealed batches stay in object storage; the new voters
+  read them from there.
 - The survivor's sealed end is its own metadata replica. With a live
   metadata quorum that replica is current within a heartbeat; the command
   does not yet wait for a linearizable read.

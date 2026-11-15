@@ -152,7 +152,7 @@ impl Encodable for CreatableTopicConfigs {
         }
         if version >= 5 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -204,7 +204,7 @@ impl Encodable for CreatableTopicConfigs {
         }
         if version >= 5 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -455,7 +455,7 @@ impl Encodable for CreatableTopicResult {
             if self.topic_config_error_code != 0 {
                 num_tagged_fields += 1;
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -464,7 +464,7 @@ impl Encodable for CreatableTopicResult {
             types::UnsignedVarInt.encode(buf, num_tagged_fields as u32)?;
             if self.topic_config_error_code != 0 {
                 let computed_size = types::Int16.compute_size(&self.topic_config_error_code)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -510,7 +510,7 @@ impl Encodable for CreatableTopicResult {
             if self.topic_config_error_code != 0 {
                 num_tagged_fields += 1;
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -519,7 +519,7 @@ impl Encodable for CreatableTopicResult {
             total_size += types::UnsignedVarInt.compute_size(num_tagged_fields as u32)?;
             if self.topic_config_error_code != 0 {
                 let computed_size = types::Int16.compute_size(&self.topic_config_error_code)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -689,7 +689,7 @@ impl Encodable for CreateTopicsResponse {
         }
         if version >= 5 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -712,7 +712,7 @@ impl Encodable for CreateTopicsResponse {
         }
         if version >= 5 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields

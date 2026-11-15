@@ -1,5 +1,7 @@
 //! Real clients for the Phase 5 paths the broker tests already cover.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
@@ -104,7 +106,7 @@ fn show(node: &Node, ran: &Output, client: &str) {
 fn jars() -> Option<String> {
     let jars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-jars");
     if !jars.join("kafka-clients-4.4.0.jar").is_file() {
-        eprintln!("skipping java; missing kafka jars");
+        support::skipped("java; missing kafka jars");
         return None;
     }
     let mut cp = Vec::new();
@@ -153,7 +155,7 @@ fn java(node: &Node, class_source: &str, args: &[&str]) {
 fn python(node: &Node, mode: &str) {
     let python = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pykafka/bin/python");
     if !python.is_file() {
-        eprintln!("skipping librdkafka; missing {}", python.display());
+        support::skipped(&format!("librdkafka; missing {}", python.display()));
         return;
     }
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/python/phase5_roundtrip.py");
@@ -169,7 +171,7 @@ fn python(node: &Node, mode: &str) {
 fn go(node: &Node, mode: &str) {
     let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
     if !go.is_file() {
-        eprintln!("skipping franz-go; missing {}", go.display());
+        support::skipped(&format!("franz-go; missing {}", go.display()));
         return;
     }
     let ran = Command::new(go)
@@ -193,7 +195,7 @@ fn clients_commit_and_abort_a_transaction() {
 #[test]
 fn clients_see_a_compacted_log() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping compaction clients; set CAMUS_MINIO=1");
+        support::skipped("compaction clients; set CAMUS_MINIO=1");
         return;
     }
     let node = spawn(true);

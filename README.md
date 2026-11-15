@@ -7,8 +7,9 @@
 [![Kafka 4.4.0](https://img.shields.io/badge/Kafka-4.4.0-171717)](docs/compatibility.md)
 [![Rust](https://img.shields.io/badge/rust-stable-934c1a)](rust-toolchain.toml)
 
-Camus is a Kafka broker in one Rust binary. Producers, consumers, and admin
-clients use the Kafka wire protocol. The log is stored in Cloudflare R2, or
+Camus is a broker compatible with Apache Kafka, in one Rust binary.
+Producers, consumers, and admin clients use the Apache Kafka wire protocol.
+The log is stored in Cloudflare R2, or
 any S3-compatible bucket. Brokers replicate metadata, and a short
 write-ahead log, with Raft. A deployment does not need a JVM, ZooKeeper,
 KRaft, or a separate database.
@@ -62,9 +63,16 @@ the address clients should dial. On Railway those fall back to
 `RAILWAY_TCP_PROXY_DOMAIN` and `RAILWAY_TCP_PROXY_PORT`.
 
 `GET /admin/metrics` returns JSON, including `current_leader` and
-`wal_leader`. `GET /metrics` is Prometheus.
+`wal_leader`. `GET /metrics` is Prometheus: consumer lag, WAL upload lag,
+object-store calls by operation, and produce and fetch latency.
+[docs/metrics.md](docs/metrics.md) lists every series and its memory cost,
+and [deploy/grafana/camus.json](deploy/grafana/camus.json) is a Grafana
+dashboard for lag, upload lag, and estimated R2 spend.
 
-Three brokers plus MinIO: `docker compose --profile brokers up`. The image
+Three brokers plus MinIO: `docker compose --profile brokers up`. Broker 1
+listens on 9092. `init` runs `camus admin init` and retries until the
+brokers answer, so a Kafka client can use `localhost:9092` without a
+manual curl. The image
 is published from `main` to `ghcr.io/<owner>/camus`, tagged `latest` and
 the commit sha, after the test workflow passes. The GitHub package stays
 private until you change that in the package settings.
@@ -141,21 +149,39 @@ The full list is in [docs/compatibility.md](docs/compatibility.md).
 limited by object-storage latency. `r2` keeps no log bytes on the broker.
 See [ADR 0005](docs/adr/0005-durability-and-acks.md).
 
+The metadata leader writes a snapshot to `meta/snap/` every 30 seconds or
+10,000 applied entries, and moves `meta/snap/CURRENT` at most once a
+second. If every broker disk is lost, metadata newer than that snapshot is
+gone. Sealed log bytes can still be rebuilt from the objects (ADR 0008).
+`CAMUS_META_SNAPSHOT_MS=0` turns the upload off.
+`camus admin restore-cluster` loads that snapshot onto a fresh metadata
+group and rebuilds sealed extents from object footers. Unsealed WAL
+entries stay lost. Group offsets can move back by one snapshot interval.
+
 Set the mode at topic creation with `durability.mode`. The cluster default
 is `CAMUS_DEFAULT_DURABILITY`.
 
 `acks=1` waits for the same barrier as `acks=all`, so it costs what
-`acks=all` costs rather than a leader-local write: in
-[Benchmarks/](Benchmarks/README.md), one producer on three brokers sees a p50
-of about 7 ms and a p99 of about 17 ms in `wal` mode, and about 294 ms and
-576 ms in `r2` mode, where each ack waits for an object store write. In
-exchange, an acknowledged record survives the loss of the leader.
+`acks=all` costs rather than a leader-local write. One producer on three
+brokers, 1 KiB `acks=all`, measured:
+
+| Environment | `wal` p50 / p99 | `r2` p50 / p99 |
+| --- | --- | --- |
+| Linux 7.0 (aarch64), OrbStack VM on an Apple M4 Pro, 12 CPUs, 12 GiB, broker data on a Docker volume, MinIO on the Mac over host networking. The VM disk may not pass every `fsync` through to the SSD. [Table](Benchmarks/README.md#linux), [raw](Benchmarks/raw/linux-orbstack.md) | 7.10 / 16.55 ms | 293.81 / 576.16 ms |
+| Apple M4 Pro, macOS, APFS on the internal SSD, MinIO in Docker on that machine. [Table](Benchmarks/README.md#latency-3-brokers-one-producer-1-kib-acksall), [raw](Benchmarks/raw/latency-3-brokers.md) | 11.06 / 31.06 ms | 278.40 / 284.75 ms |
+
+An acknowledged record survives the loss of the leader.
 
 ## Configuration
 
-Broker settings come from the environment at startup. Kafka's name is in
-parentheses where there is one; [docs/compatibility.md](docs/compatibility.md#defaults)
-lists each default next to Kafka's.
+Broker settings come from `camus.toml` at startup (Kafka's name, or
+`durability.mode`, `wal.disk.limit`, and `[s3]`). Pass `--config` to use
+another path. A variable below overrides the file, and a flag overrides
+both. The process prints `key=value source` as it starts. Kafka's name is
+in parentheses where there is one;
+[docs/compatibility.md](docs/compatibility.md#defaults) lists each default
+next to Kafka's. `camus admin config` prints the same list from a running
+broker.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -169,7 +195,9 @@ lists each default next to Kafka's.
 | `CAMUS_NUM_PARTITIONS` | 1 | `num.partitions` |
 | `CAMUS_MESSAGE_MAX_BYTES` | 1048588 | `message.max.bytes` |
 | `CAMUS_WAL_DISK_LIMIT` | 8 GiB | Unsealed WAL bytes before produce is held |
-| `CAMUS_FLUSH_MS` | 250 | How often unsealed data is uploaded |
+| `CAMUS_FLUSH_MS` | 250 | Busy upload interval. A shard with at least 4 MiB unsealed uses this |
+| `CAMUS_QUIET_FLUSH_MS` | 30000 | How long a smaller unsealed prefix waits before upload |
+| `CAMUS_RACK` | — | `broker.rack`. Fetch v11 sends a client in this zone to a local voter |
 | `CAMUS_RETENTION_CHECK_MS` | 300000 | `log.retention.check.interval.ms` |
 | `CAMUS_COMPACT_MS` | 300000 | Compaction interval; `0` turns it off |
 | `CAMUS_SWEEP_MS` | 300000 | Orphaned-object sweep interval |
@@ -188,6 +216,9 @@ lists each default next to Kafka's.
 | `CAMUS_CONSUMER_SESSION_MS`, `CAMUS_CONSUMER_HEARTBEAT_MS` | 45000, 5000 | KIP-848 session and heartbeat |
 | `CAMUS_AUTO_LEADER_REBALANCE` | `true` | `auto.leader.rebalance.enable` |
 | `CAMUS_LEADER_IMBALANCE_CHECK_MS` | 300000 | `leader.imbalance.check.interval.seconds` |
+| `CAMUS_QUIC` | off | Raft votes, empty heartbeats, and shard announcements. `on` sends them over QUIC |
+| `CAMUS_QUIC_PORT` | the HTTP port | UDP port for that traffic; set the same value on every broker |
+| `CAMUS_SHARD_ANNOUNCE_MS` | 200 | How often a shard leader writes its view to metadata |
 
 Flags: `--kafka-addr`, `--advertised-addr` (`advertised.listeners`),
 `--tls-cert`/`--tls-key` (SASL_SSL), `--tls-client-ca` (mTLS),
@@ -220,11 +251,24 @@ broker on a non-loopback address, so it also needs `CAMUS_ECOSYSTEM_DOCKER=1`.
 GitHub Actions runs `cargo test --workspace --locked` on pull requests and
 on `main`.
 
+## When not to use Camus
+
+The fit is a log with several consumers and replay, without a full disk replica on every broker. These want something else. The longer list is [site/limits.html](site/limits.html#when-not).
+
+- A p99 under 10 ms on the object-storage path. Measured `r2` p99 is 576.16 ms (Linux OrbStack) and 284.75 ms (macOS). `wal` on that Linux run is 16.55 ms p99. Those are the rows in the durability section above and in [Benchmarks/](Benchmarks/README.md).
+- One cluster across regions. Election waits 400–800 ms. MirrorMaker 2 is tested from Apache Kafka 4.4.0 into Camus, not the other way, in [docs/compatibility.md](docs/compatibility.md).
+- A consensus group per tiny partition. Partitions share a shard log ([ADR 0006](docs/adr/0006-wal-shards.md)). The default count follows CPU cores and stops at eight shards per voter.
+- A queue that acknowledges one message. Consumers commit an offset. Share groups are not in the API matrix.
+- A Kafka deployment whose disk and JVM cost is already fine.
+
 ## Docs
 
 - [docs/PLAN.md](docs/PLAN.md) — what has been accepted, phase by phase
 - [docs/adr/](docs/adr/) — the decisions
 - [docs/compatibility.md](docs/compatibility.md) — Kafka 4.4.0 pin and the API matrix
+- [site/limits.html](site/limits.html) — production limits
+- [site/delivery.html](site/delivery.html) — ordering, retries, transactions, loss windows
+- [site/compare.html](site/compare.html) — AutoMQ, Redpanda, Iggy, Nisshi, WarpStream, Bufstream
 
 The workspace crates are `protocol`, `broker`, `raft`, `metadata`, `wal`,
 `storage`, `uploader`, `coordinator`, `compactor`, `cli`, and
@@ -233,3 +277,5 @@ has lost a majority, at its sealed end. That drops acknowledged data that
 was not sealed yet.
 
 License: Apache-2.0.
+
+Apache, Apache Kafka and Kafka are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Camus is not affiliated with or endorsed by the ASF.

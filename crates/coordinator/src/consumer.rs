@@ -127,10 +127,7 @@ pub(super) fn apply(
     };
     if let Some(group) = groups.get(&request.group) {
         if !group.consumer && !group.members.is_empty() {
-            return done(fail(
-                codes::INCONSISTENT_GROUP_PROTOCOL,
-                &request.member_id,
-            ));
+            return done(fail(codes::INCONSISTENT_GROUP_PROTOCOL, &request.member_id));
         }
         if let Err(code) = admit(group, config, request, &member_id) {
             return done(fail(code, &member_id));
@@ -286,10 +283,7 @@ fn leave(groups: &mut HashMap<String, Group>, request: &ConsumerHeartbeat) -> Ou
         return done(fail(codes::GROUP_ID_NOT_FOUND, &request.member_id));
     };
     if !group.consumer {
-        return done(fail(
-            codes::INCONSISTENT_GROUP_PROTOCOL,
-            &request.member_id,
-        ));
+        return done(fail(codes::INCONSISTENT_GROUP_PROTOCOL, &request.member_id));
     }
     let member_id = if let Some(instance) = &request.instance_id {
         match group.static_member(instance) {
@@ -432,7 +426,9 @@ fn upsert_member(
                     record.member_id = member_id.to_string();
                     record.member_epoch = 0;
                     record.previous_member_epoch = 0;
-                    group.members.insert(member_id.to_string(), blank(record, group.next_order, now));
+                    group
+                        .members
+                        .insert(member_id.to_string(), blank(record, group.next_order, now));
                     group.next_order += 1;
                     replaced = true;
                 }
@@ -574,7 +570,11 @@ fn assign(group: &Group, assignor: &str) -> BTreeMap<String, BTreeMap<String, Ve
 }
 
 fn topic_ids(group: &Group, member: &MemberRecord) -> BTreeSet<String> {
-    let mut names: BTreeSet<&str> = member.subscribed_topics.iter().map(String::as_str).collect();
+    let mut names: BTreeSet<&str> = member
+        .subscribed_topics
+        .iter()
+        .map(String::as_str)
+        .collect();
     if let Some(pattern) = &member.subscribed_regex {
         if let Ok(pattern) = Regex::new(pattern) {
             for name in group.topic_cache.keys() {
@@ -908,12 +908,7 @@ fn plan(
             BTreeMap::new(),
         );
     }
-    (
-        "stable".into(),
-        group.generation,
-        assigned,
-        BTreeMap::new(),
-    )
+    ("stable".into(), group.generation, assigned, BTreeMap::new())
 }
 
 fn partition_epoch(group: &Group, topic: &str, partition: i32) -> i32 {
@@ -1095,14 +1090,8 @@ mod tests {
         assert_eq!(granted.error, codes::NONE);
         assert_eq!(parts(&granted), vec![2, 3]);
 
-        assert_eq!(
-            coordinator.check_commit("g", "a", None, 2),
-            codes::NONE
-        );
-        assert_eq!(
-            coordinator.check_commit("g", "a", None, 1),
-            codes::NONE
-        );
+        assert_eq!(coordinator.check_commit("g", "a", None, 2), codes::NONE);
+        assert_eq!(coordinator.check_commit("g", "a", None, 1), codes::NONE);
         assert_eq!(
             coordinator.check_commit("g", "a", None, 9),
             codes::STALE_MEMBER_EPOCH

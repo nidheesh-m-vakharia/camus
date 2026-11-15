@@ -91,7 +91,7 @@ impl Encodable for ApiVersion {
         types::Int16.encode(buf, &self.max_version)?;
         if version >= 3 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -110,7 +110,7 @@ impl Encodable for ApiVersion {
         total_size += types::Int16.compute_size(&self.max_version)?;
         if version >= 3 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -316,7 +316,7 @@ impl Encodable for ApiVersionsResponse {
             if self.zk_migration_ready {
                 num_tagged_fields += 1;
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -326,7 +326,7 @@ impl Encodable for ApiVersionsResponse {
             if !self.supported_features.is_empty() {
                 let computed_size = types::CompactArray(types::Struct { version })
                     .compute_size(&self.supported_features)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -339,7 +339,7 @@ impl Encodable for ApiVersionsResponse {
             }
             if self.finalized_features_epoch != -1 {
                 let computed_size = types::Int64.compute_size(&self.finalized_features_epoch)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -352,7 +352,7 @@ impl Encodable for ApiVersionsResponse {
             if !self.finalized_features.is_empty() {
                 let computed_size = types::CompactArray(types::Struct { version })
                     .compute_size(&self.finalized_features)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -365,7 +365,7 @@ impl Encodable for ApiVersionsResponse {
             }
             if self.zk_migration_ready {
                 let computed_size = types::Boolean.compute_size(&self.zk_migration_ready)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -406,7 +406,7 @@ impl Encodable for ApiVersionsResponse {
             if self.zk_migration_ready {
                 num_tagged_fields += 1;
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -416,7 +416,7 @@ impl Encodable for ApiVersionsResponse {
             if !self.supported_features.is_empty() {
                 let computed_size = types::CompactArray(types::Struct { version })
                     .compute_size(&self.supported_features)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -428,7 +428,7 @@ impl Encodable for ApiVersionsResponse {
             }
             if self.finalized_features_epoch != -1 {
                 let computed_size = types::Int64.compute_size(&self.finalized_features_epoch)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -441,7 +441,7 @@ impl Encodable for ApiVersionsResponse {
             if !self.finalized_features.is_empty() {
                 let computed_size = types::CompactArray(types::Struct { version })
                     .compute_size(&self.finalized_features)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -453,7 +453,7 @@ impl Encodable for ApiVersionsResponse {
             }
             if self.zk_migration_ready {
                 let computed_size = types::Boolean.compute_size(&self.zk_migration_ready)?;
-                if computed_size > std::u32::MAX as usize {
+                if computed_size > u32::MAX as usize {
                     bail!(
                         "Tagged field is too large to encode ({} bytes)",
                         computed_size
@@ -644,7 +644,7 @@ impl Encodable for FinalizedFeatureKey {
         }
         if version >= 3 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -681,7 +681,7 @@ impl Encodable for FinalizedFeatureKey {
         }
         if version >= 3 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -843,7 +843,7 @@ impl Encodable for SupportedFeatureKey {
         }
         if version >= 3 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -880,7 +880,7 @@ impl Encodable for SupportedFeatureKey {
         }
         if version >= 3 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields

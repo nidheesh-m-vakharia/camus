@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cost — Camus</title>
+  <meta name="description" content="A monthly cost estimate for a Camus workload on Cloudflare R2, with the formulas from ADR 0007.">
+  <link rel="canonical" href="https://camus.nidheesh.dev/cost">
+  <meta name="robots" content="index,follow">
+  <meta property="og:site_name" content="Camus">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Cost — Camus">
+  <meta property="og:description" content="A monthly cost estimate for a Camus workload on Cloudflare R2, with the formulas from ADR 0007.">
+  <meta property="og:url" content="https://camus.nidheesh.dev/cost">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Cost — Camus">
+  <meta name="twitter:description" content="A monthly cost estimate for a Camus workload on Cloudflare R2, with the formulas from ADR 0007.">
+  <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="fonts/Pollen-variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <div class="shell">
+    <nav class="nav" aria-label="Pages">
+      <a class="mark" href="index.html">
+        <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
+          <circle cx="4.6" cy="4.6" r="2.7"/>
+          <circle cx="4.6" cy="14" r="2.7"/>
+          <circle cx="4.6" cy="23.4" r="2.7"/>
+          <path d="M16.6 7a7 7 0 0 0 0 14" fill="none" stroke="currentColor" stroke-width="4.6" stroke-linecap="round"/>
+        </svg>
+        <span class="mark-name">Camus</span>
+        <span class="mark-sub">Kafka protocol, R2 log</span>
+      </a>
+      <ul>
+        <li><a href="index.html">Intro</a></li>
+        <li><a href="why.html">Why</a></li>
+        <li><a href="run.html">Run</a></li>
+        <li><a href="clients.html">Clients</a></li>
+        <li><a href="durability.html">Durability</a></li>
+        <li><a href="benchmarks.html">Benchmarks</a></li>
+        <li>
+          <a href="setup.html">Setup</a>
+          <ul>
+            <li><a href="minio.html">Bucket</a></li>
+            <li><a href="brokers.html">Three brokers</a></li>
+            <li><a href="sasl.html">SASL</a></li>
+            <li><a href="tests.html">Tests</a></li>
+          </ul>
+        </li>
+        <li>
+          <a href="docs.html">Docs</a>
+          <ul>
+            <li><a href="limits.html">Production</a></li>
+            <li><a href="delivery.html">Delivery</a></li>
+            <li><a href="compare.html">Compare</a></li>
+            <li><a href="cost.html" aria-current="page">Cost</a></li>
+            <li><a href="recovery.html">Recovery</a></li>
+          </ul>
+        </li>
+      </ul>
+      <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">Source on GitHub</a>
+    </nav>
+    <main id="content">
+      <header class="hero entrance">
+        <h1 style="--n: 0">What a month of this log costs.</h1>
+      </header>
+      <p class="lede">Planning numbers from <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr/0007-r2-layout-and-cost.md">ADR 0007</a>, not a bill. R2 Standard prices are the ones recorded there on 2026-11-05. The same arithmetic is <code>scripts/cost.py</code>.</p>
+
+      <h2>The formulas</h2>
+      <p>One active upload stream writes one object per flush. A stream at 16 MiB/s or more still flushes every <code>CAMUS_FLUSH_MS</code> (250 ms) or at 8 MiB, whichever comes first. A quieter stream waits until the object reaches 8 MiB, and at most 30 seconds (<code>CAMUS_QUIET_FLUSH_MS</code>). Partitions that share a stream share that object. Several streams that all receive bytes add up.</p>
+      <p>Class A is $4.50 per million requests: those puts, plus one metadata snapshot put every 30 seconds, plus one put and one GET per 128 MiB when compaction rewrites a segment. Class B is $0.36 per million: one ranged GET per ingest object for each consumer that misses the cache, plus the compaction read. Tail reads served from the write-ahead log are not GETs. Storage is $0.015 per GB-month, and a GB is 1e9 bytes. <code>DeleteObject</code> is free. R2 egress is free. A month here is 30 days.</p>
+      <p>At 1 MiB/s a single stream is quiet: one put every 8 MiB, 0.125 puts/s. At 20 MiB/s the 250 ms timer still binds, 4 puts/s, and the ADR's $0.018432 per GiB is that timer applied to one MiB of ingest. At 100 MiB/s the 8 MiB cap binds: 12.5 puts/s, $0.000576 per GiB, rounded to $0.0006. One consumer reading every sealed object of a timer-bound stream is 4 GETs per MiB, $0.00147456 per GiB, rounded to $0.0015. The old per-partition timer, which Camus does not use, was 4,000 puts/s at 1 MiB/s across 1,000 partitions, $64.80 per hour. A quiet partition now waits for 8 MiB or 30 seconds, so those 1,000 partitions are one put each per 30 seconds.</p>
+      <p>The table starts from that rate and then applies four adjustments. MiB/s counts only while ingest is flowing, 8 hours a day unless you change it. The miss share defaults to 0, because a consumer that keeps up reads the write-ahead log. Dollars subtract the Standard free tier: 1 million Class A requests, 10 million Class B requests, and 10 GB-month. Class A also includes the orphan sweep, which lists <code>bundle/</code> every 5 minutes at one request per 1,000 keys. Compaction is on by default, as it is in the broker, so the live set is about one key per 128 MiB instead of one key per flush. Cloudflare rounds each class up to the next million requests and storage up to the next GB. This table does not.</p>
+      <p>Issue <a href="https://github.com/nidheesh-m-vakharia/camus/issues/141">#141</a> has not published object-store request counts, and <code>Benchmarks/</code> records latency and throughput. <code>python3 scripts/cost.py --check</code> matches the unrounded products above. The ADR’s rounded figures sit within 2.5% of those products, except the old “$1.6 per hour”, which was not the product of the expression beside it. The ADR now says $64.80.</p>
+
+      <h2>When the number gets large</h2>
+      <ul>
+        <li>A shard above about 16 MiB/s. It still flushes every 250 ms, before the object reaches 8 MiB. A quieter shard waits for 8 MiB or 30 seconds.</li>
+        <li>Many shards that each see a little traffic. Each shard has its own timer. Partition count alone does not do this. Partitions on one shard share one object.</li>
+        <li>Heavy cold reads. Fan-out times the share of reads that miss the cache, once per ingest object. Compaction later makes a historical read one GET per 128 MiB. Leave the miss share at 0 when consumers keep up.</li>
+        <li>A long retention with compaction off. The sweep lists every remaining key every 5 minutes, one Class A request per 1,000 keys.</li>
+      </ul>
+
+      <h2>Your workload</h2>
+      <form id="cost-form" class="cost-form">
+        <fieldset>
+          <legend>Ingest</legend>
+          <div class="cost-fields">
+            <label>Ingest, MiB/s
+              <input name="mib_s" type="number" min="0" step="0.1" value="1">
+            </label>
+            <label>Hours per day ingest flows
+              <input name="active_hours" type="number" min="0" max="24" step="any" value="8">
+            </label>
+            <label>Retention, days
+              <input name="retention_days" type="number" min="0" step="any" value="7">
+            </label>
+            <label>Partitions
+              <input name="partitions" type="number" min="1" step="1" value="1">
+            </label>
+            <label>Active upload streams
+              <input name="streams" type="number" min="1" step="1" value="1">
+            </label>
+            <label>Flush interval, ms
+              <input name="flush_ms" type="number" min="1" step="1" value="250">
+            </label>
+            <label class="check">
+              <input name="compact" type="checkbox" checked>
+              Compaction on
+            </label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Readers</legend>
+          <div class="cost-fields">
+            <label>Consumer fan-out
+              <input name="fanout" type="number" min="0" step="any" value="1">
+            </label>
+            <label>Share of reads that miss cache
+              <input name="miss" type="number" min="0" max="1" step="0.1" value="0">
+            </label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Cluster</legend>
+          <div class="cost-fields">
+            <label>Brokers
+              <input name="brokers" type="number" min="1" step="1" value="3">
+            </label>
+            <label>Durability
+              <select name="mode">
+                <option value="wal" selected>wal</option>
+                <option value="r2">r2</option>
+              </select>
+            </label>
+            <label>Replication factor
+              <input name="rf" type="number" min="1" step="1" value="3">
+            </label>
+            <label>Upload lag, seconds
+              <input name="lag_s" type="number" min="0" step="any" value="1">
+            </label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Prices</legend>
+          <div class="cost-fields">
+            <label>Instance, USD / hour
+              <input name="hourly" type="number" min="0" step="0.01" value="0.04">
+            </label>
+            <label>Disk, USD / GB-month
+              <input name="disk_per_gb" type="number" min="0" step="0.01" value="0.08">
+            </label>
+            <label>VM network, USD / GiB
+              <input name="net_per_gib" type="number" min="0" step="0.01" value="0.01">
+            </label>
+          </div>
+        </fieldset>
+      </form>
+
+      <div class="table-scroll" aria-live="polite">
+        <table>
+          <thead>
+            <tr><th>Line</th><th>Amount</th><th>USD / month</th></tr>
+          </thead>
+          <tbody id="cost-rows"></tbody>
+        </table>
+      </div>
+      <p>Bundled puts per second while ingest is flowing: <span id="cost-puts">4</span>. If each partition flushed alone: <span id="cost-rejected">4</span> puts per second. That second figure is not part of the total. List pages this month: <span id="cost-lists">0</span>.</p>
+      <p>Compute is brokers times the hourly price times 720 hours, whether or not ingest is flowing. <code>wal</code> disk is the footprint while ingest is flowing: replication factor times that rate times upload lag, capped at 8 GiB per broker. It is not scaled down by the idle hours. <code>r2</code> keeps no log on disk. Each network row is one copy of the bytes produced during the flowing hours. Follower replication is that volume times replication factor minus one, and only in <code>wal</code> mode. Out to consumers is that volume times fan-out. The price fields start at a small cloud rate: $0.04 per broker-hour, $0.08 per GB-month of disk, and $0.01 per GiB of virtual-machine traffic. Replace them with your own rates.</p>
+
+      <h2>Next to Confluent Cloud</h2>
+      <p>Dated 2026-11-12. These rows are a fixed example, separate from the form. Three Hetzner CX33 brokers on the USD list: $0.016 an hour, capped at $9.99 a month, plus a $0.60 IPv4, so $32 for the three. Each includes 20 TB of outbound traffic, then $1.20 per TB. Traffic between the brokers is outside that quota. R2 is the price in ADR 0007. Confluent’s figures are the list card the same day, before a region multiplier, support, or connectors. Their GB is a GiB. Storage on Basic and Standard is about three copies. An eCKU is counted only during the hours ingest flows. A Standard cluster left on all month is $540 per eCKU before those bytes.</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Workload</th><th>Camus on these brokers</th><th>Confluent Cloud</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1 MiB/s, 8 hours a day, 7 days, 1 reader</td>
+              <td>$35</td>
+              <td>Basic $132. Standard $286–$312</td>
+            </tr>
+            <tr>
+              <td>1 MiB/s, 24 hours a day, 7 days, 1 reader</td>
+              <td>$41</td>
+              <td>Basic $395. Standard about $935</td>
+            </tr>
+            <tr>
+              <td>100 MiB/s, 8 hours a day, 7 days, 3 readers</td>
+              <td>$765</td>
+              <td>Standard $17,300–$22,300</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <h2>What applies here</h2>
+      <ul id="cost-notes"></ul>
+
+      <footer>
+        <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
+        <p>Apache, Apache Kafka and Kafka are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Camus is not affiliated with or endorsed by the ASF.</p>
+      </footer>
+    </main>
+  </div>
+  <script src="site.js"></script>
+  <script src="cost.js?v=5"></script>
+</body>
+</html>

@@ -137,7 +137,7 @@ impl Encodable for WritableTxnMarker {
             types::Int8.encode(buf, &self.transaction_version)?;
         }
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -159,7 +159,7 @@ impl Encodable for WritableTxnMarker {
             total_size += types::Int8.compute_size(&self.transaction_version)?;
         }
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -285,7 +285,7 @@ impl Encodable for WritableTxnMarkerTopic {
         types::CompactString.encode(buf, &self.name)?;
         types::CompactArray(types::Int32).encode(buf, &self.partition_indexes)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -301,7 +301,7 @@ impl Encodable for WritableTxnMarkerTopic {
         total_size += types::CompactString.compute_size(&self.name)?;
         total_size += types::CompactArray(types::Int32).compute_size(&self.partition_indexes)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -396,7 +396,7 @@ impl Encodable for WriteTxnMarkersRequest {
         }
         types::CompactArray(types::Struct { version }).encode(buf, &self.markers)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -411,7 +411,7 @@ impl Encodable for WriteTxnMarkersRequest {
         let mut total_size = 0;
         total_size += types::CompactArray(types::Struct { version }).compute_size(&self.markers)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

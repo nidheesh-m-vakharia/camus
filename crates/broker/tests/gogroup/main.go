@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,7 +23,26 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "member" {
+		goMember()
+		return
+	}
 	brokers = strings.Split(os.Args[1], ",")
+	if len(os.Args) > 2 && os.Args[2] == "kill" {
+		for _, protocol := range []string{"classic", "consumer"} {
+			kill(protocol)
+		}
+		fmt.Println("franz-go kill ok: uncommitted records redelivered, classic and consumer")
+		return
+	}
+	protocol := "classic"
+	if len(os.Args) > 2 && os.Args[2] == "consumer" {
+		protocol = "consumer"
+	}
+	roundTrip(protocol)
+}
+
+func roundTrip(protocol string) {
 	ctx := context.Background()
 	admin, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	must(err)
@@ -31,7 +52,7 @@ func main() {
 	admin.Close()
 
 	produce(ctx, 0, 40)
-	first, second := consumer("first"), consumer("second")
+	first, second := consumer("first", protocol), consumer("second", protocol)
 	seen := drain(ctx, []*kgo.Client{first, second}, 40)
 	check(equal(seen, span(0, 40)), "first 40")
 	for _, member := range []*kgo.Client{first, second} {
@@ -39,7 +60,7 @@ func main() {
 		member.Close()
 	}
 	produce(ctx, 40, 20)
-	third := consumer("third")
+	third := consumer("third", protocol)
 	resumed := drain(ctx, []*kgo.Client{third}, 20)
 	check(equal(resumed, span(40, 60)), fmt.Sprintf("resumed %v", keys(resumed)))
 	quiet, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -61,7 +82,7 @@ func main() {
 	_, err = adm.DeleteGroup(ctx, group)
 	must(err)
 	adminClient.Close()
-	fmt.Println("franz-go group ok: 40 shared by two members, 20 resumed by a third")
+	fmt.Printf("franz-go group ok (%s): 40 shared by two members, 20 resumed by a third\n", protocol)
 }
 
 func produce(ctx context.Context, first, count int) {
@@ -74,17 +95,27 @@ func produce(ctx context.Context, first, count int) {
 	}
 }
 
-func consumer(name string) *kgo.Client {
-	client, err := kgo.NewClient(
+func consumer(name, protocol string) *kgo.Client {
+	opts := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.ClientID(name),
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.DisableAutoCommit(),
-		kgo.SessionTimeout(10*time.Second),
-		kgo.HeartbeatInterval(time.Second),
-	)
+		// Commit before a partition moves, so its next owner starts where
+		// this member stopped and the final commit covers every record read.
+		kgo.OnPartitionsRevoked(func(ctx context.Context, client *kgo.Client, _ map[string][]int32) {
+			must(client.CommitUncommittedOffsets(ctx))
+		}),
+	}
+	// The consumer protocol takes its session from the broker.
+	if protocol == "consumer" {
+		opts = append(opts, kgo.ServerSideBalancer())
+	} else {
+		opts = append(opts, kgo.SessionTimeout(10*time.Second), kgo.HeartbeatInterval(time.Second))
+	}
+	client, err := kgo.NewClient(opts...)
 	must(err)
 	return client
 }
@@ -150,4 +181,235 @@ func must(err error) {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, err)
 	os.Exit(1)
+}
+
+// kill starts two members that do not commit, SIGKILLs one after it has
+// records the other has not seen, and waits for the survivor to read them.
+func kill(protocol string) {
+	ctx := context.Background()
+	topic = fmt.Sprintf("k%d", time.Now().UnixNano()%1_000_000_000)
+	group = fmt.Sprintf("kill-%d", time.Now().UnixNano()%1_000_000_000)
+	admin, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	must(err)
+	created, err := kadm.NewClient(admin).CreateTopic(ctx, 4, 3, nil, topic)
+	must(err)
+	must(created.Err)
+	admin.Close()
+	dir, err := os.MkdirTemp("", "group-kill")
+	must(err)
+	victimSeen := dir + "/victim"
+	survivorSeen := dir + "/survivor"
+	marker := dir + "/killed"
+	need := dir + "/need"
+	must(os.WriteFile(victimSeen, nil, 0o644))
+	must(os.WriteFile(survivorSeen, nil, 0o644))
+	victim := spawnMember("victim", protocol, victimSeen, marker, need)
+	survivor := spawnMember("survivor", protocol, survivorSeen, marker, need)
+	// Produce only after the two members own disjoint partitions. Otherwise
+	// the first member is assigned the whole topic and reads every record
+	// before the second joins, and there is nothing left to redeliver.
+	assignDeadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(assignDeadline) && !partitionsSplit(victimSeen+".parts", survivorSeen+".parts") {
+		time.Sleep(200 * time.Millisecond)
+	}
+	check(partitionsSplit(victimSeen+".parts", survivorSeen+".parts"), protocol+": members never took disjoint partitions")
+	producePinned(ctx, topic)
+	deadline := time.Now().Add(45 * time.Second)
+	var snapshot map[string]bool
+	for time.Now().Before(deadline) {
+		victimValues := readValues(victimSeen)
+		survivorValues := readValues(survivorSeen)
+		if len(victimValues) > 0 && len(survivorValues) > 0 && !containsAll(survivorValues, victimValues) {
+			snapshot = victimValues
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	check(snapshot != nil, protocol+": members never split the log")
+	must(victim.Process.Kill())
+	_, _ = victim.Process.Wait()
+	var lines []string
+	for value := range snapshot {
+		lines = append(lines, value)
+	}
+	must(os.WriteFile(need, []byte(strings.Join(lines, "\n")+"\n"), 0o644))
+	must(os.WriteFile(marker, []byte("killed\n"), 0o644))
+	done := make(chan error, 1)
+	go func() { done <- survivor.Wait() }()
+	select {
+	case err := <-done:
+		must(err)
+	case <-time.After(45 * time.Second):
+		_ = survivor.Process.Kill()
+		fatal(fmt.Errorf("%s: survivor did not finish", protocol))
+	}
+}
+
+func spawnMember(role, protocol, seen, marker, need string) *exec.Cmd {
+	exe, err := os.Executable()
+	must(err)
+	cmd := exec.Command(exe, "member", strings.Join(brokers, ","), topic, group, role, protocol, seen, marker, need)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	must(cmd.Start())
+	return cmd
+}
+
+func goMember() {
+	brokers = strings.Split(os.Args[2], ",")
+	topic = os.Args[3]
+	group = os.Args[4]
+	role := os.Args[5]
+	protocol := os.Args[6]
+	seen := os.Args[7]
+	marker := os.Args[8]
+	_ = os.Args[9]
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(brokers...),
+		kgo.ClientID(role),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.DisableAutoCommit(),
+	}
+	if protocol == "consumer" {
+		opts = append(opts, kgo.ServerSideBalancer())
+	} else {
+		opts = append(opts, kgo.SessionTimeout(6*time.Second), kgo.HeartbeatInterval(time.Second))
+	}
+	owned := map[int32]struct{}{}
+	writeOwned := func() {
+		ids := make([]int, 0, len(owned))
+		for id := range owned {
+			ids = append(ids, int(id))
+		}
+		sort.Ints(ids)
+		parts := make([]string, len(ids))
+		for i, id := range ids {
+			parts[i] = strconv.Itoa(id)
+		}
+		must(os.WriteFile(seen+".parts", []byte(strings.Join(parts, ",")), 0o644))
+	}
+	opts = append(opts,
+		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
+			for _, partition := range assigned[topic] {
+				owned[partition] = struct{}{}
+			}
+			writeOwned()
+		}),
+		kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, revoked map[string][]int32) {
+			for _, partition := range revoked[topic] {
+				delete(owned, partition)
+			}
+			writeOwned()
+		}),
+	)
+	client, err := kgo.NewClient(opts...)
+	must(err)
+	defer client.Close()
+	got := map[string]bool{}
+	deadline := time.Now().Add(150 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		fetches := client.PollFetches(ctx)
+		cancel()
+		for _, record := range fetches.Records() {
+			value := string(record.Value)
+			if got[value] {
+				continue
+			}
+			got[value] = true
+			file, err := os.OpenFile(seen, os.O_APPEND|os.O_WRONLY, 0o644)
+			must(err)
+			_, err = file.WriteString(value + "\n")
+			must(err)
+			must(file.Close())
+		}
+		if role == "survivor" {
+			if _, err := os.Stat(marker); err == nil && equal(got, producedValues()) {
+				return
+			}
+		}
+	}
+	fatal(fmt.Errorf("%s %s timed out with %d", role, protocol, len(got)))
+}
+
+func partitionsSplit(victim, survivor string) bool {
+	left := partSet(victim)
+	right := partSet(survivor)
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	all := map[string]bool{}
+	for part := range left {
+		if right[part] {
+			return false
+		}
+		all[part] = true
+	}
+	for part := range right {
+		all[part] = true
+	}
+	return len(all) == 4
+}
+
+func partSet(path string) map[string]bool {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]bool{}
+	}
+	out := map[string]bool{}
+	for _, part := range strings.Split(strings.TrimSpace(string(body)), ",") {
+		if part != "" {
+			out[part] = true
+		}
+	}
+	return out
+}
+
+func producePinned(ctx context.Context, name string) {
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.DisableIdempotentWrite(),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+	)
+	must(err)
+	defer client.Close()
+	for index := 0; index < 40; index++ {
+		record := &kgo.Record{
+			Topic:     name,
+			Partition: int32(index % 4),
+			Key:       []byte(strconv.Itoa(index)),
+			Value:     []byte("v" + strconv.Itoa(index)),
+		}
+		must(client.ProduceSync(ctx, record).FirstErr())
+	}
+}
+
+func producedValues() map[string]bool {
+	return span(0, 40)
+}
+
+func readValues(path string) map[string]bool {
+	text, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]bool{}
+	}
+	out := map[string]bool{}
+	for _, line := range strings.Split(string(text), "\n") {
+		if strings.HasPrefix(line, "v") {
+			out[line] = true
+		}
+	}
+	return out
+}
+
+func containsAll(have, want map[string]bool) bool {
+	for key := range want {
+		if !have[key] {
+			return false
+		}
+	}
+	return true
 }

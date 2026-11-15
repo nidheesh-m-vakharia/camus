@@ -5,8 +5,12 @@
 //! to return when a key is not implemented.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
+use bytes::buf::UninitSlice;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use crate::protocol::buf::ByteBufMut;
 
 use crate::error::ResponseError;
 use crate::messages::{ApiKey, RequestHeader, ResponseHeader};
@@ -381,6 +385,246 @@ pub fn decode_request<M: Decodable>(frame: &[u8]) -> Result<(RequestHeader, M), 
         anyhow::bail!("{} trailing bytes after the request body", buf.remaining());
     }
     Ok((header, message))
+}
+
+/// Encode `size || response header || body` as chunks.
+///
+/// `shared` are buffers the body already owns. A `put_slice` of one of them
+/// becomes its own chunk instead of a copy into the frame. The chunks
+/// concatenate to the same bytes as [`encode_response`].
+pub fn encode_response_chunks<M: Encodable + HeaderVersion>(
+    version: i16,
+    correlation_id: i32,
+    message: &M,
+    shared: &[Bytes],
+) -> Result<Vec<Bytes>, anyhow::Error> {
+    let mut body = ShareBuf::new(shared);
+    let header = ResponseHeader::default().with_correlation_id(correlation_id);
+    header
+        .encode(&mut body, M::header_version(version))
+        .map_err(|err| anyhow::anyhow!(err))?;
+    message
+        .encode(&mut body, version)
+        .map_err(|err| anyhow::anyhow!(err))?;
+    let mut chunks = body.finish();
+    let body_len: usize = chunks.iter().map(Bytes::len).sum();
+    let mut size = BytesMut::with_capacity(4);
+    size.put_i32(i32::try_from(body_len).map_err(|_| anyhow::anyhow!("response exceeds i32"))?);
+    chunks.insert(0, size.freeze());
+    Ok(chunks)
+}
+
+/// A write buffer that can emit a `Bytes` it was given instead of copying it.
+struct ShareBuf {
+    tail: BytesMut,
+    chunks: Vec<Piece>,
+    regions: Vec<Region>,
+}
+
+struct Region {
+    ptr: usize,
+    len: usize,
+    bytes: Bytes,
+}
+
+enum Piece {
+    Own(BytesMut),
+    Shared(Bytes),
+}
+
+impl Piece {
+    fn len(&self) -> usize {
+        match self {
+            Self::Own(bytes) => bytes.len(),
+            Self::Shared(bytes) => bytes.len(),
+        }
+    }
+}
+
+impl ShareBuf {
+    fn new(shared: &[Bytes]) -> Self {
+        let regions = shared
+            .iter()
+            .filter(|bytes| !bytes.is_empty())
+            .map(|bytes| Region {
+                ptr: bytes.as_ptr() as usize,
+                len: bytes.len(),
+                bytes: bytes.clone(),
+            })
+            .collect();
+        Self {
+            tail: BytesMut::new(),
+            chunks: Vec::new(),
+            regions,
+        }
+    }
+
+    fn finish(mut self) -> Vec<Bytes> {
+        self.flush_tail();
+        self.chunks
+            .into_iter()
+            .filter_map(|piece| match piece {
+                Piece::Own(bytes) if !bytes.is_empty() => Some(bytes.freeze()),
+                Piece::Shared(bytes) if !bytes.is_empty() => Some(bytes),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn flush_tail(&mut self) {
+        if self.tail.is_empty() {
+            return;
+        }
+        let tail = std::mem::take(&mut self.tail);
+        self.chunks.push(Piece::Own(tail));
+    }
+
+    fn share_of(&self, src: &[u8]) -> Option<Bytes> {
+        if src.is_empty() {
+            return None;
+        }
+        let ptr = src.as_ptr() as usize;
+        let end = ptr + src.len();
+        for region in &self.regions {
+            let region_end = region.ptr + region.len;
+            if ptr >= region.ptr && end <= region_end {
+                let off = ptr - region.ptr;
+                return Some(region.bytes.slice(off..off + src.len()));
+            }
+        }
+        None
+    }
+}
+
+// SAFETY: `chunk_mut` and `advance_mut` delegate to `BytesMut`, which upholds
+// `BufMut`. `put_slice` either appends to that buffer or records a shared
+// chunk and does not advance the tail.
+unsafe impl BufMut for ShareBuf {
+    fn remaining_mut(&self) -> usize {
+        usize::MAX
+    }
+
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        self.tail.reserve(64);
+        self.tail.chunk_mut()
+    }
+
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        unsafe { self.tail.advance_mut(cnt) };
+    }
+
+    fn put_slice(&mut self, src: &[u8]) {
+        if let Some(shared) = self.share_of(src) {
+            self.flush_tail();
+            self.chunks.push(Piece::Shared(shared));
+            return;
+        }
+        self.tail.extend_from_slice(src);
+    }
+}
+
+impl ByteBufMut for ShareBuf {
+    fn offset(&self) -> usize {
+        self.chunks.iter().map(Piece::len).sum::<usize>() + self.tail.len()
+    }
+
+    fn seek(&mut self, offset: usize) {
+        let len = self.offset();
+        if offset >= len {
+            self.tail.resize(self.tail.len() + (offset - len), 0);
+            return;
+        }
+        let mut at = 0;
+        for index in 0..self.chunks.len() {
+            let chunk_len = self.chunks[index].len();
+            if at + chunk_len <= offset {
+                at += chunk_len;
+                continue;
+            }
+            let keep = offset - at;
+            if keep == 0 {
+                self.chunks.truncate(index);
+            } else {
+                match &mut self.chunks[index] {
+                    Piece::Own(bytes) => bytes.truncate(keep),
+                    Piece::Shared(bytes) => {
+                        let sliced = bytes.slice(..keep);
+                        self.chunks[index] = Piece::Shared(sliced);
+                    }
+                }
+                self.chunks.truncate(index + 1);
+            }
+            self.tail.clear();
+            return;
+        }
+        self.tail.truncate(offset - at);
+    }
+
+    fn range(&mut self, r: Range<usize>) -> &mut [u8] {
+        let mut at = 0;
+        let mut found = None;
+        for index in 0..self.chunks.len() {
+            let len = self.chunks[index].len();
+            if r.start >= at && r.end <= at + len {
+                found = Some((index, at));
+                break;
+            }
+            at += len;
+        }
+        if let Some((index, start_at)) = found {
+            if matches!(&self.chunks[index], Piece::Shared(_)) {
+                let piece = std::mem::replace(&mut self.chunks[index], Piece::Own(BytesMut::new()));
+                if let Piece::Shared(bytes) = piece {
+                    self.chunks[index] = Piece::Own(BytesMut::from(bytes.as_ref()));
+                }
+            }
+            let start = r.start - start_at;
+            let end = r.end - start_at;
+            if let Piece::Own(bytes) = &mut self.chunks[index] {
+                return &mut bytes[start..end];
+            }
+        }
+        let start = r.start - at;
+        let end = r.end - at;
+        &mut self.tail[start..end]
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::*;
+    use crate::messages::fetch_response::{FetchResponse, FetchableTopicResponse, PartitionData};
+
+    #[test]
+    fn shared_fetch_records_keep_their_allocation() -> anyhow::Result<()> {
+        let payload = Bytes::from(vec![7u8; 64]);
+        let mut part = PartitionData::default();
+        part.records = Some(payload.clone());
+        let mut topic = FetchableTopicResponse::default();
+        topic.partitions = vec![part];
+        let mut response = FetchResponse::default();
+        response.responses = vec![topic];
+        let shared = response
+            .responses
+            .iter()
+            .flat_map(|topic| topic.partitions.iter())
+            .filter_map(|part| part.records.clone())
+            .collect::<Vec<_>>();
+        let chunks = encode_response_chunks(11, 7, &response, &shared)?;
+        let classic = encode_response(11, 7, &response)?;
+        let mut joined = Vec::new();
+        for chunk in &chunks {
+            joined.extend_from_slice(chunk);
+        }
+        assert_eq!(joined, classic.as_ref());
+        assert!(
+            chunks.iter().any(|chunk| {
+                chunk.as_ptr() == payload.as_ptr() && chunk.len() == payload.len()
+            }),
+            "record bytes were copied into the frame"
+        );
+        Ok(())
+    }
 }
 
 /// Insert one unknown tagged field. Flexible versions must preserve it.

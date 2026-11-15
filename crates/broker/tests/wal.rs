@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+mod support;
+
 use bytes::{Bytes, BytesMut};
 use camus_protocol::frame;
 use camus_protocol::messages::create_topics_request::{CreatableTopic, CreatableTopicConfig};
@@ -193,7 +195,7 @@ fn fetch_value(stream: &mut TcpStream, offset: i64) -> Bytes {
 #[test]
 fn wal_produce_survives_restart() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
-        eprintln!("skipping wal produce test; set CAMUS_MINIO=1");
+        support::skipped("wal produce test; set CAMUS_MINIO=1");
         return;
     }
     let root = tempfile::tempdir().unwrap();

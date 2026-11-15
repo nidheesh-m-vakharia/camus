@@ -15,6 +15,7 @@ pub mod groups;
 mod machine;
 mod network;
 mod producers;
+mod recover;
 mod txn;
 
 pub use acl::{
@@ -29,8 +30,9 @@ pub use catalog::{
 };
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{
-    check as txn_allows, clock as txn_clock, ensure as txn_ongoing, inspect as txn_inspect,
-    known_state as txn_state, spans as txn_spans, TxnClock, TxnInfo, TxnSpan,
+    check as txn_allows, clock as txn_clock, ensure as txn_ongoing, finished as txn_finished,
+    inspect as txn_inspect, known_state as txn_state, ongoing as txn_open,
+    partitions as txn_partitions, spans as txn_spans, OpenTxn, TxnClock, TxnInfo, TxnSpan,
 };
 
 use std::collections::BTreeMap;
@@ -41,10 +43,11 @@ use std::sync::Arc;
 use openraft::{Config, Raft};
 use serde::{Deserialize, Serialize};
 
-pub use machine::RedbMachine;
+pub use machine::{snapshot_rows, RedbMachine};
 pub use network::SharedRouter;
 pub use openraft::BasicNode;
 pub use openraft::RaftMetrics;
+pub use recover::{offline_key, plan_restore, ObjectSlice, RestorePlan};
 
 /// Node id in the metadata group.
 pub type NodeId = u64;
@@ -194,6 +197,11 @@ pub enum Command {
         producer_epoch: i16,
         /// The range just appended.
         span: txn::TxnSpan,
+        /// `true` skips a span `EndTxn` already committed or aborted
+        /// (ADR 0021). `false` on commands written before it, which apply
+        /// as they did when they were written.
+        #[serde(default)]
+        skip_published: bool,
     },
     /// Stage offsets that commit only with the transaction.
     StageTxnOffsets {
@@ -221,14 +229,23 @@ pub enum Command {
         /// Proposer's clock. `0` in commands written before it was carried.
         #[serde(default)]
         now_ms: i64,
+        /// Partition ends from the shard leaders. Empty on commands written
+        /// before ADR 0015, which keep the spans `NoteTxn` stored.
+        #[serde(default)]
+        ends: Vec<txn::TxnSpan>,
     },
-    /// Replace a sealed offset prefix with one object. The high watermark stays.
+    /// Replace a sealed offset range with one object. The high watermark stays.
+    /// Commands written before windows omit `covered_start` and replace the
+    /// whole prefix ending at `covered_end`.
     Compact {
         /// Topic name.
         topic: String,
         /// Partition.
         partition: i32,
-        /// Exclusive end of the prefix being replaced.
+        /// First offset of the range. `None` replaces the prefix.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        covered_start: Option<i64>,
+        /// Exclusive end of the range being replaced.
         covered_end: i64,
         /// New object key.
         object_key: String,
@@ -488,10 +505,12 @@ impl MetadataNode {
     where
         N: openraft::RaftNetworkFactory<TypeConfig>,
     {
+        let (heartbeat_interval, election_timeout_min, election_timeout_max) =
+            camus_raft::quic::raft_timeouts();
         let config = Config {
-            heartbeat_interval: 50,
-            election_timeout_min: 150,
-            election_timeout_max: 300,
+            heartbeat_interval,
+            election_timeout_min,
+            election_timeout_max,
             ..Default::default()
         };
         let config = Arc::new(config.validate()?);
@@ -570,9 +589,27 @@ impl MetadataNode {
         parts: Vec<PublishPart>,
         producers: Vec<ProducerNote>,
     ) -> anyhow::Result<Response> {
-        let response = self
-            .submit(Command::PublishWithProducers { parts, producers })
-            .await?;
+        self.publish_with(parts, producers, Vec::new()).await
+    }
+
+    /// Publish extents and, in the same log entry, any transaction spans the
+    /// object contains (ADR 0019). Empty `notes` is a plain publish.
+    pub async fn publish_with(
+        &self,
+        parts: Vec<PublishPart>,
+        producers: Vec<ProducerNote>,
+        notes: Vec<Command>,
+    ) -> anyhow::Result<Response> {
+        let publish = Command::PublishWithProducers { parts, producers };
+        let command = if notes.is_empty() {
+            publish
+        } else {
+            let mut commands = Vec::with_capacity(1 + notes.len());
+            commands.push(publish);
+            commands.extend(notes);
+            Command::Batch(commands)
+        };
+        let response = self.submit(command).await?;
         Ok(response)
     }
 
@@ -660,6 +697,24 @@ impl MetadataNode {
     }
 
     /// Stop Raft tasks. The files stay on disk.
+    /// Build a snapshot and return `(term, log index, body)` when this node
+    /// leads the group and the snapshot covers a log entry.
+    pub async fn snapshot_for_upload(&self) -> anyhow::Result<Option<(u64, u64, Vec<u8>)>> {
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics.current_leader != Some(metrics.id) {
+            return Ok(None);
+        }
+        self.raft
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let Some((index, bytes)) = self.machine.snapshot_index_and_body().await else {
+            return Ok(None);
+        };
+        Ok(Some((metrics.current_term, index, bytes)))
+    }
+
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.raft.shutdown().await?;
         Ok(())

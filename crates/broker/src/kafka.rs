@@ -6,7 +6,7 @@
 //! which fsyncs, and the upload to object storage happens after the ack.
 //! `acks=0` does not wait and gets no response.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,7 @@ use camus_metadata::{
 };
 use camus_protocol::batch::{self, BatchError};
 use camus_protocol::error::ResponseError;
-use camus_protocol::frame::{self, encode_response};
+use camus_protocol::frame::{self, encode_response, encode_response_chunks};
 use camus_protocol::idempotence::{self, Class, ProducerSeq};
 use camus_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
 use camus_protocol::messages::create_topics_response::{
@@ -70,6 +70,12 @@ const MAX_FRAME: usize = 100 * 1024 * 1024;
 /// Sealed extents read from metadata at a time. Each read is one bounded
 /// range of keys, so a request's cost does not grow with the partition's age.
 const EXTENT_PAGE: usize = 256;
+/// Transaction records read at a time when a `read_committed` ListOffsets
+/// looks for open spans.
+const TXN_PAGE: usize = 256;
+/// Most transaction records one `read_committed` ListOffsets reads, so its
+/// cost stops growing with the number of transactional ids.
+const TXN_SCAN_ROWS: usize = 16_384;
 /// Sealed ranges one partition's fetch reads from object storage at once.
 const EXTENT_READS: usize = 4;
 /// Partitions one fetch reads at once.
@@ -81,6 +87,22 @@ const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 /// Most unsealed bytes one upload pass takes: up to four objects of
 /// `FLUSH_BYTES`, put in parallel, then one publish and one seal for all.
 const UPLOAD_PASS_BYTES: usize = 4 * FLUSH_BYTES;
+/// Record bytes one compaction window holds. A larger prefix continues in
+/// the next window (one object may exceed this).
+const COMPACT_PASS_BYTES: u64 = 32 * 1024 * 1024;
+/// Extents in one window. Empty extents add no bytes, so the byte cap
+/// alone would not bound the window.
+const COMPACT_PASS_EXTENTS: usize = 1024;
+/// Objects read from one sweep listing before the next page.
+const SWEEP_PAGE: usize = 1024;
+
+/// Whether another compaction window remains after this one.
+enum CompactMore {
+    /// The eligible prefix is done, or this window failed.
+    Stop,
+    /// Compact again, starting after this offset.
+    Again(i64),
+}
 const BUFFER_LIMIT: usize = 256 * 1024 * 1024;
 /// Longest wait for a WAL seal or a metadata publish to commit. Past it the
 /// pass fails and is retried, so a shard or metadata group without quorum
@@ -132,6 +154,9 @@ struct Item {
 
 enum Reply {
     Frame(Bytes),
+    /// Header and record bytes kept as separate chunks so a fetch does not
+    /// copy the records into the frame.
+    Chunks(Vec<Bytes>),
     Silent,
     Close,
 }
@@ -195,6 +220,18 @@ impl Socket {
             Self::Tls(socket) => socket.write_all(buf).await,
         }
     }
+
+    async fn write_chunks(&mut self, chunks: &[Bytes]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(socket) => write_vectored(socket, chunks).await,
+            Self::Tls(socket) => {
+                for chunk in chunks {
+                    socket.write_all(chunk).await?;
+                }
+                Ok(())
+            }
+        }
+    }
     /// `User:<subject>` from the client's TLS certificate, formatted as
     /// Kafka's default principal builder does (RFC 2253, most specific
     /// first). `None` without a client certificate.
@@ -253,6 +290,56 @@ fn shard_key(shard: u32) -> String {
     format!("wal/{shard}")
 }
 
+/// Highest-term shard announcement per shard. Capped at 256 shards.
+const HINT_CAP: usize = 256;
+
+#[derive(Clone, Default)]
+pub struct Hints {
+    inner: Arc<std::sync::Mutex<BTreeMap<u32, (u64, NodeId, i32)>>>,
+}
+
+impl Hints {
+    /// Keep `announcement` when its term is strictly higher than the one stored.
+    pub fn note(&self, shard: u32, term: u64, leader: NodeId, epoch: i32) {
+        let Ok(mut hints) = self.inner.lock() else {
+            return;
+        };
+        if hints
+            .get(&shard)
+            .is_some_and(|(stored, _, _)| *stored >= term)
+        {
+            return;
+        }
+        if hints.len() >= HINT_CAP && !hints.contains_key(&shard) {
+            if let Some(stale) = hints.keys().next().copied() {
+                hints.remove(&stale);
+            }
+        }
+        hints.insert(shard, (term, leader, epoch));
+    }
+
+    fn get(&self, shard: u32) -> Option<(u64, NodeId, i32)> {
+        self.inner.lock().ok()?.get(&shard).copied()
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::Hints;
+
+    #[test]
+    fn a_lower_term_is_ignored() -> Result<(), String> {
+        let hints = Hints::default();
+        hints.note(0, 2, 1, 2);
+        hints.note(0, 1, 9, 1);
+        let (_, leader, epoch) = hints.get(0).ok_or("missing hint")?;
+        if leader != 1 || epoch != 2 {
+            return Err(format!("hint {leader} epoch {epoch}"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
 struct ShardView {
     leader: Option<NodeId>,
@@ -274,10 +361,17 @@ pub fn epoch_base_key(shard: u32) -> String {
 pub struct Kafka {
     node: Arc<MetadataNode>,
     bucket: Bucket,
+    /// `s3://bucket/prefix`, the directory `DescribeLogDirs` names.
+    log_dir: String,
     node_id: i32,
     host: String,
     port: i32,
     flush_ms: u64,
+    /// How long a quiet shard may hold an object that is still under 8 MiB.
+    /// A shard that has reached half an object keeps `flush_ms`.
+    quiet_ms: u64,
+    /// `broker.rack`. Empty means this broker has no zone.
+    rack: Option<String>,
     /// How often to compact sealed extents of `cleanup.policy=compact` topics.
     /// `0` turns compaction off. Kafka's cleaner is on by default, and so is
     /// this.
@@ -335,6 +429,9 @@ pub struct Kafka {
     sasl_pass: String,
     tls: Option<TlsAcceptor>,
     wal: Arc<WalSlot>,
+    /// QUIC shard announcements. A hint never outranks a stored view with a
+    /// higher epoch (ADR 0016).
+    hints: Hints,
     http: reqwest::Client,
     /// Classic consumer groups, coordinated while this broker leads metadata.
     coordinator: Arc<camus_coordinator::Coordinator>,
@@ -375,95 +472,98 @@ impl Kafka {
         sasl_pass: String,
         tls: Option<TlsAcceptor>,
         wal: Arc<WalSlot>,
+        settings: &crate::settings::Settings,
     ) -> Self {
-        let wal_limit = std::env::var("CAMUS_WAL_DISK_LIMIT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(WAL_DISK_LIMIT);
-        let flush_ms = std::env::var("CAMUS_FLUSH_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(250);
-        let env_ms = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(default)
+        let ms = |key: &str, default: u64| settings.u64(key).unwrap_or(default);
+        let wal_limit = settings.u64("wal.disk.limit").unwrap_or(WAL_DISK_LIMIT);
+        let flush_ms = ms("log.flush.interval.ms", 250);
+        let quiet_ms = ms("log.quiet.flush.ms", 30_000);
+        let rack = {
+            let rack = settings.get("broker.rack");
+            if rack.is_empty() {
+                None
+            } else {
+                Some(rack.to_string())
+            }
         };
-        let retention_check_ms = env_ms("CAMUS_RETENTION_CHECK_MS", 300_000);
-        let sweep_ms = env_ms("CAMUS_SWEEP_MS", 300_000);
-        let sweep_min_age_ms = env_ms("CAMUS_SWEEP_MIN_AGE_MS", 3_600_000) as i64;
-        let sweep_delay_ms = env_ms("CAMUS_FILE_DELETE_DELAY_MS", 60_000) as i64;
+        let retention_check_ms = ms("log.retention.check.interval.ms", 300_000);
+        let sweep_ms = ms("log.sweep.interval.ms", 300_000);
+        let sweep_min_age_ms = ms("log.sweep.min.age.ms", 3_600_000) as i64;
+        let sweep_delay_ms = ms("file.delete.delay.ms", 60_000) as i64;
         // Kafka's `super.users` is a semicolon-separated principal list.
-        let mut super_users: std::collections::BTreeSet<String> =
-            std::env::var("CAMUS_SUPER_USERS")
-                .unwrap_or_default()
-                .split(';')
-                .map(str::trim)
-                .filter(|principal| !principal.is_empty())
-                .map(str::to_string)
-                .collect();
+        let mut super_users: std::collections::BTreeSet<String> = settings
+            .get("super.users")
+            .split(';')
+            .map(str::trim)
+            .filter(|principal| !principal.is_empty())
+            .map(str::to_string)
+            .collect();
         if require_sasl && !sasl_user.is_empty() {
             super_users.insert(format!("User:{sasl_user}"));
         }
         // On the dev PLAINTEXT listener every client is `User:ANONYMOUS`, as
         // on a Kafka listener with no authorizer, so a resource no ACL names
         // stays open. An authenticated listener (SASL or mTLS) denies it.
-        let allow_if_no_acl = match std::env::var("CAMUS_ACL_ALLOW_IF_NO_ACL").ok().as_deref() {
-            Some("true") => true,
-            Some("false") => false,
+        // An explicit file or env value wins over that listener default.
+        let allow_if_no_acl = match settings.get("allow.everyone.if.no.acl.found") {
+            "true" => true,
+            "false" => false,
             _ => !require_sasl && tls.is_none(),
         };
-        let txn_max_timeout_ms = env_ms("CAMUS_TXN_MAX_TIMEOUT_MS", 900_000) as i64;
-        let txn_abort_interval_ms = env_ms("CAMUS_TXN_ABORT_INTERVAL_MS", 10_000);
-        let txn_id_expiration_ms =
-            env_ms("CAMUS_TRANSACTIONAL_ID_EXPIRATION_MS", 604_800_000) as i64;
-        let txn_cleanup_interval_ms = env_ms("CAMUS_TXN_CLEANUP_INTERVAL_MS", 3_600_000);
-        let producer_id_expiration_ms =
-            env_ms("CAMUS_PRODUCER_ID_EXPIRATION_MS", 86_400_000) as i64;
-        let producer_id_check_ms = env_ms("CAMUS_PRODUCER_ID_CHECK_INTERVAL_MS", 600_000);
-        let leader_balance_ms =
-            if std::env::var("CAMUS_AUTO_LEADER_REBALANCE").as_deref() == Ok("false") {
-                0
-            } else {
-                env_ms("CAMUS_LEADER_IMBALANCE_CHECK_MS", 300_000)
-            };
-        // Kafka's setting is in minutes; `CAMUS_OFFSETS_RETENTION_MS`
-        // overrides it for tests that cannot wait a minute.
-        let offsets_retention_ms = std::env::var("CAMUS_OFFSETS_RETENTION_MS")
+        let txn_max_timeout_ms = ms("transaction.max.timeout.ms", 900_000) as i64;
+        let txn_abort_interval_ms = ms("transaction.abort.interval.ms", 10_000);
+        let txn_id_expiration_ms = ms("transactional.id.expiration.ms", 604_800_000) as i64;
+        let txn_cleanup_interval_ms = ms("transaction.cleanup.interval.ms", 3_600_000);
+        let producer_id_expiration_ms = ms("producer.id.expiration.ms", 86_400_000) as i64;
+        let producer_id_check_ms = ms("producer.id.check.interval.ms", 600_000);
+        let leader_balance_ms = if settings.get("auto.leader.rebalance.enable") == "false" {
+            0
+        } else {
+            ms("leader.imbalance.check.interval.ms", 300_000)
+        };
+        // Kafka's setting is in minutes; `offsets.retention.ms`
+        // (`CAMUS_OFFSETS_RETENTION_MS`) overrides it for tests that cannot
+        // wait a minute.
+        let offsets_retention_ms = settings
+            .get("offsets.retention.ms")
+            .parse::<i64>()
             .ok()
-            .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or_else(|| {
-                env_ms("CAMUS_OFFSETS_RETENTION_MINUTES", 10_080).saturating_mul(60_000) as i64
+                ms("offsets.retention.minutes", 10_080).saturating_mul(60_000) as i64
             });
-        let offsets_check_ms = env_ms("CAMUS_OFFSETS_RETENTION_CHECK_INTERVAL_MS", 600_000);
-        let auto_create_topics = std::env::var("CAMUS_AUTO_CREATE_TOPICS")
-            .map(|value| value != "false")
-            .unwrap_or(true);
-        let default_partitions = std::env::var("CAMUS_NUM_PARTITIONS")
+        let offsets_check_ms = ms("offsets.retention.check.interval.ms", 600_000);
+        let auto_create_topics = settings.get("auto.create.topics.enable") != "false";
+        let default_partitions = settings
+            .get("num.partitions")
+            .parse::<i32>()
             .ok()
-            .and_then(|value| value.parse::<i32>().ok())
             .filter(|count| *count > 0)
             .unwrap_or(1);
-        let message_max_bytes = std::env::var("CAMUS_MESSAGE_MAX_BYTES")
+        let message_max_bytes = settings
+            .get("message.max.bytes")
+            .parse::<usize>()
             .ok()
-            .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(camus_metadata::config::DEFAULT_MESSAGE_MAX_BYTES as usize)
             .min(batch::MAX_BATCH_CEILING);
-        let compact_ms = std::env::var("CAMUS_COMPACT_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(300_000);
+        let compact_ms = ms("log.cleaner.backoff.ms", 300_000);
         let store = Arc::new(groups::MetadataStore {
             node: Arc::clone(&node),
         });
+        let log_dir = format!(
+            "s3://{}/{}",
+            settings.get("s3.bucket"),
+            settings.get("s3.prefix")
+        );
         Self {
             node,
             bucket,
+            log_dir,
             node_id,
             host,
             port,
             flush_ms,
+            quiet_ms,
+            rack,
             compact_ms,
             auto_create_topics,
             default_partitions,
@@ -483,8 +583,14 @@ impl Kafka {
             offsets_retention_ms,
             offsets_check_ms,
             wal_limit,
-            default_durability: std::env::var("CAMUS_DEFAULT_DURABILITY")
-                .unwrap_or_else(|_| "wal".into()),
+            default_durability: {
+                let mode = settings.get("durability.mode");
+                if mode.is_empty() {
+                    "wal".to_string()
+                } else {
+                    mode.to_string()
+                }
+            },
             require_sasl,
             super_users,
             allow_if_no_acl,
@@ -492,12 +598,16 @@ impl Kafka {
             sasl_pass,
             tls,
             wal,
+            hints: Hints::default(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("http client"),
             unknown: std::sync::Mutex::new(BTreeMap::new()),
-            coordinator: camus_coordinator::Coordinator::new(store, groups::coordinator_config()),
+            coordinator: camus_coordinator::Coordinator::new(
+                store,
+                groups::coordinator_config(settings),
+            ),
             coordinator_term: Mutex::new(None),
             buf: Mutex::new(Vec::new()),
             buffered: std::sync::atomic::AtomicUsize::new(0),
@@ -506,9 +616,9 @@ impl Kafka {
             arrivals: std::sync::Mutex::new(Arrivals::new()),
             acl_cache: std::sync::RwLock::new(None),
             read_cache: camus_storage::ReadCache::new(
-                std::env::var("CAMUS_READ_CACHE_BYTES")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
+                settings
+                    .u64("read.cache.bytes")
+                    .and_then(|bytes| usize::try_from(bytes).ok())
                     .unwrap_or(READ_CACHE_BYTES),
             ),
             disk_cache: None,
@@ -565,9 +675,10 @@ impl Kafka {
         &self,
         parts: Vec<PublishPart>,
         producers: Vec<ProducerNote>,
+        notes: Vec<Command>,
     ) -> anyhow::Result<camus_metadata::Response> {
         if self.leader() {
-            return self.node.publish(parts, producers).await;
+            return self.node.publish_with(parts, producers, notes).await;
         }
         let addr = self
             .leader_http()
@@ -575,7 +686,7 @@ impl Kafka {
         let response = self
             .http
             .post(format!("http://{addr}/admin/publish"))
-            .json(&serde_json::json!({ "parts": parts, "producers": producers }))
+            .json(&serde_json::json!({ "parts": parts, "producers": producers, "notes": notes }))
             .send()
             .await?;
         anyhow::ensure!(response.status().is_success(), "forwarded publish failed");
@@ -621,6 +732,155 @@ impl Kafka {
             .is_some_and(|shard| shard.is_leader())
     }
 
+    /// The transaction already recorded a span for this partition, so a later
+    /// batch does not write metadata again (ADR 0015).
+    fn txn_span_open(&self, transactional_id: &str, topic: &str, partition: i32) -> bool {
+        let Some(raw) = self
+            .node
+            .read_local(&format!("txn/{transactional_id}"))
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        camus_metadata::txn_spans(&raw).ok().is_some_and(|spans| {
+            spans
+                .iter()
+                .any(|span| span.topic == topic && span.partition == partition)
+        })
+    }
+
+    /// Spans to store in the same metadata commit as the extents being sealed.
+    /// One per producer and partition, and only while the transaction is open
+    /// and metadata does not already have the span.
+    fn seal_span_notes(&self, batches: &[camus_wal::Batch]) -> Vec<Command> {
+        let mut notes = Vec::new();
+        let mut seen = BTreeSet::new();
+        for batch in batches {
+            let Ok(info) = camus_protocol::batch::inspect(
+                &batch.bytes,
+                camus_protocol::batch::MAX_BATCH_CEILING,
+            ) else {
+                continue;
+            };
+            let Ok(identities) = camus_protocol::batch::producer_batches(
+                &batch.bytes,
+                camus_protocol::batch::MAX_BATCH_CEILING,
+            ) else {
+                continue;
+            };
+            for (info, identity) in info.iter().zip(identities) {
+                if !info.transactional || identity.producer_id < 0 {
+                    continue;
+                }
+                if !seen.insert((batch.topic_id, batch.partition, identity.producer_id)) {
+                    continue;
+                }
+                let Some(name) = self.topic_name_by_id(&Uuid::from_bytes(batch.topic_id)) else {
+                    continue;
+                };
+                let Some(txn_id) = self
+                    .node
+                    .read_local(&format!("txn-by-producer/{}", identity.producer_id))
+                    .ok()
+                    .flatten()
+                else {
+                    continue;
+                };
+                let Some(raw) = self.txn_record(&txn_id) else {
+                    continue;
+                };
+                let Ok(Some(open)) = camus_metadata::txn_open(&raw) else {
+                    continue;
+                };
+                if open.producer_id != identity.producer_id
+                    || self.txn_span_open(&txn_id, &name, batch.partition)
+                {
+                    continue;
+                }
+                let Some(topic) = self.topic(&name) else {
+                    continue;
+                };
+                let Some((start, end)) = self.wal_of(&topic, batch.partition).and_then(|shard| {
+                    shard.txn_span(&batch.topic_id, batch.partition, identity.producer_id)
+                }) else {
+                    continue;
+                };
+                notes.push(Command::NoteTxn {
+                    transactional_id: txn_id,
+                    producer_id: identity.producer_id,
+                    producer_epoch: open.epoch,
+                    span: TxnSpan {
+                        topic: name,
+                        partition: batch.partition,
+                        start,
+                        end,
+                        producer_id: Some(identity.producer_id),
+                    },
+                    skip_published: true,
+                });
+            }
+        }
+        notes
+    }
+
+    /// A `wal` fetch can be served here when this broker holds the shard.
+    /// An `r2` fetch can be served from any broker that has the metadata.
+    fn can_fetch(&self, topic: &Topic, partition: i32) -> bool {
+        topic.durability != "wal" || self.wal_of(topic, partition).is_some()
+    }
+
+    /// A failed read. A `wal` follower that cannot read tells the client to
+    /// use the leader. Reporting storage there would look like a broken log
+    /// on a broker that has lost its quorum (ADR 0008).
+    fn read_failure(&self, topic: &Topic, partition: i32) -> i16 {
+        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
+            NOT_LEADER
+        } else {
+            STORAGE
+        }
+    }
+
+    /// Rack stored for `id`, once that broker has registered it.
+    fn broker_rack(&self, id: i32) -> Option<String> {
+        self.node
+            .read_local(&format!("broker/{id}/rack"))
+            .ok()
+            .flatten()
+    }
+
+    /// A voter in the client's zone, when this broker leads the shard and
+    /// the client would otherwise read across zones. Fetch v11 and later.
+    fn preferred_read_replica(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        client_rack: &str,
+        version: i16,
+    ) -> Option<i32> {
+        if version < 11
+            || client_rack.is_empty()
+            || topic.durability != "wal"
+            || !self.leads_wal(topic, partition)
+            || self.rack.as_deref() == Some(client_rack)
+        {
+            return None;
+        }
+        let view = self.shard_view(self.partition_shard(topic, partition));
+        for voter in view.voters {
+            let Ok(id) = i32::try_from(voter) else {
+                continue;
+            };
+            if id == self.node_id {
+                continue;
+            }
+            if self.broker_rack(id).as_deref() == Some(client_rack) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// A partition's WAL end, or 0 when this broker does not have its shard.
     fn wal_end(&self, topic: &Topic, partition: i32) -> i64 {
         self.wal_of(topic, partition)
@@ -628,16 +888,349 @@ impl Kafka {
             .unwrap_or(0)
     }
 
+    /// The log end from the shard leader. A leader that cannot be reached
+    /// is `LEADER_NOT_AVAILABLE`, which the client retries (ADR 0015).
+    async fn shard_end(&self, topic: &Topic, partition: i32) -> Result<i64, i16> {
+        if self.leads_wal(topic, partition) {
+            return Ok(self.wal_end(topic, partition));
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/end-offset", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if !response.status().is_success() {
+            return Err(LEADER_NOT_AVAILABLE);
+        }
+        let body: serde_json::Value = response.json().await.map_err(|_| LEADER_NOT_AVAILABLE)?;
+        body.get("end")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or(LEADER_NOT_AVAILABLE)
+    }
+
+    fn txn_record(&self, transactional_id: &str) -> Option<String> {
+        self.node
+            .read_local(&format!("txn/{transactional_id}"))
+            .ok()
+            .flatten()
+    }
+
+    /// This producer still has an ongoing transaction under `id`.
+    fn txn_is_ongoing(&self, transactional_id: &str, producer_id: i64, epoch: i16) -> bool {
+        let Some(raw) = self.txn_record(transactional_id) else {
+            return false;
+        };
+        camus_metadata::txn_open(&raw)
+            .ok()
+            .flatten()
+            .is_some_and(|open| open.producer_id == producer_id && open.epoch == epoch)
+    }
+
+    /// Kafka's last stable offset: the first offset of the earliest
+    /// transaction still open on the partition, or the high watermark. A
+    /// `read_committed` consumer that resets to the end starts here, so it
+    /// still sees an open transaction that later commits.
+    fn last_stable(&self, topic: &Topic, partition: i32, high_watermark: i64) -> i64 {
+        let mut stable = high_watermark;
+        // `wal` topics: the span stays on the shard until `EndTxn` (ADR 0019).
+        if let Some(start) = self
+            .wal_of(topic, partition)
+            .and_then(|shard| shard.first_open_txn(&topic_id(topic), partition))
+        {
+            stable = stable.min(start);
+        }
+        // `r2` topics, and spans a seal or `NoteTxn` stored: ongoing
+        // transactions in metadata, read a page at a time.
+        // Past `TXN_SCAN_ROWS` the rest is not read, and an open span there
+        // does not hold the offset back.
+        let mut from = "txn/".to_string();
+        let mut scanned = 0;
+        while scanned < TXN_SCAN_ROWS {
+            let want = TXN_PAGE.min(TXN_SCAN_ROWS - scanned);
+            let Ok(rows) = self.node.scan_range_local(&from, "txn0", want) else {
+                break;
+            };
+            scanned += rows.len();
+            let full = rows.len() == want;
+            for (key, raw) in &rows {
+                from = format!("{key}\0");
+                let Ok(Some(open)) = camus_metadata::txn_open(raw) else {
+                    continue;
+                };
+                for span in open.spans {
+                    if span.topic == topic.name && span.partition == partition {
+                        stable = stable.min(span.start);
+                    }
+                }
+            }
+            if !full {
+                return stable;
+            }
+        }
+        tracing::warn!(
+            topic = %topic.name,
+            partition,
+            "read_committed ListOffsets stopped after {TXN_SCAN_ROWS} transaction records"
+        );
+        stable
+    }
+
+    /// The open span on the shard leader, or `None` when this producer has
+    /// not written one. `Err` when the leader cannot be asked.
+    async fn shard_txn_span(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<Option<(i64, i64)>, i16> {
+        if topic.durability != "wal" {
+            return Ok(None);
+        }
+        if self.leads_wal(topic, partition) {
+            return Ok(self
+                .wal_of(topic, partition)
+                .and_then(|shard| shard.txn_span(&topic_id(topic), partition, producer_id)));
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/txn-span", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+                "producer_id": producer_id,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(LEADER_NOT_AVAILABLE);
+        }
+        let body: serde_json::Value = response.json().await.map_err(|_| LEADER_NOT_AVAILABLE)?;
+        let start = body.get("start").and_then(serde_json::Value::as_i64);
+        let end = body.get("end").and_then(serde_json::Value::as_i64);
+        match (start, end) {
+            (Some(start), Some(end)) => Ok(Some((start, end))),
+            _ => Err(LEADER_NOT_AVAILABLE),
+        }
+    }
+
+    /// Freeze the span before EndTxn reads it. A batch that commits after
+    /// this is refused by the shard and is not part of the transaction.
+    async fn finish_wal_span(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<(), i16> {
+        if self.leads_wal(topic, partition) {
+            let Some(shard) = self.wal_of(topic, partition) else {
+                return Err(LEADER_NOT_AVAILABLE);
+            };
+            return shard
+                .finish_txn(topic_id(topic), partition, producer_id)
+                .await
+                .map_err(|_| LEADER_NOT_AVAILABLE);
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/finish-txn", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+                "producer_id": producer_id,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(LEADER_NOT_AVAILABLE)
+        }
+    }
+
+    /// Drop the open span after metadata has stored it.
+    async fn close_wal_span(
+        &self,
+        topic: &Topic,
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<(), i16> {
+        if self.leads_wal(topic, partition) {
+            let Some(shard) = self.wal_of(topic, partition) else {
+                return Err(LEADER_NOT_AVAILABLE);
+            };
+            return shard
+                .close_txn(topic_id(topic), partition, producer_id)
+                .await
+                .map_err(|_| LEADER_NOT_AVAILABLE);
+        }
+        let shard = self.partition_shard(topic, partition);
+        let Some(leader) = self.shard_view(shard).leader else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let metrics = self.node.raft.metrics().borrow().clone();
+        let Some(node) = metrics.membership_config.membership().get_node(&leader) else {
+            return Err(LEADER_NOT_AVAILABLE);
+        };
+        let response = self
+            .http
+            .post(format!("http://{}/wal/{shard}/close-txn", node.addr))
+            .json(&serde_json::json!({
+                "topic": topic.name,
+                "partition": partition,
+                "producer_id": producer_id,
+            }))
+            .send()
+            .await
+            .map_err(|_| LEADER_NOT_AVAILABLE)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(LEADER_NOT_AVAILABLE)
+        }
+    }
+
+    /// Close every open span this transaction still has on a WAL shard.
+    async fn close_producer_spans(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+    ) -> Result<(), i16> {
+        let Some(raw) = self.txn_record(transactional_id) else {
+            return Ok(());
+        };
+        let partitions = camus_metadata::txn_partitions(&raw).map_err(|_| NOT_LEADER)?;
+        for (name, partition) in partitions {
+            let Some(topic) = self.topic(&name) else {
+                continue;
+            };
+            if topic.durability != "wal" {
+                continue;
+            }
+            if self
+                .shard_txn_span(&topic, partition, producer_id)
+                .await?
+                .is_some()
+            {
+                self.close_wal_span(&topic, partition, producer_id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One span per partition the transaction wrote. The WAL shard has the
+    /// open range; a span already stored (a seal, or a `NoteTxn` from before
+    /// ADR 0019) is used when the shard has none.
+    async fn txn_ends(&self, transactional_id: &str) -> Result<Vec<TxnSpan>, i16> {
+        let Some(raw) = self.txn_record(transactional_id) else {
+            return Ok(Vec::new());
+        };
+        let Some(open) = camus_metadata::txn_open(&raw).map_err(|_| NOT_LEADER)? else {
+            return Ok(Vec::new());
+        };
+        let mut ends = Vec::new();
+        for (name, partition) in &open.partitions {
+            let Some(topic) = self.topic(name) else {
+                return Err(UNKNOWN_TOPIC);
+            };
+            if topic.durability == "wal" {
+                self.finish_wal_span(&topic, *partition, open.producer_id)
+                    .await?;
+            }
+            if let Some((start, end)) = self
+                .shard_txn_span(&topic, *partition, open.producer_id)
+                .await?
+            {
+                ends.push(TxnSpan {
+                    topic: name.clone(),
+                    partition: *partition,
+                    start,
+                    end,
+                    producer_id: Some(open.producer_id),
+                });
+                continue;
+            }
+            let Some(span) = open
+                .spans
+                .iter()
+                .find(|span| span.topic == *name && span.partition == *partition)
+            else {
+                continue;
+            };
+            // The stored span is the first batch's. The transaction's later
+            // batches on the partition end before the log end now (ADR 0015).
+            // An `r2` produce is acked after its metadata commit, so the
+            // committed next offset is past every batch it acked.
+            let end = if topic.durability == "wal" {
+                self.shard_end(&topic, *partition).await?
+            } else {
+                self.partition_state(&topic, *partition)
+                    .map_or(span.end, |state| state.next_offset.max(span.end))
+            };
+            ends.push(TxnSpan {
+                end,
+                producer_id: span.producer_id.or(Some(open.producer_id)),
+                ..span.clone()
+            });
+        }
+        Ok(ends)
+    }
+
     /// Shard leader and voters as clients should see them. The shard leader
     /// records itself in metadata so brokers outside the shard can answer
     /// Metadata; until it has, this broker's own view is used.
     fn shard_view(&self, shard: u32) -> ShardView {
-        self.node
+        let stored = self
+            .node
             .read_local(&shard_key(shard))
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_else(|| self.local_shard_view(shard))
+            .unwrap_or_else(|| self.local_shard_view(shard));
+        let Some((_, leader, epoch)) = self.hints.get(shard) else {
+            return stored;
+        };
+        if epoch <= stored.epoch {
+            return stored;
+        }
+        ShardView {
+            leader: Some(leader),
+            voters: stored.voters,
+            epoch,
+        }
     }
 
     fn local_shard_view(&self, shard: u32) -> ShardView {
@@ -718,7 +1311,10 @@ impl Kafka {
     /// the stored view differs.
     async fn announce_shard(&self) {
         for (id, wal) in self.wal.all() {
-            if !wal.leads_quorum(Duration::from_millis(500)) {
+            // 2s, not one heartbeat: a loaded leader can be a few hundred
+            // milliseconds past its last quorum ack and still be the leader.
+            // A node that has never been acknowledged does not announce.
+            if !wal.leads_quorum(Duration::from_secs(2)) {
                 continue;
             }
             let mine = self.local_shard_view(id);
@@ -733,6 +1329,36 @@ impl Kafka {
             }
             if let Ok(raw) = serde_json::to_string(&mine) {
                 let _ = self.meta_write(shard_key(id), raw).await;
+            }
+        }
+    }
+
+    /// Tell peers this broker leads `id`, without waiting for the metadata write.
+    async fn announce_quic(&self, endpoint: &camus_raft::quic::ControlEndpoint) {
+        for (id, wal) in self.wal.all() {
+            if !wal.is_leader() {
+                continue;
+            }
+            let announcement = camus_raft::quic::Announcement {
+                shard: id,
+                term: wal.term(),
+                leader: self.node_id as u64,
+                epoch: self.shard_epoch(id),
+            };
+            let Ok(bytes) = camus_raft::codec::encode(&announcement) else {
+                continue;
+            };
+            for voter in wal.voters() {
+                if voter == self.node_id as u64 {
+                    continue;
+                }
+                let Some(addr) = wal.voter_addr(voter) else {
+                    continue;
+                };
+                let Ok(peer) = camus_raft::quic::ControlEndpoint::peer_socket(&addr) else {
+                    continue;
+                };
+                let _ = endpoint.send_datagram(peer, &bytes).await;
             }
         }
     }
@@ -813,6 +1439,29 @@ impl Kafka {
         }
     }
 
+    /// The committed transaction spans cover every offset of this batch.
+    fn txn_batch_committed(
+        &self,
+        topic_name: &str,
+        partition: i32,
+        producer_id: i64,
+        start: i64,
+        end: i64,
+    ) -> bool {
+        let Some(topic) = self.topic(topic_name) else {
+            return false;
+        };
+        let Some(state) = self.partition_state(&topic, partition) else {
+            return false;
+        };
+        (start..end).all(|offset| {
+            state
+                .txn_committed
+                .iter()
+                .any(|span| span.covers(offset, producer_id))
+        })
+    }
+
     fn partition_state(&self, topic: &Topic, partition: i32) -> Option<camus_metadata::Partition> {
         let raw = self
             .node
@@ -882,6 +1531,13 @@ impl Kafka {
             (
                 "num.partitions",
                 self.default_partitions.to_string(),
+                "1",
+                INT,
+            ),
+            (
+                "default.replication.factor",
+                self.replication_factor(&self.default_durability)
+                    .to_string(),
                 "1",
                 INT,
             ),
@@ -962,9 +1618,7 @@ impl Kafka {
 
     /// The log directory DescribeLogDirs names: the bucket and key prefix.
     fn log_dir(&self) -> String {
-        let bucket = std::env::var("CAMUS_S3_BUCKET").unwrap_or_else(|_| "camus".into());
-        let prefix = std::env::var("CAMUS_S3_PREFIX").unwrap_or_default();
-        format!("s3://{bucket}/{prefix}")
+        self.log_dir.clone()
     }
 
     /// The partition's high watermark: the sealed end, or the WAL end for a
@@ -994,17 +1648,11 @@ impl Kafka {
         if !camus_protocol::compact::compacts(&topic.cleanup_policy) {
             return Ok(());
         }
-        let mut bytes = bytes::Bytes::copy_from_slice(raw);
-        let sets = camus_protocol::records::RecordBatchDecoder::decode_all(&mut bytes)
-            .map_err(|_| CORRUPT)?;
-        if sets
-            .iter()
-            .flat_map(|set| &set.records)
-            .any(|record| record.key.is_none())
-        {
-            return Err(INVALID_RECORD);
+        match camus_protocol::batch::has_null_key(raw, MAX_BATCH) {
+            Ok(true) => Err(INVALID_RECORD),
+            Ok(false) => Ok(()),
+            Err(_) => Err(CORRUPT),
         }
-        Ok(())
     }
 
     /// Move each partition's log start past the sealed extents that
@@ -1084,17 +1732,74 @@ impl Kafka {
                 continue;
             }
             let id = key.trim_start_matches("txn/").to_string();
-            let applied = self
-                .meta_apply(Command::AbortTimedOutTxn {
-                    transactional_id: id.clone(),
-                    producer_id: clock.producer_id,
-                    producer_epoch: clock.epoch,
-                    now_ms: now,
-                })
-                .await;
-            if let Ok(response) = applied {
-                if response.value.as_deref() == Some("1") {
-                    tracing::info!(transactional_id = %id, "aborted a transaction past its timeout");
+            // The span lives on the WAL until now (ADR 0019). Read it before
+            // the abort, then mark that range in the same commit. A span
+            // already stored by a seal is left to the abort command.
+            let ends = match self.txn_ends(&id).await {
+                Ok(ends) => ends,
+                Err(code) => {
+                    tracing::warn!(transactional_id = %id, code, "could not read the open span");
+                    continue;
+                }
+            };
+            let stored = self
+                .txn_record(&id)
+                .and_then(|raw| camus_metadata::txn_open(&raw).ok().flatten());
+            let mut commands = vec![Command::AbortTimedOutTxn {
+                transactional_id: id.clone(),
+                producer_id: clock.producer_id,
+                producer_epoch: clock.epoch,
+                now_ms: now,
+            }];
+            for span in &ends {
+                let covered = stored.as_ref().is_some_and(|open| {
+                    open.spans.iter().any(|item| {
+                        item.topic == span.topic
+                            && item.partition == span.partition
+                            && item.start == span.start
+                            && item.end == span.end
+                    })
+                });
+                if !covered {
+                    commands.push(Command::NoteTxn {
+                        transactional_id: id.clone(),
+                        producer_id: clock.producer_id,
+                        producer_epoch: clock.epoch,
+                        span: span.clone(),
+                        skip_published: true,
+                    });
+                }
+            }
+            let command = if commands.len() == 1 {
+                commands.remove(0)
+            } else {
+                Command::Batch(commands)
+            };
+            let Ok(response) = self.meta_apply(command).await else {
+                continue;
+            };
+            let aborted = response.value.as_deref() == Some("1")
+                || response
+                    .each
+                    .first()
+                    .and_then(|child| child.value.as_deref())
+                    == Some("1");
+            if !aborted {
+                continue;
+            }
+            tracing::info!(transactional_id = %id, "aborted a transaction past its timeout");
+            for span in &ends {
+                let Some(topic) = self.topic(&span.topic) else {
+                    continue;
+                };
+                if topic.durability != "wal" {
+                    continue;
+                }
+                if let Err(code) = self
+                    .close_wal_span(&topic, span.partition, clock.producer_id)
+                    .await
+                {
+                    tracing::warn!(transactional_id = %id, code, "the span stayed open after the abort");
                 }
             }
         }
@@ -1234,44 +1939,54 @@ impl Kafka {
         if !self.leader() {
             return Ok(());
         }
-        // List before reading references: an object published in between is
-        // then either referenced or too young to delete.
-        let listed: Vec<camus_compactor::sweep::Listed> = self
-            .bucket
-            .list("bundle/")
-            .await?
-            .into_iter()
-            .map(|(key, size, modified_ms)| camus_compactor::sweep::Listed {
-                key,
-                size,
-                modified_ms,
-            })
-            .collect();
+        // References are read before the listing. An object published after
+        // that read is absent from the set; its ULID is younger than
+        // `sweep_min_age_ms`, so this pass does not delete it. The listing
+        // is one page at a time, so the pass does not hold every key.
         let referenced = self.referenced_objects()?;
-        let plan = self.sweeper.lock().await.plan(
-            &listed,
-            &referenced,
-            txn::now_ms(),
-            self.sweep_min_age_ms,
-            self.sweep_delay_ms,
-        );
+        let mut listing = self.bucket.list_pages("bundle/");
+        let mut sweeper = self.sweeper.lock().await;
+        sweeper.begin();
         let stats = &camus_compactor::STATS;
-        for object in plan {
-            if !self.leader() {
+        loop {
+            let page = listing.next_page(SWEEP_PAGE).await?;
+            if page.is_empty() {
                 break;
             }
-            match self.bucket.delete(&object.key).await {
-                Ok(()) => {
-                    stats
-                        .objects_deleted
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    stats
-                        .bytes_deleted
-                        .fetch_add(object.size, std::sync::atomic::Ordering::Relaxed);
+            let listed: Vec<camus_compactor::sweep::Listed> = page
+                .into_iter()
+                .map(|(key, size, modified_ms)| camus_compactor::sweep::Listed {
+                    key,
+                    size,
+                    modified_ms,
+                })
+                .collect();
+            let plan = sweeper.observe(
+                &listed,
+                &referenced,
+                txn::now_ms(),
+                self.sweep_min_age_ms,
+                self.sweep_delay_ms,
+            );
+            for object in plan {
+                if !self.leader() {
+                    sweeper.finish();
+                    return Ok(());
                 }
-                Err(err) => tracing::warn!(key = %object.key, %err, "orphan delete failed"),
+                match self.bucket.delete(&object.key).await {
+                    Ok(()) => {
+                        stats
+                            .objects_deleted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        stats
+                            .bytes_deleted
+                            .fetch_add(object.size, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(err) => tracing::warn!(key = %object.key, %err, "orphan delete failed"),
+                }
             }
         }
+        sweeper.finish();
         stats
             .sweeps
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1297,39 +2012,63 @@ impl Kafka {
     }
 
     async fn compact_partition(&self, topic: &Topic, partition: i32) {
+        // Each pass rewrites at most `COMPACT_PASS_BYTES` of sealed records.
+        // A prefix larger than that continues on the next iteration, after
+        // the range just replaced.
+        let mut after = -1i64;
+        loop {
+            match self.compact_window(topic, partition, after).await {
+                CompactMore::Stop => return,
+                CompactMore::Again(end) => after = end,
+            }
+        }
+    }
+
+    /// Compact one byte-capped window starting after `after`.
+    async fn compact_window(&self, topic: &Topic, partition: i32, after: i64) -> CompactMore {
         let Some(state) = self.partition_state(topic, partition) else {
-            return;
+            return CompactMore::Stop;
         };
         // `min.compaction.lag.ms`: only the leading extents whose newest
         // record is at least that old are compacted.
         let now = txn::now_ms();
         let lag = topic.config_i64("min.compaction.lag.ms");
-        let mut eligible: Vec<camus_metadata::Extent> = Vec::new();
+        let mut window: Vec<camus_metadata::Extent> = Vec::new();
+        let mut bytes = 0u64;
+        let mut more = false;
         'scan: loop {
-            let after = eligible.last().map_or(-1, |extent| extent.end);
-            let Ok(page) = self.extents_after(topic, partition, &state, after, EXTENT_PAGE) else {
-                return;
+            let cursor = window.last().map_or(after, |extent| extent.end);
+            let Ok(page) = self.extents_after(topic, partition, &state, cursor, EXTENT_PAGE) else {
+                return CompactMore::Stop;
             };
             let full = page.len() == EXTENT_PAGE;
             for extent in page {
                 if now.saturating_sub(extent.max_timestamp) < lag {
                     break 'scan;
                 }
-                eligible.push(extent);
+                let len = u64::from(extent.length);
+                if !window.is_empty()
+                    && (window.len() >= COMPACT_PASS_EXTENTS
+                        || bytes.saturating_add(len) > COMPACT_PASS_BYTES)
+                {
+                    more = true;
+                    break 'scan;
+                }
+                bytes = bytes.saturating_add(len);
+                window.push(extent);
             }
             if !full {
                 break;
             }
         }
-        let Some(last) = eligible.last() else {
-            return;
+        let Some(last) = window.last() else {
+            return CompactMore::Stop;
         };
+        let covered_start = window[0].start;
         let covered_end = last.end;
         let tombstones_before = now.saturating_sub(topic.config_i64("delete.retention.ms"));
-        let mut records = Vec::new();
-        let mut base_timestamp = i64::MAX;
-        let mut max_timestamp = i64::MIN;
-        for extent in &eligible {
+        let mut bodies = Vec::new();
+        for extent in &window {
             if extent.length == 0 {
                 continue;
             }
@@ -1339,47 +2078,58 @@ impl Kafka {
                 .get_range(&extent.key, extent.file_offset..end)
                 .await
             else {
-                return;
+                return CompactMore::Stop;
             };
-            let mut cursor = bytes::Bytes::from(bytes);
-            let Ok(sets) = camus_protocol::records::RecordBatchDecoder::decode_all(&mut cursor)
-            else {
-                return;
-            };
-            for set in sets {
-                for record in set.records {
-                    let covers = |spans: &[camus_metadata::Span]| {
-                        spans
-                            .iter()
-                            .any(|span| span.start <= record.offset && record.offset < span.end)
-                    };
-                    if record.transactional
-                        && !covers(&state.txn_committed)
-                        && !covers(&state.txn_aborted)
-                    {
-                        return;
+            bodies.push(bytes);
+        }
+        let committed = state.txn_committed;
+        let aborted = state.txn_aborted;
+        // Decoding, planning, and rebuilding run on the blocking pool, off
+        // the threads that serve requests.
+        let rebuilt = tokio::task::spawn_blocking(move || {
+            if std::env::var("CAMUS_FAILPOINT").ok().as_deref() == Some("slow-compact") {
+                if let Ok(path) = std::env::var("CAMUS_FAILPOINT_MARKER") {
+                    let _ = std::fs::write(path, b"held");
+                }
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+            let mut records = Vec::new();
+            let mut base_timestamp = i64::MAX;
+            let mut max_timestamp = i64::MIN;
+            for bytes in bodies {
+                let mut cursor = bytes;
+                let sets =
+                    camus_protocol::records::RecordBatchDecoder::decode_all(&mut cursor).ok()?;
+                for set in sets {
+                    for record in set.records {
+                        let covers = |spans: &[camus_metadata::Span]| {
+                            spans
+                                .iter()
+                                .any(|span| span.covers(record.offset, record.producer_id))
+                        };
+                        if record.transactional && !covers(&committed) && !covers(&aborted) {
+                            return None;
+                        }
+                        if covers(&aborted) {
+                            continue;
+                        }
+                        base_timestamp = base_timestamp.min(record.timestamp);
+                        max_timestamp = max_timestamp.max(record.timestamp);
+                        records.push(record);
                     }
-                    if covers(&state.txn_aborted) {
-                        continue;
-                    }
-                    base_timestamp = base_timestamp.min(record.timestamp);
-                    max_timestamp = max_timestamp.max(record.timestamp);
-                    records.push(record);
                 }
             }
-        }
-        // Planning and rebuilding run on the blocking pool, off the threads
-        // that serve requests.
-        let rebuilt = tokio::task::spawn_blocking(move || {
             let kept = camus_protocol::compact::plan_expiring(&records, tombstones_before)?;
-            if kept.is_empty() {
-                return Some(None);
-            }
-            camus_protocol::compact::rebuild(&kept).ok().map(Some)
+            let body = if kept.is_empty() {
+                None
+            } else {
+                Some(camus_protocol::compact::rebuild(&kept).ok()?)
+            };
+            Some((base_timestamp, max_timestamp, body))
         })
         .await;
-        let Ok(Some(rebuilt)) = rebuilt else {
-            return;
+        let Ok(Some((mut base_timestamp, mut max_timestamp, rebuilt))) = rebuilt else {
+            return CompactMore::Stop;
         };
         // When nothing survives, the prefix becomes an extent with no
         // object and no bytes. The log start stays where it is, as Kafka's
@@ -1388,11 +2138,11 @@ impl Kafka {
             None => (String::new(), 0),
             Some(body) => {
                 let Ok(length) = u32::try_from(body.len()) else {
-                    return;
+                    return CompactMore::Stop;
                 };
                 let object_key = camus_uploader::object_key();
                 if self.bucket.put_new(&object_key, body).await.is_err() {
-                    return;
+                    return CompactMore::Stop;
                 }
                 (object_key, length)
             }
@@ -1401,11 +2151,12 @@ impl Kafka {
             base_timestamp = 0;
             max_timestamp = 0;
         }
-        let _ = self
+        match self
             .node
             .apply(Command::Compact {
                 topic: topic.name.clone(),
                 partition,
+                covered_start: Some(covered_start),
                 covered_end,
                 object_key,
                 file_offset: 0,
@@ -1413,11 +2164,103 @@ impl Kafka {
                 base_timestamp,
                 max_timestamp,
             })
-            .await;
+            .await
+        {
+            Ok(response) if response.error_code == 0 && more => CompactMore::Again(covered_end),
+            _ => CompactMore::Stop,
+        }
     }
 
     /// Accept connections until the listener closes.
+    /// Write a metadata snapshot to object storage on the leader. The object
+    /// is `meta/snap/{term}-{index}.snap`. `meta/snap/CURRENT` names the
+    /// newest one and moves at most once a second (ADR 0004).
+    async fn metadata_snapshots(&self) {
+        let interval_ms = std::env::var("CAMUS_META_SNAPSHOT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30_000);
+        if interval_ms == 0 {
+            return;
+        }
+        let every = std::env::var("CAMUS_META_SNAPSHOT_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10_000)
+            .max(1);
+        let interval = Duration::from_millis(interval_ms);
+        let mut uploaded: Option<u64> = None;
+        let mut since = Instant::now();
+        let mut current_at: Option<Instant> = None;
+        let mut pending: Option<String> = None;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some(key) = pending.clone() {
+                let due = current_at
+                    .map(|at| at.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if due
+                    && self
+                        .bucket
+                        .put("meta/snap/CURRENT", bytes::Bytes::from(key))
+                        .await
+                        .is_ok()
+                {
+                    current_at = Some(Instant::now());
+                    pending = None;
+                }
+            }
+            let metrics = self.node.raft.metrics().borrow().clone();
+            if metrics.current_leader != Some(metrics.id) {
+                continue;
+            }
+            let Some(applied) = metrics.last_applied.map(|id| id.index) else {
+                continue;
+            };
+            let advanced = match uploaded {
+                Some(prev) => applied > prev,
+                None => applied > 0,
+            };
+            let by_count = uploaded.is_some_and(|prev| applied.saturating_sub(prev) >= every);
+            let by_time = since.elapsed() >= interval;
+            if !advanced || !(by_time || by_count) {
+                continue;
+            }
+            let Ok(Some((term, index, body))) = self.node.snapshot_for_upload().await else {
+                continue;
+            };
+            if uploaded.is_some_and(|prev| index <= prev) {
+                continue;
+            }
+            let key = format!("meta/snap/{term}-{index}.snap");
+            let missing = self.bucket.is_missing(&key).await.unwrap_or(true);
+            if missing
+                && self
+                    .bucket
+                    .put_new(&key, bytes::Bytes::from(body))
+                    .await
+                    .is_err()
+            {
+                tracing::warn!(%key, "metadata snapshot upload failed");
+                continue;
+            }
+            uploaded = Some(index);
+            since = Instant::now();
+            META_SNAPSHOT_INDEX.store(index, std::sync::atomic::Ordering::Relaxed);
+            META_SNAPSHOT_AT_MS.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or(0),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            pending = Some(key);
+        }
+    }
+
     pub async fn run(self: Arc<Self>, listener: TcpListener) {
+        let snaps = Arc::clone(&self);
+        tokio::spawn(async move { snaps.metadata_snapshots().await });
         let flush = Arc::clone(&self);
         tokio::spawn(async move {
             loop {
@@ -1506,8 +2349,6 @@ impl Kafka {
                 }
             });
         }
-        // One upload loop per shard, started as shards open, so a shard
-        // that is slow or without quorum delays and backs off only itself.
         let upload = Arc::clone(&self);
         tokio::spawn(async move {
             let mut started = std::collections::BTreeSet::new();
@@ -1524,6 +2365,32 @@ impl Kafka {
             Arc::clone(&self),
             Arc::clone(&self.coordinator),
         ));
+        if let Some(endpoint) = camus_raft::quic::current() {
+            let hints = self.hints.clone();
+            endpoint
+                .set_datagram_handler(move |bytes| {
+                    let Ok(announcement) =
+                        camus_raft::codec::decode::<camus_raft::quic::Announcement>(&bytes)
+                    else {
+                        return;
+                    };
+                    hints.note(
+                        announcement.shard,
+                        announcement.term,
+                        announcement.leader,
+                        announcement.epoch,
+                    );
+                })
+                .await;
+            let announcing = Arc::clone(&self);
+            tokio::spawn(async move {
+                let (heartbeat_ms, _, _) = camus_raft::quic::raft_timeouts();
+                loop {
+                    announcing.announce_quic(&endpoint).await;
+                    tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
+                }
+            });
+        }
         let register = Arc::clone(&self);
         tokio::spawn(async move {
             let key = format!("broker/{}", register.node_id);
@@ -1533,8 +2400,19 @@ impl Kafka {
                 if stored.as_deref() != Some(addr.as_str()) {
                     let _ = register.meta_write(key.clone(), addr.clone()).await;
                 }
+                if let Some(rack) = &register.rack {
+                    let rack_key = format!("broker/{}/rack", register.node_id);
+                    let stored = register.node.read_local(&rack_key).ok().flatten();
+                    if stored.as_deref() != Some(rack.as_str()) {
+                        let _ = register.meta_write(rack_key, rack.clone()).await;
+                    }
+                }
                 register.announce_shard().await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                let announce_ms = std::env::var("CAMUS_SHARD_ANNOUNCE_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(200);
+                tokio::time::sleep(Duration::from_millis(announce_ms)).await;
             }
         });
         loop {
@@ -1583,6 +2461,11 @@ impl Kafka {
                 match reply {
                     Reply::Frame(frame) => {
                         if socket.write_all(&frame).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Reply::Chunks(chunks) => {
+                        if socket.write_chunks(&chunks).await.is_err() {
                             return Ok(());
                         }
                     }
@@ -1668,8 +2551,26 @@ impl Kafka {
             ApiKey::CreateTopics => self.create_topics(&header, &mut buf, &caller).await,
             ApiKey::DeleteTopics => self.delete_topics(&header, &mut buf, &caller).await,
             ApiKey::DescribeConfigs => self.describe_configs(&header, &mut buf, &caller),
-            ApiKey::Produce => return self.produce(&header, &mut buf, &caller).await,
-            ApiKey::Fetch => self.fetch(&header, &mut buf, &caller).await,
+            ApiKey::Produce => {
+                let started = Instant::now();
+                return match self.produce(&header, &mut buf, &caller).await {
+                    Handled::Now(reply) => {
+                        crate::metrics::PRODUCE_LATENCY.record(started.elapsed());
+                        Handled::Now(reply)
+                    }
+                    Handled::Later(rest) => Handled::Later(Box::pin(async move {
+                        let reply = rest.await;
+                        crate::metrics::PRODUCE_LATENCY.record(started.elapsed());
+                        reply
+                    })),
+                };
+            }
+            ApiKey::Fetch => {
+                let started = Instant::now();
+                let reply = self.fetch(&header, &mut buf, &caller).await;
+                crate::metrics::FETCH_LATENCY.record(started.elapsed());
+                reply
+            }
             ApiKey::ListOffsets => self.list_offsets(&header, &mut buf, &caller).await,
             ApiKey::SaslHandshake => self.sasl_handshake(&header, &mut buf, session),
             ApiKey::SaslAuthenticate => self.sasl_authenticate(&header, &mut buf, session),
@@ -1882,6 +2783,7 @@ impl Kafka {
                 broker.node_id = BrokerId(id);
                 broker.host = StrBytes::from_string(host.to_string());
                 broker.port = port;
+                broker.rack = self.broker_rack(id).map(StrBytes::from_string);
                 Some(broker)
             })
             .collect()
@@ -2333,6 +3235,11 @@ impl Kafka {
                         out.read_only = row.spec.create_only;
                         out.config_source = row.source;
                         out.config_type = row.spec.config_type();
+                        if request.include_documentation {
+                            if let Some(note) = row.spec.note() {
+                                out.documentation = Some(StrBytes::from_static_str(note));
+                            }
+                        }
                         if request.include_synonyms {
                             let mut synonym = camus_protocol::messages::describe_configs_response::DescribeConfigsSynonym::default();
                             synonym.name = StrBytes::from_static_str(row.spec.name);
@@ -2640,6 +3547,19 @@ impl Kafka {
         }
         self.arrived(&produce.topic, produce.partition);
         if let Some((id, producer, epoch)) = produce.txn {
+            // The WAL apply recorded the span. Metadata hears about it at
+            // EndTxn. A batch that commits after the transaction ended is
+            // still aborted here, or read_committed would stop in front of it.
+            if self.txn_is_ongoing(&id, producer, epoch) {
+                return Ok(response.base_offset);
+            }
+            let start = response.base_offset;
+            let end = start + i64::from(produce.records);
+            // EndTxn already stored this batch. Aborting the whole open span
+            // would hide the batches it committed.
+            if self.txn_batch_committed(&produce.topic, produce.partition, producer, start, end) {
+                return Ok(response.base_offset);
+            }
             let noted = self
                 .meta_apply(Command::NoteTxn {
                     transactional_id: id,
@@ -2648,9 +3568,11 @@ impl Kafka {
                     span: TxnSpan {
                         topic: produce.topic,
                         partition: produce.partition,
-                        start: response.base_offset,
-                        end: response.base_offset + i64::from(produce.records),
+                        start,
+                        end,
+                        producer_id: Some(producer),
                     },
+                    skip_published: true,
                 })
                 .await;
             if let Some(code) = noted_error(&noted) {
@@ -2681,6 +3603,15 @@ impl Kafka {
         frame_of(header.request_api_version, header.correlation_id, &response)
     }
 
+    /// A restore found two objects for this range whose batch bytes differ.
+    fn restore_offline(&self, topic_id: &str, partition: i32) -> bool {
+        self.node
+            .read_local(&camus_metadata::offline_key(topic_id, partition))
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     async fn enqueue_partition(
         &self,
         name: &str,
@@ -2695,6 +3626,9 @@ impl Kafka {
         let Some(topic) = topic else {
             return Err(UNKNOWN_TOPIC);
         };
+        if self.restore_offline(&topic.id, partition) {
+            return Err(LEADER_NOT_AVAILABLE);
+        }
         if topic.durability == "wal" {
             return self
                 .write_wal(
@@ -2981,6 +3915,7 @@ impl Kafka {
     async fn upload_loop(self: Arc<Self>, id: u32) {
         let mut failures = 0u32;
         let mut backlog = false;
+        let mut quiet = QuietHold::default();
         loop {
             // A pass that filled its object leaves more behind; start the
             // next one at once so a backlog drains at R2's pace.
@@ -2995,11 +3930,15 @@ impl Kafka {
             let Some(wal) = self.wal.shard(id) else {
                 continue;
             };
-            match self.upload_shard(wal).await {
+            match self.upload_shard(id, wal, &mut quiet).await {
                 Upload::Failed => {
                     failures = failures.saturating_add(1);
                     backlog = false;
                     tracing::warn!(shard = id, failures, "wal upload failed; retrying");
+                }
+                Upload::Hold => {
+                    failures = 0;
+                    backlog = false;
                 }
                 pass => {
                     failures = 0;
@@ -3012,9 +3951,19 @@ impl Kafka {
     /// One upload pass for one shard this broker leads. The shard is fixed
     /// for the whole pass, so a truncate mid-upload cannot seal into the
     /// shard that replaced it.
-    async fn upload_shard(&self, wal: Arc<Shard>) -> Upload {
+    async fn upload_shard(&self, id: u32, wal: Arc<Shard>, quiet: &mut QuietHold) -> Upload {
         if !wal.is_leader() {
+            *quiet = QuietHold::default();
             return Upload::Done;
+        }
+        // Hold the whole pass, including the object put. A seal-only delay
+        // would still publish, which is what a stuck quorum must not do for
+        // this shard while the others continue.
+        if std::env::var("CAMUS_FAILPOINT")
+            .ok()
+            .is_some_and(|raw| raw == format!("slow-seal:{id}"))
+        {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
         }
         let pending = match wal.pending(UPLOAD_PASS_BYTES as u64).await {
             Ok(pending) => pending,
@@ -3024,6 +3973,7 @@ impl Kafka {
             }
         };
         if pending.is_empty() {
+            *quiet = QuietHold::default();
             return Upload::Done;
         }
         let taken: usize = pending.iter().map(|batch| batch.bytes.len()).sum();
@@ -3070,14 +4020,30 @@ impl Kafka {
             cursor.insert(key, batch.end);
             upload.push(batch);
         }
+        let queued: usize = upload.iter().map(|batch| batch.bytes.len()).sum();
+        if queued == 0 {
+            *quiet = QuietHold::default();
+        } else {
+            let started = quiet.since.get_or_insert_with(Instant::now);
+            let waited = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if !upload_due(queued, waited, self.flush_ms, self.quiet_ms) {
+                return Upload::Hold;
+            }
+        }
+        let times = crate::metrics::shard_times(id);
         if !upload.is_empty() {
+            let started = Instant::now();
+            let span_notes = self.seal_span_notes(&upload);
             let (parts, producers, seals, all_put) = self.put_objects(upload).await;
             if !all_put {
                 ok = false;
             }
             if !parts.is_empty() {
-                let published = self.meta_publish(parts, producers).await;
-                let accepted = published.is_ok_and(|response| response.error_code == 0);
+                let published = self.meta_publish(parts, producers, span_notes).await;
+                let accepted = published.is_ok_and(|response| {
+                    response.error_code == 0
+                        && response.each.iter().all(|child| child.error_code == 0)
+                });
                 if !accepted {
                     ok = false;
                 }
@@ -3092,6 +4058,9 @@ impl Kafka {
                     drops.extend(seals);
                 }
             }
+            if ok {
+                times.upload.record(started.elapsed());
+            }
         }
         let done = if !ok {
             Upload::Failed
@@ -3100,13 +4069,23 @@ impl Kafka {
         } else {
             Upload::Done
         };
+        if ok {
+            *quiet = QuietHold::default();
+        }
         if drops.is_empty() {
             return done;
         }
-        if let Ok(Ok(index)) = tokio::time::timeout(COMMIT_TIMEOUT, wal.seal(drops)).await {
-            let _ = wal.purge(index).await;
+        // A shard without quorum never finishes the seal. Fail the pass so
+        // this shard backs off instead of retrying on every flush interval.
+        let started = Instant::now();
+        match tokio::time::timeout(COMMIT_TIMEOUT, wal.seal(drops)).await {
+            Ok(Ok(index)) => {
+                times.seal.record(started.elapsed());
+                let _ = wal.purge(index).await;
+                done
+            }
+            _ => Upload::Failed,
         }
-        done
     }
 
     /// Buffer one `r2` batch. Returns how long it waited for buffer space.
@@ -3296,6 +4275,42 @@ impl Kafka {
                 bytes: sealed,
             });
         }
+        let mut span_notes = Vec::new();
+        let mut noted = pieces.iter();
+        for (item, plan) in items.iter().zip(&plans) {
+            let Some(id) = item.txn_id.clone() else {
+                if matches!(plan, Plan::Append) {
+                    let _ = noted.next();
+                }
+                continue;
+            };
+            let (start, end) = match plan {
+                Plan::Replay(offset) => (*offset, offset + i64::from(item.records)),
+                Plan::Append => {
+                    let Some(piece) = noted.next() else {
+                        return fail(items, STORAGE);
+                    };
+                    (piece.start, piece.end)
+                }
+                Plan::Error(_) => continue,
+            };
+            if self.txn_span_open(&id, &item.topic, item.partition) {
+                continue;
+            }
+            span_notes.push(Command::NoteTxn {
+                transactional_id: id,
+                producer_id: item.producer_id,
+                producer_epoch: item.producer_epoch,
+                span: TxnSpan {
+                    topic: item.topic.clone(),
+                    partition: item.partition,
+                    start,
+                    end,
+                    producer_id: Some(item.producer_id),
+                },
+                skip_published: true,
+            });
+        }
         let mut parts = Vec::new();
         if !pieces.is_empty() {
             // Encode each partition's batches together, so they publish as one
@@ -3338,12 +4353,13 @@ impl Kafka {
                     max_timestamp: item.max_timestamp,
                 });
             }
-            let published =
-                tokio::time::timeout(COMMIT_TIMEOUT, self.node.publish(coalesce(parts), notes))
-                    .await;
+            let published = tokio::time::timeout(
+                COMMIT_TIMEOUT,
+                self.node.publish_with(coalesce(parts), notes, span_notes),
+            )
+            .await;
             let code = match published {
-                Ok(Ok(response)) if response.error_code == 0 => None,
-                Ok(Ok(response)) => Some(response.error_code),
+                Ok(Ok(response)) => publish_note_error(&response),
                 Ok(Err(_)) => Some(NOT_LEADER),
                 Err(_) => Some(REQUEST_TIMED_OUT),
             };
@@ -3353,38 +4369,12 @@ impl Kafka {
             for item in &items {
                 self.arrived(&item.topic, item.partition);
             }
-        }
-        let mut noted = pieces.iter();
-        for (item, plan) in items.iter().zip(&plans) {
-            let Some(id) = item.txn_id.clone() else {
-                if matches!(plan, Plan::Append) {
-                    let _ = noted.next();
+        } else {
+            for command in span_notes {
+                let applied = self.meta_apply(command).await;
+                if let Some(code) = noted_error(&applied) {
+                    return fail(items, code);
                 }
-                continue;
-            };
-            let (start, end) = match plan {
-                Plan::Replay(offset) => (*offset, offset + i64::from(item.records)),
-                Plan::Append => {
-                    let piece = noted.next().expect("piece");
-                    (piece.start, piece.end)
-                }
-                Plan::Error(_) => continue,
-            };
-            let applied = self
-                .meta_apply(Command::NoteTxn {
-                    transactional_id: id,
-                    producer_id: item.producer_id,
-                    producer_epoch: item.producer_epoch,
-                    span: TxnSpan {
-                        topic: item.topic.clone(),
-                        partition: item.partition,
-                        start,
-                        end,
-                    },
-                })
-                .await;
-            if let Some(code) = noted_error(&applied) {
-                return fail(items, code);
             }
         }
         let mut appends = pieces.iter();
@@ -3405,6 +4395,8 @@ impl Kafka {
             return Reply::Close;
         };
         let mut response = FetchResponse::default();
+        let client_rack = request.rack_id.as_str();
+        let version = header.request_api_version;
         let deadline = Instant::now() + Duration::from_millis(request.max_wait_ms.max(0) as u64);
         let min_bytes = usize::try_from(request.min_bytes.max(1)).unwrap_or(1);
         // Woken when a batch commits on one of these partitions here.
@@ -3448,6 +4440,8 @@ impl Kafka {
                             partition.fetch_offset,
                             partition.partition_max_bytes,
                             request.isolation_level,
+                            client_rack,
+                            version,
                         )
                     })
                     .collect();
@@ -3474,7 +4468,19 @@ impl Kafka {
             }
         }
         drop(watching);
-        frame_of(header.request_api_version, header.correlation_id, &response)
+        let shared: Vec<Bytes> = response
+            .responses
+            .iter()
+            .flat_map(|topic| topic.partitions.iter())
+            .filter_map(|part| part.records.clone())
+            .filter(|records| !records.is_empty())
+            .collect();
+        frame_of_shared(
+            header.request_api_version,
+            header.correlation_id,
+            &response,
+            &shared,
+        )
     }
 
     async fn fetch_partition(
@@ -3485,6 +4491,8 @@ impl Kafka {
         offset: i64,
         max_bytes: i32,
         isolation: i8,
+        client_rack: &str,
+        version: i16,
     ) -> PartitionData {
         let mut row = PartitionData::default();
         row.partition_index = partition;
@@ -3492,7 +4500,17 @@ impl Kafka {
             row.error_code = UNKNOWN_TOPIC;
             return row;
         };
-        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
+        if self.restore_offline(&topic.id, partition) {
+            row.error_code = LEADER_NOT_AVAILABLE;
+            return row;
+        }
+        if let Some(preferred) = self.preferred_read_replica(topic, partition, client_rack, version)
+        {
+            row.preferred_read_replica = BrokerId(preferred);
+            row.error_code = 0;
+            return row;
+        }
+        if !self.can_fetch(topic, partition) {
             row.error_code = NOT_LEADER;
             return row;
         }
@@ -3522,13 +4540,13 @@ impl Kafka {
                 row.error_code = 1;
                 return row;
             }
-            let mut out = BytesMut::new();
+            let mut out = RecordOut::default();
             let mut stopped = false;
             let mut after = offset;
             'extents: loop {
                 let Ok(page) = self.extents_after(topic, partition, &state, after, EXTENT_PAGE)
                 else {
-                    row.error_code = STORAGE;
+                    row.error_code = self.read_failure(topic, partition);
                     return row;
                 };
                 let full = page.len() == EXTENT_PAGE;
@@ -3549,7 +4567,7 @@ impl Kafka {
                 let mut reads = futures::stream::iter(pending).buffered(EXTENT_READS);
                 while let Some(read) = reads.next().await {
                     let Ok(bytes) = read else {
-                        row.error_code = STORAGE;
+                        row.error_code = self.read_failure(topic, partition);
                         return row;
                     };
                     let Ok(info) = batch::inspect(&bytes, MAX_FRAME) else {
@@ -3557,16 +4575,49 @@ impl Kafka {
                         return row;
                     };
                     let mut cursor = 0;
-                    for batch in info {
+                    let mut span: Option<usize> = None;
+                    let producers = batch::producer_batches(&bytes, MAX_FRAME).unwrap_or_default();
+                    for (index, batch) in info.iter().enumerate() {
                         let next = batch.last_offset + 1;
+                        let producer = producers
+                            .get(index)
+                            .map(|row| row.producer_id)
+                            .unwrap_or(-1);
                         if isolation == 1 {
-                            match txn_batch(batch.base_offset, batch.transactional, &state) {
+                            match txn_batch(
+                                batch.base_offset,
+                                producer,
+                                batch.transactional,
+                                &state,
+                            ) {
                                 TxnView::Stop => {
+                                    if let Some(start) = span.take() {
+                                        out.push(bytes.slice(start..cursor));
+                                    }
                                     stable = stable.min(batch.base_offset);
                                     stopped = true;
                                     break 'extents;
                                 }
                                 TxnView::Skip => {
+                                    if let Some(start) = span.take() {
+                                        out.push(bytes.slice(start..cursor));
+                                    }
+                                    // A marker in its place moves the consumer
+                                    // past the range, as in Kafka (ADR 0021).
+                                    // Markers count toward the fetch size, so a
+                                    // long run of aborts cannot grow it.
+                                    if next > offset {
+                                        if let Some(marker) = bytes
+                                            .get(cursor..cursor + batch.len)
+                                            .and_then(|raw| batch::abort_marker(raw).ok())
+                                        {
+                                            if !out.is_empty() && out.len() + marker.len() > limit {
+                                                stopped = true;
+                                                break 'extents;
+                                            }
+                                            out.push(marker);
+                                        }
+                                    }
                                     cursor += batch.len;
                                     continue;
                                 }
@@ -3574,13 +4625,24 @@ impl Kafka {
                             }
                         }
                         if next > offset && batch.base_offset < stable {
-                            if !out.is_empty() && out.len() + batch.len > limit {
+                            let already = out.len() + span.map(|start| cursor - start).unwrap_or(0);
+                            if already > 0 && already + batch.len > limit {
+                                if let Some(start) = span.take() {
+                                    out.push(bytes.slice(start..cursor));
+                                }
                                 stopped = true;
                                 break 'extents;
                             }
-                            out.extend_from_slice(&bytes[cursor..cursor + batch.len]);
+                            if span.is_none() {
+                                span = Some(cursor);
+                            }
+                        } else if let Some(start) = span.take() {
+                            out.push(bytes.slice(start..cursor));
                         }
                         cursor += batch.len;
+                    }
+                    if let Some(start) = span.take() {
+                        out.push(bytes.slice(start..cursor));
                     }
                 }
                 if !full {
@@ -3599,7 +4661,7 @@ impl Kafka {
                 let extra = match unsealed {
                     Ok(extra) => extra,
                     Err(_) => {
-                        row.error_code = STORAGE;
+                        row.error_code = self.read_failure(topic, partition);
                         return row;
                     }
                 };
@@ -3615,12 +4677,12 @@ impl Kafka {
                     extra
                 };
                 let extra = if isolation == 1 {
-                    filter_txn(&extra, &state, &mut stable)
+                    filter_txn(&extra, &state, offset, &mut stable)
                 } else {
                     extra
                 };
                 if !extra.is_empty() && (out.is_empty() || out.len() + extra.len() <= limit) {
-                    out.extend_from_slice(&extra);
+                    out.push(Bytes::from(extra));
                 }
             }
             let moved = self
@@ -3630,9 +4692,9 @@ impl Kafka {
                 row.high_watermark = stable;
                 row.last_stable_offset = stable;
             }
-            if !out.is_empty() {
-                row.records = Some(out.freeze());
-            }
+            // An empty fetch is an empty record set, as from Kafka, not null:
+            // librdkafka rejects a null set as a parse failure.
+            row.records = Some(out.into_bytes().unwrap_or_default());
             if !moved {
                 return row;
             }
@@ -3672,6 +4734,7 @@ impl Kafka {
                         partition.partition_index,
                         partition.current_leader_epoch,
                         partition.timestamp,
+                        request.isolation_level,
                     )
                     .await;
                 // The epoch is in the response from v4. The encoder refuses a
@@ -3693,6 +4756,7 @@ impl Kafka {
         partition: i32,
         current_leader_epoch: i32,
         timestamp: i64,
+        isolation: i8,
     ) -> ListOffsetsPartitionResponse {
         let mut row = ListOffsetsPartitionResponse::default();
         row.partition_index = partition;
@@ -3702,7 +4766,7 @@ impl Kafka {
             row.offset = -1;
             return row;
         };
-        if topic.durability == "wal" && !self.leads_wal(topic, partition) {
+        if !self.can_fetch(topic, partition) {
             row.error_code = NOT_LEADER;
             row.offset = -1;
             return row;
@@ -3722,8 +4786,13 @@ impl Kafka {
             row.offset = state.log_start;
             return row;
         }
+        let high_watermark = state.next_offset.max(self.wal_end(topic, partition));
         if timestamp == -1 {
-            row.offset = state.next_offset.max(self.wal_end(topic, partition));
+            row.offset = if isolation == 1 {
+                self.last_stable(topic, partition, high_watermark)
+            } else {
+                high_watermark
+            };
             return row;
         }
         let mut after = -1;
@@ -3756,8 +4825,19 @@ impl Kafka {
                 let mut batch_offset = extent.start;
                 for batch in info {
                     if batch.max_timestamp >= timestamp {
-                        row.offset = batch_offset;
-                        row.timestamp = batch.max_timestamp;
+                        // Kafka keeps a timestamp lookup only below the last
+                        // offset the isolation level may read.
+                        let fetchable = if isolation == 1 {
+                            self.last_stable(topic, partition, high_watermark)
+                        } else {
+                            high_watermark
+                        };
+                        if batch_offset < fetchable {
+                            row.offset = batch_offset;
+                            row.timestamp = batch.max_timestamp;
+                        } else {
+                            row.offset = -1;
+                        }
                         return row;
                     }
                     batch_offset += i64::from(batch.records);
@@ -3854,6 +4934,11 @@ impl Kafka {
 /// Milliseconds produce requests spent held at `wal.disk.limit`, in total.
 pub static PRODUCE_HOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Log index of the newest metadata snapshot written to object storage.
+pub static META_SNAPSHOT_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Unix milliseconds when that snapshot was written. `0` means none yet.
+pub static META_SNAPSHOT_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Kafka ACL resource types, operations, and authorization errors.
 pub(crate) mod auth {
     pub(crate) const TOPIC: i8 = 2;
@@ -3904,6 +4989,30 @@ enum Upload {
     Full,
     /// The put or the publish failed; back off.
     Failed,
+    /// Unsealed bytes are waiting for a full object, or for the busy timer.
+    Hold,
+}
+
+/// When the current quiet prefix started. Cleared after an upload.
+#[derive(Default)]
+struct QuietHold {
+    since: Option<Instant>,
+}
+
+/// A full object uploads immediately. Half an object uploads on `flush_ms`.
+/// Anything smaller waits until `quiet_ms`, so a trickle does not put four
+/// times a second.
+fn upload_due(pending: usize, waited_ms: u64, flush_ms: u64, quiet_ms: u64) -> bool {
+    if pending == 0 {
+        return false;
+    }
+    if pending >= FLUSH_BYTES {
+        return true;
+    }
+    if pending >= FLUSH_BYTES / 2 && waited_ms >= flush_ms {
+        return true;
+    }
+    waited_ms >= quiet_ms
 }
 
 /// Exponential backoff from 100ms to 5s, with up to half again as jitter so
@@ -4117,6 +5226,21 @@ fn coalesce(mut parts: Vec<PublishPart>) -> Vec<PublishPart> {
     out
 }
 
+/// A publish that carried transaction spans fails when the publish or any
+/// span was rejected. An abort marker (`value` set, error code 0) is a
+/// failure for the producer: the batch is in the log and not in the transaction.
+fn publish_note_error(response: &camus_metadata::Response) -> Option<i16> {
+    if response.each.is_empty() {
+        return noted_error(&Ok(response.clone()));
+    }
+    for child in &response.each {
+        if let Some(code) = noted_error(&Ok(child.clone())) {
+            return Some(code);
+        }
+    }
+    None
+}
+
 fn noted_error(applied: &anyhow::Result<camus_metadata::Response>) -> Option<i16> {
     match applied {
         Ok(response) if response.error_code != 0 => Some(response.error_code),
@@ -4134,21 +5258,26 @@ enum TxnView {
     Stop,
 }
 
-fn txn_batch(offset: i64, transactional: bool, state: &camus_metadata::Partition) -> TxnView {
+fn txn_batch(
+    offset: i64,
+    producer_id: i64,
+    transactional: bool,
+    state: &camus_metadata::Partition,
+) -> TxnView {
     if !transactional {
         return TxnView::Take;
     }
     if state
         .txn_aborted
         .iter()
-        .any(|span| span.start <= offset && offset < span.end)
+        .any(|span| span.covers(offset, producer_id))
     {
         return TxnView::Skip;
     }
     if state
         .txn_committed
         .iter()
-        .any(|span| span.start <= offset && offset < span.end)
+        .any(|span| span.covers(offset, producer_id))
     {
         TxnView::Take
     } else {
@@ -4156,17 +5285,38 @@ fn txn_batch(offset: i64, transactional: bool, state: &camus_metadata::Partition
     }
 }
 
-fn filter_txn(bytes: &[u8], state: &camus_metadata::Partition, stable: &mut i64) -> Vec<u8> {
+/// The `read_committed` view of WAL batches read from `offset`. An aborted
+/// batch becomes an abort marker at its last offset, so the consumer moves
+/// past it (ADR 0021).
+fn filter_txn(
+    bytes: &[u8],
+    state: &camus_metadata::Partition,
+    offset: i64,
+    stable: &mut i64,
+) -> Vec<u8> {
     let Ok(info) = batch::inspect(bytes, MAX_FRAME) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     let mut cursor = 0;
-    for batch in info {
-        match txn_batch(batch.base_offset, batch.transactional, state) {
+    let producers = batch::producer_batches(bytes, MAX_FRAME).unwrap_or_default();
+    for (index, batch) in info.iter().enumerate() {
+        let producer = producers
+            .get(index)
+            .map(|row| row.producer_id)
+            .unwrap_or(-1);
+        match txn_batch(batch.base_offset, producer, batch.transactional, state) {
             TxnView::Stop => {
                 *stable = (*stable).min(batch.base_offset);
                 break;
+            }
+            TxnView::Skip if batch.last_offset >= offset && batch.base_offset < *stable => {
+                if let Some(empty) = bytes
+                    .get(cursor..cursor + batch.len)
+                    .and_then(|raw| batch::abort_marker(raw).ok())
+                {
+                    out.extend_from_slice(&empty);
+                }
             }
             TxnView::Skip => {}
             TxnView::Take if batch.base_offset < *stable => {
@@ -4177,6 +5327,74 @@ fn filter_txn(bytes: &[u8], state: &camus_metadata::Partition, stable: &mut i64)
         cursor += batch.len;
     }
     out
+}
+
+#[derive(Default)]
+struct RecordOut {
+    parts: Vec<Bytes>,
+    len: usize,
+}
+
+impl RecordOut {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push(&mut self, bytes: Bytes) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.len += bytes.len();
+        self.parts.push(bytes);
+    }
+
+    fn into_bytes(self) -> Option<Bytes> {
+        match self.parts.len() {
+            0 => None,
+            1 => self.parts.into_iter().next(),
+            _ => {
+                let mut buf = BytesMut::with_capacity(self.len);
+                for part in self.parts {
+                    buf.extend_from_slice(&part);
+                }
+                Some(buf.freeze())
+            }
+        }
+    }
+}
+
+async fn write_vectored(socket: &mut TcpStream, chunks: &[Bytes]) -> std::io::Result<()> {
+    use std::io::IoSlice;
+    let mut bufs: Vec<IoSlice<'_>> = chunks.iter().map(|chunk| IoSlice::new(chunk)).collect();
+    let mut rest = bufs.as_mut_slice();
+    while rest.iter().any(|slice| !slice.is_empty()) {
+        let n = tokio::io::AsyncWriteExt::write_vectored(socket, rest).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write closed",
+            ));
+        }
+        IoSlice::advance_slices(&mut rest, n);
+    }
+    Ok(())
+}
+
+fn frame_of_shared<M>(version: i16, correlation: i32, message: &M, shared: &[Bytes]) -> Reply
+where
+    M: camus_protocol::protocol::Encodable + camus_protocol::protocol::HeaderVersion,
+{
+    match encode_response_chunks(version, correlation, message, shared) {
+        Ok(chunks) => Reply::Chunks(chunks),
+        Err(err) => {
+            tracing::warn!(%err, version, "response encode failed");
+            Reply::Close
+        }
+    }
 }
 
 fn frame_of<M>(version: i16, correlation: i32, message: &M) -> Reply
@@ -4245,5 +5463,32 @@ mod principal_tests {
             .collect();
         assert_eq!(encoded, vec!["2.5.4.3", "2.5.4.10"]);
         assert_eq!(rfc2253(parsed.subject()), "O=example,CN=alice\\, the admin");
+    }
+}
+
+#[cfg(test)]
+mod upload_due_tests {
+    use super::upload_due;
+
+    const OBJECT: usize = 8 * 1024 * 1024;
+
+    #[test]
+    fn a_trickle_waits_and_a_full_object_uploads() -> Result<(), String> {
+        if upload_due(100, 0, 250, 30_000) {
+            return Err("a new trickle must wait".into());
+        }
+        if !upload_due(100, 30_000, 250, 30_000) {
+            return Err("a trickle uploads at the quiet bound".into());
+        }
+        if !upload_due(OBJECT, 0, 250, 30_000) {
+            return Err("a full object uploads immediately".into());
+        }
+        if upload_due(OBJECT / 2, 0, 250, 30_000) {
+            return Err("half an object waits for the busy timer".into());
+        }
+        if !upload_due(OBJECT / 2, 250, 250, 30_000) {
+            return Err("half an object uploads on the busy timer".into());
+        }
+        Ok(())
     }
 }

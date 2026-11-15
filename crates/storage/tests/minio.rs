@@ -8,6 +8,9 @@ use camus_storage::{Bucket, BucketConfig};
 #[tokio::test]
 async fn put_range_and_delete() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        if std::env::var("CAMUS_REQUIRE_CLIENTS").ok().as_deref() == Some("1") {
+            panic!("required test skipped: MinIO test; set CAMUS_MINIO=1");
+        }
         eprintln!("skipping MinIO test; set CAMUS_MINIO=1");
         return;
     }
@@ -45,6 +48,9 @@ async fn put_range_and_delete() {
 #[tokio::test]
 async fn a_prefix_namespaces_keys_and_list_strips_it() {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        if std::env::var("CAMUS_REQUIRE_CLIENTS").ok().as_deref() == Some("1") {
+            panic!("required test skipped: MinIO test; set CAMUS_MINIO=1");
+        }
         eprintln!("skipping MinIO test; set CAMUS_MINIO=1");
         return;
     }

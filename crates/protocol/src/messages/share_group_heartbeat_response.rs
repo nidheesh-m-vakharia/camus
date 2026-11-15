@@ -60,7 +60,7 @@ impl Encodable for Assignment {
         }
         types::CompactArray(types::Struct { version }).encode(buf, &self.topic_partitions)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -76,7 +76,7 @@ impl Encodable for Assignment {
         total_size +=
             types::CompactArray(types::Struct { version }).compute_size(&self.topic_partitions)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -258,7 +258,7 @@ impl Encodable for ShareGroupHeartbeatResponse {
         types::Int32.encode(buf, &self.heartbeat_interval_ms)?;
         types::OptionStruct { version }.encode(buf, &self.assignment)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -279,7 +279,7 @@ impl Encodable for ShareGroupHeartbeatResponse {
         total_size += types::Int32.compute_size(&self.heartbeat_interval_ms)?;
         total_size += types::OptionStruct { version }.compute_size(&self.assignment)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -404,7 +404,7 @@ impl Encodable for TopicPartitions {
         types::Uuid.encode(buf, &self.topic_id)?;
         types::CompactArray(types::Int32).encode(buf, &self.partitions)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -420,7 +420,7 @@ impl Encodable for TopicPartitions {
         total_size += types::Uuid.compute_size(&self.topic_id)?;
         total_size += types::CompactArray(types::Int32).compute_size(&self.partitions)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

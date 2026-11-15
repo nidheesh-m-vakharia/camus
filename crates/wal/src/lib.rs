@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::{Config, Raft};
+use openraft::{Config, EntryPayload, Raft};
 use serde::{Deserialize, Serialize};
 
 pub use machine::Batch;
@@ -66,6 +66,93 @@ openraft::declare_raft_types!(
         R = Response,
 );
 
+fn batch_slices(entry: &openraft::Entry<TypeConfig>) -> Vec<&[u8]> {
+    match &entry.payload {
+        EntryPayload::Normal(Command::Append(batch)) => vec![batch.raw.as_ref()],
+        EntryPayload::Normal(Command::Appends(batches)) => {
+            batches.iter().map(|batch| batch.raw.as_ref()).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn clear_batches(entry: &mut openraft::Entry<TypeConfig>) {
+    match &mut entry.payload {
+        EntryPayload::Normal(Command::Append(batch)) => batch.raw.clear(),
+        EntryPayload::Normal(Command::Appends(batches)) => {
+            for batch in batches {
+                batch.raw.clear();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fill_batches(entry: &mut openraft::Entry<TypeConfig>, raws: Vec<Vec<u8>>) {
+    let mut raws = raws.into_iter();
+    match &mut entry.payload {
+        EntryPayload::Normal(Command::Append(batch)) => {
+            if let Some(raw) = raws.next() {
+                batch.raw = bytes::Bytes::from(raw);
+            }
+        }
+        EntryPayload::Normal(Command::Appends(batches)) => {
+            for batch in batches {
+                if let Some(raw) = raws.next() {
+                    batch.raw = bytes::Bytes::from(raw);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn encode_log_len(entry: &openraft::Entry<TypeConfig>) -> std::io::Result<usize> {
+    let slices = batch_slices(entry);
+    let mut stripped = entry.clone();
+    clear_batches(&mut stripped);
+    let header = camus_raft::codec::encode(&stripped)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+    Ok(4 + 4
+        + slices.len() * 4
+        + 4
+        + header.len()
+        + slices.iter().map(|batch| batch.len()).sum::<usize>())
+}
+
+fn encode_log(
+    entry: &openraft::Entry<TypeConfig>,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    let slices = batch_slices(entry);
+    let mut stripped = entry.clone();
+    clear_batches(&mut stripped);
+    let header = camus_raft::codec::encode(&stripped)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+    camus_raft::layout::write_parts(&header, &slices, out)
+}
+
+fn decode_log(bytes: &[u8]) -> std::io::Result<openraft::Entry<TypeConfig>> {
+    let Some((header, raws)) = camus_raft::layout::read_parts(bytes)? else {
+        return camus_raft::codec::decode(bytes)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()));
+    };
+    let mut entry: openraft::Entry<TypeConfig> = camus_raft::codec::decode(header)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+    fill_batches(&mut entry, raws);
+    Ok(entry)
+}
+
+fn log_batch_at(entry: &openraft::Entry<TypeConfig>, pos: usize) -> std::io::Result<Option<u64>> {
+    let slices = batch_slices(entry);
+    let mut stripped = entry.clone();
+    clear_batches(&mut stripped);
+    let header = camus_raft::codec::encode(&stripped)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+    let lens: Vec<usize> = slices.iter().map(|batch| batch.len()).collect();
+    Ok(camus_raft::layout::batch_offset(header.len(), &lens, pos))
+}
+
 /// A committed command.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -78,6 +165,29 @@ pub enum Command {
     Seal {
         /// Identity of each dropped batch.
         drops: Vec<SealDrop>,
+    },
+    /// Stop this producer from extending its span. `EndTxn` sends this
+    /// before it reads the span, so a batch that commits afterwards is not
+    /// part of the transaction. A producer with no span is recorded too,
+    /// until `CloseTxn`, so a later batch is refused the same way.
+    FinishTxn {
+        /// Topic id.
+        topic_id: [u8; 16],
+        /// Partition.
+        partition: i32,
+        /// Producer whose span is frozen.
+        producer_id: i64,
+    },
+    /// Forget the open transaction span for one producer on one partition.
+    /// Missing spans are not an error. `EndTxn` sends this after metadata
+    /// has stored the span (ADR 0019).
+    CloseTxn {
+        /// Topic id.
+        topic_id: [u8; 16],
+        /// Partition.
+        partition: i32,
+        /// Producer whose span ends.
+        producer_id: i64,
     },
 }
 
@@ -234,23 +344,37 @@ impl From<Failure> for WriteError {
 /// Bytes one packed entry may carry before the committer starts another.
 const GROUP_BYTES: usize = 1024 * 1024;
 
-/// Packed entries that may be committing at once. Two: the next group's disk
-/// flush runs while the previous group waits on its quorum. The group is
-/// packed before a slot is taken, so the extra slot does not flush one batch
-/// at a time. Four slots, taken before the pack, measured 10.4 MiB/s and
-/// 0.18 fsyncs per ack against 14.9 MiB/s and 0.07 with a single slot
-/// (`broker/tests/throughput.rs`, 32 producers).
+/// Packed entries that may be committing at once. A second one starts only
+/// when a full group is already waiting, so its disk flush overlaps the
+/// previous quorum. Starting it sooner halves the group: on 2026-11-10, 32
+/// producers did 0.12 fsyncs per ack against 0.06 with one slot
+/// ([#129](https://github.com/nidheesh-m-vakharia/camus/issues/129)). Four
+/// slots, taken before the pack, measured 10.4 MiB/s and 0.18 fsyncs per ack
+/// against 14.9 MiB/s and 0.07 (`broker/tests/throughput.rs`, 32 producers).
 const IN_FLIGHT: usize = 2;
 
 /// Group commit (ADR 0006). Batches that arrive while entries are being
 /// committed wait here and go into the next entry together, so concurrent
 /// producers share one quorum fsync. Entries are submitted to Raft in arrival
 /// order, which is the order offsets are assigned.
+fn ack_delay() -> Option<std::time::Duration> {
+    let Ok(raw) = std::env::var("CAMUS_ACK_DELAY_MS") else {
+        return None;
+    };
+    let Ok(ms) = raw.parse::<u64>() else {
+        return None;
+    };
+    (ms > 0).then_some(std::time::Duration::from_millis(ms))
+}
+
 async fn commit_loop(
     raft: Raft<TypeConfig>,
     storage_failed: Arc<AtomicBool>,
     mut queue: tokio::sync::mpsc::UnboundedReceiver<Vec<Queued>>,
 ) {
+    // Test hook: the entry is already committed. Holding the ack lets a
+    // produce time out and still leave the record in the log.
+    let ack_delay = ack_delay();
     let slots = Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT));
     // Batches received but not yet packed, in arrival order. A request's
     // batches arrive as one chunk; a chunk larger than a group spills into
@@ -263,11 +387,32 @@ async fn commit_loop(
             };
             ready.extend(chunk);
         }
+        // While one commit is in flight, leave a short group queued. The
+        // slot that just freed would otherwise flush it immediately, and the
+        // queue never fills during the quorum wait.
+        loop {
+            while let Ok(chunk) = queue.try_recv() {
+                ready.extend(chunk);
+            }
+            let waiting: usize = ready.iter().map(|(append, _, _)| append.raw.len()).sum();
+            let idle = slots.available_permits() == IN_FLIGHT;
+            if waiting >= GROUP_BYTES || ready.len() >= machine::MAX_PACKED || idle {
+                break;
+            }
+            let idle_slots = slots.clone();
+            tokio::select! {
+                biased;
+                chunk = queue.recv() => {
+                    let Some(chunk) = chunk else {
+                        return;
+                    };
+                    ready.extend(chunk);
+                }
+                _ = wait_until_idle(idle_slots) => {}
+            }
+        }
         let mut size = 0;
         let mut group = Vec::new();
-        // Pack before taking a slot. With two commits allowed, the queue
-        // still fills to `GROUP_BYTES` while both slots are busy, and a free
-        // slot then flushes that whole pack instead of the next single batch.
         pack(&mut queue, &mut ready, &mut group, &mut size);
         let Ok(slot) = slots.clone().acquire_owned().await else {
             return;
@@ -289,6 +434,7 @@ async fn commit_loop(
         let submitted = raft.client_write_ff(command).await;
         let raft = raft.clone();
         let flag = storage_failed.clone();
+        let ack_delay = ack_delay;
         tokio::spawn(async move {
             let _slot = slot;
             // Dropped once this task has sent every result.
@@ -328,6 +474,9 @@ async fn commit_loop(
                     return failure(code, waiters);
                 }
             };
+            if let Some(delay) = ack_delay {
+                tokio::time::sleep(delay).await;
+            }
             if written.data.each.is_empty() {
                 if let Some(waiter) = waiters.into_iter().next() {
                     let _ = waiter.send(Ok(written.data));
@@ -399,6 +548,18 @@ async fn purge_to(raft: &Raft<TypeConfig>, machine: &Machine, upto: u64) {
     }
     if let Err(err) = raft.trigger().purge_log(upto).await {
         tracing::warn!(%err, "wal log purge failed");
+    }
+}
+
+/// Wait until every commit slot is free, then release them. Dropping this
+/// future releases any slot it has already taken.
+async fn wait_until_idle(slots: Arc<tokio::sync::Semaphore>) {
+    let mut held = Vec::with_capacity(IN_FLIGHT);
+    for _ in 0..IN_FLIGHT {
+        let Ok(permit) = slots.clone().acquire_owned().await else {
+            return;
+        };
+        held.push(permit);
     }
 }
 
@@ -489,10 +650,12 @@ impl Shard {
     where
         N: openraft::RaftNetworkFactory<TypeConfig>,
     {
+        let (heartbeat_interval, election_timeout_min, election_timeout_max) =
+            camus_raft::quic::raft_timeouts();
         let config = Config {
-            heartbeat_interval: 50,
-            election_timeout_min: 150,
-            election_timeout_max: 300,
+            heartbeat_interval,
+            election_timeout_min,
+            election_timeout_max,
             // An entry is a packed group of up to `GROUP_BYTES` (plus one
             // client batch). Eight per AppendEntries keeps an RPC far below
             // the broker's HTTP body limit even with JSON encoding.
@@ -504,7 +667,8 @@ impl Shard {
             ..Default::default()
         };
         let config = Arc::new(config.validate()?);
-        let log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
+        let mut log = camus_raft::SegmentLogStore::open(dir.join("log"))?;
+        log.set_codec(encode_log_len, encode_log, decode_log);
         let log_stats = log.stats();
         let machine = Arc::new(Machine::open(&dir.join("state.redb"), log.clone())?);
         let raft = Raft::new(node_id, config, network, log, machine.clone()).await?;
@@ -550,6 +714,23 @@ impl Shard {
             && metrics
                 .millis_since_quorum_ack
                 .is_some_and(|ms| u128::from(ms) < within.as_millis())
+    }
+
+    /// Add `id` as a learner, wait until it has this shard's log, then make
+    /// it a voter. The caller is the leader. `node.addr` is that broker's
+    /// HTTP address, the same form `initialize` stores.
+    pub async fn add_voter(&self, id: NodeId, node: BasicNode) -> anyhow::Result<()> {
+        self.raft
+            .add_learner(id, node, true)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        let mut ids = std::collections::BTreeSet::new();
+        ids.insert(id);
+        self.raft
+            .change_membership(openraft::ChangeMembers::AddVoterIds(ids), false)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
     }
 
     /// Voter ids in the latest membership this node has seen.
@@ -707,6 +888,60 @@ impl Shard {
         Ok(())
     }
 
+    /// Open transaction span for one producer on one partition: inclusive
+    /// start and exclusive end. `None` when this producer has no open span.
+    pub fn txn_span(
+        &self,
+        topic_id: &[u8; 16],
+        partition: i32,
+        producer_id: i64,
+    ) -> Option<(i64, i64)> {
+        self.machine.txn_span(topic_id, partition, producer_id)
+    }
+
+    /// First offset of the earliest open transaction span on a partition.
+    /// `None` when no transaction is open there.
+    pub fn first_open_txn(&self, topic_id: &[u8; 16], partition: i32) -> Option<i64> {
+        self.machine.first_open_txn(topic_id, partition)
+    }
+
+    /// Freeze this producer's span. A later transactional batch from the
+    /// producer is refused and is not appended.
+    pub async fn finish_txn(
+        &self,
+        topic_id: [u8; 16],
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<(), WriteError> {
+        self.raft
+            .client_write(Command::FinishTxn {
+                topic_id,
+                partition,
+                producer_id,
+            })
+            .await
+            .map_err(|err| self.classify(err))?;
+        Ok(())
+    }
+
+    /// Forget that producer's open span. A second close is a no-op.
+    pub async fn close_txn(
+        &self,
+        topic_id: [u8; 16],
+        partition: i32,
+        producer_id: i64,
+    ) -> Result<(), WriteError> {
+        self.raft
+            .client_write(Command::CloseTxn {
+                topic_id,
+                partition,
+                producer_id,
+            })
+            .await
+            .map_err(|err| self.classify(err))?;
+        Ok(())
+    }
+
     /// Next offset for a partition. `0` when the shard has not appended.
     pub fn end_offset(&self, topic_id: &[u8; 16], partition: i32) -> i64 {
         self.machine.end_offset(topic_id, partition)
@@ -725,6 +960,12 @@ impl Shard {
     /// against this.
     pub fn unsealed_bytes(&self) -> u64 {
         self.machine.unsealed_bytes()
+    }
+
+    /// Unix milliseconds this broker applied, or loaded at open, the oldest
+    /// batch not yet sealed. `None` when nothing is unsealed.
+    pub fn oldest_unsealed_ms(&self) -> Option<u64> {
+        self.machine.oldest_unsealed_ms()
     }
 
     /// The oldest committed batches not yet sealed, up to about `limit`
@@ -837,6 +1078,26 @@ mod tests {
         panic!("no wal leader");
     }
 
+    /// Append on whichever shard leads, as a client would. Right after a
+    /// failover a new leader can step down before the write reaches it, so
+    /// `NotLeader` is retried until the deadline.
+    async fn append_on_leader(shards: &[&Shard], batch: Append) -> (NodeId, Response) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let leader = wait_leader(shards).await;
+            let Some(shard) = shards.iter().find(|shard| shard.node_id == leader) else {
+                panic!("leader {leader} is not a live shard");
+            };
+            match shard.append(batch.clone()).await {
+                Ok(response) => return (leader, response),
+                Err(WriteError::NotLeader) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(err) => panic!("append on {leader} failed: {err}"),
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_voters_keep_acked_batches_after_losing_the_leader() {
         let dir = tempfile::tempdir().unwrap();
@@ -879,10 +1140,11 @@ mod tests {
         gone.raft.shutdown().await.unwrap();
         drop(gone);
         let live: Vec<&Shard> = shards.iter().flatten().collect();
-        let next = wait_leader(&live).await;
+        let (next, response) = append_on_leader(&live, append_of(b"d")).await;
         assert_ne!(next, leader);
-        let survivor = live.iter().find(|shard| shard.node_id == next).unwrap();
-        let response = survivor.append(append_of(b"d")).await.unwrap();
+        let Some(survivor) = live.iter().find(|shard| shard.node_id == next) else {
+            panic!("no survivor {next}");
+        };
         assert_eq!(response.base_offset, 3, "acked offsets 0..3 survive");
         assert_eq!(survivor.end_offset(&[1; 16], 0), 4);
         let tail = survivor.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
@@ -976,18 +1238,19 @@ mod tests {
         gone.raft.shutdown().await.unwrap();
         drop(gone);
         let live: Vec<&Shard> = shards.iter().flatten().collect();
-        let next = wait_leader(&live).await;
+        let (next, after) = append_on_leader(&live, batch).await;
         assert_ne!(next, leader);
-        let survivor = live.iter().find(|shard| shard.node_id == next).unwrap();
-        let after = survivor.append(batch).await.unwrap();
         assert_eq!(after.error_code, 0);
         assert_eq!(
             after.base_offset, 0,
             "the new leader still has the sequence"
         );
-        assert_eq!(survivor.end_offset(&[1; 16], 0), 1);
-        let followed = survivor.append(idempotent(b"next", 7, 0, 1)).await.unwrap();
+        let (next, followed) = append_on_leader(&live, idempotent(b"next", 7, 0, 1)).await;
         assert_eq!(followed.base_offset, 1);
+        let Some(survivor) = live.iter().find(|shard| shard.node_id == next) else {
+            panic!("no survivor {next}");
+        };
+        assert_eq!(survivor.end_offset(&[1; 16], 0), 2);
         let tail = survivor.read(&[1; 16], 0, 0, 0, usize::MAX).await.unwrap();
         assert_eq!(
             camus_protocol::batch::inspect(&tail, 1024 * 1024)

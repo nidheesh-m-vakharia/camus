@@ -3,20 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Camus — a Kafka broker that stores the log in object storage</title>
-  <meta name="description" content="Camus is a Kafka-compatible broker in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
+  <title>Camus — compatible with Apache Kafka, log in object storage</title>
+  <meta name="description" content="Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
   <link rel="canonical" href="https://camus.nidheesh.dev/">
   <meta name="robots" content="index,follow">
   <meta property="og:site_name" content="Camus">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Camus — a Kafka broker that stores the log in object storage">
-  <meta property="og:description" content="Camus is a Kafka-compatible broker in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
+  <meta property="og:title" content="Camus — compatible with Apache Kafka, log in object storage">
+  <meta property="og:description" content="Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
   <meta property="og:url" content="https://camus.nidheesh.dev/">
   <meta property="og:image" content="https://camus.nidheesh.dev/banner.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:image" content="https://camus.nidheesh.dev/banner.png">
-  <meta name="twitter:title" content="Camus — a Kafka broker that stores the log in object storage">
-  <meta name="twitter:description" content="Camus is a Kafka-compatible broker in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
+  <meta name="twitter:title" content="Camus — compatible with Apache Kafka, log in object storage">
+  <meta name="twitter:description" content="Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
   <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -27,7 +27,7 @@
       "@context": "https://schema.org",
       "@type": "SoftwareSourceCode",
       "name": "Camus",
-      "description": "Camus is a Kafka-compatible broker in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.",
+      "description": "Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.",
       "url": "https://camus.nidheesh.dev/",
       "codeRepository": "https://github.com/nidheesh-m-vakharia/camus",
       "programmingLanguage": "Rust",
@@ -63,7 +63,7 @@
   <main id="content" class="home-main">
     <section class="home-hero entrance">
       <div class="home-hero-text">
-        <h1 style="--n: 0">A Kafka broker that keeps the log in object storage.</h1>
+        <h1 style="--n: 0">A broker compatible with Apache Kafka. The log stays in object storage.</h1>
         <p class="lede" style="--n: 1">Producers, consumers, and admin clients speak the Kafka wire protocol. The durable log lives in Cloudflare R2, or any S3-compatible bucket. A small set of Rust binaries replicates metadata, and a short write-ahead log, with Raft.</p>
         <p class="home-actions"><a class="button" href="run.html">Run one broker</a><a href="durability.html">How a produce is acknowledged</a></p>
       </div>
@@ -119,27 +119,72 @@
       <figcaption id="iso-caption"><code>wal</code>: a batch goes to the leader and reaches a majority's write-ahead log, and then the producer gets its ack. Objects go up to the bucket afterwards.</figcaption>
       </figure>
     </section>
-    <div class="home-body">
-      <h2>One process</h2>
-      <p>Camus is a single binary. It accepts Kafka TCP, writes record batches as objects, and keeps topics, groups, offsets, and transactions in a Raft group. A deployment does not add a JVM inside the broker, ZooKeeper, KRaft, or a separate database.</p>
-      <p>The brokers are the same program with different node ids. They agree on metadata through Raft. In the default durability mode they also replicate a short write-ahead log, so a produce can be acknowledged after a disk quorum. The object upload still happens. The write-ahead log is a buffer of seconds, then it is truncated.</p>
-      <h2>What you point a client at</h2>
-      <p>The bootstrap server. Compatibility is pinned to Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. Where a KIP and that tree disagree, the tree wins. The matrix of implemented APIs, and which client has actually passed each one, is in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a>.</p>
-      <p>Three clients have been run against the broker: kafka-clients 4.4.0, librdkafka through confluent-kafka 2.16.1, and franz-go v1.22.0. They produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the compatibility doc stays unmarked until that client has really passed the call.</p>
-      <h2>Where to go next</h2>
-      <ul>
-      <li><a href="run.html">Run</a> one broker with Docker, or from a checkout.</li>
-      <li><a href="minio.html">Give it a bucket</a> before you care about the sealed log.</li>
-      <li><a href="clients.html">Clients</a> lists what those libraries can do, and the differences that will surprise you.</li>
-      <li><a href="durability.html">Durability</a> is the choice between acknowledging on a disk quorum and acknowledging only after the object is stored.</li>
-      </ul>
+    <div class="home-sheets">
+      <section class="sheet">
+        <h2>One process</h2>
+        <div class="board">
+          <div class="absent">
+            <p>A deployment does not add</p>
+            <ul>
+              <li>a JVM inside the broker</li>
+              <li>ZooKeeper</li>
+              <li>KRaft</li>
+              <li>a separate database</li>
+            </ul>
+          </div>
+          <div class="arch">
+            <ul class="arch-clients">
+              <li>kafka-clients <span>4.4.0</span></li>
+              <li>confluent-kafka <span>2.16.1</span></li>
+              <li>franz-go <span>v1.22.0</span></li>
+            </ul>
+            <div class="broker">
+              <p class="broker-name">camus-broker</p>
+              <ol>
+                <li><span>Kafka TCP</span> the bootstrap address</li>
+                <li><span>Metadata Raft</span> topics, groups, offsets, transactions</li>
+                <li><span>Write-ahead log</span> seconds, then truncated</li>
+                <li><span>Uploader</span> record batches as objects</li>
+              </ol>
+            </div>
+            <p class="arch-store">R2 <span>or any S3 bucket</span></p>
+            <div class="bus" aria-hidden="true"><span></span><span><span>Kafka wire</span></span><span></span></div>
+            <span class="hwire hwire-store" aria-hidden="true"><span>objects</span></span>
+          </div>
+          <div class="arch-bridge" aria-hidden="true"><span></span></div>
+          <div class="peers">
+            <div class="peer-row" role="group" aria-label="Three copies of the same binary">
+              <span>node 1</span>
+              <span class="raft"><span>Raft</span></span>
+              <span>node 2</span>
+              <span class="raft"><span>Raft</span></span>
+              <span>node 3</span>
+            </div>
+            <p>The same program, different node ids.</p>
+          </div>
+        </div>
+        <div class="sheet-note">
+          <p>In the default durability mode a produce is acknowledged after a majority has the write-ahead log on disk. The object upload still happens. That slice of the log is then truncated.</p>
+          <p>What you point a client at is the bootstrap server. Compatibility is pinned to Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. Where a KIP and that tree disagree, the tree wins. kafka-clients, librdkafka through confluent-kafka, and franz-go produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> stays unmarked until that client has really passed the call.</p>
+        </div>
+      </section>
+      <section class="sheet">
+        <h2>Roadmap</h2>
+        <ol class="roadmap">
+          <li><a href="run.html"><span>Run</span> Start one broker with Docker, or from a checkout. It listens for Kafka and forms a one-node group by itself.</a></li>
+          <li><a href="minio.html"><span>Bucket</span> Give it a bucket before you care about the sealed log. Locally that is MinIO, until you point it at R2 or another S3 store.</a></li>
+          <li><a href="clients.html"><span>Clients</span> Change the bootstrap address and keep the client you already have. kafka-clients, librdkafka, and franz-go have been run against the broker.</a></li>
+          <li><a href="durability.html"><span>Durability</span> Choose when a produce is acknowledged. <code>wal</code> answers after a disk majority. <code>r2</code> answers only after the object is stored.</a></li>
+          <li><a href="limits.html"><span>Production</span> See what is still sharp, and when not to use Camus, before you trust it with a real workload.</a></li>
+        </ol>
+      </section>
     </div>
   </main>
   <footer class="site-footer">
     <div class="site-footer-inner">
       <div class="site-footer-brand">
         <span class="mark-name">Camus</span>
-        <p>A Kafka broker in one Rust binary. The log lives in R2, or any S3-compatible bucket.</p>
+        <p>A broker compatible with Apache Kafka, in one Rust binary. The log lives in R2, or any S3-compatible bucket.</p>
       </div>
       <nav class="site-footer-links" aria-label="Footer">
         <div>
@@ -164,6 +209,10 @@
           <h2>Project</h2>
           <ul>
             <li><a href="docs.html">Docs</a></li>
+            <li><a href="limits.html">Production</a></li>
+            <li><a href="delivery.html">Delivery</a></li>
+            <li><a href="compare.html">Compare</a></li>
+            <li><a href="cost.html">Cost</a></li>
             <li><a href="recovery.html">Recovery</a></li>
             <li><a href="https://github.com/nidheesh-m-vakharia/camus">GitHub</a></li>
           </ul>
@@ -171,6 +220,7 @@
       </nav>
     </div>
     <p class="site-footer-legal">License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>
+    <p class="site-footer-legal">Apache, Apache Kafka and Kafka are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Camus is not affiliated with or endorsed by the ASF.</p>
   </footer>
   <script src="site.js"></script>
 </body>

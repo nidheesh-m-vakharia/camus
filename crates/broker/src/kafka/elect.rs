@@ -67,7 +67,18 @@ impl Kafka {
                 continue;
             }
             held.insert(shard);
-            if !seen.contains(&shard) || !wal.follower_caught_up(preferred) {
+            // A shard has to be led here across two passes, so a broker that
+            // just won an election is not handed straight back.
+            if !seen.contains(&shard) {
+                continue;
+            }
+            // Replication metrics lag a restart. Wait briefly, the same way
+            // hand-over does, before deciding the preferred voter is behind.
+            let caught_up = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !wal.follower_caught_up(preferred) && tokio::time::Instant::now() < caught_up {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if !wal.follower_caught_up(preferred) {
                 continue;
             }
             let Some(addr) = wal.voter_addr(preferred) else {
@@ -78,11 +89,19 @@ impl Kafka {
                 preferred,
                 "handing shard back to its preferred leader"
             );
-            let _ = self
-                .http
-                .post(format!("http://{addr}/wal/{shard}/campaign"))
-                .send()
-                .await;
+            // Followers that heard from the leader inside its lease refuse
+            // votes, so one campaign often loses. Campaign past that lease.
+            for _ in 0..6 {
+                if wal.leader() == Some(preferred) {
+                    break;
+                }
+                let _ = self
+                    .http
+                    .post(format!("http://{addr}/wal/{shard}/campaign"))
+                    .send()
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
         *seen = held;
     }

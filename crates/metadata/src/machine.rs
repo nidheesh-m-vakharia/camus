@@ -97,6 +97,11 @@ fn encode_rows(kv: &impl ReadableTable<&'static str, &'static str>) -> Result<Ve
 }
 
 /// The rows of a snapshot body in either format.
+/// Rows in a metadata snapshot body, the same bytes `build_snapshot` writes.
+pub fn snapshot_rows(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    decode_rows(bytes)
+}
+
 fn decode_rows(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
     match bytes.strip_prefix(SNAPSHOT_MAGIC) {
         Some(rows) => camus_raft::codec::decode(rows).map_err(|err| err.to_string()),
@@ -141,6 +146,14 @@ pub struct RedbMachine {
 }
 
 impl RedbMachine {
+    /// The latest snapshot's log index and body, if one has been built.
+    pub async fn snapshot_index_and_body(&self) -> Option<(u64, Vec<u8>)> {
+        let stored = self.current_snapshot.read().await;
+        let stored = stored.as_ref()?;
+        let index = stored.meta.last_log_id?.index;
+        Some((index, stored.data.clone()))
+    }
+
     /// Open or create the database file.
     pub fn open(path: &Path) -> Result<Self, StorageError<NodeId>> {
         if let Some(parent) = path.parent() {
@@ -425,12 +438,14 @@ fn apply_command(
                 producer_id,
                 producer_epoch,
                 span,
+                skip_published,
             } => txn::outcome(txn::note(
                 &read,
                 &transactional_id,
                 producer_id,
                 producer_epoch,
                 span,
+                skip_published,
             )),
             Command::StageTxnOffsets {
                 transactional_id,
@@ -510,6 +525,7 @@ fn apply_command(
             Command::Compact {
                 topic,
                 partition,
+                covered_start,
                 covered_end,
                 object_key,
                 file_offset,
@@ -521,6 +537,7 @@ fn apply_command(
                 &scan,
                 &topic,
                 partition,
+                covered_start,
                 covered_end,
                 &object_key,
                 file_offset,
@@ -534,6 +551,7 @@ fn apply_command(
                 producer_epoch,
                 committed,
                 now_ms,
+                ends,
             } => txn::outcome(txn::end(
                 &read,
                 &transactional_id,
@@ -541,6 +559,7 @@ fn apply_command(
                 producer_epoch,
                 committed,
                 now_ms,
+                &ends,
             )),
             Command::SaveGroup { .. }
             | Command::CommitOffsets { .. }

@@ -92,7 +92,7 @@ impl Encodable for BatchIndexAndErrorMessage {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -126,7 +126,7 @@ impl Encodable for BatchIndexAndErrorMessage {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -264,7 +264,7 @@ impl Encodable for LeaderIdAndEpoch {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -294,7 +294,7 @@ impl Encodable for LeaderIdAndEpoch {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -470,7 +470,7 @@ impl Encodable for NodeEndpoint {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -514,7 +514,7 @@ impl Encodable for NodeEndpoint {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -758,7 +758,7 @@ impl Encodable for PartitionProduceResponse {
                     num_tagged_fields += 1;
                 }
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -769,7 +769,7 @@ impl Encodable for PartitionProduceResponse {
                 if &self.current_leader != &Default::default() {
                     let computed_size =
                         types::Struct { version }.compute_size(&self.current_leader)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -816,7 +816,7 @@ impl Encodable for PartitionProduceResponse {
                     num_tagged_fields += 1;
                 }
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -827,7 +827,7 @@ impl Encodable for PartitionProduceResponse {
                 if &self.current_leader != &Default::default() {
                     let computed_size =
                         types::Struct { version }.compute_size(&self.current_leader)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -1016,7 +1016,7 @@ impl Encodable for ProduceResponse {
                     num_tagged_fields += 1;
                 }
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -1027,7 +1027,7 @@ impl Encodable for ProduceResponse {
                 if !self.node_endpoints.is_empty() {
                     let computed_size = types::CompactArray(types::Struct { version })
                         .compute_size(&self.node_endpoints)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -1059,7 +1059,7 @@ impl Encodable for ProduceResponse {
                     num_tagged_fields += 1;
                 }
             }
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -1070,7 +1070,7 @@ impl Encodable for ProduceResponse {
                 if !self.node_endpoints.is_empty() {
                     let computed_size = types::CompactArray(types::Struct { version })
                         .compute_size(&self.node_endpoints)?;
-                    if computed_size > std::u32::MAX as usize {
+                    if computed_size > u32::MAX as usize {
                         bail!(
                             "Tagged field is too large to encode ({} bytes)",
                             computed_size
@@ -1234,7 +1234,7 @@ impl Encodable for TopicProduceResponse {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields
@@ -1267,7 +1267,7 @@ impl Encodable for TopicProduceResponse {
         }
         if version >= 9 {
             let num_tagged_fields = self.unknown_tagged_fields.len();
-            if num_tagged_fields > std::u32::MAX as usize {
+            if num_tagged_fields > u32::MAX as usize {
                 bail!(
                     "Too many tagged fields to encode ({} fields)",
                     num_tagged_fields

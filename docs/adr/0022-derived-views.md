@@ -1,4 +1,4 @@
-# ADR 0016: Derived views over the log
+# ADR 0022: Derived views over the log
 
 Status: Proposed
 Date: 2026-11-14

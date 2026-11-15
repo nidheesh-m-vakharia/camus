@@ -10,6 +10,8 @@ The reference tree is pinned in docs/compatibility.md. Code that closely
 follows Kafka carries a comment pointing at the source file and the pinned
 tag. Translation is limited to behavior that Camus actually implements.
 
+Apache, Apache Kafka and Kafka are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. Camus is not affiliated with or endorsed by the ASF.
+
 Camus's own code is licensed under the Apache License, Version 2.0.
 The full text is in the LICENSE file.
 

@@ -36,6 +36,7 @@ impl Node {
                 "127.0.0.1:0",
                 "--data-dir",
                 dir.to_str().unwrap(),
+                "--dev-plaintext",
             ])
             .env("RUST_LOG", "info")
             .stdout(log.try_clone().unwrap())
@@ -131,6 +132,8 @@ fn three_processes_survive_losing_the_leader() {
         .unwrap();
     assert!(metrics.contains("camus_up 1"));
     assert!(metrics.contains("camus_raft_term"));
+    assert!(metrics.contains("camus_wal_unsealed_bytes{shard=\"0\"}"));
+    assert!(metrics.contains("camus_object_store_requests_total{op=\"put\"}"));
 }
 
 fn wait_leader(nodes: &[Node]) -> (u64, String) {

@@ -90,7 +90,7 @@ impl Encodable for CopartitionGroup {
         types::CompactArray(types::Int16).encode(buf, &self.source_topic_regex)?;
         types::CompactArray(types::Int16).encode(buf, &self.repartition_source_topics)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -108,7 +108,7 @@ impl Encodable for CopartitionGroup {
         total_size +=
             types::CompactArray(types::Int16).compute_size(&self.repartition_source_topics)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -221,7 +221,7 @@ impl Encodable for Endpoint {
         types::CompactString.encode(buf, &self.host)?;
         types::UInt16.encode(buf, &self.port)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -237,7 +237,7 @@ impl Encodable for Endpoint {
         total_size += types::CompactString.compute_size(&self.host)?;
         total_size += types::UInt16.compute_size(&self.port)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -347,7 +347,7 @@ impl Encodable for KeyValue {
         types::CompactString.encode(buf, &self.key)?;
         types::CompactString.encode(buf, &self.value)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -363,7 +363,7 @@ impl Encodable for KeyValue {
         total_size += types::CompactString.compute_size(&self.key)?;
         total_size += types::CompactString.compute_size(&self.value)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -698,7 +698,7 @@ impl Encodable for StreamsGroupHeartbeatRequest {
         types::CompactArray(types::Struct { version }).encode(buf, &self.task_end_offsets)?;
         types::Boolean.encode(buf, &self.shutdown_application)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -735,7 +735,7 @@ impl Encodable for StreamsGroupHeartbeatRequest {
             types::CompactArray(types::Struct { version }).compute_size(&self.task_end_offsets)?;
         total_size += types::Boolean.compute_size(&self.shutdown_application)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -966,7 +966,7 @@ impl Encodable for Subtopology {
             .encode(buf, &self.repartition_source_topics)?;
         types::CompactArray(types::Struct { version }).encode(buf, &self.copartition_groups)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -993,7 +993,7 @@ impl Encodable for Subtopology {
         total_size += types::CompactArray(types::Struct { version })
             .compute_size(&self.copartition_groups)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -1119,7 +1119,7 @@ impl Encodable for TaskIds {
         types::CompactString.encode(buf, &self.subtopology_id)?;
         types::CompactArray(types::Int32).encode(buf, &self.partitions)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -1135,7 +1135,7 @@ impl Encodable for TaskIds {
         total_size += types::CompactString.compute_size(&self.subtopology_id)?;
         total_size += types::CompactArray(types::Int32).compute_size(&self.partitions)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -1260,7 +1260,7 @@ impl Encodable for TaskOffset {
         types::Int32.encode(buf, &self.partition)?;
         types::Int64.encode(buf, &self.offset)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -1277,7 +1277,7 @@ impl Encodable for TaskOffset {
         total_size += types::Int32.compute_size(&self.partition)?;
         total_size += types::Int64.compute_size(&self.offset)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -1420,7 +1420,7 @@ impl Encodable for TopicInfo {
         types::Int16.encode(buf, &self.replication_factor)?;
         types::CompactArray(types::Struct { version }).encode(buf, &self.topic_configs)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -1439,7 +1439,7 @@ impl Encodable for TopicInfo {
         total_size +=
             types::CompactArray(types::Struct { version }).compute_size(&self.topic_configs)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -1555,7 +1555,7 @@ impl Encodable for Topology {
         types::Int32.encode(buf, &self.epoch)?;
         types::CompactArray(types::Struct { version }).encode(buf, &self.subtopologies)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields
@@ -1572,7 +1572,7 @@ impl Encodable for Topology {
         total_size +=
             types::CompactArray(types::Struct { version }).compute_size(&self.subtopologies)?;
         let num_tagged_fields = self.unknown_tagged_fields.len();
-        if num_tagged_fields > std::u32::MAX as usize {
+        if num_tagged_fields > u32::MAX as usize {
             bail!(
                 "Too many tagged fields to encode ({} fields)",
                 num_tagged_fields

@@ -39,10 +39,10 @@ RUN mkdir -p \
     && printf '' > crates/compactor/src/lib.rs \
     && printf 'fn main() {}\n' > crates/cli/src/main.rs \
     && printf 'fn main() {}\n' > crates/engine-bench/src/main.rs \
-    && cargo build --release --locked -p camus-broker
+    && cargo build --release --locked -p camus-broker -p camus-cli
 
 COPY crates crates
-RUN cargo build --release --locked -p camus-broker
+RUN cargo build --release --locked -p camus-broker -p camus-cli
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -52,6 +52,7 @@ RUN apt-get update \
     && mkdir -p /data \
     && chown camus:camus /data
 COPY --from=build /src/target/release/camus-broker /usr/local/bin/camus-broker
+COPY --from=build /src/target/release/camus /usr/local/bin/camus
 COPY deploy/broker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
 USER camus

@@ -1,16 +1,16 @@
 # ADR 0014: Multiple WAL shards and leadership balance
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-09
 
 ## Context
 
 ADR 0006 chose several WAL shards, each an openraft group, with
-`shard = partition mod shard_count`. What was built has one shard. The
-shard key is fixed at `wal/0`, each broker opens one shard from `wal_dir`,
-the WAL RPC routes have no shard in them, and `truncate-to-sealed` replaces
-that one shard. Every broker is a voter, and the shard leader leads every
-`wal` partition.
+`shard = partition mod shard_count`. When this record was opened the
+running broker had one shard: the key was fixed at `wal/0`, each broker
+opened one shard from `wal_dir`, the WAL RPC routes had no shard in them,
+and `truncate-to-sealed` replaced that one shard. Every broker was a voter,
+and the shard leader led every `wal` partition.
 
 That leaves three Kafka behaviors out of reach:
 
@@ -25,7 +25,8 @@ That leaves three Kafka behaviors out of reach:
   shard's partitions.
 
 Issues #47, #48, #49, and #54 assumed the shards existed. This ADR records
-how to build them before that work starts.
+how they were built. The delivery steps below are in the tree, covered by
+`crates/broker/tests/wal_shards.rs` and the ecosystem leader-election run.
 
 ## Decision
 

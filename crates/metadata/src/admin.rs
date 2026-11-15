@@ -521,12 +521,28 @@ mod tests {
         let mut state = catalog::parse_partition(row)?;
         state.next_offset = 20;
         state.txn_committed = vec![
-            catalog::Span { start: 0, end: 4 },
-            catalog::Span { start: 8, end: 12 },
+            catalog::Span {
+                start: 0,
+                end: 4,
+                producer_id: None,
+            },
+            catalog::Span {
+                start: 8,
+                end: 12,
+                producer_id: None,
+            },
         ];
         state.txn_aborted = vec![
-            catalog::Span { start: 4, end: 8 },
-            catalog::Span { start: 12, end: 14 },
+            catalog::Span {
+                start: 4,
+                end: 8,
+                producer_id: None,
+            },
+            catalog::Span {
+                start: 12,
+                end: 14,
+                producer_id: None,
+            },
         ];
         map.insert(
             key.clone(),
@@ -553,12 +569,20 @@ mod tests {
         assert_eq!(state.log_start, 10);
         assert_eq!(
             state.txn_committed,
-            vec![catalog::Span { start: 8, end: 12 }],
+            vec![catalog::Span {
+                start: 8,
+                end: 12,
+                producer_id: None
+            }],
             "a span reaching past the log start stays"
         );
         assert_eq!(
             state.txn_aborted,
-            vec![catalog::Span { start: 12, end: 14 }]
+            vec![catalog::Span {
+                start: 12,
+                end: 14,
+                producer_id: None
+            }]
         );
         Ok(())
     }

@@ -26,6 +26,9 @@ pub struct TxnSpan {
     pub start: i64,
     /// Exclusive.
     pub end: i64,
+    /// Producer that wrote the batches. Absent on spans stored before ADR 0015.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +143,20 @@ fn partition_row(
     Ok(Some((key, catalog::parse_partition(&raw)?)))
 }
 
+/// `EndTxn` already committed or aborted a range that starts this span, for
+/// the same producer.
+fn published(get: Get<'_>, span: &TxnSpan, producer_id: i64) -> Result<bool, String> {
+    let Some((_, partition)) = partition_row(get, &span.topic, span.partition)? else {
+        return Ok(false);
+    };
+    let producer = span.producer_id.unwrap_or(producer_id);
+    Ok(partition
+        .txn_committed
+        .iter()
+        .chain(&partition.txn_aborted)
+        .any(|range| range.producer_id == Some(producer) && range.covers(span.start, producer)))
+}
+
 fn mark(
     get: Get<'_>,
     put: &mut Vec<(String, String)>,
@@ -155,6 +172,7 @@ fn mark(
         let range = Span {
             start: span.start,
             end: span.end,
+            producer_id: span.producer_id,
         };
         if committed {
             partition.txn_committed.push(range);
@@ -290,7 +308,16 @@ pub fn note(
     producer_id: i64,
     epoch: i16,
     span: TxnSpan,
+    skip_published: bool,
 ) -> Result<Issued, String> {
+    // A seal reads the open span from the WAL and carries it in its own
+    // commit. When `EndTxn` applies first, the range is already published.
+    // Recording it again would abort a committed range, which hides it, or
+    // add it to the producer's next transaction. Commands written before
+    // ADR 0021 keep the old rule, so replaying them gives the same state.
+    if skip_published && published(get, &span, producer_id)? {
+        return Ok(applied(Vec::new(), String::new()));
+    }
     let Some(mut txn) = load(get, transactional_id)? else {
         return Ok(Issued::Reject(INVALID_TXN));
     };
@@ -310,10 +337,18 @@ pub fn note(
     {
         return Ok(Issued::Reject(INVALID_TXN));
     }
-    if txn.spans.iter().any(|item| {
-        item.topic == span.topic && item.partition == span.partition && item.start == span.start
-    }) {
+    if txn
+        .spans
+        .iter()
+        .any(|item| item.topic == span.topic && item.partition == span.partition)
+    {
+        // The first batch on this partition already opened the span. EndTxn
+        // writes the end (ADR 0015).
         return Ok(applied(Vec::new(), String::new()));
+    }
+    let mut span = span;
+    if span.producer_id.is_none() {
+        span.producer_id = Some(producer_id);
     }
     txn.spans.push(span);
     let mut put = Vec::new();
@@ -399,6 +434,7 @@ pub fn end(
     epoch: i16,
     committed: bool,
     now_ms: i64,
+    ends: &[TxnSpan],
 ) -> Result<Issued, String> {
     let Some(mut txn) = load(get, transactional_id)? else {
         return Ok(Issued::Reject(INVALID_TXN));
@@ -409,9 +445,21 @@ pub fn end(
     if txn.state != "ongoing" {
         return Ok(Issued::Reject(INVALID_TXN));
     }
+    // Spans from the WAL (ADR 0019) are the ranges to publish. An empty
+    // list is a command from before that, which already stored them.
+    let mut ranges = if ends.is_empty() {
+        txn.spans.clone()
+    } else {
+        ends.to_vec()
+    };
+    for span in &mut ranges {
+        if span.producer_id.is_none() {
+            span.producer_id = Some(producer_id);
+        }
+    }
     let mut put = Vec::new();
     if committed {
-        mark(get, &mut put, &txn.spans, true)?;
+        mark(get, &mut put, &ranges, true)?;
         if let Some(group) = txn.group.clone() {
             for offset in &txn.offsets {
                 put.push((
@@ -422,7 +470,7 @@ pub fn end(
         }
         txn.state = "committed".into();
     } else {
-        mark(get, &mut put, &txn.spans, false)?;
+        mark(get, &mut put, &ranges, false)?;
         txn.state = "aborted".into();
     }
     txn.spans.clear();
@@ -568,6 +616,53 @@ pub fn clock(raw: &str) -> Result<TxnClock, String> {
     })
 }
 
+/// An ongoing transaction's producer and the partitions it added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTxn {
+    /// Producer id.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub epoch: i16,
+    /// Partitions added to this transaction.
+    pub partitions: Vec<(String, i32)>,
+    /// Spans already stored, from a `NoteTxn` or a seal.
+    pub spans: Vec<TxnSpan>,
+}
+
+/// The ongoing transaction at `txn/{id}`, or `None` when it is not ongoing.
+pub fn ongoing(raw: &str) -> Result<Option<OpenTxn>, String> {
+    let txn: Txn = serde_json::from_str(raw).map_err(|err| err.to_string())?;
+    if txn.state != "ongoing" {
+        return Ok(None);
+    }
+    Ok(Some(OpenTxn {
+        producer_id: txn.producer_id,
+        epoch: txn.epoch,
+        partitions: txn.partitions,
+        spans: txn.spans,
+    }))
+}
+
+/// `Some(true)` when this producer already committed, `Some(false)` when it
+/// aborted. `None` when the id is still ongoing or belongs to someone else.
+pub fn finished(raw: &str, producer_id: i64, epoch: i16) -> Result<Option<bool>, String> {
+    let txn: Txn = serde_json::from_str(raw).map_err(|err| err.to_string())?;
+    if txn.producer_id != producer_id || txn.epoch != epoch {
+        return Ok(None);
+    }
+    Ok(match txn.state.as_str() {
+        "committed" => Some(true),
+        "aborted" => Some(false),
+        _ => None,
+    })
+}
+
+/// Partitions added to the transaction at `txn/{id}`, including after it ends.
+pub fn partitions(raw: &str) -> Result<Vec<(String, i32)>, String> {
+    let txn: Txn = serde_json::from_str(raw).map_err(|err| err.to_string())?;
+    Ok(txn.partitions)
+}
+
 /// The ranges of the ongoing transaction at `txn/{id}`, or none when it is
 /// not ongoing.
 pub fn spans(raw: &str) -> Result<Vec<TxnSpan>, String> {
@@ -676,6 +771,146 @@ mod tests {
         body(&get).expect("txn command")
     }
 
+    /// A seal that carries a span `EndTxn` already committed must not abort
+    /// it, or add it to the next transaction (ADR 0021).
+    #[test]
+    fn a_late_seal_note_leaves_a_committed_range_visible() -> Result<(), String> {
+        let mut store = memory();
+        let get = |store: &HashMap<String, String>, key: &str| Ok(store.get(key).cloned());
+        let issued = init(&|key| get(&store, key), "late", -1, -1, 60_000, 0)?;
+        let Issued::Applied { value, .. } = &issued else {
+            return Err("init rejected".into());
+        };
+        let (id, epoch) = value.split_once(',').ok_or("init value")?;
+        let id: i64 = id.parse().map_err(|_| "producer id")?;
+        let epoch: i16 = epoch.parse().map_err(|_| "epoch")?;
+        apply(&mut store, issued);
+        let span = |start, end| TxnSpan {
+            topic: "orders".into(),
+            partition: 0,
+            start,
+            end,
+            producer_id: Some(id),
+        };
+        let partitions = [("orders".to_string(), 0)];
+        let issued = add_partitions(&|key| get(&store, key), "late", id, epoch, &partitions, 1)?;
+        apply(&mut store, issued);
+        let issued = end(
+            &|key| get(&store, key),
+            "late",
+            id,
+            epoch,
+            true,
+            2,
+            &[span(7, 8)],
+        )?;
+        apply(&mut store, issued);
+        // The seal's note lands after the commit, then after the next
+        // transaction starts.
+        let issued = note(&|key| get(&store, key), "late", id, epoch, span(7, 8), true)?;
+        apply(&mut store, issued);
+        let issued = add_partitions(&|key| get(&store, key), "late", id, epoch, &partitions, 3)?;
+        apply(&mut store, issued);
+        let issued = note(&|key| get(&store, key), "late", id, epoch, span(7, 8), true)?;
+        apply(&mut store, issued);
+        let issued = end(
+            &|key| get(&store, key),
+            "late",
+            id,
+            epoch,
+            false,
+            4,
+            &[span(8, 9)],
+        )?;
+        apply(&mut store, issued);
+        let Some((_, partition)) = partition_row(&|key| get(&store, key), "orders", 0)? else {
+            return Err("partition".into());
+        };
+        assert!(partition
+            .txn_committed
+            .iter()
+            .any(|range| range.covers(7, id)));
+        assert!(!partition
+            .txn_aborted
+            .iter()
+            .any(|range| range.covers(7, id)));
+        assert!(partition
+            .txn_aborted
+            .iter()
+            .any(|range| range.covers(8, id)));
+        // A batch past the committed end is still a late write, and aborts.
+        let issued = note(
+            &|key| get(&store, key),
+            "late",
+            id,
+            epoch,
+            span(9, 10),
+            true,
+        )?;
+        apply(&mut store, issued);
+        let Some((_, partition)) = partition_row(&|key| get(&store, key), "orders", 0)? else {
+            return Err("partition".into());
+        };
+        assert!(partition
+            .txn_aborted
+            .iter()
+            .any(|range| range.covers(9, id)));
+        Ok(())
+    }
+
+    /// A `NoteTxn` written before ADR 0021 has no `skip_published` and must
+    /// apply as it did then, so a replay gives the state the cluster had.
+    #[test]
+    fn an_old_note_keeps_the_old_rule() -> Result<(), String> {
+        let old = r#"{"NoteTxn":{"transactional_id":"late","producer_id":1,"producer_epoch":0,"span":{"topic":"orders","partition":0,"start":7,"end":8}}}"#;
+        let command: crate::Command = serde_json::from_str(old).map_err(|err| err.to_string())?;
+        let crate::Command::NoteTxn { skip_published, .. } = command else {
+            return Err("not a NoteTxn".into());
+        };
+        assert!(!skip_published);
+
+        let mut store = memory();
+        let get = |store: &HashMap<String, String>, key: &str| Ok(store.get(key).cloned());
+        let issued = init(&|key| get(&store, key), "late", -1, -1, 60_000, 0)?;
+        let Issued::Applied { value, .. } = &issued else {
+            return Err("init rejected".into());
+        };
+        let (id, epoch) = value.split_once(',').ok_or("init value")?;
+        let id: i64 = id.parse().map_err(|_| "producer id")?;
+        let epoch: i16 = epoch.parse().map_err(|_| "epoch")?;
+        apply(&mut store, issued);
+        let span = TxnSpan {
+            topic: "orders".into(),
+            partition: 0,
+            start: 7,
+            end: 8,
+            producer_id: Some(id),
+        };
+        let partitions = [("orders".to_string(), 0)];
+        let issued = add_partitions(&|key| get(&store, key), "late", id, epoch, &partitions, 1)?;
+        apply(&mut store, issued);
+        let issued = end(
+            &|key| get(&store, key),
+            "late",
+            id,
+            epoch,
+            true,
+            2,
+            std::slice::from_ref(&span),
+        )?;
+        apply(&mut store, issued);
+        let issued = note(&|key| get(&store, key), "late", id, epoch, span, false)?;
+        apply(&mut store, issued);
+        let Some((_, partition)) = partition_row(&|key| get(&store, key), "orders", 0)? else {
+            return Err("partition".into());
+        };
+        assert!(partition
+            .txn_aborted
+            .iter()
+            .any(|range| range.covers(7, id)));
+        Ok(())
+    }
+
     #[test]
     fn commit_publishes_the_range_and_the_offset() {
         let mut store = memory();
@@ -709,7 +944,9 @@ mod tests {
                     partition: 0,
                     start: 0,
                     end: 2,
+                    producer_id: None,
                 },
+                true,
             )
         });
         apply(&mut store, issued);
@@ -733,11 +970,18 @@ mod tests {
             )
         });
         apply(&mut store, issued);
-        let issued = call(&store, |get| end(get, "checkout", id, epoch, true, 0));
+        let issued = call(&store, |get| end(get, "checkout", id, epoch, true, 0, &[]));
         apply(&mut store, issued);
         let get = |key: &str| Ok(store.get(key).cloned());
         let (_, partition) = partition_row(&get, "orders", 0).unwrap().unwrap();
-        assert_eq!(partition.txn_committed, vec![Span { start: 0, end: 2 }]);
+        assert_eq!(
+            partition.txn_committed,
+            vec![Span {
+                start: 0,
+                end: 2,
+                producer_id: Some(id),
+            }]
+        );
         assert!(store.contains_key(&groups::offset_key("readers", "topic-1", 0)));
     }
 
@@ -774,7 +1018,9 @@ mod tests {
                     partition: 0,
                     start: 0,
                     end: 1,
+                    producer_id: None,
                 },
+                true,
             )
         });
         apply(&mut store, issued);
@@ -791,7 +1037,14 @@ mod tests {
         apply(&mut store, issued);
         let get = |key: &str| Ok(store.get(key).cloned());
         let (_, partition) = partition_row(&get, "orders", 0).unwrap().unwrap();
-        assert_eq!(partition.txn_aborted, vec![Span { start: 0, end: 1 }]);
+        assert_eq!(
+            partition.txn_aborted,
+            vec![Span {
+                start: 0,
+                end: 1,
+                producer_id: Some(id),
+            }]
+        );
     }
 
     #[test]
@@ -816,7 +1069,7 @@ mod tests {
             add_partitions(get, "checkout", id, epoch, &[("orders".into(), 0)], 1_000)
         });
         apply(&mut store, issued);
-        let issued = call(&store, |get| end(get, "checkout", id, epoch, true, 0));
+        let issued = call(&store, |get| end(get, "checkout", id, epoch, true, 0, &[]));
         apply(&mut store, issued);
         let issued = call(&store, |get| {
             note(
@@ -829,7 +1082,9 @@ mod tests {
                     partition: 0,
                     start: 4,
                     end: 5,
+                    producer_id: None,
                 },
+                true,
             )
         });
         match &issued {
@@ -839,7 +1094,14 @@ mod tests {
         apply(&mut store, issued);
         let get = |key: &str| Ok(store.get(key).cloned());
         let (_, partition) = partition_row(&get, "orders", 0).unwrap().unwrap();
-        assert_eq!(partition.txn_aborted, vec![Span { start: 4, end: 5 }]);
+        assert_eq!(
+            partition.txn_aborted,
+            vec![Span {
+                start: 4,
+                end: 5,
+                producer_id: None
+            }]
+        );
     }
 
     fn started(store: &mut HashMap<String, String>, at: i64) -> (i64, i16) {
@@ -865,7 +1127,9 @@ mod tests {
                     partition: 0,
                     start: 0,
                     end: 1,
+                    producer_id: None,
                 },
+                true,
             )
         });
         apply(store, issued);
@@ -877,6 +1141,57 @@ mod tests {
         let part = catalog::parse_partition(&store[&catalog::partition_storage_key(&topic.id, 0)])
             .unwrap();
         part.txn_aborted.len()
+    }
+
+    #[test]
+    fn end_txn_marks_a_span_the_wal_held() -> Result<(), String> {
+        let mut store = memory();
+        let issued = call(&store, |get| init(get, "checkout", -1, -1, 1_000, 1_000));
+        let Issued::Applied { value, .. } = &issued else {
+            return Err("init".into());
+        };
+        let mut parts = value.split(',');
+        let id: i64 = parts
+            .next()
+            .ok_or("id")?
+            .parse()
+            .map_err(|err: std::num::ParseIntError| err.to_string())?;
+        let epoch: i16 = parts
+            .next()
+            .ok_or("epoch")?
+            .parse()
+            .map_err(|err: std::num::ParseIntError| err.to_string())?;
+        apply(&mut store, issued);
+        let issued = call(&store, |get| {
+            add_partitions(get, "checkout", id, epoch, &[("orders".into(), 0)], 1_000)
+        });
+        apply(&mut store, issued);
+        let issued = call(&store, |get| {
+            end(
+                get,
+                "checkout",
+                id,
+                epoch,
+                true,
+                2_000,
+                &[TxnSpan {
+                    topic: "orders".into(),
+                    partition: 0,
+                    start: 0,
+                    end: 4,
+                    producer_id: None,
+                }],
+            )
+        });
+        apply(&mut store, issued);
+        let topic = catalog::parse_topic(store.get("topic/orders").ok_or("topic")?)?;
+        let key = catalog::partition_storage_key(&topic.id, 0);
+        let part = catalog::parse_partition(store.get(&key).ok_or("partition")?)?;
+        let span = part.txn_committed.first().ok_or("no committed span")?;
+        if span.start != 0 || span.end != 4 {
+            return Err(format!("{}..{}", span.start, span.end));
+        }
+        Ok(())
     }
 
     #[test]
@@ -919,7 +1234,9 @@ mod tests {
     fn a_stale_abort_command_changes_nothing() {
         let mut store = memory();
         let (id, epoch) = started(&mut store, 10_000);
-        let issued = call(&store, |get| end(get, "checkout", id, epoch, true, 10_100));
+        let issued = call(&store, |get| {
+            end(get, "checkout", id, epoch, true, 10_100, &[])
+        });
         apply(&mut store, issued);
         let stale = call(&store, |get| {
             abort_timed_out(get, "checkout", id, epoch, 99_000)
@@ -942,7 +1259,9 @@ mod tests {
             panic!("expire");
         };
         assert!(del.is_empty(), "ongoing transactions never expire");
-        let issued = call(&store, |get| end(get, "checkout", id, epoch, false, 20_000));
+        let issued = call(&store, |get| {
+            end(get, "checkout", id, epoch, false, 20_000, &[])
+        });
         apply(&mut store, issued);
         let get = |key: &str| Ok(store.get(key).cloned());
         let Outcome::Change { del, .. } =
@@ -957,5 +1276,61 @@ mod tests {
             panic!("expire");
         };
         assert!(del.contains(&"txn/checkout".to_string()), "{del:?}");
+    }
+
+    #[test]
+    fn a_second_batch_keeps_one_span_and_end_txn_sets_the_end() -> Result<(), String> {
+        let mut store = memory();
+        let (id, epoch) = started(&mut store, 1_000);
+        let issued = call(&store, |get| {
+            note(
+                get,
+                "checkout",
+                id,
+                epoch,
+                TxnSpan {
+                    topic: "orders".into(),
+                    partition: 0,
+                    start: 1,
+                    end: 2,
+                    producer_id: None,
+                },
+                true,
+            )
+        });
+        let Issued::Applied { put, .. } = &issued else {
+            return Err("second note rejected".into());
+        };
+        if !put.is_empty() {
+            return Err("second note wrote metadata".into());
+        }
+        let issued = call(&store, |get| {
+            end(
+                get,
+                "checkout",
+                id,
+                epoch,
+                true,
+                2_000,
+                &[TxnSpan {
+                    topic: "orders".into(),
+                    partition: 0,
+                    start: 0,
+                    end: 4,
+                    producer_id: Some(id),
+                }],
+            )
+        });
+        apply(&mut store, issued);
+        let get = |key: &str| Ok(store.get(key).cloned());
+        let (_, partition) = partition_row(&get, "orders", 0)?.ok_or("missing partition")?;
+        let span = partition.txn_committed.first().ok_or("missing span")?;
+        if span.start != 0 || span.end != 4 || span.producer_id != Some(id) {
+            return Err(format!("span {span:?}"));
+        }
+        if !span.covers(3, id) || span.covers(3, id.saturating_add(1)) {
+            return Err("producer match".into());
+        }
+        Ok(())
     }
 }
