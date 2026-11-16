@@ -187,6 +187,15 @@ under 1 MiB for a 1 GiB snapshot. Recovery and `decode_rows` read
 `CAMUSKV3` by ignoring the index. They still read `CAMUSKV2` and the
 older JSON body.
 
+Amended 2026-11-16, before any broker wrote `CAMUSKV3`. The trailer's
+CRC32C covered only the index, so a flipped byte in a row still decoded
+and could be restored as wrong metadata. Each index entry now also holds
+the CRC32C of its block's bytes. A copier checks only the blocks it
+reads, which one CRC over the whole body would not allow. Recovery and
+`decode_rows` no longer ignore the index. They check every block, and
+they check that each entry starts a row with that entry's key, beginning
+at the first row.
+
 A copy reads `CURRENT`, then the trailer and index in one ranged GET of
 the object's tail, then one ranged GET for each mirrored topic's run of
 blocks. The bytes read follow the mirrored topics' metadata, not the
@@ -379,3 +388,33 @@ their measurement on that hardware, not a Camus target.
   rule.
 - Trusting NTP as an instant. Set aside. That is the Cassandra failure the
   clock rule avoids.
+
+## As built
+
+Phase 0, the reader. `decode_rows` in `crates/metadata/src/machine.rs`
+reads `CAMUSKV3`. Snapshot install, `camus admin restore-cluster`, and
+`camus admin verify-snapshot` all go through it.
+
+- The body is `CAMUSKV3`, then the rows exactly as after `CAMUSKV2`. Next
+  comes the index, a postcard `Vec<(String, u64, u32)>`. Each entry holds
+  a block's first key, that row's byte offset in the body, and the CRC32C
+  of the block, which runs to the next block or to the index. Last is a
+  28-byte trailer: the index offset (u64 LE), the index length (u64 LE),
+  the CRC32C of the index (u32 LE), and `CAMUSKV3`.
+- A row starts a new block when it begins at least 64 KiB past the start
+  of the previous block. A block therefore always starts on a row.
+- The reader refuses a body in any of these cases:
+  - the trailer is short, or lacks its magic
+  - the index does not end at the trailer
+  - the index fails its CRC32C
+  - the rows do not fill exactly the bytes before the index
+  - the first entry is not the first row
+  - an entry does not start a row, or names a different key
+  - a block fails its CRC32C
+
+  Before anything is written, install decodes and checks the whole body,
+  so a refused body leaves the state machine unchanged.
+- `build_snapshot` still writes `CAMUSKV2`. A test pins this, so that a
+  broker one release older can install every snapshot this release
+  builds. The encoder exists only in tests. Turning it on is the writer
+  half of phase 0, in the next release.

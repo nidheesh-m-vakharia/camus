@@ -10,6 +10,7 @@ description = "Metadata Raft group: topics will live here; Phase 0 stores a repl
 anyhow = "1"
 camus-protocol = { path = "../protocol" }
 camus-raft = { path = "../raft" }
+crc = "3"
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 redb = "4"
 reqwest = { version = "0.13", features = ["json"] }
