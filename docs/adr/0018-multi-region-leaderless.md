@@ -1,11 +1,24 @@
-# ADR 0018: Multi-region leaderless replication
+# ADR 0018: Mirror topics between regions
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-12
 
 Note, 2026-11-14: one cluster per region, with MirrorMaker 2 between
 regions, is accepted and tested as [ADR 0020](0020-one-region-per-cluster.md).
 This record stays proposed for the native copy of sealed objects.
+
+Note, 2026-11-16: accepted after the revision below. Nothing is built
+yet. The phases are under Delivery.
+
+Note, 2026-11-16: the first draft left four things open: how a
+destination finds the source's sealed objects, which offsets a destination
+client reads, how a produce in a non-home region reaches the home, and
+what the commit-wait protects. This revision answers them. It also adds a
+block index to metadata snapshots, so a destination reads only the
+snapshot rows of the topics it mirrors. It changes two earlier choices.
+Destination offsets now equal source offsets, and a produce to a mirror
+is refused instead of forwarded. The draft's reasons are kept under
+Alternatives.
 
 ## Context
 
@@ -47,74 +60,280 @@ dead region must not start an election somewhere else.
 
 ## Decision
 
-A region is one Camus cluster. It has its own metadata Raft group, its own
-WAL shards, and its own bucket. No broker is a voter in another region's
-group. Election timeouts stay the ones in ADR 0016.
+A region is one Camus cluster, as in ADR 0020. It has its own metadata
+Raft group, its own WAL shards, and its own bucket. No broker is a voter
+in another region's group. Election timeouts stay the ones in ADR 0016.
 
-A partition has one home region. Only that region assigns offsets. A
-produce sent to any other region is forwarded to the home. The home's ack
-is still the ADR 0005 barrier. Forwarding does not add a second Raft group.
+### Mirror topics
 
-Replication copies sealed objects. Any broker in a destination region may
-pull an object and install it. There is no leader election across regions
-and no cross-region vote. The destination publishes those bytes under its
-own replication cursor. A Kafka client in the destination reads that
-cursor. It does not see the source partition's offsets. Translating
-between them is MirrorMaker 2, which is the interop path in issues 59 and
-147, not a second offset assignment.
+A partition has one home region. Only that region assigns offsets.
 
-### Clocks
+A destination region holds the topic as a **mirror topic**. It is
+read-only, and it has the source's partition count and the source's
+offsets. A Kafka client in the destination fetches offset `N` and gets
+the same batch the home assigned at `N`. A record's offset is the same in
+every region that holds it.
 
-Multi-region code uses TrueTime's rule, not a wall-clock instant.
+An operator creates a mirror with
+`camus admin mirror create --source <alias> --topic <name>`. The
+destination's metadata records the topic with a new topic id and a
+`mirror_of` field naming the source alias and the source topic id. A
+topic that already exists in the destination cannot become a mirror.
 
-- The broker reads the host clock daemon's error bound `ε` and its drift
-  rate. The time of a sample is the interval `[sample − ε, sample + ε]`.
-  Until the next sample, both ends move outward by `drift × elapsed`.
-- A replicated batch is stamped `s = latest` at the home when the object
-  is sealed. A destination applies it only after `earliest > s` on the
-  destination's own interval. A home that publishes the replication record
-  does the same wait. Overlapping intervals cannot be ordered, so they are
-  not applied in timestamp order until the wait ends.
-- Camus does not assume a GPS or atomic clock. Google's 1–7 ms sawtooth is
-  their measurement on that hardware. It is not a Camus target. `ε` is
-  whatever the daemon reports.
-- If the daemon has no source, or it will not report a bound, the broker
-  refuses the multi-region publish and the destination refuses the apply.
-  The home region still acks local produces under ADR 0005. A drifted
-  clock cannot move an offset.
+`Produce` to a mirror topic returns `INVALID_TOPIC_EXCEPTION` (17), with
+the error message "Cannot append to mirror topic `<name>` of `<alias>`".
+That is what Kafka 4.4.0 returns for an append to an internal topic
+(`ReplicaManager.appendToLocalLog`): the topic exists, and clients may
+not write to it. The Java client does not retry it, so a producer that
+points at the wrong region fails fast. Producers write to the home
+region's cluster.
 
-Promoting a destination to home is an operator action, in the same class
-as `truncate-to-sealed` ([0008](0008-failure-and-recovery.md)). A source
-region going away does not elect a home anywhere else. Partitions homed in
-a surviving region keep taking produces. Partitions homed in the dead
-region stop at the last sealed object a destination has applied.
-Unreplicated acks in the dead region follow ADR 0008 for that region.
+`DeleteRecords`, `CreatePartitions`, and `AlterConfigs` on a mirror topic
+return `POLICY_VIOLATION` (44), with the same message. That is Kafka's
+error when the broker refuses an admin change. Retention configs stay
+alterable, because a mirror's retention is its own.
 
-Two regions both producing into one offset sequence is not this mode. That
-would be two homes and two cursors. It can be added later. It does not
-merge into one gap-free sequence.
+### Linking clusters
+
+Brokers in different clusters never connect to each other. Inside a
+cluster, brokers use the HTTP port for Raft, WAL shard calls, and
+`/admin/*`, and QUIC when `CAMUS_QUIC` is on (ADR 0016). That port has no
+authentication, so it stays on the cluster's private network. A link
+between clusters is configuration on the destination only. The source
+is not told that it is being mirrored, and it is not configured for it.
+
+A link is a source alias. An operator adds one with:
+
+```
+camus admin mirror link add --alias us-east \
+  --endpoint https://… --region auto --bucket camus-us-east \
+  [--prefix …] [--virtual-host]
+```
+
+- The alias is 1–32 characters of `[a-z0-9-]`, and it is unique in the
+  destination. It names the link in `mirror_of`, in metrics, and in the
+  write errors.
+- The endpoint, region, bucket, prefix, and addressing style are a
+  metadata record, the same fields as the cluster's own `s3.*` settings.
+  Every broker learns them through Raft.
+- The access key and secret key are not stored in metadata. Snapshots are
+  uploaded to the destination's bucket, so a key in metadata would end up
+  in that bucket. Each broker reads `CAMUS_MIRROR_<ALIAS>_ACCESS_KEY` and
+  `CAMUS_MIRROR_<ALIAS>_SECRET_KEY`, where `<ALIAS>` is the alias in upper
+  case with `-` turned into `_`. That is how `CAMUS_S3_SECRET_KEY` works
+  today. Keys are not logged. To rotate them, restart the brokers one at
+  a time.
+- The copier runs on the metadata leader, so every metadata voter needs
+  the keys. A leader without them does not copy. It sets
+  `camus_mirror_stalled` to 1 for each of that link's partitions and logs
+  which variable is missing.
+- The key should be read-only on the source bucket. Camus never writes,
+  deletes, or lists through a link, so a key that can do more is not
+  needed.
+
+`link add` checks the link before it commits it. It reads the source's
+`meta/snap/CURRENT` and that snapshot's trailer with the given keys, and
+it refuses the link if either read fails or the snapshot is not
+`CAMUSKV3`. `camus admin mirror link remove --alias` refuses while a
+mirror topic still names the alias. To remove one, promote or delete
+those topics first.
+
+### Finding sealed objects
+
+A destination does not talk to source brokers. It reads the source
+bucket with a read-only credential configured for that source alias:
+
+1. GET the source's `meta/snap/CURRENT`, then the index at the end of the
+   snapshot it names (ADR 0004, and the format below). A snapshot is one
+   committed state of the source's metadata. It names only published
+   extents and never an orphan (ADR 0007).
+2. For each mirrored partition, ranged-GET only the snapshot blocks that
+   hold its rows, and take the extents from the destination's
+   `sealed_end` onward.
+3. Ranged-GET each extent's bytes from the source bucket. Concatenate the
+   extents for one flush into one new object under the destination's own
+   `bundle/{ulid}.seg` key, with the same footer format. PUT it to the
+   destination bucket.
+4. Commit the extents to destination metadata with the ADR 0007
+   compare-and-append on `sealed_end`. The batch bytes, base offsets, and
+   leader epochs are the source's, byte for byte.
+
+The destination publishes a mirrored batch only after its own bucket holds
+the bytes. That is the ADR 0005 `r2` barrier: an R2 put plus a metadata
+commit. A mirror never serves bytes from the source bucket, so losing the
+source region does not lose anything the destination has published.
+
+No source broker has to be up for this. A source region whose brokers are
+gone but whose bucket answers can still be drained.
+
+### Snapshot block index
+
+A snapshot body is the metadata rows in key order (`CAMUSKV2`). A
+topic's rows are contiguous in it: `part/{topic_id}/…` for its
+partitions, `ext/{topic_id}/{partition}/{end}` for its extents, and
+`offset/{group}/{topic_id}/…` for one group's offsets. This ADR adds
+`CAMUSKV3`: the same rows, followed by a block index and a fixed
+trailer.
+
+- A block is the rows that start in one 64 KiB stretch of the body. It
+  always ends on a row boundary.
+- The index lists each block's first key and byte offset.
+- The trailer holds the index's offset and length, a CRC32C of the
+  index, and the magic again.
+
+The index is part of the one snapshot object. It adds no put and no
+write to `CURRENT`. Its size is about one entry per 64 KiB of body,
+under 1 MiB for a 1 GiB snapshot. Recovery and `decode_rows` read
+`CAMUSKV3` by ignoring the index. They still read `CAMUSKV2` and the
+older JSON body.
+
+A copy reads `CURRENT`, then the trailer and index in one ranged GET of
+the object's tail, then one ranged GET for each mirrored topic's run of
+blocks. The bytes read follow the mirrored topics' metadata, not the
+whole source cluster's. The index is capped at 4 MiB when it is read.
+An index over the cap fails the copy with `camus_mirror_stalled` set to
+1. The copier does not fall back to the whole body.
+
+The copy runs on the destination's metadata leader, one task per source
+alias. Its object buffer is capped at 8 MiB, the same as the flush cap.
+It decodes the snapshot blocks it fetched one at a time and keeps only
+the mirrored partitions' rows.
+
+Copy lag is the source's snapshot interval plus one copy, about 30 seconds
+at the ADR 0004 defaults. The source's WAL tail is not copied. Only sealed
+objects are.
+
+### Gaps and deletes at the source
+
+- The source's compactor can replace an extent and delete the old key
+  after the snapshot was read. A GET that returns 404 makes the copier
+  read `CURRENT` again. The new snapshot names the replacement key, and
+  the offsets in it are unchanged (ADR 0010).
+- If source retention has moved the log start past the destination's
+  `sealed_end`, the mirror cannot stay gap-free. That partition's copy
+  stops. `camus_mirror_stalled` goes to 1, and the destination keeps
+  serving what it has. `camus admin mirror reset --topic --partition`
+  moves the destination's log start to the source's log start, which
+  drops the destination's copy of that partition. It refuses without
+  `--i-accept-data-loss`.
+- A mirror's retention is its own topic config, so a destination can keep
+  data longer than the source does.
+
+### Transactions and consumer groups
+
+Each copied extent carries the source's committed and aborted
+transaction spans from the same snapshot. ADR 0021 makes markers at
+fetch, so a `read_committed` consumer in the destination sees the same
+records that it would see at the source. The destination's last stable
+offset is its sealed end, or the start of the first span the snapshot
+still shows open, whichever is lower.
+
+Offsets are equal, so committed group offsets can be copied without
+translating them. For the groups an operator lists, the copier writes the
+snapshot's committed offsets into destination metadata. It does this only
+while the group has no members in the destination, which is the
+`sync.group.offsets.enabled` rule from MirrorMaker 2. It clamps each
+offset to the destination's high watermark.
+
+### Promotion
+
+`camus admin mirror promote --topic <name>` stops the copy, clears
+`mirror_of`, and makes the topic writable. The next produce is assigned
+the destination's `next_offset`, the end of what was copied. Metadata
+keeps the promoted end per partition as `promoted_at`.
+
+Promotion is an operator action, in the same class as
+`truncate-to-sealed` (ADR 0008). The destination does not promote itself
+when the source goes silent. Batches the source acked and had not sealed,
+or sealed after the last snapshot that was copied, exist only in the
+source. If the source region comes back, its log and the promoted log
+both hold offsets past `promoted_at`. That is a fork.
+[Issue 151](https://github.com/nidheesh-m-vakharia/camus/issues/151) is
+the check that finds it. Mirroring back into the old source has to start
+from `promoted_at`, and the old source's suffix is discarded with the
+same `--i-accept-data-loss` gate.
+
+### Clocks, for promoting several partitions at one cut
+
+Phases 1 and 2 below do not read a clock. Offsets come from the home, and
+a source snapshot is already one consistent cut of every partition homed
+in that region. Promoting every mirror of one source at the same snapshot
+gives a consistent failover for that region.
+
+The clock rule is for one destination that mirrors from several source
+regions. An operator who wants one cut across all of them needs
+timestamps that respect real-time order across homes. That is the only
+thing the commit-wait is for. It is phase 3, and it uses TrueTime's rule,
+not a wall-clock instant:
+
+- The broker reads the kernel's error bound with `ntp_adjtime(2)`
+  (`maxerror`, which the kernel grows by the 500 ppm tolerance each
+  second between syncs). The time of a sample is the interval
+  `[now − maxerror, now + maxerror]`.
+- The home stamps each extent with `s = latest` when it is sealed, and
+  waits until `earliest > s` before it commits the extent to metadata.
+  If extent `a` commits before extent `b` is sealed, in absolute time and
+  at any home, then `s_a < s_b`.
+- A destination publishes `applied_s` for each source: the `s` of the
+  snapshot it last finished copying. A promotion at cut `c` uses, for each
+  source, only extents with `s ≤ c`. It refuses unless every source's
+  `applied_s ≥ c`.
+- If `ntp_adjtime` reports `TIME_ERROR` or the clock is unsynchronised,
+  the home stamps nothing, and the extent is not eligible for a cross-region
+  cut. Local `wal` and `r2` acks never wait on the clock. A drifted clock
+  cannot move an offset.
+
+Camus does not assume a GPS or atomic clock. Google's 1–7 ms sawtooth is
+their measurement on that hardware, not a Camus target.
+
+### Delivery
+
+0. Reading `CAMUSKV3` snapshots, in one release, before any broker
+   writes them. Then the writer.
+1. Link add and remove, mirror create, copying from the indexed
+   snapshot, the write errors above, the gap stall and reset, and
+   metrics. Acceptance test: Camus to Camus with MinIO as two buckets.
+   Offsets and batch bytes are equal. Killing every source broker after
+   the last snapshot loses nothing the destination published. A link
+   with a wrong key is refused at `link add`.
+2. Transaction spans, consumer group offset sync, promotion, and the
+   issue 151 fork check.
+3. Clock stamping, `applied_s`, and promotion at a cut across sources.
 
 ## Consequences
 
-- A replicated batch becomes visible in another region only after the
-  object copy and the commit-wait. The wait is the width of the interval.
-  On a daemon with a large `ε`, that wait dominates. Local `wal` and `r2`
-  acks do not take the wait.
-- Destination offsets and source offsets differ. Clients that assume one
-  global offset are wrong. The difference belongs in
-  `docs/compatibility.md` when this is built.
-- [Issue 151](https://github.com/nidheesh-m-vakharia/camus/issues/151) is
-  the check that two regions did not fork one offset sequence.
-  [Issue 141](https://github.com/nidheesh-m-vakharia/camus/issues/141) is
-  still the one-region R2 measurement. Cross-region cost is not claimed
-  from it.
-- [Issue 147](https://github.com/nidheesh-m-vakharia/camus/issues/147)
-  stays the documentation and MirrorMaker work. This ADR is the native
-  copy beside that. Building it is a later change. Nothing in the tree
-  speaks this mode yet.
-- Object layout stays write-once ([0007](0007-r2-layout-and-cost.md)). A
-  replicated object is a new key in the destination bucket. The source key
-  is not rewritten.
+- A record in the destination has the same offset, the same bytes, and the
+  same `read_committed` visibility as at the source. A consumer that fails
+  over keeps its committed offset without translation. This replaces the
+  MirrorMaker 2 offset-sync granularity in ADR 0020 for Camus to Camus.
+  Kafka to Camus and Camus to Kafka stay on MirrorMaker 2.
+- The copy is asynchronous. A batch that the source acked and the
+  destination has not copied is lost to the destination if the source
+  region goes. The window is the snapshot interval plus one copy, plus
+  the source's unsealed WAL tail. It is not an ack barrier.
+- A mirror topic is read-only. Mirror topics are not a Kafka 4.4.0
+  feature. The write errors, `mirror_of`, and equal offsets go in
+  `docs/compatibility.md`.
+- Reading the snapshot for one copy costs `2 + T + G` GETs per source:
+  `CURRENT`, the snapshot tail, one range for each of the `T` mirrored
+  topics, and one for each of the `G` groups whose offsets are synced.
+  The GETs for batch bytes come on top. At the 30 second interval
+  that is Class B, and it does not depend on partition count. Snapshot
+  bytes read follow the mirrored topics' metadata and not the whole
+  source cluster's, which matters on S3 where transfer between regions
+  is billed. R2 does not charge egress.
+- Snapshots change format to `CAMUSKV3`. A broker that only reads
+  `CAMUSKV2` cannot read the new snapshot, so the reader ships one
+  release before the writer.
+- Object layout stays write-once (ADR 0007). A copied object is a new key
+  in the destination bucket. The source key is never rewritten.
+- The destination needs a read-only credential for each source bucket.
+  It needs no network path to source brokers, only an HTTPS path to the
+  source bucket. An operator who loses that key cannot copy until a new
+  one is set on the voters.
+- [Issue 141](https://github.com/nidheesh-m-vakharia/camus/issues/141)
+  is still the one-region R2 measurement. Cross-region cost is not
+  claimed from it.
 
 ## Alternatives
 
@@ -124,15 +343,39 @@ merge into one gap-free sequence.
 - Cassandra or ScyllaDB last-writer-wins on one partition. Set aside. Two
   regions would both append, and ADR 0009 forbids a gap, a reuse, or a
   silent reorder. A point timestamp publishes the write of whichever clock
-  is ahead. Scylla's topology Raft does not order the log. The quorum idea
-  that survives is local to the home region, which ADR 0005 already is.
+  is ahead.
 - A BookKeeper ensemble spread across regions, one writer, a cross-region
   write quorum. Set aside for the same reason as stretched Raft: the ack
   waits on the far region, on every produce.
+- Destination offsets of its own, under a replication cursor (the first
+  draft). Set aside. A client would produce at the home, get offset `N`,
+  and then fetch a different `N` in its own region. Failover would need
+  offset translation again, which MirrorMaker 2 already does.
+- Forwarding a produce from a non-home region to the home (the first
+  draft). Set aside for now. Kafka 4.x producers are idempotent by
+  default, and producer ids are per cluster. A forwarded idempotent or
+  transactional produce would need the home to own the producer id that
+  the destination handed out. Refusing the write is a fast, clear error.
+  It can be revisited once mirrors work.
+- Reading the source over a broker API instead of its bucket. Set aside.
+  It needs an authenticated cross-cluster port, and it fails when the
+  source brokers are down, which is the case mirroring is for.
+- Reading the whole source snapshot each interval. Set aside. The bytes
+  read would grow with every topic and group at the source, including
+  ones that are never mirrored.
+- A per-topic manifest that the source writes beside each snapshot. Set
+  aside. That is an extra put per mirrored topic per snapshot, and the
+  block index gets the same reads without any new writes.
+- `POLICY_VIOLATION` for `Produce` on a mirror. Set aside. It is not one
+  of Kafka's produce errors, and 4.4.0 already uses
+  `INVALID_TOPIC_EXCEPTION` for an append to a topic that clients may not
+  write.
+- Listing the source bucket and reading footers, as recovery does
+  (ADR 0008). Set aside. A listing cannot tell a published object from an
+  orphan, and LIST is Class A.
 - Assigning the next offset from a quorum of TrueTime bounds, with no home.
-  A record at `s` could take an offset only once every region in the quorum
-  had promised it would not commit an earlier `s`. A region that stops
-  reporting blocks the log. Removing it is the same operator step as
-  promoting a home, so the home region is the smaller rule.
-- Trusting NTP as an instant. Set aside. That is the Cassandra failure this
-  clock rule is here to avoid.
+  A region that stops reporting blocks the log. Removing it is the same
+  operator step as promoting a home, so the home region is the smaller
+  rule.
+- Trusting NTP as an instant. Set aside. That is the Cassandra failure the
+  clock rule avoids.
