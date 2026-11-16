@@ -53,6 +53,28 @@ const LEGACY_SNAPSHOT: &str = "snapshot";
 /// `SnapshotBody` written before.
 const SNAPSHOT_MAGIC: &[u8; 8] = b"CAMUSKV2";
 
+/// First and last bytes of a snapshot body with a block index (ADR 0018):
+/// the rows exactly as after [`SNAPSHOT_MAGIC`], then the index, a postcard
+/// [`IndexEntry`] per block, then a [`TRAILER_LEN`]-byte trailer. This release reads it;
+/// `build_snapshot` still writes [`SNAPSHOT_MAGIC`], so a broker one release
+/// older can install every snapshot this one builds.
+const INDEXED_MAGIC: &[u8; 8] = b"CAMUSKV3";
+
+/// Index offset (u64 LE), index length (u64 LE), CRC32C of the index
+/// (u32 LE), then [`INDEXED_MAGIC`].
+const TRAILER_LEN: usize = 8 + 8 + 4 + 8;
+
+/// One block of an indexed body: its first row's key, that row's byte offset
+/// in the body, and the CRC32C of the block's bytes. A block runs from its
+/// offset to the next block's, or to the index.
+type IndexEntry = (String, u64, u32);
+
+/// A row starts a new block once it is this far past the last block's start.
+#[cfg(test)]
+const BLOCK_BYTES: u64 = 64 * 1024;
+
+const CRC32C: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+
 /// Longest time between durable applies.
 const DURABLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -103,12 +125,172 @@ pub fn snapshot_rows(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
 }
 
 fn decode_rows(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
-    match bytes.strip_prefix(SNAPSHOT_MAGIC) {
-        Some(rows) => camus_raft::codec::decode(rows).map_err(|err| err.to_string()),
-        None => serde_json::from_slice::<SnapshotBody>(bytes)
-            .map(|body| body.data.into_iter().collect())
-            .map_err(|err| err.to_string()),
+    if let Some(rows) = bytes.strip_prefix(SNAPSHOT_MAGIC) {
+        return camus_raft::codec::decode(rows).map_err(|err| err.to_string());
     }
+    if bytes.starts_with(INDEXED_MAGIC) {
+        return decode_indexed(bytes);
+    }
+    serde_json::from_slice::<SnapshotBody>(bytes)
+        .map(|body| body.data.into_iter().collect())
+        .map_err(|err| err.to_string())
+}
+
+/// Rows of a [`INDEXED_MAGIC`] body. Install and restore read every row, so
+/// they check every block: each index entry must start a row with its key,
+/// and each block must match its CRC32C.
+fn decode_indexed(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let (index_at, index) = indexed_parts(bytes)?;
+    let rows_bytes = bytes
+        .get(INDEXED_MAGIC.len()..index_at)
+        .ok_or("snapshot index starts inside the magic")?;
+    let rows: Vec<(String, String)> =
+        camus_raft::codec::decode(rows_bytes).map_err(|err| err.to_string())?;
+    let used = camus_raft::codec::encoded_len(&rows).map_err(|err| err.to_string())?;
+    if used != rows_bytes.len() {
+        return Err(format!(
+            "snapshot rows end at byte {used} of {}",
+            rows_bytes.len()
+        ));
+    }
+    let entries: Vec<IndexEntry> =
+        camus_raft::codec::decode(index).map_err(|err| err.to_string())?;
+    check_blocks(bytes, index_at, &rows, &entries)?;
+    Ok(rows)
+}
+
+/// Bytes postcard uses for the varint `value`.
+fn varint_len(value: u64) -> usize {
+    (u64::BITS - value.max(1).leading_zeros()).div_ceil(7) as usize
+}
+
+/// Check that `entries` start blocks on rows of `rows`, in order, from the
+/// first row, and that each block's bytes match its CRC32C.
+fn check_blocks(
+    bytes: &[u8],
+    index_at: usize,
+    rows: &[(String, String)],
+    entries: &[IndexEntry],
+) -> Result<(), String> {
+    let mut starts = Vec::with_capacity(entries.len());
+    let mut at = INDEXED_MAGIC.len() + varint_len(rows.len() as u64);
+    for (key, value) in rows {
+        if let Some((first, offset, _)) = entries.get(starts.len()) {
+            if *offset == at as u64 {
+                if first != key {
+                    return Err(format!(
+                        "snapshot block {} names key {first:?}, its row is {key:?}",
+                        starts.len()
+                    ));
+                }
+                starts.push(at);
+            }
+        }
+        if starts.is_empty() {
+            return Err("snapshot index does not start at the first row".into());
+        }
+        for text in [key, value] {
+            at += varint_len(text.len() as u64) + text.len();
+        }
+    }
+    if starts.len() != entries.len() {
+        return Err(format!(
+            "snapshot block {} does not start on a row",
+            starts.len()
+        ));
+    }
+    for (block, ((_, _, crc), start)) in entries.iter().zip(&starts).enumerate() {
+        let end = starts.get(block + 1).copied().unwrap_or(index_at);
+        let bytes = bytes
+            .get(*start..end)
+            .ok_or("snapshot block is out of bounds")?;
+        if CRC32C.checksum(bytes) != *crc {
+            return Err(format!("snapshot block {block} fails its CRC32C"));
+        }
+    }
+    Ok(())
+}
+
+/// Check an indexed body's trailer and the index's CRC32C, and return where
+/// the rows end and the index's bytes.
+fn indexed_parts(bytes: &[u8]) -> Result<(usize, &[u8]), String> {
+    let trailer_at = bytes
+        .len()
+        .checked_sub(TRAILER_LEN)
+        .filter(|at| *at >= INDEXED_MAGIC.len())
+        .ok_or("snapshot is shorter than its trailer")?;
+    let trailer = bytes
+        .get(trailer_at..)
+        .ok_or("snapshot trailer is missing")?;
+    let le_u64 = |at: usize| -> Option<u64> {
+        let field: [u8; 8] = trailer.get(at..at + 8)?.try_into().ok()?;
+        Some(u64::from_le_bytes(field))
+    };
+    let (Some(index_at), Some(index_len)) = (le_u64(0), le_u64(8)) else {
+        return Err("snapshot trailer is truncated".into());
+    };
+    let crc: [u8; 4] = trailer
+        .get(16..20)
+        .and_then(|field| field.try_into().ok())
+        .ok_or("snapshot trailer is truncated")?;
+    if trailer.get(20..) != Some(INDEXED_MAGIC.as_slice()) {
+        return Err("snapshot trailer does not end in its magic".into());
+    }
+    let index_at = usize::try_from(index_at).map_err(|err| err.to_string())?;
+    let index_len = usize::try_from(index_len).map_err(|err| err.to_string())?;
+    if index_at.checked_add(index_len) != Some(trailer_at) || index_at < INDEXED_MAGIC.len() {
+        return Err(format!(
+            "snapshot index at {index_at}, {index_len} bytes, does not end at the trailer {trailer_at}"
+        ));
+    }
+    let index = bytes
+        .get(index_at..trailer_at)
+        .ok_or("snapshot index is out of bounds")?;
+    if CRC32C.checksum(index) != u32::from_le_bytes(crc) {
+        return Err("snapshot index fails its CRC32C".into());
+    }
+    Ok((index_at, index))
+}
+
+/// Encode `rows`, in key order, as an [`INDEXED_MAGIC`] body. Only tests
+/// write this format until the release after the reader.
+#[cfg(test)]
+fn encode_indexed(rows: &[(&str, &str)]) -> Result<Vec<u8>, String> {
+    let mut out = INDEXED_MAGIC.to_vec();
+    push_varint(&mut out, rows.len() as u64);
+    let mut firsts: Vec<(String, u64)> = Vec::new();
+    let mut block_at: Option<u64> = None;
+    for (key, value) in rows {
+        let at = out.len() as u64;
+        let starts_block = match block_at {
+            Some(start) => at - start >= BLOCK_BYTES,
+            None => true,
+        };
+        if starts_block {
+            firsts.push((key.to_string(), at));
+            block_at = Some(at);
+        }
+        for text in [key, value] {
+            push_varint(&mut out, text.len() as u64);
+            out.extend_from_slice(text.as_bytes());
+        }
+    }
+    let index_at = out.len() as u64;
+    let mut index: Vec<IndexEntry> = Vec::with_capacity(firsts.len());
+    for (block, (key, start)) in firsts.iter().enumerate() {
+        let end = firsts.get(block + 1).map_or(index_at, |(_, next)| *next);
+        let bytes = out
+            .get(*start as usize..end as usize)
+            .ok_or("block out of bounds")?;
+        index.push((key.clone(), *start, CRC32C.checksum(bytes)));
+    }
+    let index = camus_raft::codec::encode(&index).map_err(|err| err.to_string())?;
+    out.extend_from_slice(&index);
+    out.extend_from_slice(&index_at.to_le_bytes());
+    out.extend_from_slice(&(index.len() as u64).to_le_bytes());
+    out.extend_from_slice(&CRC32C.checksum(&index).to_le_bytes());
+    out.extend_from_slice(INDEXED_MAGIC);
+    Ok(out)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1105,5 +1287,219 @@ mod tests {
                 .is_none(),
             "no JSON copy is written"
         );
+    }
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Rows in key order whose encoding spans several 64 KiB blocks.
+    fn many_rows() -> Vec<(String, String)> {
+        (0..3_000)
+            .map(|at| (format!("ext/topic/{at:010}"), "v".repeat(100)))
+            .collect()
+    }
+
+    fn borrowed(rows: &[(String, String)]) -> Vec<(&str, &str)> {
+        rows.iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
+    }
+
+    /// The rows bytes (with the magic) and the decoded index of `body`.
+    fn split(body: &[u8]) -> Result<(Vec<u8>, Vec<IndexEntry>), Box<dyn std::error::Error>> {
+        let (index_at, index) = indexed_parts(body)?;
+        let rows = body.get(..index_at).ok_or("rows out of bounds")?.to_vec();
+        Ok((rows, camus_raft::codec::decode(index)?))
+    }
+
+    /// `rows` (with the magic), then `entries` as the index, then a trailer
+    /// with `index_at` in place of the real offset.
+    fn assemble(
+        rows: &[u8],
+        entries: &[IndexEntry],
+        index_at: u64,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let index = camus_raft::codec::encode(entries)?;
+        let mut body = rows.to_vec();
+        body.extend_from_slice(&index);
+        body.extend_from_slice(&index_at.to_le_bytes());
+        body.extend_from_slice(&(index.len() as u64).to_le_bytes());
+        body.extend_from_slice(&CRC32C.checksum(&index).to_le_bytes());
+        body.extend_from_slice(INDEXED_MAGIC);
+        Ok(body)
+    }
+
+    fn refused(body: &[u8], expect: &str) -> TestResult {
+        let err = decode_rows(body).err().ok_or("body decoded")?;
+        assert!(err.contains(expect), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn varint_len_matches_what_postcard_writes() -> TestResult {
+        for value in [0u64, 1, 127, 128, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+            assert_eq!(varint_len(value), camus_raft::codec::encoded_len(&value)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_indexed_body_reads_the_same_rows() -> TestResult {
+        let rows = many_rows();
+        let body = encode_indexed(&borrowed(&rows))?;
+        assert_eq!(decode_rows(&body)?, rows);
+        assert_eq!(snapshot_rows(&body)?, rows);
+        Ok(())
+    }
+
+    #[test]
+    fn index_entries_start_blocks_on_row_boundaries() -> TestResult {
+        let rows = many_rows();
+        let body = encode_indexed(&borrowed(&rows))?;
+        let (_, index) = split(&body)?;
+        assert!(index.len() > 1, "{} blocks", index.len());
+        assert_eq!(
+            index.first().map(|(key, _, _)| key),
+            rows.first().map(|(key, _)| key)
+        );
+        for pair in index.windows(2) {
+            assert!(pair[1].1 - pair[0].1 >= BLOCK_BYTES);
+            assert!(pair[0].0 < pair[1].0, "keys in order");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_indexed_body_reads_no_rows() -> TestResult {
+        let body = encode_indexed(&[])?;
+        assert_eq!(decode_rows(&body)?, Vec::<(String, String)>::new());
+        assert!(split(&body)?.1.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_corrupt_index_is_refused() -> TestResult {
+        let mut body = encode_indexed(&borrowed(&many_rows()))?;
+        let (index_at, _) = indexed_parts(&body)?;
+        let byte = body.get_mut(index_at).ok_or("no index byte")?;
+        *byte ^= 0xff;
+        refused(&body, "index fails its CRC32C")
+    }
+
+    #[test]
+    fn a_flipped_byte_in_a_row_is_refused() -> TestResult {
+        let mut body = encode_indexed(&borrowed(&many_rows()))?;
+        // A `v` in a value near the middle: the rows still decode.
+        let middle = body.len() / 2;
+        let at = middle
+            + body
+                .get(middle..)
+                .and_then(|rest| rest.iter().position(|byte| *byte == b'v'))
+                .ok_or("no value byte")?;
+        let byte = body.get_mut(at).ok_or("no row byte")?;
+        *byte = b'w';
+        refused(&body, "fails its CRC32C")
+    }
+
+    #[test]
+    fn a_truncated_indexed_body_is_refused() -> TestResult {
+        let body = encode_indexed(&borrowed(&many_rows()))?;
+        for keep in [
+            body.len() - 1,
+            body.len() - TRAILER_LEN,
+            INDEXED_MAGIC.len(),
+        ] {
+            let cut = body.get(..keep).ok_or("cut out of bounds")?;
+            assert!(decode_rows(cut).is_err(), "{keep} bytes decoded");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_trailer_that_misplaces_the_index_is_refused() -> TestResult {
+        let body = encode_indexed(&[("a", "1")])?;
+        let (rows, index) = split(&body)?;
+        let real = rows.len() as u64;
+        for index_at in [
+            0,
+            INDEXED_MAGIC.len() as u64 - 1,
+            real - 1,
+            real + 1,
+            u64::MAX,
+        ] {
+            refused(
+                &assemble(&rows, &index, index_at)?,
+                "does not end at the trailer",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rows_that_stop_short_of_the_index_are_refused() -> TestResult {
+        let body = encode_indexed(&[("a", "1")])?;
+        let (mut rows, index) = split(&body)?;
+        rows.push(0);
+        refused(&assemble(&rows, &index, rows.len() as u64)?, "rows end")
+    }
+
+    #[test]
+    fn an_index_entry_off_a_row_start_is_refused() -> TestResult {
+        let body = encode_indexed(&borrowed(&many_rows()))?;
+        let (rows, mut index) = split(&body)?;
+        let entry = index.get_mut(1).ok_or("one block")?;
+        entry.1 += 1;
+        refused(
+            &assemble(&rows, &index, rows.len() as u64)?,
+            "does not start on a row",
+        )
+    }
+
+    #[test]
+    fn an_index_entry_with_the_wrong_key_is_refused() -> TestResult {
+        let body = encode_indexed(&borrowed(&many_rows()))?;
+        let (rows, mut index) = split(&body)?;
+        let entry = index.get_mut(1).ok_or("one block")?;
+        entry.0.push('x');
+        refused(&assemble(&rows, &index, rows.len() as u64)?, "names key")
+    }
+
+    #[test]
+    fn an_index_that_skips_the_first_row_is_refused() -> TestResult {
+        let body = encode_indexed(&borrowed(&many_rows()))?;
+        let (rows, mut index) = split(&body)?;
+        index.remove(0);
+        refused(
+            &assemble(&rows, &index, rows.len() as u64)?,
+            "does not start at the first row",
+        )
+    }
+
+    #[tokio::test]
+    async fn an_indexed_snapshot_installs() -> TestResult {
+        let rows = many_rows();
+        let dir = tempfile::tempdir()?;
+        let mut source = filled(dir.path(), &borrowed(&rows));
+        let built = source.build_snapshot().await?;
+        let body = encode_indexed(&borrowed(&rows))?;
+
+        let other = tempfile::tempdir()?;
+        let mut target = Arc::new(RedbMachine::open(&other.path().join("state.redb"))?);
+        target
+            .install_snapshot(&built.meta, Box::new(Cursor::new(body)))
+            .await?;
+        assert_eq!(target.scan("ext/")?, rows);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_builder_still_writes_the_unindexed_format() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let mut machine = filled(dir.path(), &[("a", "1")]);
+        let body = machine.build_snapshot().await?.snapshot.into_inner();
+        assert!(
+            body.starts_with(SNAPSHOT_MAGIC),
+            "a broker one release older must be able to install this"
+        );
+        Ok(())
     }
 }
