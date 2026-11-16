@@ -7,8 +7,136 @@
 //! partition offline.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::sync::Arc;
+
+use openraft::storage::RaftStateMachine;
+use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+use serde::Serialize;
 
 use crate::catalog::{self, Extent, Partition, PublishPart};
+use crate::{Command, RedbMachine, TypeConfig};
+
+/// Commands per apply when rebuilding, as `restore-cluster` batches them.
+const REBUILD_BATCH: usize = 128;
+
+/// Rows read per page when listing rebuilt partitions.
+const REBUILD_PAGE: usize = 1024;
+
+/// Most partitions [`rebuild`] lists. Past it, only the totals count them.
+pub const REBUILD_LISTED: usize = 100_000;
+
+/// One partition as a restore from a plan would leave it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RestoredPartition {
+    /// Topic name.
+    pub topic: String,
+    /// Partition index.
+    pub partition: i32,
+    /// Earliest offset still present.
+    pub log_start: i64,
+    /// Next offset, the end of what the restore can serve.
+    pub end: i64,
+    /// Kept from being served because overlapping objects disagree.
+    pub offline: bool,
+}
+
+/// What [`rebuild`] found.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Rebuilt {
+    /// Topics in the rebuilt state.
+    pub topics: usize,
+    /// Partitions in the rebuilt state.
+    pub partitions: usize,
+    /// The first [`REBUILD_LISTED`] partitions, in topic id order.
+    pub listed: Vec<RestoredPartition>,
+}
+
+/// Apply `plan` to a new state machine in `dir`, the way `restore-cluster`
+/// applies it to a fresh metadata group, and read back every partition.
+/// `dir` should be empty; the caller removes it.
+pub async fn rebuild(dir: &Path, plan: &RestorePlan) -> anyhow::Result<Rebuilt> {
+    let mut machine = Arc::new(RedbMachine::open(&dir.join("state.redb"))?);
+    let mut commands: Vec<Command> = Vec::new();
+    for chunk in plan.puts.chunks(REBUILD_BATCH) {
+        commands.push(Command::Batch(
+            chunk
+                .iter()
+                .cloned()
+                .map(|(key, value)| Command::Put { key, value })
+                .collect(),
+        ));
+    }
+    for chunk in plan.publish.chunks(REBUILD_BATCH) {
+        commands.push(Command::Publish {
+            parts: chunk.to_vec(),
+        });
+    }
+    for (index, command) in commands.into_iter().enumerate() {
+        let entry: Entry<TypeConfig> = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 0), index as u64 + 1),
+            payload: EntryPayload::Normal(command),
+        };
+        let responses = machine.apply([entry]).await?;
+        if let Some(code) = responses
+            .iter()
+            .map(|response| response.error_code)
+            .find(|code| *code != 0)
+        {
+            anyhow::bail!("the rebuilt state rejected a command ({code})");
+        }
+    }
+
+    let topics: Vec<String> = match machine.get("topics")? {
+        Some(raw) => serde_json::from_str(&raw)?,
+        None => Vec::new(),
+    };
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    let mut partitions = 0;
+    let mut listed = Vec::new();
+    let mut from = "part/".to_string();
+    loop {
+        let page = machine.scan_range(&from, "part0", REBUILD_PAGE)?;
+        let Some((last, _)) = page.last() else {
+            break;
+        };
+        from = format!("{last}\0");
+        for (key, value) in &page {
+            let Some((id, partition)) = part_of(key) else {
+                continue;
+            };
+            let state: Partition = serde_json::from_str(value)?;
+            partitions += 1;
+            if listed.len() >= REBUILD_LISTED {
+                continue;
+            }
+            let topic = match names.get(&id) {
+                Some(name) => name.clone(),
+                None => {
+                    let name = machine.get(&format!("id/{id}"))?.unwrap_or_default();
+                    // Only the current topic's name is kept, so the map
+                    // holds at most one entry while partitions are in id
+                    // order.
+                    names.clear();
+                    names.insert(id.clone(), name.clone());
+                    name
+                }
+            };
+            listed.push(RestoredPartition {
+                topic,
+                partition,
+                log_start: state.log_start,
+                end: state.next_offset,
+                offline: machine.get(&offline_key(&id, partition))?.is_some(),
+            });
+        }
+    }
+    Ok(Rebuilt {
+        topics: topics.len(),
+        partitions,
+        listed,
+    })
+}
 
 /// One footer slice inside an object under `bundle/` or `seg/`.
 #[derive(Debug, Clone)]
@@ -367,5 +495,48 @@ mod tests {
         assert!(plan.offline.is_empty());
         assert_eq!(plan.publish.len(), 1);
         assert_eq!(plan.publish[0].object_key, "bundle/0C.seg");
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_serves_the_snapshot_plus_the_published_suffix() -> anyhow::Result<()> {
+        let mut rows = rows(2);
+        rows.push(("topics".into(), serde_json::to_string(&["orders"])?));
+        let slices = vec![
+            slice("bundle/01.seg", 0, 2, None),
+            slice("bundle/02.seg", 2, 4, None),
+            slice("bundle/03.seg", 6, 8, None),
+        ];
+        let plan = plan_restore(&rows, &slices);
+        let dir = tempfile::tempdir()?;
+        let rebuilt = rebuild(dir.path(), &plan).await?;
+        assert_eq!(rebuilt.topics, 1);
+        assert_eq!(rebuilt.partitions, 1);
+        assert_eq!(
+            rebuilt.listed,
+            vec![RestoredPartition {
+                topic: "orders".into(),
+                partition: 0,
+                log_start: 0,
+                end: 4,
+                offline: false,
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_reports_a_partition_whose_objects_disagree() -> anyhow::Result<()> {
+        let rows = rows(0);
+        let slices = vec![
+            slice("bundle/01.seg", 0, 2, Some(b"aaaa")),
+            slice("bundle/02.seg", 0, 2, Some(b"bbbb")),
+        ];
+        let plan = plan_restore(&rows, &slices);
+        let dir = tempfile::tempdir()?;
+        let rebuilt = rebuild(dir.path(), &plan).await?;
+        assert_eq!(rebuilt.listed.len(), 1);
+        assert!(rebuilt.listed[0].offline);
+        assert_eq!(rebuilt.listed[0].end, 0);
+        Ok(())
     }
 }

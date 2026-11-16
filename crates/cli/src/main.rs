@@ -81,6 +81,22 @@ enum Admin {
         #[arg(long, default_value_t = false)]
         i_accept_data_loss: bool,
     },
+    /// Restore drill. Rebuild the newest metadata snapshot and the object
+    /// footers in a scratch directory on the broker and report what
+    /// `restore-cluster` would serve. Reads the bucket; the cluster is not
+    /// changed. Exits 1 when a partition would be offline or the snapshot is
+    /// older than `--max-age-secs`.
+    VerifySnapshot {
+        /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
+        #[arg(long)]
+        broker: Option<String>,
+        /// Fail when the snapshot is older than this many seconds.
+        #[arg(long)]
+        max_age_secs: Option<u64>,
+        /// Print the broker's full JSON report, every partition included.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -200,6 +216,54 @@ fn main() -> anyhow::Result<()> {
             )?;
             let broker = broker_addr(broker)?;
             post_loss(&broker, "/admin/restore-cluster")?;
+        }
+        Top::Admin(Admin::VerifySnapshot {
+            broker,
+            max_age_secs,
+            json,
+        }) => {
+            let broker = broker_addr(broker)?;
+            // A rebuild reads every object footer, which can outlast the
+            // client's default 30-second timeout on a large bucket.
+            let response = reqwest::blocking::Client::builder()
+                .timeout(None)
+                .build()?
+                .get(format!("http://{broker}/admin/verify-snapshot"))
+                .send()?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text()?;
+                eprintln!("{broker} refused ({status}): {body}");
+                std::process::exit(1);
+            }
+            let report: serde_json::Value = response.json()?;
+            if json {
+                println!("{report}");
+            }
+            let age_ms = report["snapshot_age_ms"].as_u64().unwrap_or(u64::MAX);
+            let offline = report["offline"].as_u64().unwrap_or(0);
+            if !json {
+                println!(
+                    "snapshot: {} (index {}, {}s old)",
+                    report["snapshot"].as_str().unwrap_or("none"),
+                    report["snapshot_index"],
+                    age_ms / 1000
+                );
+                println!(
+                    "topics: {}, partitions: {}, rebuilt extents: {}, offline partitions: {offline}",
+                    report["topics"], report["partitions"], report["extents"]
+                );
+            }
+            let stale = max_age_secs.is_some_and(|max| age_ms > max.saturating_mul(1000));
+            if stale {
+                eprintln!("the snapshot is older than --max-age-secs");
+            }
+            if offline > 0 {
+                eprintln!("{offline} partitions would be offline after a restore");
+            }
+            if stale || offline > 0 {
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

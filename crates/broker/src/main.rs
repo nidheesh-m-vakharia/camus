@@ -133,6 +133,8 @@ struct Admin {
     wal_dir: PathBuf,
     http: reqwest::Client,
     truncating: tokio::sync::Mutex<()>,
+    /// Held while `verify-snapshot` rebuilds, so drills do not pile up.
+    verifying: tokio::sync::Mutex<()>,
     settings: settings::Settings,
     /// The Kafka listener, once it starts, for consumer lag in `/metrics`.
     kafka: std::sync::OnceLock<Arc<kafka::Kafka>>,
@@ -219,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
             .timeout(std::time::Duration::from_secs(10))
             .build()?,
         truncating: tokio::sync::Mutex::new(()),
+        verifying: tokio::sync::Mutex::new(()),
         settings: settings.clone(),
         kafka: std::sync::OnceLock::new(),
     });
@@ -244,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/admin/join-wal", post(join_wal))
                 .route("/admin/add-wal-voter", post(add_wal_voter))
                 .route("/admin/restore-cluster", post(restore_cluster))
+                .route("/admin/verify-snapshot", get(verify_snapshot))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
                 .route("/wal/{shard}/txn-span", post(shard_txn_span))
@@ -391,6 +395,9 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          # HELP camus_raft_current_leader Node id of the current leader, or NaN.\n\
          # TYPE camus_raft_current_leader gauge\n\
          camus_raft_current_leader {leader}\n\
+         # HELP camus_raft_last_applied Log index of the last metadata entry this node applied.\n\
+         # TYPE camus_raft_last_applied gauge\n\
+         camus_raft_last_applied {}\n\
          # HELP camus_retention_cuts_total Partitions whose log start retention moved.\n\
          # TYPE camus_retention_cuts_total counter\n\
          camus_retention_cuts_total {}\n\
@@ -441,6 +448,7 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         } else {
             0
         },
+        metrics.last_applied.map_or(0, |id| id.index),
         stats.retention_cuts.load(Relaxed),
         stats.sweeps.load(Relaxed),
         stats.objects_deleted.load(Relaxed),
@@ -1900,6 +1908,32 @@ async fn restore_cluster(
             Err((status, text))
         }
     }
+}
+
+/// Rebuild the newest snapshot and the object footers in a scratch
+/// directory and report what `restore-cluster` would serve. Any broker can
+/// answer; it reads the bucket and changes nothing in the cluster.
+async fn verify_snapshot(
+    State(admin): State<Arc<Admin>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Ok(_held) = admin.verifying.try_lock() else {
+        return Err((
+            StatusCode::CONFLICT,
+            "a snapshot check is already running on this broker".into(),
+        ));
+    };
+    let bucket = open_bucket(&admin.settings)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let scratch =
+        std::env::temp_dir().join(format!("camus-verify-snapshot-{}-{stamp}", admin.node_id));
+    recover::verify(&bucket, &scratch)
+        .await
+        .map(Json)
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))
 }
 
 /// `allow.everyone.if.no.acl.found` follows the listener when nobody set it:
