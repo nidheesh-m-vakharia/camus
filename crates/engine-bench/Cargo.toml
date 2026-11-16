@@ -12,6 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 camus-raft = { path = "../raft" }
-fjall = "2"
+fjall = "3"
 redb = "4"
 tempfile = "3"
