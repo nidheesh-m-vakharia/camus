@@ -568,7 +568,7 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
 async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Value> {
     let metrics = admin.node.raft.metrics().borrow().clone();
     let wal = admin.wal.get();
-    Json(serde_json::json!({
+    let mut out = serde_json::json!({
         "id": metrics.id,
         "current_term": metrics.current_term,
         "current_leader": metrics.current_leader,
@@ -579,10 +579,8 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
         "wal_log_fsyncs": wal.log_stats().0,
         "wal_log_entries": wal.log_stats().1,
         "wal_log_bytes": wal.log_stats().2,
-        "wal_rpc_sent_count": camus_wal::RPC_TIMES.sent_count.load(std::sync::atomic::Ordering::Relaxed),
-        "wal_rpc_sent_us": camus_wal::RPC_TIMES.sent_us.load(std::sync::atomic::Ordering::Relaxed),
-        "wal_rpc_handled_count": camus_wal::RPC_TIMES.handled_count.load(std::sync::atomic::Ordering::Relaxed),
-        "wal_rpc_handled_us": camus_wal::RPC_TIMES.handled_us.load(std::sync::atomic::Ordering::Relaxed),
+        "produce_count": metrics::PRODUCE_LATENCY.totals().0,
+        "produce_us": metrics::PRODUCE_LATENCY.totals().1,
         "wal_storage_failed": wal.storage_failed(),
         "retention_cuts": camus_compactor::STATS.retention_cuts.load(std::sync::atomic::Ordering::Relaxed),
         "sweeps": camus_compactor::STATS.sweeps.load(std::sync::atomic::Ordering::Relaxed),
@@ -602,7 +600,35 @@ async fn admin_metrics(State(admin): State<Arc<Admin>>) -> Json<serde_json::Valu
                 "unsealed_bytes": shard.unsealed_bytes(),
             }))
             .collect::<Vec<_>>(),
-    }))
+    });
+    let log = wal.log_times();
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(fields) = out.as_object_mut() {
+        for (name, stage) in [
+            ("wal_queued", &camus_wal::COMMIT_TIMES.queued),
+            ("wal_committed", &camus_wal::COMMIT_TIMES.committed),
+            ("wal_rpc_sent", &camus_wal::RPC_TIMES.sent),
+            ("wal_rpc_handled", &camus_wal::RPC_TIMES.handled),
+        ] {
+            fields.insert(format!("{name}_count"), load(&stage.count).into());
+            fields.insert(format!("{name}_us"), load(&stage.us).into());
+            fields.insert(format!("{name}_max_us"), load(&stage.max_us).into());
+            fields.insert(format!("{name}_slow"), load(&stage.slow).into());
+        }
+        for (name, value) in [
+            ("wal_log_append_us", load(&log.append_us)),
+            ("wal_log_pool_wait_us", load(&log.pool_wait_us)),
+            ("wal_log_pool_wait_max_us", load(&log.pool_wait_max_us)),
+            ("wal_log_pool_wait_slow", load(&log.pool_wait_slow)),
+            ("wal_log_io_us", load(&log.io_us)),
+            ("wal_log_io_max_us", load(&log.io_max_us)),
+            ("wal_log_io_slow", load(&log.io_slow)),
+        ] {
+            fields.insert(name.into(), value.into());
+        }
+    }
+    Json(out)
 }
 
 /// Shard count when init omits one. One shard per core of this process,

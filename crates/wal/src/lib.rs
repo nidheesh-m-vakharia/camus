@@ -30,29 +30,78 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// follower around its own `append_entries`. The difference is transport.
 pub static RPC_TIMES: RpcTimes = RpcTimes::new();
 
+/// Where a produce's time goes between [`Shard::submit`] and its result, summed
+/// over every shard in the process. Fixed counters, so the cost does not grow.
+pub static COMMIT_TIMES: CommitTimes = CommitTimes::new();
+
+/// An event at least this long counts as slow in [`StageTime::slow`].
+pub const SLOW_US: u64 = 50_000;
+
+/// A count of events, their total and longest time, and how many were slow.
+pub struct StageTime {
+    pub count: std::sync::atomic::AtomicU64,
+    pub us: std::sync::atomic::AtomicU64,
+    pub max_us: std::sync::atomic::AtomicU64,
+    /// Events that took at least [`SLOW_US`].
+    pub slow: std::sync::atomic::AtomicU64,
+}
+
+impl StageTime {
+    const fn new() -> Self {
+        Self {
+            count: std::sync::atomic::AtomicU64::new(0),
+            us: std::sync::atomic::AtomicU64::new(0),
+            max_us: std::sync::atomic::AtomicU64::new(0),
+            slow: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn record(&self, elapsed: Duration) {
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.us.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+        if us >= SLOW_US {
+            self.slow.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Counters behind [`COMMIT_TIMES`].
+pub struct CommitTimes {
+    /// Per batch: from `submit` until its group is handed to Raft.
+    pub queued: StageTime,
+    /// Per group: from handing it to Raft until it is committed on a
+    /// majority and applied here.
+    pub committed: StageTime,
+}
+
+impl CommitTimes {
+    const fn new() -> Self {
+        Self {
+            queued: StageTime::new(),
+            committed: StageTime::new(),
+        }
+    }
+}
+
 /// Counters behind [`RPC_TIMES`].
 pub struct RpcTimes {
-    pub sent_count: std::sync::atomic::AtomicU64,
-    pub sent_us: std::sync::atomic::AtomicU64,
-    pub handled_count: std::sync::atomic::AtomicU64,
-    pub handled_us: std::sync::atomic::AtomicU64,
+    pub sent: StageTime,
+    pub handled: StageTime,
 }
 
 impl RpcTimes {
     const fn new() -> Self {
         Self {
-            sent_count: std::sync::atomic::AtomicU64::new(0),
-            sent_us: std::sync::atomic::AtomicU64::new(0),
-            handled_count: std::sync::atomic::AtomicU64::new(0),
-            handled_us: std::sync::atomic::AtomicU64::new(0),
+            sent: StageTime::new(),
+            handled: StageTime::new(),
         }
     }
 
     /// Record a follower's handling time for a request with entries.
     pub fn handled(&self, elapsed: Duration) {
-        self.handled_count.fetch_add(1, Ordering::Relaxed);
-        self.handled_us
-            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.handled.record(elapsed);
     }
 }
 
@@ -289,6 +338,7 @@ type Queued = (
     Append,
     tokio::sync::oneshot::Sender<Result<Response, Failure>>,
     Budget,
+    std::time::Instant,
 );
 
 /// A share of a shard's queue budget, released when every batch it covers
@@ -394,7 +444,7 @@ async fn commit_loop(
             while let Ok(chunk) = queue.try_recv() {
                 ready.extend(chunk);
             }
-            let waiting: usize = ready.iter().map(|(append, _, _)| append.raw.len()).sum();
+            let waiting: usize = ready.iter().map(|(append, _, _, _)| append.raw.len()).sum();
             let idle = slots.available_permits() == IN_FLIGHT;
             if waiting >= GROUP_BYTES || ready.len() >= machine::MAX_PACKED || idle {
                 break;
@@ -421,7 +471,8 @@ async fn commit_loop(
         let mut appends = Vec::with_capacity(group.len());
         let mut waiters = Vec::with_capacity(group.len());
         let mut budgets = Vec::with_capacity(group.len());
-        for (append, waiter, budget) in group {
+        for (append, waiter, budget, queued_at) in group {
+            COMMIT_TIMES.queued.record(queued_at.elapsed());
             appends.push(append);
             waiters.push(waiter);
             budgets.push(budget);
@@ -431,6 +482,7 @@ async fn commit_loop(
         } else {
             Command::Appends(appends)
         };
+        let handed = std::time::Instant::now();
         let submitted = raft.client_write_ff(command).await;
         let raft = raft.clone();
         let flag = storage_failed.clone();
@@ -474,6 +526,7 @@ async fn commit_loop(
                     return failure(code, waiters);
                 }
             };
+            COMMIT_TIMES.committed.record(handed.elapsed());
             if let Some(delay) = ack_delay {
                 tokio::time::sleep(delay).await;
             }
@@ -846,11 +899,12 @@ impl Shard {
                 .await
                 .map_err(|_| WriteError::Other(anyhow::anyhow!("wal committer stopped")))?,
         );
+        let queued_at = std::time::Instant::now();
         let (chunk, pending): (Vec<_>, Vec<_>) = batches
             .into_iter()
             .map(|batch| {
                 let (done, wait) = tokio::sync::oneshot::channel();
-                ((batch, done, budget.clone()), Pending(wait))
+                ((batch, done, budget.clone(), queued_at), Pending(wait))
             })
             .unzip();
         self.queue
@@ -948,6 +1002,13 @@ impl Shard {
     }
 
     /// Log append counters for this shard: `(fsyncs, entries, bytes)`.
+    /// The log's append counters: microseconds in total, waiting for a
+    /// blocking-pool thread, and writing and fsyncing, with the longest wait,
+    /// write, and slow counts. One append per fsync.
+    pub fn log_times(&self) -> &camus_raft::AppendStats {
+        &self.log_stats
+    }
+
     pub fn log_stats(&self) -> (u64, u64, u64) {
         (
             self.log_stats.fsyncs.load(Ordering::Relaxed),

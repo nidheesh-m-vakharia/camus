@@ -571,9 +571,19 @@ pub fn admin(http: &str) -> Option<serde_json::Value> {
 /// Wait until every node agrees on the metadata leader and every shard voter
 /// agrees on the shard leader. Returns the metadata leader's id.
 pub fn wait_settled(nodes: &[&Node]) -> i32 {
+    let https: Vec<&str> = nodes.iter().map(|node| node.http.as_str()).collect();
+    match settled(&https) {
+        Ok(leader) => leader,
+        Err(err) => panic!("{err}"),
+    }
+}
+
+/// Wait until every broker at these admin addresses names the same metadata
+/// leader and the same WAL leader, and return the metadata leader.
+pub fn settled(https: &[&str]) -> Result<i32, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        let views: Vec<_> = nodes.iter().filter_map(|node| admin(&node.http)).collect();
+        let views: Vec<_> = https.iter().filter_map(|http| admin(http)).collect();
         let meta: BTreeSet<_> = views
             .iter()
             .map(|view| view["current_leader"].as_i64())
@@ -587,17 +597,14 @@ pub fn wait_settled(nodes: &[&Node]) -> i32 {
             })
             .map(|view| view["wal_leader"].as_i64())
             .collect();
-        if views.len() == nodes.len()
-            && meta.len() == 1
-            && wal.len() == 1
-            && !meta.contains(&None)
-            && !wal.contains(&None)
-        {
-            return meta.into_iter().next().unwrap().unwrap() as i32;
+        if views.len() == https.len() && meta.len() == 1 && wal.len() == 1 && !wal.contains(&None) {
+            if let Some(Some(leader)) = meta.into_iter().next() {
+                return Ok(i32::try_from(leader)?);
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("nodes did not agree on leaders");
+    Err("nodes did not agree on leaders".into())
 }
 
 pub fn connect(addr: &str) -> TcpStream {
@@ -924,12 +931,171 @@ fn peers(nodes: &[Node], wal: &[i32]) -> Vec<serde_json::Value> {
 }
 
 fn post_init(nodes: &[Node], body: &serde_json::Value) {
+    if let Err(err) = post_init_at(&nodes[0].http, body) {
+        panic!("{err}");
+    }
+}
+
+fn post_init_at(http: &str, body: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
     let init = reqwest::blocking::Client::new()
-        .post(format!("http://{}/admin/init", nodes[0].http))
+        .post(format!("http://{http}/admin/init"))
         .json(body)
-        .send()
-        .unwrap();
-    assert!(init.status().is_success(), "{}", init.text().unwrap());
+        .send()?;
+    if !init.status().is_success() {
+        return Err(format!("init failed: {}", init.text()?).into());
+    }
+    Ok(())
+}
+
+/// A broker a benchmark runs against.
+pub struct BenchNode {
+    pub id: i32,
+    pub http: String,
+    pub kafka: String,
+    /// The process, when the broker runs on this machine.
+    pub pid: Option<u32>,
+}
+
+/// Brokers for one benchmark run, each run on a fresh cluster.
+///
+/// By default they start here, each in its own directory. With
+/// `CAMUS_BENCH_CLUSTER`, a comma list of `id=kafka_addr=admin_addr`, they
+/// are brokers on other machines: `CAMUS_BENCH_RESET`, a shell command, is run
+/// first to stop them, wipe their data, and start them again. It receives the
+/// run's broker environment (for example `CAMUS_FLUSH_MS`) as its own.
+pub struct BenchCluster {
+    pub nodes: Vec<BenchNode>,
+    /// The metadata leader.
+    pub controller: i32,
+    _local: Vec<Node>,
+    _root: Option<tempfile::TempDir>,
+}
+
+impl BenchCluster {
+    /// `shards` is the WAL shard count, or `None` for the broker default.
+    pub fn start(
+        brokers: i32,
+        opts: Opts,
+        shards: Option<u32>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let voters: Vec<i32> = (1..=brokers).collect();
+        let Ok(cluster) = std::env::var("CAMUS_BENCH_CLUSTER") else {
+            let root = tempfile::tempdir()?;
+            let local: Vec<Node> = voters
+                .iter()
+                .map(|id| Node::with(*id, &root.path().join(format!("node-{id}")), opts.clone()))
+                .collect();
+            match shards {
+                Some(shards) => init_shards(&local, &voters, shards),
+                None => init(&local, &voters),
+            }
+            let https: Vec<&str> = local.iter().map(|node| node.http.as_str()).collect();
+            let controller = settled(&https)?;
+            let nodes = local
+                .iter()
+                .map(|node| BenchNode {
+                    id: node.id,
+                    http: node.http.clone(),
+                    kafka: kafka_addr(node),
+                    pid: Some(node.child.id()),
+                })
+                .collect();
+            let root = if std::env::var("CAMUS_BENCH_KEEP").is_ok() {
+                // Leave the broker logs for inspection.
+                eprintln!("keeping {}", root.path().display());
+                std::mem::forget(root);
+                None
+            } else {
+                Some(root)
+            };
+            return Ok(Self {
+                nodes,
+                controller,
+                _local: local,
+                _root: root,
+            });
+        };
+        let mut nodes = Vec::new();
+        for entry in cluster.split(',').filter(|entry| !entry.is_empty()) {
+            let mut parts = entry.splitn(3, '=');
+            let (Some(id), Some(kafka), Some(http)) = (parts.next(), parts.next(), parts.next())
+            else {
+                return Err(
+                    format!("CAMUS_BENCH_CLUSTER entry {entry:?} is not id=kafka=admin").into(),
+                );
+            };
+            nodes.push(BenchNode {
+                id: id.parse()?,
+                http: http.to_string(),
+                kafka: kafka.to_string(),
+                pid: None,
+            });
+        }
+        if nodes.len() != voters.len() {
+            return Err(format!(
+                "CAMUS_BENCH_CLUSTER names {} brokers; the run wants {brokers}",
+                nodes.len()
+            )
+            .into());
+        }
+        let reset = std::env::var("CAMUS_BENCH_RESET")
+            .map_err(|_| "CAMUS_BENCH_CLUSTER needs CAMUS_BENCH_RESET")?;
+        let mut command = Command::new("sh");
+        command.args(["-c", &reset]);
+        for (key, value) in &opts.env {
+            command.env(key, value);
+        }
+        // As for a local broker: the quiet hold follows a longer flush.
+        if let Some((_, flush)) = opts.env.iter().find(|(key, _)| key == "CAMUS_FLUSH_MS") {
+            if !opts
+                .env
+                .iter()
+                .any(|(key, _)| key == "CAMUS_QUIET_FLUSH_MS")
+            {
+                command.env("CAMUS_QUIET_FLUSH_MS", flush);
+            }
+        }
+        if !command.status()?.success() {
+            return Err("CAMUS_BENCH_RESET failed".into());
+        }
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while nodes.iter().any(|node| admin(&node.http).is_none()) {
+            if Instant::now() >= deadline {
+                return Err("remote brokers did not answer on their admin addresses".into());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let peers: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|node| serde_json::json!({"id": node.id, "addr": node.http, "wal": true}))
+            .collect();
+        let body = match shards {
+            Some(shards) => serde_json::json!({"peers": peers, "shards": shards}),
+            None => serde_json::json!(peers),
+        };
+        let first = nodes.first().ok_or("CAMUS_BENCH_CLUSTER is empty")?;
+        post_init_at(&first.http, &body)?;
+        let https: Vec<&str> = nodes.iter().map(|node| node.http.as_str()).collect();
+        let controller = settled(&https)?;
+        Ok(Self {
+            nodes,
+            controller,
+            _local: Vec::new(),
+            _root: None,
+        })
+    }
+
+    pub fn node(&self, id: i32) -> Result<&BenchNode, Box<dyn std::error::Error>> {
+        self.nodes
+            .iter()
+            .find(|node| node.id == id)
+            .ok_or_else(|| format!("no broker {id}").into())
+    }
+
+    /// Process ids of every broker, when all of them run here.
+    pub fn pids(&self) -> Option<Vec<u32>> {
+        self.nodes.iter().map(|node| node.pid).collect()
+    }
 }
 
 /// Partition 0's leader epoch as Metadata through `via` reports it.

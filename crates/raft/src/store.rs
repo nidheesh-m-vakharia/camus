@@ -92,6 +92,36 @@ pub struct AppendStats {
     /// Bytes returned by [`SegmentLogStore::read_slice`]. A ranged read adds
     /// the requested length, not the rest of the entry.
     pub read_bytes: std::sync::atomic::AtomicU64,
+    /// Microseconds `append` took, from the call until it returned.
+    pub append_us: std::sync::atomic::AtomicU64,
+    /// Of `append_us`, microseconds waiting for a blocking-pool thread.
+    pub pool_wait_us: std::sync::atomic::AtomicU64,
+    /// Of `append_us`, microseconds writing and fsyncing.
+    pub io_us: std::sync::atomic::AtomicU64,
+    /// The longest single wait for a blocking-pool thread.
+    pub pool_wait_max_us: std::sync::atomic::AtomicU64,
+    /// The longest single write and fsync.
+    pub io_max_us: std::sync::atomic::AtomicU64,
+    /// Waits for a blocking-pool thread of at least [`SLOW_US`].
+    pub pool_wait_slow: std::sync::atomic::AtomicU64,
+    /// Writes and fsyncs of at least [`SLOW_US`].
+    pub io_slow: std::sync::atomic::AtomicU64,
+}
+
+/// An append stage at least this long counts as slow in [`AppendStats`].
+pub const SLOW_US: u64 = 50_000;
+
+fn micros(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Add `us` to a stage's longest time and, if it is slow, its slow count.
+fn note_slowest(max: &std::sync::atomic::AtomicU64, slow: &std::sync::atomic::AtomicU64, us: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    max.fetch_max(us, Relaxed);
+    if us >= SLOW_US {
+        slow.fetch_add(1, Relaxed);
+    }
 }
 
 impl<C> SegmentLogStore<C>
@@ -303,16 +333,31 @@ where
         let entries = prepared.len() as u64;
         let log = self.log.clone();
         let encode = self.encode;
-        tokio::task::spawn_blocking(move || {
-            log.append_encoded(&prepared, |entry, writer| encode(entry, writer))
-                .map_err(|err| io_err::<C>(None, &err))
+        let called = std::time::Instant::now();
+        let (waited, io, written) = tokio::task::spawn_blocking(move || {
+            let waited = called.elapsed();
+            let started = std::time::Instant::now();
+            let written = log.append_encoded(&prepared, |entry, writer| encode(entry, writer));
+            (waited, started.elapsed(), written)
         })
         .await
-        .map_err(|err| io_err::<C>(None, &err))??;
+        .map_err(|err| io_err::<C>(None, &err))?;
+        written.map_err(|err| io_err::<C>(None, &err))?;
         use std::sync::atomic::Ordering::Relaxed;
         self.stats.fsyncs.fetch_add(1, Relaxed);
         self.stats.entries.fetch_add(entries, Relaxed);
         self.stats.bytes.fetch_add(total, Relaxed);
+        self.stats
+            .append_us
+            .fetch_add(micros(called.elapsed()), Relaxed);
+        self.stats.pool_wait_us.fetch_add(micros(waited), Relaxed);
+        self.stats.io_us.fetch_add(micros(io), Relaxed);
+        note_slowest(
+            &self.stats.pool_wait_max_us,
+            &self.stats.pool_wait_slow,
+            micros(waited),
+        );
+        note_slowest(&self.stats.io_max_us, &self.stats.io_slow, micros(io));
         callback.log_io_completed(Ok(()));
         Ok(())
     }
