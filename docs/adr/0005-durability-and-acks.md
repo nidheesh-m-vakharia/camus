@@ -155,3 +155,7 @@ table.
   Not in the first implementation, so the default cannot be mis-set.
 - Waiting for R2 on every `wal` ack "to be safe." Rejected. That erases the
   reason `wal` exists and misses the latency target.
+
+Amended 2026-11-16: ADR 0023 (proposed) describes the migration. A topic
+that has data switches modes by fencing produce, draining the old path,
+and flipping in one metadata command.

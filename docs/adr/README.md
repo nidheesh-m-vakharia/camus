@@ -29,6 +29,7 @@ accepted.
 | [0019](0019-txn-span-in-the-wal.md) | Transaction spans live in the WAL until `EndTxn` |
 | [0020](0020-one-region-per-cluster.md) | One region per cluster, MirrorMaker 2 between regions |
 | [0021](0021-transaction-markers.md) | Transaction markers are made at fetch, not stored |
+| [0023](0023-switching-durability-mode.md) | Switching `durability.mode` on a topic that has data (proposed) |
 | [0022](0022-derived-views.md) | Derived views over the log: tables, graph, vectors (proposed) |
 
 Read [../PLAN.md](../PLAN.md) for the summary.
