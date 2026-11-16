@@ -934,34 +934,58 @@ fn mirror_maker_copies_from_camus_to_apache_kafka() -> Res {
     mirror_and_fail_over(dir.path(), ("camus", &camus), ("apache", &apache))
 }
 
+/// The `node_modules` directory holding KafkaJS 2, installed under
+/// `target/kafkajs` when `node` cannot resolve it there. CI restores
+/// `target/` from a cache that can keep the package's directory without its
+/// files, so this asks `node`, not the file system.
+fn kafkajs_modules() -> Res<PathBuf> {
+    let modules = target().join("kafkajs");
+    let node_path = modules.join("node_modules");
+    let resolves = || {
+        Command::new("node")
+            .args(["-e", "require.resolve('kafkajs')"])
+            .env("NODE_PATH", &node_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if resolves() {
+        return Ok(node_path);
+    }
+    match std::fs::remove_dir_all(&modules) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    std::fs::create_dir_all(&modules)?;
+    let installed = Command::new("npm")
+        .args(["install", "--silent", "--prefix"])
+        .arg(&modules)
+        .arg("kafkajs@2")
+        .status()?;
+    if !installed.success() || !resolves() {
+        return Err("npm install kafkajs failed".into());
+    }
+    Ok(node_path)
+}
+
 #[test]
-fn kafkajs_round_trips() {
+fn kafkajs_round_trips() -> Res {
     if !enabled() {
-        return;
+        return Ok(());
     }
     if Command::new("npm").arg("--version").output().is_err() {
         support::skipped("KafkaJS; npm is not installed");
-        return;
+        return Ok(());
     }
-    let modules = target().join("kafkajs");
-    if !modules.join("node_modules/kafkajs").is_dir() {
-        std::fs::create_dir_all(&modules).unwrap();
-        let installed = Command::new("npm")
-            .args(["install", "--silent", "--prefix"])
-            .arg(&modules)
-            .arg("kafkajs@2")
-            .status()
-            .unwrap();
-        assert!(installed.success(), "npm install kafkajs failed");
-    }
-    let dir = tempfile::tempdir().unwrap();
+    let node_path = kafkajs_modules()?;
+    let dir = tempfile::tempdir()?;
     let (_node, bootstrap) = broker(dir.path());
     let ran = Command::new("node")
         .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/ecosystem/kafkajs_roundtrip.js"))
         .arg(&bootstrap)
-        .env("NODE_PATH", modules.join("node_modules"))
-        .output()
-        .unwrap();
+        .env("NODE_PATH", &node_path)
+        .output()?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&ran.stdout),
@@ -971,6 +995,7 @@ fn kafkajs_round_trips() {
         ran.status.success() && text.contains("kafkajs ok"),
         "{text}"
     );
+    Ok(())
 }
 
 fn program(name: &str, fallbacks: &[&str]) -> Option<PathBuf> {
@@ -1327,25 +1352,14 @@ fn clients_read_a_transactional_topic_without_stored_markers() -> Fallible {
         support::skipped("KafkaJS transaction reader; npm is not installed");
         return Ok(());
     }
-    let modules = target().join("kafkajs");
-    if !modules.join("node_modules/kafkajs").is_dir() {
-        std::fs::create_dir_all(&modules)?;
-        let installed = Command::new("npm")
-            .args(["install", "--silent", "--prefix"])
-            .arg(&modules)
-            .arg("kafkajs@2")
-            .status()?;
-        if !installed.success() {
-            return Err("npm install kafkajs failed".into());
-        }
-    }
+    let node_path = kafkajs_modules()?;
     let ran = Command::new("node")
         .arg(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/ecosystem/kafkajs_txn_markers.js"),
         )
         .args([bootstrap.as_str(), "txn-markers", committed.as_str()])
-        .env("NODE_PATH", modules.join("node_modules"))
+        .env("NODE_PATH", &node_path)
         .output()?;
     let text = format!(
         "{}{}",
