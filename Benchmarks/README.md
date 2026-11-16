@@ -3,6 +3,71 @@
 The newest results are first. The 2026-11-05 baseline is kept below,
 unchanged. `raw/` has the benchmark output for both.
 
+## 2026-11-16, Linux latency by stage (#228)
+
+Linux 7.2 (aarch64) in an OrbStack VM on an Apple M4 Pro, 12 CPUs, Docker
+overlay filesystem. Release build of commit `527abcc` plus the stage
+counters added for #228. MinIO in Docker on the same machine, each benchmark
+run once. The VM's disk is a virtual one, so compare these numbers only with
+other runs in the same VM. Output in `raw/2026-11-16-linux-latency-stages.md`.
+
+### Latency, 3 brokers, one producer, 1 KiB `acks=all`
+
+| Mode | Samples | p50 ms | p99 ms | p99.9 ms | p99.99 ms | max ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `wal` | 20000 | 3.43 | 13.96 | 27.14 | 202.89 | 280.17 |
+| `r2` | 100 | 270.24 | 349.86 | - | - | 389.92 |
+
+### Where a `wal` ack's time goes, means
+
+| Stage | Mean ms | Per |
+| --- | ---: | --- |
+| Client round trip | 3.93 | ack |
+| Produce handler on the leader | 3.88 | request |
+| Queued before Raft | 0.00 | batch |
+| Raft commit and apply | 3.85 | group |
+| Leader log append | 1.89 | append |
+| of which waiting for a blocking-pool thread | 0.01 | append |
+| of which write and fsync | 1.87 | append |
+| Append RPC from the leader | 2.10 | RPC |
+| Append handling on a follower | 2.02 | RPC |
+| Leader log appends per ack | 1.01 | ack |
+
+The blocking-pool hop costs 0.01 ms of a 3.9 ms ack: the ack is the leader's
+fsync and the follower round trip, which overlap.
+
+### Where slow acks come from
+
+Two more runs in the same VM, at the production upload interval and at
+2000 ms. The VM was noisier than for the baseline: p99 76.38 ms at 250 ms
+against 13.96 ms above. Each row counts events of 50 ms or more during the
+20,000 samples; "Longest" is since the broker started.
+
+| Stage | 250 ms upload: slow / longest ms | 2000 ms upload: slow / longest ms |
+| --- | ---: | ---: |
+| Client round trip | 376 / 858.01 | 106 / 1484.23 |
+| Raft commit and apply | 371 / 857.66 | 106 / 1483.96 |
+| Leader: waiting for a blocking-pool thread | 0 / 1.46 | 0 / 3.49 |
+| Leader: write and fsync | 149 / 603.11 | 20 / 1473.94 |
+| Followers: waiting for a blocking-pool thread | 0 / 4.22 | 0 / 2.78 |
+| Followers: write and fsync | 309 / 749.03 | 40 / 1480.86 |
+
+Slow acks are slow fsyncs, on the leader or on the followers it waits for.
+No blocking-pool wait reached 50 ms. Uploading less often cut slow fsyncs by
+about 7x; here MinIO writes to the same virtual disk as the WAL.
+
+### Blocking-pool wait under load, 3 brokers
+
+| Producers | Mean wait ms | Longest ms | Ack p50 ms | Ack p99 ms | MiB/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.011 | 0.90 | 2.98 | 6.81 | 5.0 |
+| 8 | 0.025 | 0.73 | 6.99 | 23.28 | 15.7 |
+| 32 | 0.045 | 1.23 | 14.37 | 40.32 | 32.0 |
+
+At 32 producers the hop is 0.3% of the median ack. Driving `io_uring` from
+the shard's task, or pinning shards to cores, would not change these
+numbers; #228 records the decision.
+
 ## 2026-11-10, commit `56f0c3a`
 
 Apple M4 Pro, macOS, APFS on the internal SSD. Release build, commit

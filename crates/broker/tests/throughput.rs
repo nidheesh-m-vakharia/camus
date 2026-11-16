@@ -151,6 +151,7 @@ fn run(producers: usize, seconds: u64) -> Row {
         })
         .collect();
     let fsyncs_before = counter(&leader_http, "wal_log_fsyncs");
+    let pool_wait_before = counter(&leader_http, "wal_log_pool_wait_us");
     let bytes_before = counter(&leader_http, "wal_log_bytes");
     let stop = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
@@ -179,6 +180,12 @@ fn run(producers: usize, seconds: u64) -> Row {
         .collect();
     let elapsed = started.elapsed().as_secs_f64();
     let fsyncs = counter(&leader_http, "wal_log_fsyncs") - fsyncs_before;
+    let pool_wait = counter(&leader_http, "wal_log_pool_wait_us") - pool_wait_before;
+    eprintln!(
+        "producers={producers}: leader log append waits {:.3} ms for a blocking-pool thread on average, {:.2} ms at most",
+        pool_wait as f64 / fsyncs.max(1) as f64 / 1000.0,
+        counter(&leader_http, "wal_log_pool_wait_max_us") as f64 / 1000.0
+    );
     let sent = counter(&leader_http, "wal_rpc_sent_us") as f64
         / counter(&leader_http, "wal_rpc_sent_count").max(1) as f64;
     let followers: Vec<&Node> = nodes.iter().filter(|node| node.id != leader).collect();

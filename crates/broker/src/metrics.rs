@@ -44,6 +44,11 @@ impl Histogram {
         self.sum_us.fetch_add(us, Relaxed);
     }
 
+    /// Samples recorded and their total in microseconds.
+    pub fn totals(&self) -> (u64, u64) {
+        (self.count.load(Relaxed), self.sum_us.load(Relaxed))
+    }
+
     /// Write this histogram's `_bucket`, `_sum` and `_count` lines.
     /// `labels` is either empty or `key="value"` pairs without braces.
     pub fn render(&self, out: &mut String, name: &str, labels: &str) {
