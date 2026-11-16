@@ -135,7 +135,8 @@ generation and each assignment is committed through the metadata group
 before members hear of it, and an offset commit is checked against the
 stored generation when it is applied, so a failover keeps the generation
 and an old generation cannot commit. `FindCoordinator` serves groups and
-transactions. Share groups answer `INVALID_REQUEST` (42).
+transactions. Share groups answer `INVALID_REQUEST` (42); ADR 0026 (proposed)
+plans KIP-932 share groups with their state in the WAL shard.
 `ConsumerGroupHeartbeat` (KIP-848) versions 0–1 are implemented. The
 broker's default assignor is `uniform`, sticky like Kafka's `UniformAssignor`
 (members keep their partitions up to a fair share and only the rest move),
