@@ -47,7 +47,10 @@ pub use machine::{snapshot_rows, RedbMachine};
 pub use network::SharedRouter;
 pub use openraft::BasicNode;
 pub use openraft::RaftMetrics;
-pub use recover::{offline_key, plan_restore, ObjectSlice, RestorePlan};
+pub use recover::{
+    offline_key, plan_restore, rebuild, ObjectSlice, Rebuilt, RestorePlan, RestoredPartition,
+    REBUILD_LISTED,
+};
 
 /// Node id in the metadata group.
 pub type NodeId = u64;

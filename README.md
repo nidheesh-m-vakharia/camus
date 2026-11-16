@@ -158,6 +158,33 @@ gone. Sealed log bytes can still be rebuilt from the objects (ADR 0008).
 group and rebuilds sealed extents from object footers. Unsealed WAL
 entries stay lost. Group offsets can move back by one snapshot interval.
 
+What a whole-cluster restore can lose (the RPO):
+
+- **Records.** In `r2` mode, nothing that was acknowledged. In `wal` mode,
+  the unsealed tail: at most one upload interval, and never more than
+  `wal.disk.limit` per broker.
+- **Everything else in metadata.** Committed offsets, configs, ACLs,
+  producer state, and transaction outcomes newer than the snapshot. That
+  is at most `CAMUS_META_SNAPSHOT_MS` (30 s), plus the time an upload has
+  been failing.
+
+`camus admin verify-snapshot` is the restore drill. Any broker reads the
+newest snapshot and the footer of every object, and applies the restore plan to a
+scratch state machine in its temp directory. It then reports the
+snapshot's age, the topic and partition counts, each partition's log start
+and end, and any partition that would come back offline. It reads the
+bucket only and changes nothing in the cluster. It exits 1 when a
+partition would be offline, or when the snapshot is older than
+`--max-age-secs`.
+
+Run it daily from cron and after every upgrade. Alert on its exit status
+and on `CamusMetadataSnapshotStale` in
+[`deploy/prometheus/camus-alerts.yml`](deploy/prometheus/camus-alerts.yml).
+Like `restore-cluster`, a drill downloads every object under `bundle/` and
+`seg/` in full, one at a time, to read its footer. A drill therefore costs
+one get per object plus the bucket's size in egress, and on R2 that egress
+is free.
+
 Set the mode at topic creation with `durability.mode`. The cluster default
 is `CAMUS_DEFAULT_DURABILITY`.
 

@@ -1,0 +1,25 @@
+# Prometheus alert rules for Camus. Load with `rule_files:` in prometheus.yml.
+# docs/metrics.md describes each series.
+groups:
+  - name: camus
+    rules:
+      # The metadata leader uploads a snapshot every 30 s (CAMUS_META_SNAPSHOT_MS)
+      # or 10,000 entries, but only after metadata has changed. An idle cluster
+      # keeps an old snapshot safely, so this fires only when the leader has
+      # applied entries the newest snapshot does not hold. The snapshot gauges
+      # are 0 on a broker that has not uploaded one since it started.
+      - alert: CamusMetadataSnapshotStale
+        expr: |
+          (camus_raft_leader == 1)
+          and on (instance) (camus_raft_last_applied > camus_meta_snapshot_index)
+          and on (instance) (time() * 1000 - camus_meta_snapshot_unix_ms > 300000)
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Camus metadata snapshot is more than 5 minutes behind"
+          description: >-
+            Metadata newer than the last snapshot in object storage would be lost
+            if every broker disk were lost. Check camus_object_store_errors_total{op="put"}
+            and the leader's log for "metadata snapshot upload failed", then run
+            `camus admin verify-snapshot`.

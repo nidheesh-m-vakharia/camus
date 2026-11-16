@@ -15,7 +15,7 @@ caps below.
 
 | Family | Labels | Series per broker | Memory |
 | --- | --- | --- | --- |
-| Process, Raft, sweep, snapshot | none | 11 | existing counters; Raft values are read at scrape |
+| Process, Raft, sweep, snapshot | none | 12 | existing counters; Raft values are read at scrape |
 | `camus_object_store_*` | `op` (5 values) | 13 | 13 atomics |
 | `camus_wal_*` gauges | `shard` | 4 per open shard | read from the shard at scrape; the oldest unsealed age adds 8 bytes to each unsealed batch's in-memory index entry, which `CAMUS_WAL_DISK_LIMIT` already bounds |
 | `camus_wal_upload_seconds`, `camus_wal_seal_seconds` | `shard`, `le` | 17 per open shard each | 256 shard slots plus one `overflow` slot, 66,048 bytes static for all histograms |
@@ -112,6 +112,7 @@ Histogram buckets are 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms, and
 | `camus_raft_term` | gauge | Current metadata Raft term. |
 | `camus_raft_leader` | gauge | 1 when this broker leads metadata. |
 | `camus_raft_current_leader` | gauge | Node id of the metadata leader, or NaN. |
+| `camus_raft_last_applied` | gauge | Log index of the last metadata entry this broker applied. |
 | `camus_retention_cuts_total` | counter | Partitions whose log start retention moved. |
 | `camus_sweeps_total` | counter | Completed orphan object sweeps. |
 | `camus_sweep_objects_deleted_total` | counter | Objects the sweep deleted. |
@@ -119,3 +120,14 @@ Histogram buckets are 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms, and
 | `camus_produce_hold_ms_total` | counter | Milliseconds produce waited at the WAL disk limit. |
 | `camus_meta_snapshot_index` | gauge | Log index of the newest metadata snapshot in object storage. |
 | `camus_meta_snapshot_unix_ms` | gauge | Unix milliseconds of that snapshot, or 0. |
+
+The snapshot gauges are set by the broker that uploaded the snapshot, so
+they are 0 on a broker that has not led metadata since it started.
+
+## Alerts
+
+[`deploy/prometheus/camus-alerts.yml`](../deploy/prometheus/camus-alerts.yml)
+has `CamusMetadataSnapshotStale`. It fires when the metadata leader has
+applied entries past `camus_meta_snapshot_index` and the snapshot is more
+than five minutes old, for five minutes. A snapshot is only uploaded after
+metadata changes, so an idle cluster with an old snapshot does not fire it.

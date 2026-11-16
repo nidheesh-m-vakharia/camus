@@ -2,8 +2,14 @@
 //!
 //! This is the "every disk is gone" path in ADR 0008. Unsealed WAL entries
 //! are not in the bucket, and metadata newer than the snapshot is not either.
+//! [`verify`] runs the same plan into a scratch directory, as a restore drill.
 
-use camus_metadata::{plan_restore, snapshot_rows, Command, MetadataNode, ObjectSlice};
+use std::path::Path;
+
+use camus_metadata::{
+    plan_restore, rebuild, snapshot_rows, Command, MetadataNode, ObjectSlice, RestorePlan,
+    REBUILD_LISTED,
+};
 use camus_storage::Bucket;
 use uuid::Uuid;
 
@@ -21,11 +27,7 @@ pub async fn restore(node: &MetadataNode, bucket: &Bucket) -> anyhow::Result<ser
             anyhow::bail!("metadata already has topics; restore starts from an empty group");
         }
     }
-    let body = snapshot_body(bucket).await?;
-    let rows = snapshot_rows(&body).map_err(|err| anyhow::anyhow!(err))?;
-    let mut slices = object_slices(bucket).await?;
-    load_overlap_bytes(bucket, &mut slices).await;
-    let plan = plan_restore(&rows, &slices);
+    let (_, plan) = load_plan(bucket).await?;
     for chunk in plan.puts.chunks(PUTS) {
         let commands = chunk
             .iter()
@@ -54,7 +56,52 @@ pub async fn restore(node: &MetadataNode, bucket: &Bucket) -> anyhow::Result<ser
     }))
 }
 
-async fn snapshot_body(bucket: &Bucket) -> anyhow::Result<Vec<u8>> {
+/// The newest snapshot object, and the restore plan for it and the footers.
+async fn load_plan(bucket: &Bucket) -> anyhow::Result<(Snapshot, RestorePlan)> {
+    let snapshot = newest_snapshot(bucket).await?;
+    let rows = snapshot_rows(&snapshot.body).map_err(|err| anyhow::anyhow!(err))?;
+    let mut slices = object_slices(bucket).await?;
+    load_overlap_bytes(bucket, &mut slices).await;
+    Ok((snapshot, plan_restore(&rows, &slices)))
+}
+
+/// Rebuild the newest snapshot and the footers into a scratch state machine
+/// under `scratch`, and report what a restore would serve. Reads the bucket
+/// only; the live cluster is not touched. `scratch` is removed afterwards.
+pub async fn verify(bucket: &Bucket, scratch: &Path) -> anyhow::Result<serde_json::Value> {
+    let (snapshot, plan) = load_plan(bucket).await?;
+    let rebuilt = rebuild(scratch, &plan).await;
+    let removed = std::fs::remove_dir_all(scratch);
+    let rebuilt = rebuilt?;
+    removed?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    Ok(serde_json::json!({
+        "snapshot": snapshot.key,
+        "snapshot_index": snap_index(&snapshot.key),
+        "snapshot_unix_ms": snapshot.modified_ms,
+        "snapshot_age_ms": now_ms.saturating_sub(snapshot.modified_ms).max(0),
+        "rows": plan.puts.len(),
+        "extents": plan.publish.len(),
+        "topics": rebuilt.topics,
+        "partitions": rebuilt.partitions,
+        "offline": plan.offline.len(),
+        "listed": rebuilt.listed,
+        "listed_cap": REBUILD_LISTED,
+    }))
+}
+
+/// A metadata snapshot object.
+struct Snapshot {
+    key: String,
+    /// When the object was written, from the listing.
+    modified_ms: i64,
+    body: Vec<u8>,
+}
+
+async fn newest_snapshot(bucket: &Bucket) -> anyhow::Result<Snapshot> {
     let objects = bucket.list("meta/snap/").await?;
     if let Some((_, size, _)) = objects
         .iter()
@@ -62,9 +109,15 @@ async fn snapshot_body(bucket: &Bucket) -> anyhow::Result<Vec<u8>> {
     {
         if let Ok(pointer) = bucket.get_range("meta/snap/CURRENT", 0..*size).await {
             if let Ok(key) = String::from_utf8(pointer.to_vec()) {
-                if let Some((_, snap_size, _)) = objects.iter().find(|(name, _, _)| name == &key) {
+                if let Some((_, snap_size, modified_ms)) =
+                    objects.iter().find(|(name, _, _)| name == &key)
+                {
                     let body = bucket.get_range(&key, 0..*snap_size).await?;
-                    return Ok(body.to_vec());
+                    return Ok(Snapshot {
+                        key,
+                        modified_ms: *modified_ms,
+                        body: body.to_vec(),
+                    });
                 }
             }
         }
@@ -74,10 +127,14 @@ async fn snapshot_body(bucket: &Bucket) -> anyhow::Result<Vec<u8>> {
         .filter(|(key, _, _)| key.ends_with(".snap"))
         .collect();
     snaps.sort_by_key(|(key, _, _)| snap_index(key));
-    let Some((key, size, _)) = snaps.last() else {
+    let Some((key, size, modified_ms)) = snaps.last() else {
         anyhow::bail!("no metadata snapshot under meta/snap/");
     };
-    Ok(bucket.get_range(key, 0..*size).await?.to_vec())
+    Ok(Snapshot {
+        key: key.clone(),
+        modified_ms: *modified_ms,
+        body: bucket.get_range(key, 0..*size).await?.to_vec(),
+    })
 }
 
 fn snap_index(key: &str) -> u64 {
