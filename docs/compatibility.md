@@ -306,7 +306,10 @@ sequence state is sealed in metadata, with `last_timestamp` and
 a classic or unknown group is `GROUP_ID_NOT_FOUND` (69).
 AlterPartitionReassignments, ListPartitionReassignments, and
 AlterReplicaLogDirs stay unimplemented: a partition's replicas are the voters
-of its WAL shard, not a placement that can be moved on its own. Client quotas
+of its WAL shard, not a placement that can be moved on its own, so
+`kafka-reassign-partitions.sh` fails with `UnsupportedVersionException`. ADR 0024
+(proposed) adds and removes brokers by moving whole shard voters with
+`camus admin move-voter`, `rebalance-voters`, and `drain` instead. Client quotas
 stay unimplemented; throttling is internal and there is no byte-rate quota
 API. Delegation tokens, client telemetry, and UpdateFeatures stay
 unimplemented.
