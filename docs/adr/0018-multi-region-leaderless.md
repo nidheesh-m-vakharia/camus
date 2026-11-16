@@ -3,6 +3,10 @@
 Status: Proposed
 Date: 2026-11-12
 
+Note, 2026-11-14: one cluster per region, with MirrorMaker 2 between
+regions, is accepted and tested as [ADR 0020](0020-one-region-per-cluster.md).
+This record stays proposed for the native copy of sealed objects.
+
 ## Context
 
 A Camus cluster is one region. Metadata and each WAL shard elect inside
