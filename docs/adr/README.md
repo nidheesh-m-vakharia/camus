@@ -2,9 +2,9 @@
 
 Records 0001–0013 were accepted on 2026-11-05 and are implemented, with the
 amendments their files note. 0014, 0015, 0016, and 0017 are accepted. 0016
-sends votes, empty heartbeats, and shard announcements over QUIC unless
-`CAMUS_QUIC` is `off`. 0018 and 0022 are proposed. 0019, 0020, and 0021 are
-accepted.
+sends votes, empty heartbeats, and shard announcements over QUIC when
+`CAMUS_QUIC` is `on`; it is off by default. 0018, 0022, 0024, 0025, and 0026
+are proposed. 0019, 0020, and 0021 are accepted.
 
 | ADR | Title |
 | --- | --- |
@@ -30,5 +30,8 @@ accepted.
 | [0020](0020-one-region-per-cluster.md) | One region per cluster, MirrorMaker 2 between regions |
 | [0021](0021-transaction-markers.md) | Transaction markers are made at fetch, not stored |
 | [0022](0022-derived-views.md) | Derived views over the log: tables, graph, vectors (proposed) |
+| [0024](0024-moving-shard-voters.md) | Adding and removing brokers by moving shard voters (proposed) |
+| [0025](0025-client-quotas.md) | Per-principal usage first, then Kafka client quotas (proposed) |
+| [0026](0026-share-groups.md) | Share groups (KIP-932), keeping state in the WAL shard (proposed) |
 
 Read [../PLAN.md](../PLAN.md) for the summary.

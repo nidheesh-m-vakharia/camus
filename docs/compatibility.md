@@ -40,7 +40,7 @@ error rather than a partial imitation.
 | Partition leadership | Leadership belongs to WAL shards, one per core by default (rounded so each broker leads the same number, capped at eight per broker), each with up to three voters; partitions are placed on shards round-robin at creation and never move. A shard's first voter is its preferred leader: the balancer and `ElectLeaders PREFERRED` move all of the shard's partitions together, by election, so the shard pauses briefly and its epoch rises | Leaders and preferred replicas per partition, reassignment | 0006, 0014 |
 | Topic configs | Segment, flush, and `min.insync.replicas` configs are accepted and stored. `DescribeConfigs` names the setting that applies. `LogAppendTime`, broker-side recompression, and tiered storage are rejected | All applied | 0017 |
 | Regions | One cluster per region. Two regions are two clusters joined by MirrorMaker 2 (see [Regions](#regions)) | A stretched cluster across regions is possible with rack-aware replicas | 0020 |
-| Broker configs and quotas | Broker settings come from `camus.toml`, then `CAMUS_*`, then flags, all read at startup, and are read-only in `DescribeConfigs`; client quotas are not implemented | Dynamic broker configs and quotas | — |
+| Broker configs and quotas | Broker settings come from `camus.toml`, then `CAMUS_*`, then flags, all read at startup, and are read-only in `DescribeConfigs`; client quotas are not implemented yet; ADR 0025 (proposed) plans per-principal usage metrics, then `producer_byte_rate` and `consumer_byte_rate` | Dynamic broker configs and quotas | 0025 |
 
 `acks=0` matches Kafka: the broker does not wait, and the batch may be lost.
 
@@ -135,7 +135,8 @@ generation and each assignment is committed through the metadata group
 before members hear of it, and an offset commit is checked against the
 stored generation when it is applied, so a failover keeps the generation
 and an old generation cannot commit. `FindCoordinator` serves groups and
-transactions. Share groups answer `INVALID_REQUEST` (42).
+transactions. Share groups answer `INVALID_REQUEST` (42); ADR 0026 (proposed)
+plans KIP-932 share groups with their state in the WAL shard.
 `ConsumerGroupHeartbeat` (KIP-848) versions 0–1 are implemented. The
 broker's default assignor is `uniform`, sticky like Kafka's `UniformAssignor`
 (members keep their partitions up to a fair share and only the rest move),
@@ -306,9 +307,16 @@ sequence state is sealed in metadata, with `last_timestamp` and
 a classic or unknown group is `GROUP_ID_NOT_FOUND` (69).
 AlterPartitionReassignments, ListPartitionReassignments, and
 AlterReplicaLogDirs stay unimplemented: a partition's replicas are the voters
-of its WAL shard, not a placement that can be moved on its own. Client quotas
-stay unimplemented; throttling is internal and there is no byte-rate quota
-API. Delegation tokens, client telemetry, and UpdateFeatures stay
+of its WAL shard, not a placement that can be moved on its own, so
+`kafka-reassign-partitions.sh` fails with `UnsupportedVersionException`. ADR 0024
+(proposed) adds and removes brokers by moving whole shard voters with
+`camus admin move-voter`, `rebalance-voters`, and `drain` instead. Client quotas
+are unimplemented for now; throttling is internal and there is no byte-rate
+quota API. ADR 0025 (proposed) adds per-principal usage metrics first, then
+`DescribeClientQuotas` and `AlterClientQuotas` v0–v1 with Kafka's per-broker
+`producer_byte_rate` and `consumer_byte_rate` and KIP-219 throttling; the WAL
+produce hold stays separate and keeps `throttle_time_ms` at 0 for its share.
+Delegation tokens, client telemetry, and UpdateFeatures stay
 unimplemented.
 Unimplemented keys are absent from `ApiVersions`.
 A client that sends a known key at a version the schema can encode receives
@@ -365,8 +373,8 @@ acceptance test. `-` means not run.
 | AlterPartitionReassignments | 45 | | not planned | unimplemented | - | - | - |
 | ListPartitionReassignments | 46 | | not planned | unimplemented | - | - | - |
 | OffsetDelete | 47 | 4 | 0 | implemented | pass | - | pass |
-| DescribeClientQuotas | 48 | | throttle is internal; API not planned for 0–5 | unimplemented | - | - | - |
-| AlterClientQuotas | 49 | | not planned | unimplemented | - | - | - |
+| DescribeClientQuotas | 48 | | planned, v0–v1 (ADR 0025) | unimplemented | - | - | - |
+| AlterClientQuotas | 49 | | planned, v0–v1 (ADR 0025) | unimplemented | - | - | - |
 | DescribeUserScramCredentials | 50 | | 0 | implemented | - | - | - |
 | AlterUserScramCredentials | 51 | | 0 | implemented | - | - | - |
 | DescribeQuorum | 55 | | not planned (KRaft-specific) | unimplemented | - | - | - |
