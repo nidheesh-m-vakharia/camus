@@ -3,7 +3,7 @@
 Records 0001–0013 were accepted on 2026-11-05 and are implemented, with the
 amendments their files note. 0014, 0015, 0016, and 0017 are accepted. 0016
 sends votes, empty heartbeats, and shard announcements over QUIC when
-`CAMUS_QUIC` is `on`; it is off by default. 0018, 0022, and 0024 are
+`CAMUS_QUIC` is `on`; it is off by default. 0018, 0022, 0024, and 0025 are
 proposed. 0019, 0020, and 0021 are accepted.
 
 | ADR | Title |
@@ -31,5 +31,6 @@ proposed. 0019, 0020, and 0021 are accepted.
 | [0021](0021-transaction-markers.md) | Transaction markers are made at fetch, not stored |
 | [0022](0022-derived-views.md) | Derived views over the log: tables, graph, vectors (proposed) |
 | [0024](0024-moving-shard-voters.md) | Adding and removing brokers by moving shard voters (proposed) |
+| [0025](0025-client-quotas.md) | Per-principal usage first, then Kafka client quotas (proposed) |
 
 Read [../PLAN.md](../PLAN.md) for the summary.
