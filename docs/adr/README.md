@@ -3,8 +3,8 @@
 Records 0001–0013 were accepted on 2026-11-05 and are implemented, with the
 amendments their files note. 0014, 0015, 0016, and 0017 are accepted. 0016
 sends votes, empty heartbeats, and shard announcements over QUIC when
-`CAMUS_QUIC` is `on`; it is off by default. 0018, 0022, 0024, 0025, and 0026
-are proposed. 0019, 0020, and 0021 are accepted.
+`CAMUS_QUIC` is `on`; it is off by default. 0018, 0019, 0020, and 0021 are
+accepted. 0018 is not built yet. 0022, 0024, 0025, and 0026 are proposed.
 
 | ADR | Title |
 | --- | --- |
@@ -25,7 +25,7 @@ are proposed. 0019, 0020, and 0021 are accepted.
 | [0015](0015-transaction-spans.md) | Transaction spans without a metadata write per produce |
 | [0016](0016-quic-control-plane.md) | QUIC for Raft control traffic |
 | [0017](0017-ignored-topic-configs.md) | Accepted topic configs that do not change behavior |
-| [0018](0018-multi-region-leaderless.md) | Multi-region replication, one home per partition, TrueTime commit-wait |
+| [0018](0018-multi-region-leaderless.md) | Mirror topics between regions: same offsets, copied from the source bucket |
 | [0019](0019-txn-span-in-the-wal.md) | Transaction spans live in the WAL until `EndTxn` |
 | [0020](0020-one-region-per-cluster.md) | One region per cluster, MirrorMaker 2 between regions |
 | [0021](0021-transaction-markers.md) | Transaction markers are made at fetch, not stored |
