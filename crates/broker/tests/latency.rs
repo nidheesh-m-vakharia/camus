@@ -14,7 +14,9 @@
 //! interval (default 250, the production value). Two more tables split a
 //! `wal` ack into stages from the brokers' admin counters: mean time per
 //! stage, and how many events in each stage took 50 ms or more.
-//! `CAMUS_BENCH_PARTITIONS` sends one batch to each of that many partitions
+//! `CAMUS_BENCH_CLUSTER` and `CAMUS_BENCH_RESET` run it against brokers on
+//! other machines (see `BenchCluster` in `support`); memory is then not
+//! sampled. `CAMUS_BENCH_PARTITIONS` sends one batch to each of that many partitions
 //! in every request, as a client batching for one broker does. Every
 //! partition must be led by the broker the producer dials, so use it with
 //! `CAMUS_BENCH_BROKERS=1`.
@@ -160,7 +162,8 @@ impl Stages {
 /// One mode's samples, sorted, and what the brokers counted while they ran.
 struct Run {
     sorted: Vec<Duration>,
-    memory: Memory,
+    /// `None` when the brokers run on other machines.
+    memory: Option<Memory>,
     leader: i32,
     /// The shard leader's counters.
     on_leader: Stages,
@@ -168,29 +171,33 @@ struct Run {
     on_followers: Stages,
 }
 
-fn run(mode: &'static str, warmup: usize, samples: usize, opts: Opts) -> Run {
-    let root = tempfile::tempdir().unwrap();
+fn run(
+    mode: &'static str,
+    warmup: usize,
+    samples: usize,
+    opts: Opts,
+) -> Result<Run, Box<dyn std::error::Error>> {
     let brokers = count("CAMUS_BENCH_BROKERS", 3) as i32;
-    let nodes: Vec<Node> = (1..=brokers)
-        .map(|id| Node::with(id, &root.path().join(format!("node-{id}")), opts.clone()))
-        .collect();
-    init(&nodes, &(1..=brokers).collect::<Vec<_>>());
-    let meta_leader = wait_settled(&nodes.iter().collect::<Vec<_>>());
-    let controller = nodes.iter().find(|node| node.id == meta_leader).unwrap();
+    let cluster = BenchCluster::start(brokers, opts, None)?;
     let partitions = count("CAMUS_BENCH_PARTITIONS", 1) as i32;
-    create_topic_with(&kafka_addr(controller), mode, partitions);
-    let (leader_id, leader) = partition_leader(&kafka_addr(&nodes[0]), None);
-    let pids: Vec<u32> = nodes.iter().map(|node| node.child.id()).collect();
+    create_topic_with(&cluster.node(cluster.controller)?.kafka, mode, partitions);
+    let first = cluster.nodes.first().ok_or("no brokers")?;
+    let (leader_id, leader) = partition_leader(&first.kafka, None);
+    // Memory is sampled only when every broker runs on this machine.
+    let pids = cluster.pids();
     // Empty: the cluster and topic exist, nothing has been produced.
-    let idle = steady_rss(&pids, Duration::from_secs(3));
-    let sampler = MemorySampler::start(pids.clone());
+    let idle = pids
+        .as_ref()
+        .map(|pids| steady_rss(pids, Duration::from_secs(3)));
+    let sampler = pids.clone().map(MemorySampler::start);
     let mut stream = connect(&leader);
-    stream.set_nodelay(true).unwrap();
+    stream.set_nodelay(true)?;
     let value = "x".repeat(1024);
     for _ in 0..warmup {
         assert_eq!(produce_on(&mut stream, &value, partitions), 0);
     }
-    let before: Vec<Vec<u64>> = nodes
+    let before: Vec<Vec<u64>> = cluster
+        .nodes
         .iter()
         .map(|node| stage_counters(&node.http))
         .collect();
@@ -202,7 +209,7 @@ fn run(mode: &'static str, warmup: usize, samples: usize, opts: Opts) -> Run {
     }
     let mut on_leader = Stages::between(&[], &[]);
     let mut on_followers = Stages::between(&[], &[]);
-    for (node, before) in nodes.iter().zip(&before) {
+    for (node, before) in cluster.nodes.iter().zip(&before) {
         let grew = Stages::between(before, &stage_counters(&node.http));
         if node.id == leader_id {
             on_leader.add(&grew);
@@ -210,23 +217,28 @@ fn run(mode: &'static str, warmup: usize, samples: usize, opts: Opts) -> Run {
             on_followers.add(&grew);
         }
     }
-    let peak = sampler.finish();
-    std::thread::sleep(Duration::from_secs(3));
-    let after = steady_rss(&pids, Duration::from_secs(2));
-    out.sort();
-    let memory = Memory {
-        ids: nodes.iter().map(|node| node.id).collect(),
-        idle,
-        peak,
-        after,
+    let memory = match (pids, idle, sampler) {
+        (Some(pids), Some(idle), Some(sampler)) => {
+            let peak = sampler.finish();
+            std::thread::sleep(Duration::from_secs(3));
+            let after = steady_rss(&pids, Duration::from_secs(2));
+            Some(Memory {
+                ids: cluster.nodes.iter().map(|node| node.id).collect(),
+                idle,
+                peak,
+                after,
+            })
+        }
+        _ => None,
     };
-    Run {
+    out.sort();
+    Ok(Run {
         sorted: out,
         memory,
         leader: leader_id,
         on_leader,
         on_followers,
-    }
+    })
 }
 
 fn pct(sorted: &[Duration], p: f64) -> f64 {
@@ -246,7 +258,7 @@ fn pct_or_dash(sorted: &[Duration], p: f64, needed: usize) -> String {
 
 #[test]
 #[ignore = "benchmark; run with --ignored --release"]
-fn wal_versus_r2_produce_latency() {
+fn wal_versus_r2_produce_latency() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         std::env::var("CAMUS_MINIO").ok().as_deref(),
         Some("1"),
@@ -259,13 +271,13 @@ fn wal_versus_r2_produce_latency() {
         100,
         count("CAMUS_BENCH_WAL", 20_000),
         Opts::default().env("CAMUS_FLUSH_MS", &flush),
-    );
+    )?;
     let r2 = run(
         "r2",
         5,
         count("CAMUS_BENCH_R2", 100),
         Opts::default().env("CAMUS_FLUSH_MS", &flush),
-    );
+    )?;
     println!("| Mode | Samples | p50 ms | p99 ms | p99.9 ms | p99.99 ms | max ms |");
     println!("| --- | --- | --- | --- | --- | --- | --- |");
     for (mode, run) in [("wal", &wal), ("r2", &r2)] {
@@ -367,14 +379,19 @@ fn wal_versus_r2_produce_latency() {
         println!("| {label} | {slow} | {longest:.2} |");
     }
     println!();
+    if wal.memory.is_none() {
+        // Remote brokers: their memory is not sampled from here.
+        return Ok(());
+    }
     println!("| Run | Broker | Idle MiB | Peak MiB | After MiB |");
     println!("| --- | --- | ---: | ---: | ---: |");
     for (mode, run) in [("wal", &wal), ("r2", &r2)] {
-        for row in run
-            .memory
-            .rows(&format!("latency `{mode}`"), Some(run.leader))
-        {
+        let Some(memory) = &run.memory else {
+            continue;
+        };
+        for row in memory.rows(&format!("latency `{mode}`"), Some(run.leader)) {
             println!("{row}");
         }
     }
+    Ok(())
 }

@@ -14,7 +14,11 @@
 //!
 //! `CAMUS_BENCH_SECONDS` (default 10), `CAMUS_BENCH_PRODUCERS` (a comma
 //! list, default `1,8,32`), and `CAMUS_BENCH_BROKERS` (default 3) adjust the
-//! run.
+//! run. `CAMUS_BENCH_RECORDS` (default 16) and `CAMUS_BENCH_RECORD_BYTES`
+//! (default 1024) set the batch; 250 × 1000 is Iggy's `pinned_producer`
+//! workload. `CAMUS_BENCH_CLUSTER` and `CAMUS_BENCH_RESET` run it against
+//! brokers on other machines (see `BenchCluster` in `support`); memory is
+//! then not sampled.
 
 mod support;
 
@@ -34,11 +38,15 @@ use camus_protocol::records::{
 };
 use support::*;
 
-const RECORDS: usize = 16;
-const RECORD_BYTES: usize = 1024;
+fn knob(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
 
-fn records_batch() -> Bytes {
-    let records: Vec<Record> = (0..RECORDS)
+fn records_batch(records: usize, record_bytes: usize) -> Bytes {
+    let records: Vec<Record> = (0..records)
         .map(|index| Record {
             transactional: false,
             control: false,
@@ -51,7 +59,7 @@ fn records_batch() -> Bytes {
             offset: index as i64,
             timestamp: 9,
             key: None,
-            value: Some(Bytes::from(vec![b'x'; RECORD_BYTES])),
+            value: Some(Bytes::from(vec![b'x'; record_bytes])),
             headers: Default::default(),
         })
         .collect();
@@ -96,50 +104,40 @@ struct Row {
     mb_per_s: f64,
     p50: f64,
     p99: f64,
+    p999: f64,
     fsyncs_per_ack: f64,
     log_bytes_per_payload_byte: f64,
-    memory: Memory,
+    /// `None` when the brokers run on other machines.
+    memory: Option<Memory>,
     leader: i32,
 }
 
-fn run(producers: usize, seconds: u64) -> Row {
-    let root = tempfile::tempdir().unwrap();
-    let base = root.path().to_path_buf();
-    if std::env::var("CAMUS_BENCH_KEEP").is_ok() {
-        // Leave the broker logs for inspection.
-        eprintln!("keeping {}", base.display());
-        std::mem::forget(root);
-    }
-    let brokers: i32 = std::env::var("CAMUS_BENCH_BROKERS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(3);
-    let nodes: Vec<Node> = (1..=brokers)
-        .map(|id| {
-            Node::with(
-                id,
-                &base.join(format!("node-{id}")),
-                Opts::default().env("CAMUS_FLUSH_MS", "250"),
-            )
-        })
-        .collect();
+fn run(producers: usize, seconds: u64) -> Result<Row, Box<dyn std::error::Error>> {
+    let brokers = knob("CAMUS_BENCH_BROKERS", 3) as i32;
     // One shard, so every partition is on the leader the producers dial.
-    init_shards(&nodes, &(1..=brokers).collect::<Vec<_>>(), 1);
-    let meta_leader = wait_settled(&nodes.iter().collect::<Vec<_>>());
-    let controller = nodes.iter().find(|node| node.id == meta_leader).unwrap();
-    create_topic_with(&kafka_addr(controller), "wal", producers as i32);
-    let (leader, leader_addr) = partition_leader(&kafka_addr(&nodes[0]), None);
-    let leader_http = nodes
-        .iter()
-        .find(|node| node.id == leader)
-        .unwrap()
-        .http
-        .clone();
-    let batch = records_batch();
-    let pids: Vec<u32> = nodes.iter().map(|node| node.child.id()).collect();
+    let cluster = BenchCluster::start(
+        brokers,
+        Opts::default().env("CAMUS_FLUSH_MS", "250"),
+        Some(1),
+    )?;
+    create_topic_with(
+        &cluster.node(cluster.controller)?.kafka,
+        "wal",
+        producers as i32,
+    );
+    let first = cluster.nodes.first().ok_or("no brokers")?;
+    let (leader, leader_addr) = partition_leader(&first.kafka, None);
+    let leader_http = cluster.node(leader)?.http.clone();
+    let records = knob("CAMUS_BENCH_RECORDS", 16);
+    let record_bytes = knob("CAMUS_BENCH_RECORD_BYTES", 1024);
+    let batch = records_batch(records, record_bytes);
+    // Memory is sampled only when every broker runs on this machine.
+    let pids = cluster.pids();
     // Empty: the cluster and topic exist, nothing has been produced.
-    let idle = steady_rss(&pids, Duration::from_secs(3));
-    let sampler = MemorySampler::start(pids.clone());
+    let idle = pids
+        .as_ref()
+        .map(|pids| steady_rss(pids, Duration::from_secs(3)));
+    let sampler = pids.clone().map(MemorySampler::start);
 
     // Warm up every connection, then measure.
     let mut streams: Vec<TcpStream> = (0..producers)
@@ -188,7 +186,11 @@ fn run(producers: usize, seconds: u64) -> Row {
     );
     let sent = counter(&leader_http, "wal_rpc_sent_us") as f64
         / counter(&leader_http, "wal_rpc_sent_count").max(1) as f64;
-    let followers: Vec<&Node> = nodes.iter().filter(|node| node.id != leader).collect();
+    let followers: Vec<&BenchNode> = cluster
+        .nodes
+        .iter()
+        .filter(|node| node.id != leader)
+        .collect();
     let handled = followers
         .iter()
         .map(|node| counter(&node.http, "wal_rpc_handled_us"))
@@ -206,34 +208,41 @@ fn run(producers: usize, seconds: u64) -> Row {
         );
     }
     let log_bytes = counter(&leader_http, "wal_log_bytes") - bytes_before;
-    let peak = sampler.finish();
-    std::thread::sleep(Duration::from_secs(3));
-    let after = steady_rss(&pids, Duration::from_secs(2));
+    let memory = match (pids, idle, sampler) {
+        (Some(pids), Some(idle), Some(sampler)) => {
+            let peak = sampler.finish();
+            std::thread::sleep(Duration::from_secs(3));
+            let after = steady_rss(&pids, Duration::from_secs(2));
+            Some(Memory {
+                ids: cluster.nodes.iter().map(|node| node.id).collect(),
+                idle,
+                peak,
+                after,
+            })
+        }
+        _ => None,
+    };
     latencies.sort();
     let acks = latencies.len();
-    let payload = (acks * RECORDS * RECORD_BYTES) as f64;
+    let payload = (acks * records * record_bytes) as f64;
     let pct = |p: f64| latencies[((acks as f64 - 1.0) * p).round() as usize].as_secs_f64() * 1000.0;
-    Row {
+    Ok(Row {
         producers,
         acks,
         mb_per_s: payload / elapsed / (1024.0 * 1024.0),
         p50: pct(0.50),
         p99: pct(0.99),
+        p999: pct(0.999),
         fsyncs_per_ack: fsyncs as f64 / acks as f64,
         log_bytes_per_payload_byte: log_bytes as f64 / payload,
-        memory: Memory {
-            ids: nodes.iter().map(|node| node.id).collect(),
-            idle,
-            peak,
-            after,
-        },
+        memory,
         leader,
-    }
+    })
 }
 
 #[test]
 #[ignore = "benchmark; run with --ignored --release"]
-fn wal_produce_throughput() {
+fn wal_produce_throughput() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         std::env::var("CAMUS_MINIO").ok().as_deref(),
         Some("1"),
@@ -243,32 +252,36 @@ fn wal_produce_throughput() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(10);
-    let producers: Vec<usize> = std::env::var("CAMUS_BENCH_PRODUCERS")
+    let producers = std::env::var("CAMUS_BENCH_PRODUCERS")
         .unwrap_or_else(|_| "1,8,32".into())
         .split(',')
-        .map(|value| value.trim().parse().unwrap())
-        .collect();
+        .map(|value| value.trim().parse::<usize>())
+        .collect::<Result<Vec<_>, _>>()?;
     println!(
-        "| Producers | Acks | MiB/s | p50 ms | p99 ms | fsyncs/ack | log bytes/payload byte |"
+        "| Producers | Acks | MiB/s | p50 ms | p99 ms | p99.9 ms | fsyncs/ack | log bytes/payload byte |"
     );
-    println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     let mut memory = Vec::new();
     for count in producers {
-        let row = run(count, seconds);
+        let row = run(count, seconds)?;
         println!(
-            "| {} | {} | {:.1} | {:.2} | {:.2} | {:.2} | {:.2} |",
+            "| {} | {} | {:.1} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
             row.producers,
             row.acks,
             row.mb_per_s,
             row.p50,
             row.p99,
+            row.p999,
             row.fsyncs_per_ack,
             row.log_bytes_per_payload_byte,
         );
-        memory.extend(
-            row.memory
-                .rows(&format!("{} producers", row.producers), Some(row.leader)),
-        );
+        if let Some(sampled) = &row.memory {
+            memory.extend(sampled.rows(&format!("{} producers", row.producers), Some(row.leader)));
+        }
+    }
+    if memory.is_empty() {
+        // Remote brokers: their memory is not sampled from here.
+        return Ok(());
     }
     println!();
     println!("| Run | Broker | Idle MiB | Peak MiB | After MiB |");
@@ -276,4 +289,5 @@ fn wal_produce_throughput() {
     for line in memory {
         println!("{line}");
     }
+    Ok(())
 }

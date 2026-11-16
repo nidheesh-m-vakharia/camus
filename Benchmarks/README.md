@@ -3,6 +3,56 @@
 The newest results are first. The 2026-11-05 baseline is kept below,
 unchanged. `raw/` has the benchmark output for both.
 
+## 2026-11-16, AWS, 3 × `i4i.2xlarge` (#228)
+
+Three brokers on `i4i.2xlarge` in `us-east-1a`: Intel Xeon Platinum 8375C
+@ 2.90 GHz, 8 vCPU, 64 GiB, the data directory on the 1.7 TB local NVMe
+(ext4, `noatime`), Ubuntu 24.04 with kernel `7.0.0-1014-aws`. The client ran
+on a `c6i.2xlarge` in the same zone, and objects went to S3 in `us-east-1`.
+This is half the size of the `i4i.4xlarge` Iggy publishes its 3-node results
+on. Release build of commit `7d92263` plus the remote mode used to run it
+(`CAMUS_BENCH_CLUSTER`, `scripts/bench-reset-ssh.sh`). Each benchmark ran
+once. Output in `raw/2026-11-16-aws-i4i-2xlarge.md`.
+
+### Latency, one producer, 1 KiB `acks=all`
+
+| Upload interval | Mode | Samples | p50 ms | p99 ms | p99.9 ms | p99.99 ms | max ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 250 ms | `wal` | 100000 | 0.93 | 1.03 | 1.94 | 2.47 | 37.34 |
+| 250 ms | `r2` | 100 | 280.13 | 313.27 | - | - | 340.66 |
+| 2000 ms | `wal` | 20000 | 0.93 | 1.02 | 1.45 | 5.16 | 6.51 |
+
+No `wal` ack and no stage took 50 ms or more in either run. In the 100,000
+sample run the longest fsync was 0.75 ms on the leader and 6.76 ms on a
+follower; the 37.34 ms ack was one append RPC, while the followers handled
+every RPC within 6.81 ms. A mean ack is the leader's 0.17 ms write and
+fsync overlapping a 0.48 ms round trip to the followers. The 202.89 ms
+p99.99 measured in the VM below came from its virtual disk.
+
+### Throughput, 16 × 1 KiB records per batch, `acks=all`, 10 s, one shard
+
+| Producers | MiB/s | p50 ms | p99 ms | p99.9 ms | fsyncs/ack | Pool wait mean / longest ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 14.1 | 1.10 | 1.26 | 2.03 | 1.00 | 0.011 / 0.16 |
+| 8 | 43.3 | 2.84 | 3.84 | 4.69 | 0.25 | 0.012 / 0.08 |
+| 32 | 69.3 | 7.09 | 10.05 | 12.31 | 0.06 | 0.014 / 0.30 |
+
+### Iggy's `pinned_producer` workload
+
+One producer, 250 × 1000-byte records per batch, each batch acknowledged
+after a WAL majority fsync, 30 s. Iggy's row is its published `i4i-cluster3`
+run on `i4i.4xlarge` (server 0.10.0, `producer-1p-persisted@500MB`, a fsync
+per batch), from `benchmarks.iggy.apache.org`. The machines differ in size,
+and Iggy's page does not say how its three nodes replicate, so this is a
+reference point, not a like-for-like result.
+
+| System | Machines | MB/s | p50 ms | p99 ms | p99.9 ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Camus | 3 × `i4i.2xlarge` | 74.6 | 3.26 | 4.85 | 17.71 |
+| Iggy 0.10.0 | 3 × `i4i.4xlarge` | 222.4 | 1.12 | 1.22 | 1.69 |
+
+MB here is 10^6 bytes, as Iggy reports it (Camus: 71.1 MiB/s).
+
 ## 2026-11-16, Linux latency by stage (#228)
 
 Linux 7.2 (aarch64) in an OrbStack VM on an Apple M4 Pro, 12 CPUs, Docker
