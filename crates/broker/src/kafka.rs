@@ -3626,6 +3626,9 @@ impl Kafka {
         let Some(topic) = topic else {
             return Err(UNKNOWN_TOPIC);
         };
+        if topic.mirror_of.is_some() {
+            return Err(INVALID_TOPIC);
+        }
         if self.restore_offline(&topic.id, partition) {
             return Err(LEADER_NOT_AVAILABLE);
         }
@@ -5079,6 +5082,9 @@ fn produce_message(code: i16) -> Option<StrBytes> {
     let text = match code {
         INVALID_RECORD => "Compacted topic cannot accept message without key.",
         TOO_LARGE => "The record batch is larger than the topic's max.message.bytes.",
+        // Produce returns it only for a mirror topic, as Kafka 4.4.0 does for
+        // an internal one (ADR 0018).
+        INVALID_TOPIC => "Cannot append to a mirror topic. Produce to its source cluster.",
         _ => return None,
     };
     Some(StrBytes::from_static_str(text))

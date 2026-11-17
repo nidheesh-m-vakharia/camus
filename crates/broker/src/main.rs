@@ -248,6 +248,14 @@ async fn main() -> anyhow::Result<()> {
                 .route("/admin/add-wal-voter", post(add_wal_voter))
                 .route("/admin/restore-cluster", post(restore_cluster))
                 .route("/admin/verify-snapshot", get(verify_snapshot))
+                .route(
+                    "/admin/mirror/links",
+                    get(mirror_links).post(add_mirror_link),
+                )
+                .route(
+                    "/admin/mirror/links/{alias}",
+                    axum::routing::delete(remove_mirror_link),
+                )
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
                 .route("/wal/{shard}/txn-span", post(shard_txn_span))
@@ -1500,23 +1508,30 @@ async fn add_wal_voter(
     Ok(Json(serde_json::json!({ "voters": opened.voters() })))
 }
 
-/// Write one metadata key here when this node leads the group, otherwise
-/// through the leader's `/admin/write`.
-async fn metadata_write(admin: &Admin, key: &str, value: &str) -> anyhow::Result<()> {
+/// The metadata leader's HTTP address, or `None` when this node leads.
+fn metadata_leader(admin: &Admin) -> anyhow::Result<Option<String>> {
     let metrics = admin.node.raft.metrics().borrow().clone();
     let leader = metrics
         .current_leader
         .ok_or_else(|| anyhow::anyhow!("no metadata leader"))?;
     if leader == metrics.id {
-        admin.node.write(key, value).await?;
-        return Ok(());
+        return Ok(None);
     }
-    let addr = metrics
+    metrics
         .membership_config
         .membership()
         .get_node(&leader)
-        .map(|node| node.addr.clone())
-        .ok_or_else(|| anyhow::anyhow!("metadata leader has no address"))?;
+        .map(|node| Some(node.addr.clone()))
+        .ok_or_else(|| anyhow::anyhow!("metadata leader has no address"))
+}
+
+/// Write one metadata key here when this node leads the group, otherwise
+/// through the leader's `/admin/write`.
+async fn metadata_write(admin: &Admin, key: &str, value: &str) -> anyhow::Result<()> {
+    let Some(addr) = metadata_leader(admin)? else {
+        admin.node.write(key, value).await?;
+        return Ok(());
+    };
     let response = admin
         .http
         .post(format!("http://{addr}/admin/write"))
@@ -1525,6 +1540,92 @@ async fn metadata_write(admin: &Admin, key: &str, value: &str) -> anyhow::Result
         .await?;
     anyhow::ensure!(response.status().is_success(), "metadata write failed");
     Ok(())
+}
+
+/// Commit `command` here when this node leads the group, otherwise through
+/// the leader's `/admin/apply`.
+async fn metadata_apply(
+    admin: &Admin,
+    command: Command,
+) -> anyhow::Result<camus_metadata::Response> {
+    let Some(addr) = metadata_leader(admin)? else {
+        return admin.node.apply(command).await;
+    };
+    let response = admin
+        .http
+        .post(format!("http://{addr}/admin/apply"))
+        .json(&command)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "metadata leader refused the command: {}",
+        response.status()
+    );
+    Ok(response.json().await?)
+}
+
+/// Every mirror link (ADR 0018), as JSON, from this broker's applied
+/// metadata: a link just added through another broker may lag by a commit.
+/// At most `MAX_LINKS` exist.
+async fn mirror_links(
+    State(admin): State<Arc<Admin>>,
+) -> Result<Json<Vec<camus_metadata::mirror::MirrorLink>>, (StatusCode, String)> {
+    let rows = admin
+        .node
+        .scan_local(camus_metadata::mirror::links_prefix())
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    rows.iter()
+        .map(|(_, raw)| serde_json::from_str(raw))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+/// Add a mirror link. Its keys are not part of it: each broker reads them
+/// from `CAMUS_MIRROR_<ALIAS>_ACCESS_KEY` and `_SECRET_KEY`.
+async fn add_mirror_link(
+    State(admin): State<Arc<Admin>>,
+    Json(link): Json<camus_metadata::mirror::MirrorLink>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let what = format!("link {}", link.alias);
+    mirror_outcome(&admin, Command::AddMirrorLink { link }, &what).await
+}
+
+/// Remove a mirror link that no mirror topic names.
+async fn remove_mirror_link(
+    State(admin): State<Arc<Admin>>,
+    axum::extract::Path(alias): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let what = format!("link {alias}");
+    mirror_outcome(&admin, Command::RemoveMirrorLink { alias }, &what).await
+}
+
+/// Commit a mirror command and map its code: 400 for a malformed request,
+/// 409 for a conflict or a link in use.
+async fn mirror_outcome(
+    admin: &Admin,
+    command: Command,
+    what: &str,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let response = metadata_apply(admin, command)
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    match response.error_code {
+        0 => Ok(StatusCode::OK),
+        camus_metadata::mirror::INVALID_REQUEST => Err((
+            StatusCode::BAD_REQUEST,
+            format!("{what}: alias must be 1-32 of [a-z0-9-], endpoint and bucket set, and a mirror needs its link"),
+        )),
+        camus_metadata::mirror::POLICY_VIOLATION => Err((
+            StatusCode::CONFLICT,
+            format!("{what}: the alias names another bucket, or a mirror topic still uses it"),
+        )),
+        code => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{what}: error code {code}"),
+        )),
+    }
 }
 
 async fn write(
