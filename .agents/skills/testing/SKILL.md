@@ -9,12 +9,15 @@ description: Run, choose, or write Camus tests. Covers the env gates (MinIO, eco
 
 | Tier | Command | Needs |
 | --- | --- | --- |
-| Default (CI) | `cargo test --workspace --locked` | nothing; gated tests print "skipping" and pass |
+| Default (CI) | `cargo nextest run --workspace --locked` | [cargo-nextest](https://nexte.st/docs/installation/pre-built-binaries/); gated tests print "skipping" and pass |
 | One suite | `cargo test -p camus-broker --test groups` | |
-| Bucket | `docker compose up -d minio create-bucket`, then `CAMUS_MINIO=1 cargo test ...` | Docker |
-| Interop clients | `cargo test -p camus-broker --test clients` | `target/kafka-jars/kafka-clients-4.4.0.jar` (+ deps), `target/pykafka/bin/python`, `target/go/bin/go`, JDK 21 |
+| Bucket | `docker compose up -d minio create-bucket`, then `CAMUS_MINIO=1 cargo nextest run ...` | Docker |
+| Interop clients | `cargo nextest run -p camus-broker --test clients` | `target/kafka-jars/kafka-clients-4.4.0.jar` (+ deps), `target/pykafka/bin/python`, `target/go/bin/go`, JDK 21 |
 | Ecosystem | `CAMUS_ECOSYSTEM=1 cargo test -p camus-broker --test ecosystem -- --test-threads=1` | JDK, npm, Go + librdkafka, .NET SDK; `CAMUS_ECOSYSTEM_DOCKER=1` adds Schema Registry |
 | Benchmarks | see the `perf` skill | `--release -- --ignored` |
+
+`.config/nextest.toml` runs four tests at a time. The ecosystem tier stays on
+`cargo test -- --test-threads=1` so its Docker and port setup stays serial.
 
 A gated test that skips still passes. If the test you need to run printed
 "skipping", say so in your report. Don't claim it passed.
