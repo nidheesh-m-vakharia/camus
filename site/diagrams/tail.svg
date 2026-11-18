@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="dg dg-tail" viewBox="0 0 560 440" width="560" height="440" fill="none" stroke="currentColor" stroke-width="1" focusable="false" style="overflow:visible;font-family:Pollen, sans-serif;font-optical-sizing:auto;font-synthesis:none;font-weight:400;color:#171717" role="img" aria-labelledby="dg-tail-title" aria-describedby="dg-tail-desc">
+<title id="dg-tail-title">One log, a short tail on disk</title>
+<desc id="dg-tail-desc">The log&#x27;s sealed body lives as objects in the bucket. Each of three brokers holds only the same newest stretch, the unsealed tail, until the uploader moves it into the bucket.</desc>
+<g fill="currentColor" fill-opacity="0.055" stroke="none"><path d="M380 124h100v104h-100Z"/></g>
+<g opacity="1"><path d="M60 296h320v24h-320Z"/><path d="M80 296v24M100 296v24M120 296v24M140 296v24M160 296v24M180 296v24M200 296v24M220 296v24M240 296v24M260 296v24M280 296v24M300 296v24M320 296v24M340 296v24M360 296v24"/><path d="M380 124h100v24h-100Z"/><path d="M400 124v24M420 124v24M440 124v24M460 124v24"/><path d="M380 164h100v24h-100Z"/><path d="M400 164v24M420 164v24M440 164v24M460 164v24"/><path d="M380 204h100v24h-100Z"/><path d="M400 204v24M420 204v24M440 204v24M460 204v24"/></g>
+<g opacity="0.32"><path d="M44 280h456v56h-456Z"/><path d="M60 292L60 258"/><path d="M380 292L380 258"/><path d="M60 262L155.6 262"/><path d="M284.4 262L380 262"/><path d="M56 266l8-8M376 266l8-8"/><path d="M380 120L380 92"/><path d="M480 120L480 92"/><path d="M380 96L389.9 96"/><path d="M470.1 96L480 96"/><path d="M376 100l8-8M476 100l8-8"/><path d="M508 308l-4.24 -4.24M508 308l4.24 -4.24"/></g>
+<g opacity="0.32" stroke-dasharray="3 5"><path d="M380 296h100v24h-100M400 296v24M420 296v24M440 296v24M460 296v24"/></g>
+<g opacity="0.32" stroke-dasharray="4 6"><path d="M508 176L508 308"/></g>
+<g opacity="0.14"><path d="M380 236L380 288"/><path d="M480 236L480 288"/></g>
+<g fill="currentColor" stroke="none" font-size="11" text-anchor="start" opacity="0.72"><text x="52" y="356">R2 or any S3 bucket</text></g>
+<g fill="currentColor" stroke="none" font-size="10" text-anchor="middle" opacity="0.5"><text x="220" y="265.5">sealed log, as objects</text><text x="430" y="99.5">unsealed tail</text></g>
+<g fill="currentColor" stroke="none" font-size="11" text-anchor="end" opacity="0.72"><text x="368" y="140">broker 1</text><text x="368" y="180">broker 2</text><text x="368" y="220">broker 3</text></g>
+<g fill="currentColor" stroke="none" font-size="10" text-anchor="start" opacity="0.5"><text x="516" y="232">upload</text></g>
+</svg>
