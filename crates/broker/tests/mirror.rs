@@ -392,9 +392,30 @@ fn a_mirror_copies_the_source_and_outlives_it() -> TestResult {
     }
     let pid = std::process::id();
     let source_prefix = format!("mirror-copy-src-{pid}/");
-    let source_dir = tempfile::tempdir()?;
-    let source = spawn_under(source_dir.path(), &source_prefix, &[]);
-    let source_addr = kafka_addr(&source);
+    // Three source brokers, so the WAL leader can fail over and raise the
+    // leader epoch the copied batches carry.
+    let source_dirs = [
+        tempfile::tempdir()?,
+        tempfile::tempdir()?,
+        tempfile::tempdir()?,
+    ];
+    let mut sources: Vec<support::Node> = source_dirs
+        .iter()
+        .zip(1..)
+        .map(|(dir, id)| {
+            support::Node::with(
+                id,
+                dir.path(),
+                Opts::default()
+                    .env("CAMUS_S3_PREFIX", &source_prefix)
+                    .env("CAMUS_META_SNAPSHOT_MS", "200"),
+            )
+        })
+        .collect();
+    support::init(&sources, &[1, 2, 3]);
+    support::wait_settled(&sources.iter().collect::<Vec<_>>());
+    support::create_wal_topic(&kafka_addr(&sources[0]));
+    let (leader, source_addr) = support::partition_leader(&kafka_addr(&sources[0]), None);
     let mut sent = Vec::new();
     for at in 0..40 {
         let value = format!("record-{at}");
@@ -402,7 +423,12 @@ fn a_mirror_copies_the_source_and_outlives_it() -> TestResult {
         assert_eq!((code, offset), (0, at), "produce {at}");
         sent.push(value);
     }
-    support::wait_sealed(&source.http, 40);
+    let survivor = sources
+        .iter()
+        .find(|node| node.id != leader)
+        .map(|node| node.http.clone())
+        .ok_or("no survivor")?;
+    support::wait_sealed(&survivor, 40);
 
     // The destination has no `orders` of its own: the mirror takes the name.
     let dest_dir = tempfile::tempdir()?;
@@ -448,12 +474,22 @@ fn a_mirror_copies_the_source_and_outlives_it() -> TestResult {
     );
 
     // New produces at the source reach the mirror at the same offsets.
+    // Fail the WAL leader over: later batches carry a higher epoch than
+    // the destination's own term, as any source that has failed over has.
+    let epoch_before = support::partition_epoch(&source_addr);
+    sources.retain(|node| node.id != leader);
+    let via = kafka_addr(&sources[0]);
+    let (_, source_addr) = support::partition_leader(&via, Some(leader));
     for at in 40..60 {
         let value = format!("record-{at}");
-        assert_eq!(produce(&source_addr, &value), (0, at));
+        assert_eq!(support::produce_retrying(&via, &value).1, at);
         sent.push(value);
     }
-    support::wait_sealed(&source.http, 60);
+    assert!(
+        support::partition_epoch(&source_addr) > epoch_before,
+        "the epoch rose"
+    );
+    support::wait_sealed(&sources[0].http, 60);
     support::wait_sealed(&dest.http, 60);
 
     assert_eq!(
@@ -461,7 +497,23 @@ fn a_mirror_copies_the_source_and_outlives_it() -> TestResult {
         raw_log(&source_addr, 60)?,
         "the mirror serves the source's batch bytes, offsets and epochs included"
     );
-    drop(source);
+    // A consumer that fetched the last batch asks for its epoch's end: the
+    // mirror must know that epoch, or the client reads it as truncation.
+    let log = raw_log(&dest_addr, 60)?;
+    let batches = camus_protocol::batch::inspect(&log, camus_protocol::batch::MAX_BATCH_CEILING)
+        .map_err(|err| format!("{err:?}"))?;
+    let last_at = log.len() - batches.last().ok_or("no batch")?.len;
+    let last_epoch = camus_protocol::batch::leader_epoch(log.get(last_at..).ok_or("short")?);
+    let current = support::partition_epoch(&dest_addr);
+    assert!(
+        current >= last_epoch,
+        "mirror epoch {current} is below a copied batch's {last_epoch}"
+    );
+    assert_eq!(
+        support::epoch_end(&dest_addr, current, last_epoch),
+        (0, last_epoch, 60)
+    );
+    drop(sources);
     assert_eq!(
         support::read_all(&dest_addr, 60),
         sent,

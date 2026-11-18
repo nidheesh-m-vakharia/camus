@@ -325,6 +325,9 @@ async fn copy_partition(
         return Ok(Copied::Stalled("the source has no such partition".into()));
     };
     let from_source = camus_metadata::parse_partition(&raw).map_err(|err| anyhow::anyhow!(err))?;
+    // Where the last window of an extent stopped, so the next window of the
+    // same extent reads on from there instead of from its first byte.
+    let mut resume: Option<(String, u64, i64)> = None;
     for _ in 0..WINDOWS_PER_ROUND {
         let raw = node
             .read_local(&camus_metadata::partition_storage_key(&topic.id, partition))?
@@ -348,13 +351,53 @@ async fn copy_partition(
                 extent.start
             )));
         }
-        let start = if empty { end.max(extent.start) } else { end };
-        if let Some(why) = copy_window(node, dest, source, topic, partition, &extent, start).await?
+        // A mirror that holds nothing starts at the source's log start, so it
+        // does not serve records the source has deleted.
+        let start = if empty {
+            end.max(extent.start).max(from_source.log_start)
+        } else {
+            end
+        };
+        if empty && start > end {
+            tracing::info!(
+                topic = topic.name,
+                partition,
+                from = end,
+                to = start,
+                "mirror starts at the source's log start"
+            );
+        }
+        let from = match &resume {
+            Some((key, pos, at)) if *key == extent.key && *at == start => Some(*pos),
+            _ => None,
+        };
+        match copy_window(
+            node, dest, source, topic, partition, &extent, start, empty, from,
+        )
+        .await?
         {
-            return Ok(Copied::Stalled(why));
+            Window::Published { pos } => {
+                resume = Some((extent.key.clone(), pos, next_end(node, topic, partition)?))
+            }
+            Window::Raced => return Ok(Copied::Some),
+            Window::Stalled(why) => return Ok(Copied::Stalled(why)),
         }
     }
     Ok(Copied::Some)
+}
+
+/// The mirror partition's next offset, as this broker has applied it.
+fn next_end(
+    node: &camus_metadata::MetadataNode,
+    topic: &Topic,
+    partition: i32,
+) -> anyhow::Result<i64> {
+    let raw = node
+        .read_local(&camus_metadata::partition_storage_key(&topic.id, partition))?
+        .ok_or_else(|| anyhow::anyhow!("{} has no partition {partition}", topic.name))?;
+    Ok(camus_metadata::parse_partition(&raw)
+        .map_err(|err| anyhow::anyhow!(err))?
+        .next_offset)
 }
 
 /// The source's first extent ending after `after`.
@@ -380,9 +423,21 @@ async fn next_extent(
     }
 }
 
+/// What one window did.
+enum Window {
+    /// Published, and the extent's bytes before `pos` are done.
+    Published { pos: u64 },
+    /// Another copier published first. Stop this partition for the round.
+    Raced,
+    /// Cannot go on.
+    Stalled(String),
+}
+
 /// Copy whole batches of `extent` from offset `start` on, at most one
-/// window, into a new object here, and publish them. `Some` is why it
-/// stopped short of publishing.
+/// window, into a new object here, and publish them. `from` is a byte
+/// position inside the extent to read on from, when an earlier window of
+/// the same extent ended there.
+#[allow(clippy::too_many_arguments)]
 async fn copy_window(
     node: &camus_metadata::MetadataNode,
     dest: &Bucket,
@@ -391,22 +446,36 @@ async fn copy_window(
     partition: i32,
     extent: &camus_metadata::Extent,
     start: i64,
-) -> anyhow::Result<Option<String>> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let extent_end = extent.file_offset + u64::from(extent.length);
-    let mut pos = extent.file_offset;
-    // Skip batches below `start`, a window at a time; after a source
+    empty: bool,
+    from: Option<u64>,
+) -> anyhow::Result<Window> {
+    let extent_end = extent
+        .file_offset
+        .checked_add(u64::from(extent.length))
+        .ok_or_else(|| anyhow::anyhow!("extent {} overflows", extent.key))?;
+    let mut pos = from.unwrap_or(extent.file_offset);
+    // Skip batches below `start`, a window at a time: after a source
     // compaction the mirror's end can fall inside an extent.
-    let (window, batches) = loop {
-        anyhow::ensure!(
-            pos < extent_end,
-            "extent {} ends before offset {start}",
-            extent.key
-        );
-        let bytes = source
-            .bucket
-            .get_exact(&extent.key, pos..extent_end.min(pos + WINDOW_BYTES))
-            .await?;
+    let (window, infos) = loop {
+        if pos >= extent_end {
+            // Every batch from here on is below `start`: a compaction
+            // dropped the extent's tail. Its offsets hold nothing; advance
+            // over them without an object.
+            return publish(
+                node,
+                dest,
+                topic,
+                partition,
+                &[],
+                &bytes::Bytes::new(),
+                start,
+                extent.end,
+                pos,
+            )
+            .await;
+        }
+        let stop = pos.saturating_add(WINDOW_BYTES).min(extent_end);
+        let bytes = source.bucket.get_exact(&extent.key, pos..stop).await?;
         let whole = whole_batches(&bytes)?;
         let bytes = bytes.slice(..whole);
         let infos =
@@ -418,105 +487,199 @@ async fn copy_window(
             .iter()
             .take_while(|info| info.last_offset < start)
             .count();
-        if skip == infos.len() {
-            pos += whole as u64;
-            continue;
-        }
         let skipped: usize = infos.iter().take(skip).map(|info| info.len).sum();
-        let first = &infos[skip];
-        if first.base_offset < start {
-            return Ok(Some(format!(
-                "offset {start} falls inside a batch at {} in {}",
-                first.base_offset, extent.key
-            )));
-        }
         pos += skipped as u64;
-        break (bytes.slice(skipped..), infos[skip..].to_vec());
-    };
-    if batches.iter().any(|info| info.transactional) {
-        return Ok(Some(
-            "transactional batches are copied once their spans are (phase 2)".into(),
-        ));
-    }
-    let to_end = pos + window.len() as u64 == extent_end;
-    // One part per run of batches sealed in the same leader epoch, so the
-    // mirror's epoch history matches the source's.
-    let topic_id = *uuid::Uuid::parse_str(&topic.id)?.as_bytes();
-    let mut pieces = Vec::new();
-    let mut epochs = Vec::new();
-    let mut at = 0;
-    let mut next_start = start;
-    let mut runs = batches.iter().peekable();
-    while let Some(first) = runs.next() {
-        let epoch = camus_protocol::batch::leader_epoch(window.get(at..).unwrap_or_default());
-        let mut len = first.len;
-        let (mut base_ts, mut max_ts, mut last) =
-            (first.base_timestamp, first.max_timestamp, first.last_offset);
-        while let Some(next) = runs.peek() {
-            let next_epoch =
-                camus_protocol::batch::leader_epoch(window.get(at + len..).unwrap_or_default());
-            if next_epoch != epoch {
-                break;
-            }
-            base_ts = base_ts.min(next.base_timestamp);
-            max_ts = max_ts.max(next.max_timestamp);
-            last = next.last_offset;
-            len += next.len;
-            runs.next();
+        if skip < infos.len() {
+            break (
+                bytes.slice(skipped..),
+                infos.get(skip..).unwrap_or_default().to_vec(),
+            );
         }
-        let end = if runs.peek().is_none() && to_end {
-            extent.end
-        } else {
-            last + 1
-        };
-        pieces.push(camus_uploader::Piece {
-            topic_id,
-            partition,
-            start: next_start,
-            end,
-            base_timestamp: base_ts,
-            max_timestamp: max_ts,
-            bytes: window.slice(at..at + len),
-        });
-        epochs.push(epoch);
-        next_start = end;
-        at += len;
+    };
+    let to_end = pos + window.len() as u64 == extent_end;
+    let mut epochs = Vec::with_capacity(infos.len());
+    let mut at = 0;
+    for info in &infos {
+        epochs.push(camus_protocol::batch::leader_epoch(
+            window.get(at..).unwrap_or_default(),
+        ));
+        at += info.len;
     }
-    let (index, body) = camus_uploader::encode(&pieces);
-    let key = camus_uploader::object_key();
-    dest.put_new(&key, body).await?;
-    let parts = pieces
-        .iter()
-        .zip(index)
-        .zip(epochs)
-        .map(
-            |((piece, (file_offset, length)), epoch)| camus_metadata::PublishPart {
-                epoch,
+    let runs = match plan(&infos, &epochs, start, extent.end, to_end, empty) {
+        Ok(runs) => runs,
+        Err(why) => return Ok(Window::Stalled(format!("{}: {why}", extent.key))),
+    };
+    let next = pos + window.len() as u64;
+    publish(
+        node, dest, topic, partition, &runs, &window, start, extent.end, next,
+    )
+    .await
+}
+
+/// Put `runs` of `window` into a new object and commit them. With no runs,
+/// commit only the move of the next offset from `start` to `empty_end`.
+#[allow(clippy::too_many_arguments)]
+async fn publish(
+    node: &camus_metadata::MetadataNode,
+    dest: &Bucket,
+    topic: &Topic,
+    partition: i32,
+    runs: &[Run],
+    window: &bytes::Bytes,
+    start: i64,
+    empty_end: i64,
+    pos: u64,
+) -> anyhow::Result<Window> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let parts: Vec<camus_metadata::PublishPart> = if runs.is_empty() {
+        vec![camus_metadata::PublishPart {
+            epoch: -1,
+            topic: topic.name.clone(),
+            partition,
+            start,
+            end: empty_end,
+            object_key: String::new(),
+            file_offset: 0,
+            length: 0,
+            base_timestamp: -1,
+            max_timestamp: -1,
+        }]
+    } else {
+        let topic_id = *uuid::Uuid::parse_str(&topic.id)?.as_bytes();
+        let pieces: Vec<camus_uploader::Piece> = runs
+            .iter()
+            .map(|run| camus_uploader::Piece {
+                topic_id,
+                partition,
+                start: run.start,
+                end: run.end,
+                base_timestamp: run.base_timestamp,
+                max_timestamp: run.max_timestamp,
+                bytes: window.slice(run.bytes.clone()),
+            })
+            .collect();
+        let (index, body) = camus_uploader::encode(&pieces);
+        let key = camus_uploader::object_key();
+        dest.put_new(&key, body).await?;
+        runs.iter()
+            .zip(index)
+            .map(|(run, (file_offset, length))| camus_metadata::PublishPart {
+                epoch: run.epoch,
                 topic: topic.name.clone(),
                 partition,
-                start: piece.start,
-                end: piece.end,
+                start: run.start,
+                end: run.end,
                 object_key: key.clone(),
                 file_offset,
                 length,
-                base_timestamp: piece.base_timestamp,
-                max_timestamp: piece.max_timestamp,
-            },
-        )
-        .collect();
+                base_timestamp: run.base_timestamp,
+                max_timestamp: run.max_timestamp,
+            })
+            .collect()
+    };
     let published = node
         .apply(camus_metadata::Command::PublishMirror { parts })
         .await?;
     match published.error_code {
         0 => {
-            COPIED_BYTES.fetch_add(window.len() as u64, Relaxed);
-            Ok(None)
+            let copied: usize = runs.iter().map(|run| run.bytes.len()).sum();
+            COPIED_BYTES.fetch_add(copied as u64, Relaxed);
+            Ok(Window::Published { pos })
         }
-        // Another round, or a leader before this one, got there first. The
-        // object is an orphan for the sweep.
-        1 => Ok(None),
+        // Another copier, such as a leader before this one, published first.
+        // An object put for this attempt is an orphan for the sweep.
+        1 => Ok(Window::Raced),
         code => anyhow::bail!("publishing into {} failed with {code}", topic.name),
     }
+}
+
+/// Batches of one leader epoch, as one published part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Run {
+    start: i64,
+    end: i64,
+    epoch: i32,
+    base_timestamp: i64,
+    max_timestamp: i64,
+    /// Byte range in the window.
+    bytes: std::ops::Range<usize>,
+}
+
+/// Plan the parts for `infos`, whole batches of one window whose CRCs were
+/// checked, in order, the first ending at or after `start`. `epochs` holds
+/// each batch's leader epoch. `extent_end` is the source extent's exclusive
+/// end offset, and `to_end` says the window reaches its last byte.
+/// `new_mirror` lets the first batch begin below `start`: a new mirror
+/// starts at a source log start that can fall inside a batch, as Kafka's
+/// can. `Err` is why the copy stalls.
+fn plan(
+    infos: &[camus_protocol::batch::BatchInfo],
+    epochs: &[i32],
+    start: i64,
+    extent_end: i64,
+    to_end: bool,
+    new_mirror: bool,
+) -> Result<Vec<Run>, String> {
+    if infos.iter().any(|info| info.transactional) {
+        return Err("transactional batches are copied once their spans are (phase 2)".into());
+    }
+    let Some(first) = infos.first() else {
+        return Err("no batch at or after the start".into());
+    };
+    if first.base_offset < start && !new_mirror {
+        return Err(format!(
+            "offset {start} falls inside a batch at {}",
+            first.base_offset
+        ));
+    }
+    // Each batch must start past the one before and stay inside the extent,
+    // so the published offsets match the bytes.
+    let mut floor = first.base_offset.min(start);
+    for info in infos {
+        if info.base_offset < floor
+            || info.last_offset < info.base_offset
+            || info.last_offset >= extent_end
+        {
+            return Err(format!(
+                "a batch at {}..={} does not fit after {floor} in an extent ending at {extent_end}",
+                info.base_offset, info.last_offset
+            ));
+        }
+        floor = info.last_offset + 1;
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let mut at = 0;
+    for (index, info) in infos.iter().enumerate() {
+        let epoch = epochs.get(index).copied().unwrap_or(-1);
+        match runs.last_mut() {
+            Some(run) if run.epoch == epoch => {
+                run.end = info.last_offset + 1;
+                run.base_timestamp = run.base_timestamp.min(info.base_timestamp);
+                run.max_timestamp = run.max_timestamp.max(info.max_timestamp);
+                run.bytes.end = at + info.len;
+            }
+            _ => {
+                let run_start = runs.last().map_or(start, |run| run.end);
+                runs.push(Run {
+                    start: run_start,
+                    end: info.last_offset + 1,
+                    epoch,
+                    base_timestamp: info.base_timestamp,
+                    max_timestamp: info.max_timestamp,
+                    bytes: at..at + info.len,
+                });
+            }
+        }
+        at += info.len;
+    }
+    // Records a compaction dropped from the extent's tail still count: the
+    // last part ends where the extent does.
+    if to_end {
+        if let Some(run) = runs.last_mut() {
+            run.end = extent_end;
+        }
+    }
+    Ok(runs)
 }
 
 /// Length of the prefix of `bytes` that is whole Kafka batches.
@@ -562,6 +725,119 @@ mod tests {
         assert!(whole_batches(cut.get(..30).unwrap_or_default()).is_err());
         assert!(whole_batches(&[0u8; 8]).is_err(), "no length field");
         Ok(())
+    }
+
+    use camus_protocol::batch::BatchInfo;
+
+    /// A checked batch of `len` bytes covering `base..=last`.
+    fn info(base: i64, last: i64, len: usize) -> BatchInfo {
+        BatchInfo {
+            len,
+            base_offset: base,
+            last_offset: last,
+            records: (last - base + 1) as i32,
+            base_timestamp: base,
+            max_timestamp: last,
+            transactional: false,
+        }
+    }
+
+    #[test]
+    fn a_plan_splits_parts_where_the_epoch_changes() -> Result<(), String> {
+        let infos = [info(0, 4, 10), info(5, 9, 20), info(10, 14, 30)];
+        let runs = plan(&infos, &[3, 3, 4], 0, 15, false, false)?;
+        assert_eq!(
+            runs,
+            vec![
+                Run {
+                    start: 0,
+                    end: 10,
+                    epoch: 3,
+                    base_timestamp: 0,
+                    max_timestamp: 9,
+                    bytes: 0..30
+                },
+                Run {
+                    start: 10,
+                    end: 15,
+                    epoch: 4,
+                    base_timestamp: 10,
+                    max_timestamp: 14,
+                    bytes: 30..60
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_last_part_of_an_extent_ends_where_the_extent_does() -> Result<(), String> {
+        // A compaction dropped 15..20 from the extent's tail.
+        let runs = plan(&[info(0, 14, 10)], &[1], 0, 20, true, false)?;
+        assert_eq!(runs.last().map(|run| run.end), Some(20));
+        let short = plan(&[info(0, 14, 10)], &[1], 0, 20, false, false)?;
+        assert_eq!(
+            short.last().map(|run| run.end),
+            Some(15),
+            "more of the extent follows"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_compaction_gap_inside_a_window_is_kept() -> Result<(), String> {
+        // Offsets 5..9 were compacted away; the parts still cover them.
+        let runs = plan(
+            &[info(0, 4, 10), info(10, 14, 10)],
+            &[1, 1],
+            0,
+            15,
+            true,
+            false,
+        )?;
+        assert_eq!((runs[0].start, runs[0].end), (0, 15));
+        Ok(())
+    }
+
+    #[test]
+    fn a_start_inside_a_batch_stalls_unless_the_mirror_is_new() -> Result<(), String> {
+        let infos = [info(0, 9, 10)];
+        assert!(plan(&infos, &[1], 5, 10, true, false).is_err());
+        let runs = plan(&infos, &[1], 5, 10, true, true)?;
+        assert_eq!(
+            (runs[0].start, runs[0].end),
+            (5, 10),
+            "a new mirror starts at the log start"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transactional_batches_stall() {
+        let mut batch = info(0, 4, 10);
+        batch.transactional = true;
+        let err = plan(&[batch], &[1], 0, 5, true, false)
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("phase 2"), "{err}");
+    }
+
+    #[test]
+    fn batches_that_do_not_fit_their_extent_stall() {
+        // Past the extent's end: publishing would claim offsets twice.
+        assert!(plan(&[info(0, 149, 10)], &[1], 0, 100, true, false).is_err());
+        // Going backwards.
+        assert!(plan(
+            &[info(0, 9, 10), info(5, 12, 10)],
+            &[1, 1],
+            0,
+            20,
+            true,
+            false
+        )
+        .is_err());
+        // Last below base.
+        assert!(plan(&[info(5, 4, 10)], &[1], 0, 20, true, false).is_err());
     }
 
     #[test]

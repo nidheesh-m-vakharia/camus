@@ -533,55 +533,83 @@ Phase 1, third part: the copier.
 
 - `run_copier` in `crates/broker/src/mirror.rs` runs on every broker but
   copies only while that broker leads metadata. It runs a round every
-  `CAMUS_MIRROR_COPY_MS` (5 s), opening each link's source once per
-  round. For each mirror partition it:
+  `CAMUS_MIRROR_COPY_MS` (5 s, at least 50 ms), opening each link's source
+  once per round. For each mirror partition it:
   1. reads the source's `part/` row
   2. finds the source extent that ends past the mirror's next offset,
      reading the source's extent keys a block at a time
   3. ranged-reads at most 8 MiB of that extent's batches, the largest
-     batch Camus accepts
+     batch Camus accepts. The next window of the same extent reads on from
+     where the last one stopped.
   4. checks every batch's CRC with `batch::inspect`
   5. writes the whole batches into a new `bundle/{ulid}.seg` here, with
      the uploader's footer, so recovery from footers (ADR 0008) sees
      mirrors as it sees anything else
-  6. commits them with `PublishMirror`
+  6. commits them with `PublishMirror`. The object is put before the
+     commit, as in ADR 0005.
 
-  A partition copies at most eight windows per round.
+  A partition copies at most eight windows per round. When a commit loses
+  a race, the partition stops for that round. The object is left to the
+  sweep.
+- The planning step is the pure function `plan`, and it is
+  unit-tested. It accepts a window only if every batch starts past the
+  one before and ends inside the source extent, so the offsets published
+  always match the bytes. Parts split wherever the leader epoch changes,
+  so the mirror's epoch history matches the source's. When a window
+  reaches the end of the source extent, its last part ends at the
+  extent's end, not at the last batch. A source compaction can drop
+  records at the tail of an extent, and this keeps those offsets
+  accounted for. When every batch left in an extent is below the mirror's
+  end, the copier commits a part with no bytes. That part moves the next
+  offset to the extent's end and stores no extent.
 - `PublishMirror` (log position 32) applies only to a mirror topic, and
-  `Publish` never does. A part must start at the partition's next
-  offset. The one exception is a partition that holds nothing: there the
-  first part may start at the source's log start, and `log_start` moves
-  with it. A copy that loses a race gets 1 and leaves an orphan object for
-  the sweep.
-- Parts split wherever the leader epoch changes, so the mirror's epoch
-  history matches the source's. When a window reaches the end of the
-  source extent, its last part ends at the extent's end, not at the last
-  batch. A source compaction can drop records at the tail of an extent,
-  and this keeps those offsets accounted for. When the mirror's end falls
-  inside a source extent, the copier skips whole batches up to it. A
-  batch that straddles the end stalls the partition.
-- A partition stalls, without publishing, in three cases:
+  `Publish` never does. A part must start at the partition's next offset.
+  A partition that holds nothing is the exception: its first part may
+  start further on. In that case the copier starts at the source's log
+  start, even when that falls inside a batch, as a Kafka log start can.
+  So a new mirror never serves records the source has deleted. The same
+  rule lets a mirror that its own retention has emptied go on from the
+  source's log start, skipping only records the source no longer has.
+  The copier logs that jump.
+- A mirror's leader epoch is the larger of the metadata term and the
+  newest source epoch it has copied. A consumer that fetched a copied
+  batch can then ask `OffsetForLeaderEpoch` for that epoch. Answered with
+  the term alone, a source that had failed over would look truncated to
+  the consumer, and the consumer would reset.
+- A partition stalls, without publishing, in five cases:
   - source retention has passed its end
+  - the source's next extent starts past its end
   - the source has no such partition
-  - a batch is transactional. Spans are copied in phase 2. Copying the
-    batch now would show aborted records to `read_committed`.
+  - its end falls inside a source batch
+  - a batch does not fit its extent, or is transactional. Spans are
+    copied in phase 2. Copying the batch now would show aborted records
+    to `read_committed`.
 - Metrics:
   - `camus_mirror_stalled_partitions` counts the partitions stalled in
     the last round.
   - `camus_mirror_copied_bytes_total` and `camus_mirror_copy_errors_total`
     count what was copied and what failed.
 
-  Every series is a static atomic.
+  Every series is a static atomic. Errors include a source that cannot be
+  read and a failed put or commit.
 - Memory is one 8 MiB window and the object built from it, one partition
-  at a time.
+  at a time. Arithmetic on a source extent's offsets is checked. Each
+  round reads this cluster's topic rows to find the mirrors, which is
+  bounded by the topic count, as a `Metadata` response is.
+- Upgrade order: `PublishMirror` is a new command, so every metadata
+  voter must run this release before a mirror is created. A voter on the
+  part-one release cannot decode it.
 - The acceptance test is `a_mirror_copies_the_source_and_outlives_it` in
   `crates/broker/tests/mirror.rs`, run with MinIO:
-  1. A source produces 40 records, and a destination mirrors them.
+  1. A three-broker source produces 40 records, and a destination mirrors
+     them.
   2. The mirror serves the same records at the same offsets.
-  3. 20 more records follow.
+  3. The source's WAL leader is killed, so the epoch rises past the
+     destination's term, and 20 more records follow.
   4. A raw fetch of both logs is byte-identical.
-  5. With the source broker gone, the mirror still serves all 60 and
+  5. The mirror reports an epoch at least as high as the last copied
+     batch's, and answers `OffsetForLeaderEpoch` for that epoch with 60.
+  6. With every source broker gone, the mirror still serves all 60 and
      refuses produce.
 - Not built yet: `camus admin mirror reset` for a stalled partition,
   transaction spans and consumer group offsets (phase 2), and promotion.
-

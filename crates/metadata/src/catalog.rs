@@ -650,7 +650,10 @@ fn publish_into(
         // `DeleteRecords` may have moved the log start past records that were
         // still in the WAL. Their extent is not kept; the sweep removes the
         // object once nothing else points into it.
-        if part.end > state.log_start {
+        // A copied part with no bytes covers offsets a source compaction
+        // dropped: it moves the next offset and stores no extent.
+        let holds_bytes = !(mirror && part.length == 0);
+        if part.end > state.log_start && holds_bytes {
             let extent = Extent {
                 start: part.start,
                 end: part.end,
