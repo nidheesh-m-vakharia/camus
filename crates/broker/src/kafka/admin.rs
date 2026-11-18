@@ -126,6 +126,7 @@ impl Kafka {
             let mut row = CreatePartitionsTopicResult::default();
             row.name = topic.name.clone();
             row.error_code = item.code;
+            row.error_message = mirror_message(item.code);
             response.results.push(row);
         }
         frame_of(header.request_api_version, header.correlation_id, &response)
@@ -287,6 +288,8 @@ impl Kafka {
             row.error_code = item.code;
             if item.code == camus_metadata::config::INVALID_CONFIG {
                 row.error_message = message.map(StrBytes::from_string);
+            } else {
+                row.error_message = mirror_message(item.code);
             }
             response.responses.push(row);
         }
@@ -531,6 +534,16 @@ fn configs_error(
     frame_of(header.request_api_version, header.correlation_id, &response)
 }
 
+/// The message for a change the metadata group refused on a mirror topic.
+/// `POLICY_VIOLATION` comes back only for that (ADR 0018).
+fn mirror_message(code: i16) -> Option<StrBytes> {
+    (code == camus_metadata::mirror::POLICY_VIOLATION).then(|| {
+        StrBytes::from_static_str(
+            "The topic is a mirror. Only retention.ms and retention.bytes may change.",
+        )
+    })
+}
+
 fn configs_from(
     request: &AlterConfigsRequest,
     header: &super::RequestHeader,
@@ -548,6 +561,8 @@ fn configs_from(
         row.error_code = item.code;
         if item.code == camus_metadata::config::INVALID_CONFIG {
             row.error_message = message.map(StrBytes::from_string);
+        } else {
+            row.error_message = mirror_message(item.code);
         }
         response.responses.push(row);
     }

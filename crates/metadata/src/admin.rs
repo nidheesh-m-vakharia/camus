@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::catalog::{self, Outcome, Partition, Topic};
 use crate::config;
 use crate::groups::{self, GroupRecord};
+use crate::mirror;
 
 const UNKNOWN_TOPIC: i16 = 3;
 const OFFSET_OUT_OF_RANGE: i16 = 1;
@@ -151,6 +152,13 @@ pub fn create_partitions(
             });
             continue;
         };
+        if stored.mirror_of.is_some() {
+            items.push(Item {
+                code: mirror::POLICY_VIOLATION,
+                low: 0,
+            });
+            continue;
+        }
         if topic.count < stored.partitions {
             items.push(Item {
                 code: INVALID_PARTITIONS,
@@ -219,6 +227,12 @@ pub fn alter_configs(
             continue;
         };
         match config::apply_change(&topic, &change.edits, change.replace) {
+            Ok(next) if topic.mirror_of.is_some() && !mirror::may_change(&topic, &next) => {
+                items.push(Item {
+                    code: mirror::POLICY_VIOLATION,
+                    low: 0,
+                });
+            }
             Ok(next) => {
                 topic = next;
                 if !change.validate_only {
@@ -259,6 +273,13 @@ pub fn delete_records(
             });
             continue;
         };
+        if topic.mirror_of.is_some() {
+            items.push(Item {
+                code: mirror::POLICY_VIOLATION,
+                low: -1,
+            });
+            continue;
+        }
         if cut.partition < 0 || cut.partition >= topic.partitions {
             items.push(Item {
                 code: UNKNOWN_TOPIC,
@@ -635,5 +656,88 @@ mod tests {
         assert_eq!(topic.retention_ms, 604_800_000);
         assert!(!topic.is_set("retention.ms"));
         assert_eq!(topic.config("segment.bytes"), "1048576");
+    }
+
+    /// `world()` with `events` replaced by a mirror of the same name.
+    fn mirror_world() -> Result<HashMap<String, String>, String> {
+        let mut map = HashMap::new();
+        let link = mirror::MirrorLink {
+            alias: "us-east".into(),
+            endpoint: "https://source.example".into(),
+            region: "auto".into(),
+            bucket: "logs".into(),
+            prefix: String::new(),
+            virtual_host: false,
+        };
+        for step in 0..2 {
+            let snapshot = map.clone();
+            let get = |key: &str| Ok(snapshot.get(key).cloned());
+            let outcome = if step == 0 {
+                mirror::add_link(&get, &|_, _, _| Ok(Vec::new()), &link)?
+            } else {
+                let of = mirror::MirrorOf {
+                    alias: "us-east".into(),
+                    topic_id: "source-id".into(),
+                };
+                mirror::create_topic(&get, "events", "topic-1", 1, &of)?
+            };
+            let Outcome::Change { put, .. } = outcome else {
+                return Err(format!("step {step} refused"));
+            };
+            map.extend(put);
+        }
+        Ok(map)
+    }
+
+    fn set(name: &str, value: &str, replace: bool) -> ConfigChange {
+        ConfigChange {
+            resource_type: 2,
+            name: "events".into(),
+            validate_only: false,
+            edits: vec![ConfigEdit {
+                name: name.into(),
+                op: 0,
+                value: Some(value.into()),
+            }],
+            replace,
+        }
+    }
+
+    #[test]
+    fn a_mirror_refuses_partitions_configs_and_deletes() -> Result<(), String> {
+        let map = mirror_world()?;
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let scan = |_: &str, _: &str, _: usize| Ok(Vec::new());
+        let grow = PartitionIncrease {
+            name: "events".into(),
+            count: 2,
+            assigned: false,
+        };
+        let codes = |done: Done| done.items.iter().map(|item| item.code).collect::<Vec<_>>();
+        assert_eq!(
+            codes(create_partitions(&get, &[grow])?),
+            vec![mirror::POLICY_VIOLATION]
+        );
+        let cut = RecordCut {
+            topic: "events".into(),
+            partition: 0,
+            offset: 0,
+            high_watermark: 0,
+        };
+        assert_eq!(
+            codes(delete_records(&get, &scan, &[cut])?),
+            vec![mirror::POLICY_VIOLATION]
+        );
+        let changes = [
+            set("retention.ms", "1000", false),
+            set("retention.bytes", "4096", true),
+            set("cleanup.policy", "compact", false),
+            set("max.message.bytes", "1024", false),
+        ];
+        assert_eq!(
+            codes(alter_configs(&get, &changes)?),
+            vec![0, 0, mirror::POLICY_VIOLATION, mirror::POLICY_VIOLATION]
+        );
+        Ok(())
     }
 }

@@ -1,0 +1,382 @@
+//! Mirror links and mirror topics (ADR 0018).
+//!
+//! A link names a source cluster's bucket. A mirror topic is a read-only copy
+//! of one source topic, with the source's offsets. Copying is a later phase;
+//! this module holds the records and the rules that keep a mirror read-only.
+
+use serde::{Deserialize, Serialize};
+
+use crate::catalog::{self, Outcome, Topic};
+
+/// Kafka `INVALID_REQUEST`: a malformed link or mirror.
+pub const INVALID_REQUEST: i16 = 42;
+/// Kafka `POLICY_VIOLATION`: the change is refused on a mirror, or the link
+/// is in use or already names another bucket.
+pub const POLICY_VIOLATION: i16 = 44;
+
+/// Longest alias. It is also an environment variable name fragment.
+const MAX_ALIAS: usize = 32;
+
+/// Most links in one cluster. Every broker holds the list, and the copier
+/// runs one task per link.
+pub const MAX_LINKS: usize = 64;
+
+/// Longest endpoint URL, region, bucket, and prefix. A bucket name is at most
+/// 63 bytes in S3 and R2, and an object key at most 1024.
+const MAX_ENDPOINT: usize = 2048;
+const MAX_REGION: usize = 64;
+const MAX_BUCKET: usize = 63;
+const MAX_PREFIX: usize = 1024;
+
+/// A source cluster's bucket, as the destination reads it. The keys to read
+/// it are not stored here: snapshots are uploaded to this cluster's bucket,
+/// so each broker reads them from its environment instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MirrorLink {
+    /// 1–32 characters of `[a-z0-9-]`, unique in this cluster.
+    pub alias: String,
+    /// S3 endpoint URL.
+    pub endpoint: String,
+    /// S3 region. R2 uses `auto`.
+    pub region: String,
+    /// Source bucket.
+    pub bucket: String,
+    /// Key prefix inside the bucket, as the source's `s3.prefix`.
+    #[serde(default)]
+    pub prefix: String,
+    /// Virtual-host addressing, as the source's `s3.virtual_host`.
+    #[serde(default)]
+    pub virtual_host: bool,
+}
+
+/// What a mirror topic copies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MirrorOf {
+    /// The link's alias.
+    pub alias: String,
+    /// The source topic's id.
+    pub topic_id: String,
+}
+
+/// Metadata key of a link.
+pub fn link_key(alias: &str) -> String {
+    format!("{}{alias}", links_prefix())
+}
+
+/// Prefix of every link key.
+pub fn links_prefix() -> &'static str {
+    "mirror/"
+}
+
+/// Whether `alias` is 1–32 characters of `[a-z0-9-]`.
+pub fn valid_alias(alias: &str) -> bool {
+    (1..=MAX_ALIAS).contains(&alias.len())
+        && alias
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Add a link. Adding the same link again changes nothing, so a retried add
+/// succeeds. A different link under a used alias is refused: the mirrors
+/// that name it would start reading another bucket. So is a link past
+/// [`MAX_LINKS`].
+pub fn add_link(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    scan: catalog::Scan,
+    link: &MirrorLink,
+) -> Result<Outcome, String> {
+    let sized = |text: &str, max: usize| !text.is_empty() && text.len() <= max;
+    if !valid_alias(&link.alias)
+        || !sized(&link.endpoint, MAX_ENDPOINT)
+        || !sized(&link.region, MAX_REGION)
+        || !sized(&link.bucket, MAX_BUCKET)
+        || link.prefix.len() > MAX_PREFIX
+    {
+        return Ok(Outcome::Reject(INVALID_REQUEST));
+    }
+    let key = link_key(&link.alias);
+    if let Some(raw) = get(&key)? {
+        let stored: MirrorLink = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+        if stored == *link {
+            return Ok(unchanged());
+        }
+        return Ok(Outcome::Reject(POLICY_VIOLATION));
+    }
+    // `0` sorts right after `/`, so this bounds the link keys.
+    let end = format!("{}0", links_prefix().trim_end_matches('/'));
+    if scan(links_prefix(), &end, MAX_LINKS)?.len() >= MAX_LINKS {
+        return Ok(Outcome::Reject(POLICY_VIOLATION));
+    }
+    Ok(Outcome::Change {
+        put: vec![(
+            key,
+            serde_json::to_string(link).map_err(|err| err.to_string())?,
+        )],
+        del: Vec::new(),
+        value: None,
+    })
+}
+
+/// Remove a link. A missing alias is not an error. A link that a mirror
+/// topic still names is refused.
+pub fn remove_link(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    alias: &str,
+) -> Result<Outcome, String> {
+    if !valid_alias(alias) {
+        return Ok(Outcome::Reject(INVALID_REQUEST));
+    }
+    let key = link_key(alias);
+    if get(&key)?.is_none() {
+        return Ok(unchanged());
+    }
+    for name in catalog::topic_names(get)? {
+        let Some(raw) = get(&catalog::topic_storage_key(&name))? else {
+            continue;
+        };
+        let topic = catalog::parse_topic(&raw)?;
+        if topic.mirror_of.is_some_and(|of| of.alias == alias) {
+            return Ok(Outcome::Reject(POLICY_VIOLATION));
+        }
+    }
+    Ok(Outcome::Change {
+        put: Vec::new(),
+        del: vec![key],
+        value: None,
+    })
+}
+
+/// Create a mirror topic: an `r2` topic with default configs and
+/// `mirror_of` set. The link must exist.
+pub fn create_topic(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    name: &str,
+    id: &str,
+    partitions: i32,
+    of: &MirrorOf,
+) -> Result<Outcome, String> {
+    if of.topic_id.is_empty() || get(&link_key(&of.alias))?.is_none() {
+        return Ok(Outcome::Reject(INVALID_REQUEST));
+    }
+    catalog::create_topic_as(get, name, id, partitions, "r2", &[], Some(of.clone()))
+}
+
+/// Whether a mirror topic may go from `before` to `after`. Only retention is
+/// the destination's own; every other config follows the source. Configs
+/// compare by value, so a legacy `AlterConfigs` that drops an override equal
+/// to its default changes nothing.
+pub fn may_change(before: &Topic, after: &Topic) -> bool {
+    let own = |name: &str| name == "retention.ms" || name == "retention.bytes";
+    let configs_same = crate::config::SPECS
+        .iter()
+        .filter(|spec| !own(spec.name))
+        .all(|spec| before.config(spec.name) == after.config(spec.name));
+    let without_configs = |topic: &Topic| {
+        let mut topic = topic.clone();
+        topic.retention_ms = 0;
+        topic.retention_bytes = 0;
+        topic.cleanup_policy.clear();
+        topic.overrides.clear();
+        topic
+    };
+    configs_same && without_configs(before) == without_configs(after)
+}
+
+fn unchanged() -> Outcome {
+    Outcome::Change {
+        put: Vec::new(),
+        del: Vec::new(),
+        value: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn link(alias: &str, bucket: &str) -> MirrorLink {
+        MirrorLink {
+            alias: alias.into(),
+            endpoint: "https://source.example".into(),
+            region: "auto".into(),
+            bucket: bucket.into(),
+            prefix: String::new(),
+            virtual_host: false,
+        }
+    }
+
+    fn apply(map: &mut HashMap<String, String>, outcome: Outcome) -> Result<i16, String> {
+        match outcome {
+            Outcome::Change { put, del, .. } => {
+                for key in del {
+                    map.remove(&key);
+                }
+                map.extend(put);
+                Ok(0)
+            }
+            Outcome::Reject(code) => Ok(code),
+        }
+    }
+
+    fn add(map: &mut HashMap<String, String>, to: &MirrorLink) -> Result<i16, String> {
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let scan = |from: &str, to: &str, limit: usize| {
+            let mut rows: Vec<(String, String)> = snapshot
+                .iter()
+                .filter(|(key, _)| key.as_str() >= from && key.as_str() < to)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            rows.sort();
+            rows.truncate(limit);
+            Ok(rows)
+        };
+        let outcome = add_link(&get, &scan, to)?;
+        apply(map, outcome)
+    }
+
+    fn remove(map: &mut HashMap<String, String>, alias: &str) -> Result<i16, String> {
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let outcome = remove_link(&get, alias)?;
+        apply(map, outcome)
+    }
+
+    fn mirror(map: &mut HashMap<String, String>, name: &str, alias: &str) -> Result<i16, String> {
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let of = MirrorOf {
+            alias: alias.into(),
+            topic_id: "source-id".into(),
+        };
+        let outcome = create_topic(&get, name, &format!("{name}-id"), 3, &of)?;
+        apply(map, outcome)
+    }
+
+    #[test]
+    fn aliases_are_short_lowercase_names() {
+        for good in ["a", "us-east", "r2-0", &"x".repeat(32)] {
+            assert!(valid_alias(good), "{good}");
+        }
+        for bad in ["", "US", "us_east", "us.east", "a/b", &"x".repeat(33)] {
+            assert!(!valid_alias(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_link_is_added_once_and_a_retry_is_a_no_op() -> TestResult {
+        let mut map = HashMap::new();
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(add(&mut map, &link("us-east", "other"))?, POLICY_VIOLATION);
+        assert_eq!(add(&mut map, &link("US", "logs"))?, INVALID_REQUEST);
+        assert_eq!(add(&mut map, &link("eu", ""))?, INVALID_REQUEST);
+        assert_eq!(
+            add(&mut map, &link("eu", &"b".repeat(64)))?,
+            INVALID_REQUEST
+        );
+        let stored = map.get(&link_key("us-east")).ok_or("no link")?;
+        assert_eq!(
+            serde_json::from_str::<MirrorLink>(stored)?,
+            link("us-east", "logs")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_mirror_needs_its_link_and_holds_it() -> TestResult {
+        let mut map = HashMap::new();
+        assert_eq!(mirror(&mut map, "events", "us-east")?, INVALID_REQUEST);
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(mirror(&mut map, "events", "us-east")?, 0);
+        let raw = map
+            .get(&catalog::topic_storage_key("events"))
+            .ok_or("no topic")?;
+        let topic = catalog::parse_topic(raw)?;
+        assert_eq!(topic.durability, "r2");
+        assert_eq!(
+            topic.mirror_of.map(|of| of.alias),
+            Some("us-east".to_string())
+        );
+
+        assert_eq!(remove(&mut map, "us-east")?, POLICY_VIOLATION);
+        assert_eq!(remove(&mut map, "missing")?, 0);
+        assert_eq!(remove(&mut map, "a/b")?, INVALID_REQUEST);
+        Ok(())
+    }
+
+    #[test]
+    fn a_mirror_refuses_a_publish_from_a_stale_broker() -> TestResult {
+        let mut map = HashMap::new();
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(mirror(&mut map, "events", "us-east")?, 0);
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let part = catalog::PublishPart {
+            epoch: 0,
+            topic: "events".into(),
+            partition: 0,
+            start: 0,
+            end: 1,
+            object_key: "bundle/x.seg".into(),
+            file_offset: 0,
+            length: 10,
+            base_timestamp: 0,
+            max_timestamp: 0,
+        };
+        assert!(matches!(
+            catalog::publish(&get, &[part], &[])?,
+            Outcome::Reject(3)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unused_link_is_removed() -> TestResult {
+        let mut map = HashMap::new();
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(remove(&mut map, "us-east")?, 0);
+        assert!(!map.contains_key(&link_key("us-east")));
+        Ok(())
+    }
+
+    #[test]
+    fn links_stop_at_the_cap() -> TestResult {
+        let mut map = HashMap::new();
+        for at in 0..MAX_LINKS {
+            assert_eq!(add(&mut map, &link(&format!("l{at}"), "logs"))?, 0);
+        }
+        assert_eq!(add(&mut map, &link("one-more", "logs"))?, POLICY_VIOLATION);
+        assert_eq!(add(&mut map, &link("l0", "logs"))?, 0, "a retry at the cap");
+        Ok(())
+    }
+
+    #[test]
+    fn a_restated_default_is_not_a_change() {
+        let mut before = Topic::new("events", "id", 1, "r2");
+        before
+            .overrides
+            .insert("max.message.bytes".into(), "1048588".into());
+        let after = Topic::new("events", "id", 1, "r2");
+        assert!(may_change(&before, &after));
+    }
+
+    #[test]
+    fn only_retention_may_change_on_a_mirror() {
+        let before = Topic::new("events", "id", 1, "r2");
+        let mut retention = before.clone();
+        retention.retention_ms = 1_000;
+        retention
+            .overrides
+            .insert("retention.ms".into(), "1000".into());
+        assert!(may_change(&before, &retention));
+        let mut cleanup = before.clone();
+        cleanup.cleanup_policy = "compact".into();
+        assert!(!may_change(&before, &cleanup));
+        let mut grown = before.clone();
+        grown.partitions = 2;
+        assert!(!may_change(&before, &grown));
+    }
+}
