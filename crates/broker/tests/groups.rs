@@ -63,6 +63,17 @@ fn check(root: &std::path::Path, ran: Output, client: &str) {
     eprintln!("{stdout}");
 }
 
+fn franz(args: &[&str]) -> std::io::Result<Option<Output>> {
+    let toolchain = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
+    if !toolchain.is_file() {
+        support::skipped(&format!("franz-go; missing {}", toolchain.display()));
+        return Ok(None);
+    }
+    let module = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gogroup");
+    let bin = go_build(&module)?;
+    Ok(Some(Command::new(bin).args(args).output()?))
+}
+
 fn minio() -> bool {
     let on = std::env::var("CAMUS_MINIO").ok().as_deref() == Some("1");
     if !on {
@@ -206,44 +217,27 @@ fn franz_go_consumer_group_commits_and_resumes() -> std::io::Result<()> {
     if !minio() {
         return Ok(());
     }
-    let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
-    if !go.is_file() {
-        support::skipped(&format!("franz-go; missing {}", go.display()));
-        return Ok(());
-    }
     let root = tempfile::tempdir()?;
     let (_nodes, bootstrap) = cluster(root.path());
-    let ran = Command::new(go)
-        .args(["run", "."])
-        .arg(&bootstrap)
-        .arg("consumer")
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gogroup"))
-        .env("GOTOOLCHAIN", "local")
-        .output()?;
+    let Some(ran) = franz(&[bootstrap.as_str(), "consumer"])? else {
+        return Ok(());
+    };
     check(root.path(), ran, "franz-go consumer protocol");
     Ok(())
 }
 
 #[test]
-fn franz_go_group_commits_and_resumes() {
+fn franz_go_group_commits_and_resumes() -> std::io::Result<()> {
     if !minio() {
-        return;
+        return Ok(());
     }
-    let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
-    if !go.is_file() {
-        support::skipped(&format!("franz-go; missing {}", go.display()));
-        return;
-    }
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir()?;
     let (_nodes, bootstrap) = cluster(root.path());
-    let ran = Command::new(go)
-        .args(["run", "."])
-        .arg(&bootstrap)
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gogroup"))
-        .env("GOTOOLCHAIN", "local")
-        .output()
-        .unwrap();
+    let Some(ran) = franz(&[bootstrap.as_str()])? else {
+        return Ok(());
+    };
     check(root.path(), ran, "franz-go");
+    Ok(())
 }
 
 fn jars() -> std::io::Result<Option<String>> {
@@ -316,20 +310,11 @@ fn franz_go_redelivers_records_from_a_killed_member() -> std::io::Result<()> {
     if !minio() {
         return Ok(());
     }
-    let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
-    if !go.is_file() {
-        eprintln!("skipping franz-go; missing {}", go.display());
-        return Ok(());
-    }
     let root = tempfile::tempdir()?;
     let (_nodes, bootstrap) = cluster_with(root.path(), fast_groups());
-    let ran = Command::new(go)
-        .args(["run", "."])
-        .arg(&bootstrap)
-        .arg("kill")
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gogroup"))
-        .env("GOTOOLCHAIN", "local")
-        .output()?;
+    let Some(ran) = franz(&[bootstrap.as_str(), "kill"])? else {
+        return Ok(());
+    };
     check(root.path(), ran, "franz-go kill");
     Ok(())
 }

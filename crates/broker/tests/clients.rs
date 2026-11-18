@@ -119,37 +119,16 @@ fn jars() -> Option<String> {
     Some(cp.join(":"))
 }
 
-fn jdk(tool: &str) -> String {
-    let homebrew = format!("/opt/homebrew/opt/openjdk@21/bin/{tool}");
-    if Path::new(&homebrew).is_file() {
-        homebrew
-    } else {
-        tool.to_string()
-    }
-}
-
-fn java(node: &Node, class_source: &str, args: &[&str]) {
+fn java(node: &Node, class_source: &str, args: &[&str]) -> std::io::Result<()> {
     let Some(cp_jars) = jars() else {
-        return;
+        return Ok(());
     };
-    let classes = node.dir.join("classes");
-    std::fs::create_dir_all(&classes).unwrap();
-    let cp = format!("{}:{cp_jars}", classes.display());
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(class_source);
-    let compiled = Command::new(jdk("javac"))
-        .args(["--release", "17", "-cp", &cp, "-d"])
-        .arg(&classes)
-        .arg(&source)
-        .output()
-        .unwrap();
-    assert!(
-        compiled.status.success(),
-        "javac\n{}",
-        String::from_utf8_lossy(&compiled.stderr)
-    );
-    let mut command = Command::new(jdk("java"));
+    let cp = support::java_classpath(&source, &cp_jars)?;
+    let mut command = Command::new(support::jdk_tool("java"));
     command.args(["-cp", &cp, "Phase5RoundTrip"]).args(args);
-    show(node, &command.output().unwrap(), "java");
+    show(node, &command.output()?, "java");
+    Ok(())
 }
 
 fn python(node: &Node, mode: &str) {
@@ -168,66 +147,66 @@ fn python(node: &Node, mode: &str) {
     show(node, &ran, "librdkafka");
 }
 
-fn go(node: &Node, mode: &str) {
-    let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
-    if !go.is_file() {
-        support::skipped(&format!("franz-go; missing {}", go.display()));
-        return;
+fn go(node: &Node, mode: &str) -> std::io::Result<()> {
+    let toolchain = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
+    if !toolchain.is_file() {
+        support::skipped(&format!("franz-go; missing {}", toolchain.display()));
+        return Ok(());
     }
-    let ran = Command::new(go)
-        .args(["run", "."])
-        .arg(mode)
-        .arg(&node.kafka)
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gophase5"))
-        .env("GOTOOLCHAIN", "local")
-        .output()
-        .unwrap();
+    let module = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/gophase5");
+    let bin = support::go_build(&module)?;
+    let ran = Command::new(bin).arg(mode).arg(&node.kafka).output()?;
     show(node, &ran, "franz-go");
+    Ok(())
 }
 
 #[test]
-fn clients_commit_and_abort_a_transaction() {
+fn clients_commit_and_abort_a_transaction() -> std::io::Result<()> {
     let node = spawn(false);
     python(&node, "txn");
-    go(&node, "txn");
+    go(&node, "txn")?;
+    Ok(())
 }
 
 #[test]
-fn clients_see_a_compacted_log() {
+fn clients_see_a_compacted_log() -> std::io::Result<()> {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
         support::skipped("compaction clients; set CAMUS_MINIO=1");
-        return;
+        return Ok(());
     }
     let node = spawn(true);
     java(
         &node,
         "tests/java/Phase5RoundTrip.java",
         &["compact", &node.kafka],
-    );
+    )?;
     python(&node, "compact");
-    go(&node, "compact");
+    go(&node, "compact")?;
+    Ok(())
 }
 
 #[test]
-fn clients_run_the_admin_apis() {
+fn clients_run_the_admin_apis() -> std::io::Result<()> {
     let node = spawn(false);
     java(
         &node,
         "tests/java/Phase5RoundTrip.java",
         &["admin", &node.kafka],
-    );
+    )?;
     python(&node, "admin");
-    go(&node, "admin");
+    go(&node, "admin")?;
+    Ok(())
 }
 
 #[test]
-fn clients_are_denied_by_an_acl() {
+fn clients_are_denied_by_an_acl() -> std::io::Result<()> {
     let node = spawn(false);
     java(
         &node,
         "tests/java/Phase5RoundTrip.java",
         &["acl", &node.kafka],
-    );
+    )?;
     python(&node, "acl");
-    go(&node, "acl");
+    go(&node, "acl")?;
+    Ok(())
 }

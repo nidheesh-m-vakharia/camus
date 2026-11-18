@@ -121,9 +121,13 @@ fn store_txn(put: &mut Vec<(String, String)>, id: &str, txn: &Txn) -> Result<(),
     Ok(())
 }
 
+/// The topic named `name`, unless it is a mirror: a mirror takes no
+/// transactional spans, so it reads as a deleted topic does (ADR 0018).
 fn topic_of(get: Get<'_>, name: &str) -> Result<Option<catalog::Topic>, String> {
     match get(&catalog::topic_storage_key(name))? {
-        Some(raw) => Ok(Some(catalog::parse_topic(&raw)?)),
+        Some(raw) => {
+            Ok(Some(catalog::parse_topic(&raw)?).filter(|topic| topic.mirror_of.is_none()))
+        }
         None => Ok(None),
     }
 }

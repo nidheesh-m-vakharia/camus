@@ -432,3 +432,58 @@ Rollback: a broker older than the reader release cannot install a
 `CAMUSKV3` snapshot. A cluster on the writer can roll back only to the
 reader release or later. Rolling back further needs every voter's log to
 cover its last snapshot, which is not something an operator can count on.
+
+Phase 1, first part: links and read-only mirrors. Copying is not built.
+
+- `crates/metadata/src/mirror.rs` holds `MirrorLink`, stored at
+  `mirror/{alias}`, and the `mirror_of` field on a topic row. The commands
+  `AddMirrorLink`, `RemoveMirrorLink`, and `CreateMirrorTopic` come after
+  `Batch` in `Command`. The Raft log is postcard, which numbers variants by
+  position, so existing entries keep their meaning.
+- Adding the same link again is a no-op, so a retry succeeds.
+  `POLICY_VIOLATION` is returned in three cases:
+  - a different link is added under an alias that is in use
+  - a link is removed while a mirror still names it
+  - a link is added past the cap of 64
+
+  An endpoint, region, bucket, or prefix longer than its limit (2048, 64,
+  63, and 1024 bytes) is `INVALID_REQUEST`, and so is an alias that does
+  not match `[a-z0-9-]{1,32}`.
+- The metadata group enforces the read-only rule when it applies a
+  command, so the rule holds whichever broker or API sends it.
+  `CreatePartitions` and `DeleteRecords` on a mirror are refused, and so
+  is a config change that alters the value of anything except
+  `retention.ms` and `retention.bytes`. Configs are compared by value, so
+  a legacy `AlterConfigs` that drops an override equal to its default is
+  not a change.
+- Produce is guarded twice. The broker refuses it with
+  `INVALID_TOPIC_EXCEPTION`, checking its own copy of metadata. That copy
+  can be behind. Picture a topic deleted and recreated under the same name
+  as a mirror: a broker that has not caught up could still accept a batch.
+  So `Publish` also refuses a mirror when it applies, with unknown-topic
+  (3), the code a deleted topic gets. The uploader already drops a deleted
+  topic's batches by topic id. Transaction span marking treats a mirror as
+  a deleted topic, too.
+- The broker's refusal message is fixed. It reads "Cannot append to a
+  mirror topic. Produce to its source cluster." and names neither the
+  topic nor the alias, since the response row already names the topic.
+- The admin routes are `GET` and `POST /admin/mirror/links` and
+  `DELETE /admin/mirror/links/{alias}`. The CLI commands are
+  `camus admin mirror link add`, `remove`, and `list`. They return 400
+  and 409 for the two refusal codes.
+- Not built yet:
+  - `link add` does not yet read the source's `CURRENT` and trailer to
+    check the link. That check comes with the copier, which also reads
+    the `CAMUS_MIRROR_<ALIAS>_*` keys.
+  - `camus admin mirror create` does not exist yet, because it reads the
+    source's partition count from the source snapshot.
+    `CreateMirrorTopic` exists and is what the copier PR will call.
+- Upgrade order: a broker older than this release cannot decode the three
+  commands, and it drops `mirror_of` when it parses a topic row. Every
+  broker must run this release before the first `link add`. A test pins
+  the commands at log positions 29 to 31, after `Batch` at 28.
+- `link list` reads the local broker's applied metadata, so a link just
+  added through another broker can be missing for one commit.
+- `crates/broker/tests/mirror.rs` is the end-to-end test. Only one path
+  has no test: forwarding a link command from a broker that does not lead
+  metadata. It uses the same leader lookup as `metadata_write`.

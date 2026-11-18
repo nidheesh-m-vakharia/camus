@@ -30,6 +30,7 @@ use tokio::sync::RwLock;
 use crate::acl;
 use crate::admin;
 use crate::catalog::{self, Outcome};
+use crate::mirror;
 use crate::txn;
 use crate::{Command, NodeId, Response, TypeConfig};
 
@@ -593,6 +594,14 @@ fn apply_command(
                 configs,
             } => catalog::create_topic(&read, &name, &id, partitions, &durability, &configs),
             Command::DeleteTopic { name } => catalog::delete_topic(&read, &scan, &name),
+            Command::AddMirrorLink { link } => mirror::add_link(&read, &scan, &link),
+            Command::RemoveMirrorLink { alias } => mirror::remove_link(&read, &alias),
+            Command::CreateMirrorTopic {
+                name,
+                id,
+                partitions,
+                of,
+            } => mirror::create_topic(&read, &name, &id, partitions, &of),
             Command::Publish { parts } => catalog::publish(&read, &parts, &[]),
             Command::PublishWithProducers { parts, producers } => {
                 catalog::publish(&read, &parts, &producers)

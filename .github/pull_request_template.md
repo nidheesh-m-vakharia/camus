@@ -2,4 +2,4 @@
 
 ## Test plan
 
-- [ ] `cargo test --workspace --locked`
+- [ ] `cargo nextest run --workspace --locked`

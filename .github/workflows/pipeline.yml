@@ -20,13 +20,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
       - name: No added unwrap/expect
         run: scripts/agent-check.sh --no-test
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo nextest run --workspace --locked
 
   clients:
     name: clients
@@ -34,6 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-java@v4
         with:
@@ -97,8 +99,8 @@ jobs:
           CAMUS_MINIO: "1"
           CAMUS_REQUIRE_CLIENTS: "1"
         run: |
-          cargo test -p camus-broker --locked --tests
-          cargo test -p camus-storage --locked --test minio
+          cargo nextest run -p camus-broker --locked --tests
+          cargo nextest run -p camus-storage --locked --test minio
 
   image:
     name: image
