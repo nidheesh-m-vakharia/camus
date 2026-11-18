@@ -586,6 +586,27 @@ pub fn publish(
     parts: &[PublishPart],
     notes: &[crate::ProducerNote],
 ) -> Result<Outcome, String> {
+    publish_into(get, parts, notes, false)
+}
+
+/// Publish batches a mirror copier copied from its source (ADR 0018). Every
+/// part's topic must be a mirror. A part may start past the partition's
+/// next offset only while the partition holds nothing (`log_start` equals
+/// `next_offset`): a new mirror begins at the source's log start, and the
+/// offsets below it read as deleted, not as a gap.
+pub fn publish_mirror(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    parts: &[PublishPart],
+) -> Result<Outcome, String> {
+    publish_into(get, parts, &[], true)
+}
+
+fn publish_into(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    parts: &[PublishPart],
+    notes: &[crate::ProducerNote],
+    mirror: bool,
+) -> Result<Outcome, String> {
     let mut pending: BTreeMap<(String, i32), Partition> = BTreeMap::new();
     let mut ids: BTreeMap<String, String> = BTreeMap::new();
     let mut put = Vec::new();
@@ -599,8 +620,9 @@ pub fn publish(
         };
         // A mirror takes no client data, whatever a stale broker believed
         // when it accepted the batch. Unknown-topic is what a deleted topic
-        // gets, so the uploader handles it the same way (ADR 0018).
-        if topic.mirror_of.is_some() {
+        // gets, so the uploader handles it the same way (ADR 0018). Only
+        // the copier publishes into a mirror, and only into a mirror.
+        if topic.mirror_of.is_some() != mirror {
             return Ok(Outcome::Reject(3));
         }
         if part.partition < 0 || part.partition >= topic.partitions {
@@ -615,7 +637,13 @@ pub fn publish(
             migrate_extents(&topic.id, part.partition, &mut state, &mut put)?;
             pending.insert(key.clone(), state);
         }
-        let state = pending.get_mut(&key).expect("inserted");
+        let Some(state) = pending.get_mut(&key) else {
+            return Err("partition state was not loaded".into());
+        };
+        if mirror && part.start > state.next_offset && state.log_start == state.next_offset {
+            state.log_start = part.start;
+            state.next_offset = part.start;
+        }
         if part.start != state.next_offset {
             return Ok(Outcome::Reject(1));
         }

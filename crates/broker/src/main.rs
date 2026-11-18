@@ -429,6 +429,15 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          # HELP camus_meta_snapshot_unix_ms Unix milliseconds of that snapshot, or 0.\n\
          # TYPE camus_meta_snapshot_unix_ms gauge\n\
          camus_meta_snapshot_unix_ms {}\n\
+         # HELP camus_mirror_copied_bytes_total Batch bytes the mirror copier published into mirror topics.\n\
+         # TYPE camus_mirror_copied_bytes_total counter\n\
+         camus_mirror_copied_bytes_total {}\n\
+         # HELP camus_mirror_stalled_partitions Mirror partitions the last copy round could not advance.\n\
+         # TYPE camus_mirror_stalled_partitions gauge\n\
+         camus_mirror_stalled_partitions {}\n\
+         # HELP camus_mirror_copy_errors_total Mirror copy rounds, sources, or partitions that failed and will be retried.\n\
+         # TYPE camus_mirror_copy_errors_total counter\n\
+         camus_mirror_copy_errors_total {}\n\
          # HELP camus_object_store_requests_total Object-store calls by operation. A retried call or a paged list counts once.\n\
          # TYPE camus_object_store_requests_total counter\n\
          camus_object_store_requests_total{{op=\"put\"}} {}\n\
@@ -466,6 +475,9 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         kafka::PRODUCE_HOLD_MS.load(Relaxed),
         kafka::META_SNAPSHOT_INDEX.load(Relaxed),
         kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
+        mirror::COPIED_BYTES.load(Relaxed),
+        mirror::STALLED.load(Relaxed),
+        mirror::COPY_ERRORS.load(Relaxed),
         store.puts.calls.load(Relaxed),
         store.gets.calls.load(Relaxed),
         store.heads.calls.load(Relaxed),

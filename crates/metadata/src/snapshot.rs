@@ -158,6 +158,21 @@ impl SnapshotIndex {
         Ok(rows)
     }
 
+    /// `run` split into one run per block, in key order, so a reader can
+    /// stop once it has the rows it needs.
+    pub fn each_block(&self, run: &BlockRun) -> Vec<BlockRun> {
+        run.blocks
+            .clone()
+            .filter_map(|block| {
+                let start = self.entries.get(block)?.1;
+                Some(BlockRun {
+                    range: start..self.block_end(block),
+                    blocks: block..block + 1,
+                })
+            })
+            .collect()
+    }
+
     fn block_end(&self, block: usize) -> u64 {
         self.entries
             .get(block + 1)
@@ -316,6 +331,25 @@ mod tests {
         );
         assert!(remote.index.run("z", "a").is_none(), "reversed range");
         assert!(remote.index.run("", "a").is_none(), "before every key");
+        Ok(())
+    }
+
+    #[test]
+    fn a_run_read_block_by_block_matches_the_whole_run() -> TestResult {
+        let remote = Remote::new(&rows())?;
+        let (from, to) = ("ext/b/", "ext/d0");
+        let run = remote.index.run(from, to).ok_or("no run")?;
+        let blocks = remote.index.each_block(&run);
+        assert_eq!(blocks.len(), run.blocks.len());
+        let mut pieced = Vec::new();
+        for block in &blocks {
+            let bytes = remote
+                .body
+                .get(block.range.start as usize..block.range.end as usize)
+                .ok_or("block out of bounds")?;
+            pieced.extend(remote.index.rows(block, bytes, from, to)?);
+        }
+        assert_eq!(pieced, remote.read(from, to)?);
         Ok(())
     }
 

@@ -2261,6 +2261,10 @@ impl Kafka {
     pub async fn run(self: Arc<Self>, listener: TcpListener) {
         let snaps = Arc::clone(&self);
         tokio::spawn(async move { snaps.metadata_snapshots().await });
+        tokio::spawn(crate::mirror::run_copier(
+            Arc::clone(&self.node),
+            self.bucket.clone(),
+        ));
         let flush = Arc::clone(&self);
         tokio::spawn(async move {
             loop {
