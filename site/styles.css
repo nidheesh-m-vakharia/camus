@@ -633,19 +633,22 @@ td.num {
   }
 }
 
-/* Questions, ruled like a drawing's schedule: a number, the question, and a
-   plus drawn from two hairlines that loses its upright when open. */
+/* Questions in rounded gray boxes: the question, and a plus drawn from two
+   hairlines that loses its upright when open. */
 .faq {
-  border-block-start: 1px solid var(--gray-6);
+  display: grid;
+  gap: 0.75rem;
 }
 
 .faq-item {
-  border-block-end: 1px solid var(--gray-6);
+  padding-inline: 1.5rem;
+  border-radius: 20px;
+  background: var(--gray-3);
 }
 
 .faq-item summary {
   display: grid;
-  grid-template-columns: 2.25rem minmax(0, 1fr) 0.75rem;
+  grid-template-columns: minmax(0, 1fr) 0.75rem;
   align-items: baseline;
   gap: 1rem;
   padding-block: 1.6rem;
@@ -656,12 +659,6 @@ td.num {
 
 .faq-item summary::-webkit-details-marker {
   display: none;
-}
-
-.faq-n {
-  color: var(--muted);
-  font-size: var(--step-1);
-  font-variant-numeric: tabular-nums;
 }
 
 .faq-q {
@@ -707,7 +704,7 @@ td.num {
 }
 
 .faq-a {
-  padding: 0 1.75rem 2rem 3.25rem;
+  padding: 0 1.75rem 1.75rem 0;
 }
 
 .faq-a p {
@@ -939,8 +936,12 @@ td.num {
     margin-block-end: 3.5rem;
   }
 
+  .faq-item {
+    padding-inline: 1.25rem;
+  }
+
   .faq-a {
-    padding-inline: 3.25rem 0;
+    padding-inline-end: 0;
   }
 
   .site-header.nav-collapsible {

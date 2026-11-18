@@ -266,39 +266,39 @@
         </header>
         <div class="faq">
           <details class="faq-item">
-            <summary><span class="faq-n">01</span><span class="faq-q">Do my Kafka clients work unchanged?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <summary><span class="faq-q">Do my Kafka clients work unchanged?</span><span class="faq-mark" aria-hidden="true"></span></summary>
             <div class="faq-a"><p>Yes, apart from the bootstrap address. Camus speaks the Apache Kafka 4.4.0 wire protocol. Every pull request runs kafka-clients 4.4.0, confluent-kafka 2.16.1, and franz-go v1.22.0 against it; KafkaJS, confluent-kafka-go, confluent-kafka-dotnet, Kafka Connect, Kafka Streams, MirrorMaker 2, Schema Registry, and Debezium run every night.</p></div>
           </details>
           <details class="faq-item">
-            <summary><span class="faq-n">02</span><span class="faq-q">What is not implemented?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <summary><span class="faq-q">What is not implemented?</span><span class="faq-mark" aria-hidden="true"></span></summary>
             <div class="faq-a"><p>Delegation tokens, client quotas, partition reassignment, and share groups. An unimplemented API answers with an error rather than a partial imitation. The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> lists every API and each deliberate difference.</p></div>
           </details>
           <details class="faq-item">
-            <summary><span class="faq-n">03</span><span class="faq-q">When is a produce acknowledged?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <summary><span class="faq-q">When is a produce acknowledged?</span><span class="faq-mark" aria-hidden="true"></span></summary>
             <div class="faq-a"><p>In <code>wal</code> mode, the default, once a majority of the shard&rsquo;s brokers has the batch on disk. In <code>r2</code> mode, only after the object is stored and its extent committed to metadata. <code>acks=1</code> waits for the same barrier as <code>acks=all</code>.</p></div>
           </details>
           <details class="faq-item">
-            <summary><span class="faq-n">04</span><span class="faq-q">What happens if the bucket goes down after an ack?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <summary><span class="faq-q">What happens if the bucket goes down after an ack?</span><span class="faq-mark" aria-hidden="true"></span></summary>
             <div class="faq-a"><p>Nothing acknowledged is lost: the ack already meant a majority fsync, and the bucket is not on that path. Uploads retry until it is back, consumers read the recent tail from the write-ahead log, and producers keep getting acks until the unsealed log reaches its disk limit. Past that, new writes are held, never acknowledged without durability.</p></div>
           </details>
           <details class="faq-item">
-            <summary><span class="faq-n">05</span><span class="faq-q">What if a majority of brokers is lost?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <summary><span class="faq-q">What if a majority of brokers is lost?</span><span class="faq-mark" aria-hidden="true"></span></summary>
             <div class="faq-a"><p>That shard&rsquo;s partitions stay offline until a lost broker returns. An operator can instead run <code>camus admin truncate-to-sealed</code>, which resumes at the sealed end and drops acknowledged batches that were not yet sealed. If every broker disk is gone and the bucket remains, <code>camus admin restore-cluster</code> rebuilds from the newest metadata snapshot. <a href="recovery.html">Recovery</a> has the steps.</p></div>
           </details>
           <details class="faq-item">
-            <summary><span class="faq-n">06</span><span class="faq-q">How fast is an ack?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <summary><span class="faq-q">How fast is an ack?</span><span class="faq-mark" aria-hidden="true"></span></summary>
             <div class="faq-a"><p>On three AWS <code>i4i.2xlarge</code> brokers with local NVMe, a <code>wal</code> ack took 0.93 ms at the median and 2.47 ms at p99.99 over 100,000 acks. An <code>r2</code> ack waits for the object store, about 280 ms there. <a href="benchmarks.html">Benchmarks</a> has every run and its machine.</p></div>
           </details>
           <details class="faq-item">
-            <summary><span class="faq-n">07</span><span class="faq-q">Are transactions and exactly-once supported?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <summary><span class="faq-q">Are transactions and exactly-once supported?</span><span class="faq-mark" aria-hidden="true"></span></summary>
             <div class="faq-a"><p>Yes. <code>read_committed</code> hides a batch until its transaction commits, and an aborted range is skipped as on Kafka. Kafka Streams with <code>exactly_once_v2</code> and Debezium with exactly-once source tasks run every night.</p></div>
           </details>
           <details class="faq-item">
-            <summary><span class="faq-n">08</span><span class="faq-q">Do I need ZooKeeper, KRaft, or a JVM?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <summary><span class="faq-q">Do I need ZooKeeper, KRaft, or a JVM?</span><span class="faq-mark" aria-hidden="true"></span></summary>
             <div class="faq-a"><p>No. Metadata replicates with Raft inside the broker, and the broker is one Rust binary. A cluster is three copies of it and a bucket.</p></div>
           </details>
           <details class="faq-item">
-            <summary><span class="faq-n">09</span><span class="faq-q">Can one cluster span regions?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <summary><span class="faq-q">Can one cluster span regions?</span><span class="faq-mark" aria-hidden="true"></span></summary>
             <div class="faq-a"><p>No. Run one cluster per region and copy between them with MirrorMaker 2, which is tested every night in both directions with consumer offsets translated. <a href="limits.html">Production</a> explains why.</p></div>
           </details>
         </div>
