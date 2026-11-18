@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Pre-PR gate for agents and humans: reject unwrap/expect on lines this
-# branch adds, then run the default test tier. `--no-test` skips the tests.
+# branch adds, then run the default test tier with nextest. `--no-test`
+# skips the tests.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -18,4 +19,8 @@ echo "no added unwrap/expect"
 python3 scripts/cost.py --check
 
 [[ "${1:-}" == "--no-test" ]] && exit 0
-cargo test --workspace --locked
+if ! command -v cargo-nextest >/dev/null 2>&1; then
+  echo "cargo-nextest is required: https://nexte.st/docs/installation/pre-built-binaries/" >&2
+  exit 1
+fi
+cargo nextest run --workspace --locked

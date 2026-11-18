@@ -1,0 +1,10 @@
+# Four tests at a time. Broker tests start real processes, and the clients
+# job shares one MinIO. A laptop and a GitHub runner both stay inside that.
+[profile.default]
+test-threads = 4
+
+# The ecosystem suite shares ports and Docker. One test at a time, including
+# when the global cap is raised.
+[[profile.default.overrides]]
+filter = 'binary(ecosystem)'
+threads-required = 8
