@@ -5,6 +5,7 @@
 
 mod kafka;
 mod metrics;
+mod mirror;
 mod recover;
 mod settings;
 mod slot;
@@ -256,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
                     "/admin/mirror/links/{alias}",
                     axum::routing::delete(remove_mirror_link),
                 )
+                .route("/admin/mirror/topics", post(create_mirror_topic))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
                 .route("/wal/{shard}/txn-span", post(shard_txn_span))
@@ -1583,13 +1585,96 @@ async fn mirror_links(
 }
 
 /// Add a mirror link. Its keys are not part of it: each broker reads them
-/// from `CAMUS_MIRROR_<ALIAS>_ACCESS_KEY` and `_SECRET_KEY`.
+/// from `CAMUS_MIRROR_<ALIAS>_ACCESS_KEY` and `_SECRET_KEY`. The link is
+/// committed only after this broker reads the source's `CURRENT` and an
+/// indexed snapshot's trailer and index with those keys.
 async fn add_mirror_link(
     State(admin): State<Arc<Admin>>,
     Json(link): Json<camus_metadata::mirror::MirrorLink>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let what = format!("link {}", link.alias);
+    if !camus_metadata::mirror::valid_alias(&link.alias) {
+        return mirror_outcome(&admin, Command::AddMirrorLink { link }, &what).await;
+    }
+    source_snapshot(&link).await?;
     mirror_outcome(&admin, Command::AddMirrorLink { link }, &what).await
+}
+
+/// Open `link`'s source and its newest snapshot: 400 when this broker lacks
+/// the keys, 502 when the source cannot be read.
+async fn source_snapshot(
+    link: &camus_metadata::mirror::MirrorLink,
+) -> Result<mirror::SourceSnapshot, (StatusCode, String)> {
+    let bucket = mirror::open_link(link).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("link {}: {err}", link.alias),
+        )
+    })?;
+    mirror::SourceSnapshot::open(bucket)
+        .await
+        .map_err(|err| source_error(&link.alias, &err))
+}
+
+/// A 502 for a failed source read. The detail goes to the log; the response
+/// gets only what [`camus_storage::public_reason`] allows, since a store
+/// error can echo the remote server's response body.
+fn source_error(alias: &str, err: &anyhow::Error) -> (StatusCode, String) {
+    tracing::warn!(
+        alias,
+        error = format!("{err:#}"),
+        "cannot read a mirror source"
+    );
+    (
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "link {alias}: cannot read the source: {}",
+            camus_storage::public_reason(err)
+        ),
+    )
+}
+
+#[derive(Deserialize)]
+struct MirrorCreate {
+    alias: String,
+    topic: String,
+}
+
+/// Create a mirror of the source topic `topic` under the same name. The
+/// partition count and the source topic id come from the source's newest
+/// snapshot.
+async fn create_mirror_topic(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<MirrorCreate>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let raw = admin
+        .node
+        .read_local(&camus_metadata::mirror::link_key(&body.alias))
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no link {}", body.alias)))?;
+    let link: camus_metadata::mirror::MirrorLink = serde_json::from_str(&raw)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let source = source_snapshot(&link).await?;
+    let topic = source
+        .topic(&body.topic)
+        .await
+        .map_err(|err| source_error(&body.alias, &err))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("{} has no topic {}", body.alias, body.topic),
+            )
+        })?;
+    let command = Command::CreateMirrorTopic {
+        name: body.topic.clone(),
+        id: uuid::Uuid::new_v4().to_string(),
+        partitions: topic.partitions,
+        of: camus_metadata::mirror::MirrorOf {
+            alias: body.alias,
+            topic_id: topic.id,
+        },
+    };
+    mirror_outcome(&admin, command, &format!("mirror {}", body.topic)).await
 }
 
 /// Remove a mirror link that no mirror topic names.
@@ -1621,6 +1706,7 @@ async fn mirror_outcome(
             StatusCode::CONFLICT,
             format!("{what}: the alias names another bucket, or a mirror topic still uses it"),
         )),
+        36 => Err((StatusCode::CONFLICT, format!("{what}: the topic exists"))),
         code => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{what}: error code {code}"),

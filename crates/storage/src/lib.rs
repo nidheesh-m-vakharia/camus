@@ -19,8 +19,8 @@ use bytes::Bytes;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
 use object_store::{
-    BackoffConfig, ClientOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
-    RetryConfig,
+    BackoffConfig, ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode,
+    PutOptions, PutPayload, RetryConfig,
 };
 
 /// Endpoint `object_store` can use for virtual-hosted requests. The bucket
@@ -106,6 +106,40 @@ fn counted<T, E>(op: &Op, result: Result<T, E>) -> Result<T, E> {
         op.errors.fetch_add(1, Relaxed);
     }
     result
+}
+
+/// Collect `stream`, failing as soon as it passes `max` bytes.
+async fn read_at_most(
+    mut stream: futures::stream::BoxStream<'static, object_store::Result<Bytes>>,
+    max: u64,
+) -> anyhow::Result<Bytes> {
+    use futures::StreamExt;
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        anyhow::ensure!(
+            (out.len() + chunk.len()) as u64 <= max,
+            "the store sent more than the {max} bytes asked for"
+        );
+        out.extend_from_slice(&chunk);
+    }
+    STATS.get_bytes.fetch_add(out.len() as u64, Relaxed);
+    Ok(Bytes::from(out))
+}
+
+/// What may be shown to a client about a failed store call. A store error's
+/// detail can carry the server's response body, such as an S3 signature
+/// error that echoes the access key id and the string signed, so only its
+/// kind is returned. Other errors are returned whole.
+pub fn public_reason(err: &anyhow::Error) -> String {
+    let store = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<object_store::Error>());
+    match store {
+        Some(object_store::Error::NotFound { .. }) => "not found".into(),
+        Some(_) => "the store refused the request or could not be reached".into(),
+        None => format!("{err:#}"),
+    }
 }
 
 /// An S3-compatible bucket.
@@ -219,6 +253,46 @@ impl Bucket {
         let result = self.store.get_range(&self.path(key), range).await;
         let bytes = counted(&STATS.gets, result)?;
         STATS.get_bytes.fetch_add(bytes.len() as u64, Relaxed);
+        Ok(bytes)
+    }
+
+    /// Read the last `len` bytes of an object, or all of it when it is
+    /// shorter, and the object's whole size. One GET, so a reader learns the
+    /// size and the tail together. A server that sends more than `len`
+    /// bytes, or more than the size it names, is an error before the excess
+    /// is buffered.
+    pub async fn get_tail(&self, key: &str, len: u64) -> anyhow::Result<(Bytes, u64)> {
+        let opts = GetOptions {
+            range: Some(GetRange::Suffix(len)),
+            ..Default::default()
+        };
+        let result = counted(
+            &STATS.gets,
+            self.store.get_opts(&self.path(key), opts).await,
+        )?;
+        let size = result.meta.size;
+        let bytes = read_at_most(result.into_stream(), len.min(size)).await?;
+        Ok((bytes, size))
+    }
+
+    /// Read `range` of an object, refusing a response longer than the range
+    /// before the excess is buffered. For objects another cluster wrote.
+    pub async fn get_exact(&self, key: &str, range: Range<u64>) -> anyhow::Result<Bytes> {
+        let want = range.end.saturating_sub(range.start);
+        let opts = GetOptions {
+            range: Some(GetRange::Bounded(range)),
+            ..Default::default()
+        };
+        let result = counted(
+            &STATS.gets,
+            self.store.get_opts(&self.path(key), opts).await,
+        )?;
+        let bytes = read_at_most(result.into_stream(), want).await?;
+        anyhow::ensure!(
+            bytes.len() as u64 == want,
+            "{key}: read {} bytes of {want}",
+            bytes.len()
+        );
         Ok(bytes)
     }
 

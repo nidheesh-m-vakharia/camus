@@ -86,3 +86,34 @@ async fn a_prefix_namespaces_keys_and_list_strips_it() {
     scoped.delete("bundle/a.seg").await.unwrap();
     assert!(scoped.list("bundle/").await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_tail_read_returns_the_end_and_the_size() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        if std::env::var("CAMUS_REQUIRE_CLIENTS").ok().as_deref() == Some("1") {
+            return Err("required test skipped: MinIO test; set CAMUS_MINIO=1".into());
+        }
+        eprintln!("skipping MinIO test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let bucket = Bucket::connect(&BucketConfig {
+        endpoint: std::env::var("CAMUS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9100".into()),
+        bucket: "camus".into(),
+        region: "us-east-1".into(),
+        access_key: "camus".into(),
+        secret_key: "camus-dev-secret".into(),
+        prefix: String::new(),
+        virtual_hosted: false,
+    })?;
+    let key = format!("tail/{}.bin", std::process::id());
+    let body: Vec<u8> = (0..100u8).collect();
+    bucket.put_new(&key, Bytes::from(body.clone())).await?;
+    let (tail, size) = bucket.get_tail(&key, 28).await?;
+    assert_eq!(size, 100);
+    assert_eq!(tail.as_ref(), body.get(72..).ok_or("short")?);
+    let (whole, size) = bucket.get_tail(&key, 1_000).await?;
+    assert_eq!((whole.as_ref(), size), (body.as_slice(), 100));
+    bucket.delete(&key).await?;
+    Ok(())
+}

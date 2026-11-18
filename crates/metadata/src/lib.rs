@@ -17,6 +17,7 @@ pub mod mirror;
 mod network;
 mod producers;
 mod recover;
+pub mod snapshot;
 mod txn;
 
 pub use acl::{
