@@ -399,7 +399,7 @@ mod tests {
     ) -> Result<i16, String> {
         let snapshot = map.clone();
         let get = |key: &str| Ok(snapshot.get(key).cloned());
-        let outcome = catalog::publish_mirror(&get, parts)?;
+        let outcome = catalog::publish_mirror(&get, parts, &[], &[])?;
         apply(map, outcome)
     }
 
@@ -435,6 +435,32 @@ mod tests {
         let created = catalog::create_topic(&get, "plain", "plain-id", 1, "r2", &[])?;
         assert_eq!(apply(&mut map, created)?, 0);
         assert_eq!(publish_copied(&mut map, &[part("plain", 0, 10)])?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_copy_carries_the_source_spans_once() -> TestResult {
+        let mut map = HashMap::new();
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(mirror(&mut map, "events", "us-east")?, 0);
+        let span = |start, end| catalog::Span {
+            start,
+            end,
+            producer_id: Some(7),
+        };
+        for parts in [[part("events", 0, 10)], [part("events", 10, 20)]] {
+            let snapshot = map.clone();
+            let get = |key: &str| Ok(snapshot.get(key).cloned());
+            let outcome = catalog::publish_mirror(&get, &parts, &[span(2, 3)], &[span(0, 1)])?;
+            assert_eq!(apply(&mut map, outcome)?, 0);
+        }
+        let state = partition(&map, "events")?;
+        assert_eq!(
+            state.txn_committed,
+            vec![span(2, 3)],
+            "a span copied twice is held once"
+        );
+        assert_eq!(state.txn_aborted, vec![span(0, 1)]);
         Ok(())
     }
 

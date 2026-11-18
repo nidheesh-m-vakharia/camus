@@ -581,9 +581,8 @@ Phase 1, third part: the copier.
   - the source's next extent starts past its end
   - the source has no such partition
   - its end falls inside a source batch
-  - a batch does not fit its extent, or is transactional. Spans are
-    copied in phase 2. Copying the batch now would show aborted records
-    to `read_committed`.
+  - a batch does not fit its extent. Phase 1 also stalled on
+    transactional batches; phase 2 replaced that with waiting, below.
 - Metrics:
   - `camus_mirror_stalled_partitions` counts the partitions stalled in
     the last round.
@@ -641,3 +640,34 @@ Phase 1, fourth part: reset.
 Phase 1 is complete. A Camus cluster can mirror another Camus cluster's
 non-transactional topics with the same offsets and bytes, and keeps them
 after the source is gone.
+
+Phase 2, first part: transactions.
+
+- The copier copies a transactional batch only once the source's snapshot
+  holds a committed or aborted span over it, matched by offset and
+  producer id. At the first transaction the source has not ended, the
+  window stops just before it.
+  - When that transaction is the window's first batch, the partition
+    waits. Waiting is not a stall, so it does not count in
+    `camus_mirror_stalled_partitions`.
+  - A later snapshot that shows the span lets the copy go on.
+  - Non-transactional records after an open transaction wait with it, as
+    they wait behind the last stable offset for a `read_committed`
+    consumer.
+- `PublishMirror` now carries the source's committed and aborted spans
+  that overlap the published offsets. Applying it adds any the partition
+  does not already hold. A mirror's `read_committed` fetch then reads as
+  the source's (ADR 0021): ABORT markers in place of aborted batches, and
+  committed batches served. A `read_uncommitted` fetch sees everything
+  copied. `PublishMirror` had not shipped, so its shape changed in place.
+- The MinIO test `a_mirror_copies_ended_transactions_and_waits_at_an_open_one`
+  covers this:
+  1. A source writes an aborted transaction, a committed one, a plain
+     record, and a transaction left open.
+  2. The mirror stops at offset 3 and does not report a stall.
+  3. `read_committed` gives the same records on the mirror as on the
+     source.
+  4. After the source commits, the mirror reaches 4.
+
+  With the spans left out, `read_committed` on the mirror returns
+  nothing, and the test fails.

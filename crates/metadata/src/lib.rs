@@ -371,6 +371,10 @@ pub enum Command {
     PublishMirror {
         /// Slices in commit order.
         parts: Vec<PublishPart>,
+        /// The source's committed transaction spans over these offsets.
+        committed: Vec<Span>,
+        /// The source's aborted transaction spans over these offsets.
+        aborted: Vec<Span>,
     },
     /// Drop a mirror partition's copy so the copier starts it again at the
     /// source's log start (ADR 0018). Loses what the mirror held.
@@ -803,7 +807,12 @@ mod command_tests {
             of,
         };
         assert_eq!(first(&create)?, 31);
-        assert_eq!(first(&Command::PublishMirror { parts: Vec::new() })?, 32);
+        let copied = Command::PublishMirror {
+            parts: Vec::new(),
+            committed: Vec::new(),
+            aborted: Vec::new(),
+        };
+        assert_eq!(first(&copied)?, 32);
         let reset = Command::ResetMirrorPartition {
             topic: "t".into(),
             partition: 0,

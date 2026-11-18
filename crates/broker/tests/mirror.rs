@@ -716,3 +716,283 @@ fn a_stalled_mirror_starts_again_after_a_reset() -> TestResult {
     }
     Ok(())
 }
+
+/// A transactional producer of `TOPIC` partition 0, for the source.
+mod txn {
+    use bytes::{Bytes, BytesMut};
+    use camus_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+    use camus_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse;
+    use camus_protocol::messages::end_txn_response::EndTxnResponse;
+    use camus_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
+    use camus_protocol::messages::produce_response::ProduceResponse;
+    use camus_protocol::messages::{
+        AddPartitionsToTxnRequest, ApiKey, EndTxnRequest, InitProducerIdRequest,
+        InitProducerIdResponse, ProduceRequest, TopicName, TransactionalId,
+    };
+    use camus_protocol::protocol::StrBytes;
+    use camus_protocol::records::{
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+        NO_PARTITION_LEADER_EPOCH,
+    };
+    use std::net::TcpStream;
+
+    use super::support::{recv, send, TOPIC};
+
+    type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    fn id() -> TransactionalId {
+        TransactionalId(StrBytes::from_static_str("mirror-checkout"))
+    }
+
+    pub struct Producer {
+        stream: TcpStream,
+        id: i64,
+        epoch: i16,
+        sequence: i32,
+    }
+
+    impl Producer {
+        pub fn init(addr: &str) -> Result<Self> {
+            let mut stream = super::connect(addr);
+            send(
+                &mut stream,
+                ApiKey::InitProducerId,
+                4,
+                &InitProducerIdRequest::default()
+                    .with_transactional_id(Some(id()))
+                    .with_transaction_timeout_ms(60_000)
+                    .with_producer_id((-1).into())
+                    .with_producer_epoch(-1),
+            );
+            let init = recv::<InitProducerIdResponse>(&mut stream, 4);
+            if init.error_code != 0 {
+                return Err(format!("InitProducerId: {}", init.error_code).into());
+            }
+            Ok(Self {
+                stream,
+                id: init.producer_id.0,
+                epoch: init.producer_epoch,
+                sequence: 0,
+            })
+        }
+
+        /// Begin a transaction on partition 0 and append `value` to it.
+        /// Returns the batch's offset.
+        pub fn send(&mut self, value: &str) -> Result<i64> {
+            send(
+                &mut self.stream,
+                ApiKey::AddPartitionsToTxn,
+                3,
+                &AddPartitionsToTxnRequest::default()
+                    .with_v3_and_below_transactional_id(id())
+                    .with_v3_and_below_producer_id(self.id.into())
+                    .with_v3_and_below_producer_epoch(self.epoch)
+                    .with_v3_and_below_topics(vec![AddPartitionsToTxnTopic::default()
+                        .with_name(TopicName(StrBytes::from_static_str(TOPIC)))
+                        .with_partitions(vec![0])]),
+            );
+            let added = recv::<AddPartitionsToTxnResponse>(&mut self.stream, 3);
+            let code =
+                added.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code;
+            if code != 0 {
+                return Err(format!("AddPartitionsToTxn: {code}").into());
+            }
+            let records = vec![Record {
+                transactional: true,
+                control: false,
+                delete_horizon: false,
+                partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                producer_id: self.id,
+                producer_epoch: self.epoch,
+                sequence: self.sequence,
+                timestamp_type: TimestampType::Creation,
+                offset: 0,
+                timestamp: 9,
+                key: Some(Bytes::from_static(b"k")),
+                value: Some(Bytes::copy_from_slice(value.as_bytes())),
+                headers: Default::default(),
+            }];
+            let mut buf = BytesMut::new();
+            RecordBatchEncoder::encode(
+                &mut buf,
+                &records,
+                &RecordEncodeOptions {
+                    version: 2,
+                    compression: Compression::None,
+                },
+            )?;
+            self.sequence += 1;
+            let mut topic = TopicProduceData::default();
+            topic.name = TopicName(StrBytes::from_static_str(TOPIC));
+            topic.partition_data = vec![PartitionProduceData::default()
+                .with_index(0)
+                .with_records(Some(buf.freeze()))];
+            send(
+                &mut self.stream,
+                ApiKey::Produce,
+                9,
+                &ProduceRequest::default()
+                    .with_acks(-1)
+                    .with_timeout_ms(5_000)
+                    .with_transactional_id(Some(id()))
+                    .with_topic_data(vec![topic]),
+            );
+            let produced = recv::<ProduceResponse>(&mut self.stream, 9);
+            let part = &produced.responses[0].partition_responses[0];
+            if part.error_code != 0 {
+                return Err(format!("Produce: {}", part.error_code).into());
+            }
+            Ok(part.base_offset)
+        }
+
+        pub fn end(&mut self, commit: bool) -> Result<()> {
+            send(
+                &mut self.stream,
+                ApiKey::EndTxn,
+                3,
+                &EndTxnRequest::default()
+                    .with_transactional_id(id())
+                    .with_producer_id(self.id.into())
+                    .with_producer_epoch(self.epoch)
+                    .with_committed(commit),
+            );
+            let ended = recv::<EndTxnResponse>(&mut self.stream, 3);
+            if ended.error_code != 0 {
+                return Err(format!("EndTxn: {}", ended.error_code).into());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `(offset, value)` for each record a fetch of `TOPIC` partition 0 from 0
+/// returns at `isolation` (0 uncommitted, 1 committed), control records
+/// left out as a client leaves them out.
+fn records_at(addr: &str, isolation: i8) -> Result<Vec<(i64, String)>, Box<dyn std::error::Error>> {
+    use camus_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
+    use camus_protocol::messages::fetch_response::FetchResponse;
+    use camus_protocol::messages::FetchRequest;
+    let mut part = FetchPartition::default();
+    part.partition = 0;
+    part.fetch_offset = 0;
+    part.partition_max_bytes = 1024 * 1024;
+    let mut topic = FetchTopic::default();
+    topic.topic = TopicName(StrBytes::from_static_str(support::TOPIC));
+    topic.partitions = vec![part];
+    let mut stream = connect(addr);
+    send(
+        &mut stream,
+        ApiKey::Fetch,
+        11,
+        &FetchRequest::default()
+            .with_max_wait_ms(50)
+            .with_isolation_level(isolation)
+            .with_topics(vec![topic]),
+    );
+    let fetched = recv::<FetchResponse>(&mut stream, 11);
+    let Some(mut bytes) = fetched.responses[0].partitions[0].records.clone() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for set in camus_protocol::records::RecordBatchDecoder::decode_all(&mut bytes)? {
+        for record in set.records {
+            if record.control {
+                continue;
+            }
+            let value = record.value.ok_or("a record without a value")?;
+            out.push((record.offset, String::from_utf8(value.to_vec())?));
+        }
+    }
+    Ok(out)
+}
+
+/// A mirror copies a transactional topic once the source ends each
+/// transaction, with its spans, so both isolation levels read as on the
+/// source, and waits at a transaction the source has not ended.
+#[test]
+fn a_mirror_copies_ended_transactions_and_waits_at_an_open_one() -> TestResult {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("mirror transaction test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let source_prefix = format!("mirror-txn-src-{pid}/");
+    let source_dir = tempfile::tempdir()?;
+    let source = spawn_under(source_dir.path(), &source_prefix, &[]);
+    let source_addr = kafka_addr(&source);
+    let mut producer = txn::Producer::init(&source_addr)?;
+    assert_eq!(producer.send("aborted")?, 0);
+    producer.end(false)?;
+    assert_eq!(producer.send("committed")?, 1);
+    producer.end(true)?;
+    assert_eq!(produce(&source_addr, "plain"), (0, 2));
+    assert_eq!(producer.send("open")?, 3);
+
+    let dest_dir = tempfile::tempdir()?;
+    let dest = support::Node::with(
+        1,
+        dest_dir.path(),
+        Opts::default()
+            .env("CAMUS_S3_PREFIX", &format!("mirror-txn-dst-{pid}/"))
+            .env("CAMUS_MIRROR_COPY_MS", "200")
+            .env("CAMUS_MIRROR_US_EAST_ACCESS_KEY", "camus")
+            .env("CAMUS_MIRROR_US_EAST_SECRET_KEY", "camus-dev-secret"),
+    );
+    support::init(std::slice::from_ref(&dest), &[1]);
+    support::wait_settled(&[&dest]);
+    let client = reqwest::blocking::Client::new();
+    let link = MirrorLink {
+        alias: "us-east".into(),
+        endpoint: "http://127.0.0.1:9100".into(),
+        region: "us-east-1".into(),
+        bucket: "camus".into(),
+        prefix: source_prefix.clone(),
+        virtual_host: false,
+    };
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/links", dest.http))
+            .json(&link)
+            .send()
+    })?;
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/topics", dest.http))
+            .json(&serde_json::json!({ "alias": "us-east", "topic": support::TOPIC }))
+            .send()
+    })?;
+
+    // Copied up to the open transaction, and no further.
+    support::wait_sealed(&dest.http, 3);
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert_eq!(
+        support::sealed_end(&dest.http),
+        3,
+        "waits at the open transaction"
+    );
+    assert_eq!(stalled(&dest.http)?, 0, "waiting is not a stall");
+    let dest_addr = kafka_addr(&dest);
+    let committed = vec![(1, "committed".to_string()), (2, "plain".to_string())];
+    assert_eq!(records_at(&dest_addr, 1)?, committed);
+    assert_eq!(
+        records_at(&source_addr, 1)?,
+        committed,
+        "the source reads the same"
+    );
+    let uncommitted: Vec<(i64, String)> = records_at(&dest_addr, 0)?;
+    assert_eq!(
+        uncommitted
+            .iter()
+            .map(|(offset, _)| *offset)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    producer.end(true)?;
+    support::wait_sealed(&dest.http, 4);
+    let mut after = committed;
+    after.push((3, "open".to_string()));
+    assert_eq!(records_at(&dest_addr, 1)?, after);
+    assert_eq!(records_at(&source_addr, 1)?, after);
+    Ok(())
+}
