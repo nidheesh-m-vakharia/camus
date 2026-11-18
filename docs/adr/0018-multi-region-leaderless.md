@@ -414,7 +414,21 @@ reads `CAMUSKV3`. Snapshot install, `camus admin restore-cluster`, and
 
   Before anything is written, install decodes and checks the whole body,
   so a refused body leaves the state machine unchanged.
-- `build_snapshot` still writes `CAMUSKV2`. A test pins this, so that a
-  broker one release older can install every snapshot this release
-  builds. The encoder exists only in tests. Turning it on is the writer
-  half of phase 0, in the next release.
+- In the reader release, `build_snapshot` still wrote `CAMUSKV2`, and a
+  test pinned that so a broker one release older could install every
+  snapshot. The writer below changed this.
+
+Phase 0, the writer, 2026-11-18. `build_snapshot` now writes `CAMUSKV3`
+through `IndexedBody`, which streams rows from the `redb` table. A test
+covers the indexed slice encoder, and it produces the same bytes. The
+index holds about one entry per 64 KiB of body, and it is the only memory
+added beyond the body itself. Snapshots from the release before
+(`CAMUSKV2`) and the older JSON bodies still install. The writer shipped
+after the reader image had been published on `main` and deployed, so a
+rolling upgrade never puts a `CAMUSKV3` snapshot in front of a broker that
+cannot read it.
+
+Rollback: a broker older than the reader release cannot install a
+`CAMUSKV3` snapshot. A cluster on the writer can roll back only to the
+reader release or later. Rolling back further needs every voter's log to
+cover its last snapshot, which is not something an operator can count on.
