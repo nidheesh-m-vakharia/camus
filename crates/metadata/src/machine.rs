@@ -30,6 +30,7 @@ use tokio::sync::RwLock;
 use crate::acl;
 use crate::admin;
 use crate::catalog::{self, Outcome};
+use crate::mirror;
 use crate::txn;
 use crate::{Command, NodeId, Response, TypeConfig};
 
@@ -55,9 +56,9 @@ const SNAPSHOT_MAGIC: &[u8; 8] = b"CAMUSKV2";
 
 /// First and last bytes of a snapshot body with a block index (ADR 0018):
 /// the rows exactly as after [`SNAPSHOT_MAGIC`], then the index, a postcard
-/// [`IndexEntry`] per block, then a [`TRAILER_LEN`]-byte trailer. This release reads it;
-/// `build_snapshot` still writes [`SNAPSHOT_MAGIC`], so a broker one release
-/// older can install every snapshot this one builds.
+/// [`IndexEntry`] per block, then a [`TRAILER_LEN`]-byte trailer.
+/// `build_snapshot` writes it. Brokers read it from the release before, so a
+/// rolling upgrade from that release installs every snapshot this one builds.
 const INDEXED_MAGIC: &[u8; 8] = b"CAMUSKV3";
 
 /// Index offset (u64 LE), index length (u64 LE), CRC32C of the index
@@ -70,7 +71,7 @@ const TRAILER_LEN: usize = 8 + 8 + 4 + 8;
 type IndexEntry = (String, u64, u32);
 
 /// A row starts a new block once it is this far past the last block's start.
-#[cfg(test)]
+/// The index holds one entry per block, so it is about 1/65536 of the body.
 const BLOCK_BYTES: u64 = 64 * 1024;
 
 const CRC32C: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
@@ -96,26 +97,77 @@ fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
-/// Encode every row of `kv` as a snapshot body, straight from the table:
-/// the magic, then what postcard writes for a `Vec<(String, String)>`.
+/// Encode every row of `kv` as an [`INDEXED_MAGIC`] snapshot body, straight
+/// from the table.
 fn encode_rows(kv: &impl ReadableTable<&'static str, &'static str>) -> Result<Vec<u8>, String> {
     let count = kv.len().map_err(|err| err.to_string())?;
-    let mut out = Vec::new();
-    out.extend_from_slice(SNAPSHOT_MAGIC);
-    push_varint(&mut out, count);
+    let mut body = IndexedBody::new(count);
     let mut written = 0u64;
     for row in kv.iter().map_err(|err| err.to_string())? {
         let (key, value) = row.map_err(|err| err.to_string())?;
-        for text in [key.value(), value.value()] {
-            push_varint(&mut out, text.len() as u64);
-            out.extend_from_slice(text.as_bytes());
-        }
+        body.row(key.value(), value.value());
         written += 1;
     }
     if written != count {
         return Err(format!("snapshot read {written} rows of {count}"));
     }
-    Ok(out)
+    body.finish()
+}
+
+/// An [`INDEXED_MAGIC`] body being written, one row at a time in key order.
+struct IndexedBody {
+    out: Vec<u8>,
+    /// Each block's first key and byte offset.
+    firsts: Vec<(String, u64)>,
+}
+
+impl IndexedBody {
+    /// A body that will hold `count` rows.
+    fn new(count: u64) -> Self {
+        let mut out = INDEXED_MAGIC.to_vec();
+        push_varint(&mut out, count);
+        Self {
+            out,
+            firsts: Vec::new(),
+        }
+    }
+
+    fn row(&mut self, key: &str, value: &str) {
+        let at = self.out.len() as u64;
+        let starts_block = match self.firsts.last() {
+            Some((_, start)) => at - start >= BLOCK_BYTES,
+            None => true,
+        };
+        if starts_block {
+            self.firsts.push((key.to_string(), at));
+        }
+        for text in [key, value] {
+            push_varint(&mut self.out, text.len() as u64);
+            self.out.extend_from_slice(text.as_bytes());
+        }
+    }
+
+    /// Append the index, each block with its CRC32C, and the trailer.
+    fn finish(self) -> Result<Vec<u8>, String> {
+        let Self { mut out, firsts } = self;
+        let index_at = out.len() as u64;
+        let mut index: Vec<IndexEntry> = Vec::with_capacity(firsts.len());
+        for (block, (key, start)) in firsts.iter().enumerate() {
+            let end = firsts.get(block + 1).map_or(index_at, |(_, next)| *next);
+            let bytes = out
+                .get(*start as usize..end as usize)
+                .ok_or("snapshot block out of bounds")?;
+            index.push((key.clone(), *start, CRC32C.checksum(bytes)));
+        }
+        drop(firsts);
+        let index = camus_raft::codec::encode(&index).map_err(|err| err.to_string())?;
+        out.extend_from_slice(&index);
+        out.extend_from_slice(&index_at.to_le_bytes());
+        out.extend_from_slice(&(index.len() as u64).to_le_bytes());
+        out.extend_from_slice(&CRC32C.checksum(&index).to_le_bytes());
+        out.extend_from_slice(INDEXED_MAGIC);
+        Ok(out)
+    }
 }
 
 /// The rows of a snapshot body in either format.
@@ -252,45 +304,14 @@ fn indexed_parts(bytes: &[u8]) -> Result<(usize, &[u8]), String> {
     Ok((index_at, index))
 }
 
-/// Encode `rows`, in key order, as an [`INDEXED_MAGIC`] body. Only tests
-/// write this format until the release after the reader.
+/// Encode `rows`, in key order, as an [`INDEXED_MAGIC`] body.
 #[cfg(test)]
 fn encode_indexed(rows: &[(&str, &str)]) -> Result<Vec<u8>, String> {
-    let mut out = INDEXED_MAGIC.to_vec();
-    push_varint(&mut out, rows.len() as u64);
-    let mut firsts: Vec<(String, u64)> = Vec::new();
-    let mut block_at: Option<u64> = None;
+    let mut body = IndexedBody::new(rows.len() as u64);
     for (key, value) in rows {
-        let at = out.len() as u64;
-        let starts_block = match block_at {
-            Some(start) => at - start >= BLOCK_BYTES,
-            None => true,
-        };
-        if starts_block {
-            firsts.push((key.to_string(), at));
-            block_at = Some(at);
-        }
-        for text in [key, value] {
-            push_varint(&mut out, text.len() as u64);
-            out.extend_from_slice(text.as_bytes());
-        }
+        body.row(key, value);
     }
-    let index_at = out.len() as u64;
-    let mut index: Vec<IndexEntry> = Vec::with_capacity(firsts.len());
-    for (block, (key, start)) in firsts.iter().enumerate() {
-        let end = firsts.get(block + 1).map_or(index_at, |(_, next)| *next);
-        let bytes = out
-            .get(*start as usize..end as usize)
-            .ok_or("block out of bounds")?;
-        index.push((key.clone(), *start, CRC32C.checksum(bytes)));
-    }
-    let index = camus_raft::codec::encode(&index).map_err(|err| err.to_string())?;
-    out.extend_from_slice(&index);
-    out.extend_from_slice(&index_at.to_le_bytes());
-    out.extend_from_slice(&(index.len() as u64).to_le_bytes());
-    out.extend_from_slice(&CRC32C.checksum(&index).to_le_bytes());
-    out.extend_from_slice(INDEXED_MAGIC);
-    Ok(out)
+    body.finish()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -573,6 +594,14 @@ fn apply_command(
                 configs,
             } => catalog::create_topic(&read, &name, &id, partitions, &durability, &configs),
             Command::DeleteTopic { name } => catalog::delete_topic(&read, &scan, &name),
+            Command::AddMirrorLink { link } => mirror::add_link(&read, &scan, &link),
+            Command::RemoveMirrorLink { alias } => mirror::remove_link(&read, &alias),
+            Command::CreateMirrorTopic {
+                name,
+                id,
+                partitions,
+                of,
+            } => mirror::create_topic(&read, &name, &id, partitions, &of),
             Command::Publish { parts } => catalog::publish(&read, &parts, &[]),
             Command::PublishWithProducers { parts, producers } => {
                 catalog::publish(&read, &parts, &producers)
@@ -983,11 +1012,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<RedbMachine> {
             .map_err(|err| io(ErrorSubject::StateMachine, &err))?;
         let bytes = match txn.open_table(KV) {
             Ok(table) => encode_rows(&table),
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                let mut empty = SNAPSHOT_MAGIC.to_vec();
-                push_varint(&mut empty, 0);
-                Ok(empty)
-            }
+            Err(redb::TableError::TableDoesNotExist(_)) => IndexedBody::new(0).finish(),
             Err(err) => Err(err.to_string()),
         }
         .map_err(|err| io(ErrorSubject::StateMachine, &std::io::Error::other(err)))?;
@@ -1210,22 +1235,38 @@ mod tests {
     }
 
     #[test]
-    fn the_body_is_what_postcard_writes_for_the_rows() {
-        let dir = tempfile::tempdir().unwrap();
+    fn the_rows_are_what_postcard_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
         let long = "x".repeat(300);
         let rows = [("a", "1"), ("b/longer", long.as_str()), ("c", "")];
         let machine = filled(dir.path(), &rows);
-        let txn = machine.db.begin_read().unwrap();
-        let body = encode_rows(&txn.open_table(KV).unwrap()).unwrap();
+        let txn = machine.db.begin_read()?;
+        let body = encode_rows(&txn.open_table(KV)?)?;
+        assert_eq!(
+            body,
+            encode_indexed(&rows)?,
+            "the table and the slice agree"
+        );
         let expected: Vec<(String, String)> = rows
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
+        let (index_at, _) = indexed_parts(&body)?;
         assert_eq!(
-            &body[SNAPSHOT_MAGIC.len()..],
-            camus_raft::codec::encode(&expected).unwrap().as_slice()
+            body.get(INDEXED_MAGIC.len()..index_at),
+            Some(camus_raft::codec::encode(&expected)?.as_slice())
         );
-        assert_eq!(decode_rows(&body).unwrap(), expected);
+        assert_eq!(decode_rows(&body)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn a_body_from_the_release_before_still_installs() -> Result<(), Box<dyn std::error::Error>> {
+        let rows = vec![("k".to_string(), "v".to_string())];
+        let mut body = SNAPSHOT_MAGIC.to_vec();
+        body.extend_from_slice(&camus_raft::codec::encode(&rows)?);
+        assert_eq!(decode_rows(&body)?, rows);
+        Ok(())
     }
 
     #[test]
@@ -1369,6 +1410,34 @@ mod tests {
     }
 
     #[test]
+    fn a_row_bigger_than_a_block_gets_a_block_of_its_own() -> TestResult {
+        let big = "b".repeat(BLOCK_BYTES as usize * 2);
+        let rows = [("a", "1"), ("b", big.as_str()), ("c", "3"), ("d", "4")];
+        let body = encode_indexed(&rows)?;
+        let (_, index) = split(&body)?;
+        let firsts: Vec<&str> = index.iter().map(|(key, _, _)| key.as_str()).collect();
+        assert_eq!(firsts, ["a", "c"], "the big row closes its block");
+        assert_eq!(decode_rows(&body)?.len(), rows.len());
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_exactly_one_block_on_starts_a_block() -> TestResult {
+        // The first row starts at 9: the magic and a one-byte count. Size
+        // the first value so the second row starts BLOCK_BYTES after it.
+        // Row bytes: key length, key, value length (3 bytes for these
+        // sizes), value.
+        let value = "v".repeat(BLOCK_BYTES as usize - 1 - 1 - 3);
+        let rows = [("a", value.as_str()), ("b", "1")];
+        let body = encode_indexed(&rows)?;
+        let (_, index) = split(&body)?;
+        let offsets: Vec<u64> = index.iter().map(|(_, at, _)| *at).collect();
+        assert_eq!(offsets, [9, 9 + BLOCK_BYTES]);
+        assert_eq!(decode_rows(&body)?.len(), rows.len());
+        Ok(())
+    }
+
+    #[test]
     fn an_empty_indexed_body_reads_no_rows() -> TestResult {
         let body = encode_indexed(&[])?;
         assert_eq!(decode_rows(&body)?, Vec::<(String, String)>::new());
@@ -1492,14 +1561,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_builder_still_writes_the_unindexed_format() -> TestResult {
+    async fn the_builder_writes_the_indexed_format() -> TestResult {
+        let rows = many_rows();
         let dir = tempfile::tempdir()?;
-        let mut machine = filled(dir.path(), &[("a", "1")]);
+        let mut machine = filled(dir.path(), &borrowed(&rows));
         let body = machine.build_snapshot().await?.snapshot.into_inner();
-        assert!(
-            body.starts_with(SNAPSHOT_MAGIC),
-            "a broker one release older must be able to install this"
-        );
+        assert!(body.starts_with(INDEXED_MAGIC));
+        assert!(split(&body)?.1.len() > 1, "several blocks");
+        assert_eq!(decode_rows(&body)?, rows);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_empty_machine_builds_an_indexed_snapshot() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let mut machine = Arc::new(RedbMachine::open(&dir.path().join("state.redb"))?);
+        let body = machine.build_snapshot().await?.snapshot.into_inner();
+        assert!(body.starts_with(INDEXED_MAGIC));
+        assert!(decode_rows(&body)?.is_empty());
         Ok(())
     }
 }

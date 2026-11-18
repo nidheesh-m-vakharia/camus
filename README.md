@@ -254,9 +254,9 @@ Flags: `--kafka-addr`, `--advertised-addr` (`advertised.listeners`),
 ## Develop
 
 ```
-cargo test --workspace
+cargo nextest run --workspace
 docker compose up -d minio create-bucket
-CAMUS_MINIO=1 cargo test -p camus-storage --test minio
+CAMUS_MINIO=1 cargo nextest run -p camus-storage --test minio
 ```
 
 `cargo test -p camus-broker --test cluster` starts three processes, commits
@@ -275,8 +275,10 @@ broker on a non-loopback address, so it also needs `CAMUS_ECOSYSTEM_DOCKER=1`.
 `--advertised-addr host:port` is what Metadata hands out, as Kafka's
 `advertised.listeners`; use it behind NAT or for clients in containers.
 
-GitHub Actions runs `cargo test --workspace --locked` on pull requests and
-on `main`.
+GitHub Actions runs `cargo nextest run --workspace --locked` on pull requests
+and on `main`. Nextest is installed from
+[the prebuilt binaries](https://nexte.st/docs/installation/pre-built-binaries/).
+`.config/nextest.toml` runs four tests at a time.
 
 ## When not to use Camus
 

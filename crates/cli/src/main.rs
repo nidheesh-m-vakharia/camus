@@ -97,6 +97,62 @@ enum Admin {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Mirror topics from another cluster's bucket (ADR 0018).
+    #[command(subcommand)]
+    Mirror(Mirror),
+}
+
+#[derive(Subcommand)]
+enum Mirror {
+    /// Links to source clusters' buckets.
+    #[command(subcommand)]
+    Link(Link),
+}
+
+#[derive(Subcommand)]
+enum Link {
+    /// Add a link. Each broker reads its keys from
+    /// `CAMUS_MIRROR_<ALIAS>_ACCESS_KEY` and `CAMUS_MIRROR_<ALIAS>_SECRET_KEY`,
+    /// the alias upper-cased with `-` as `_`. Adding the same link again
+    /// changes nothing.
+    Add {
+        /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
+        #[arg(long)]
+        broker: Option<String>,
+        /// 1-32 characters of `[a-z0-9-]`.
+        #[arg(long)]
+        alias: String,
+        /// The source bucket's S3 endpoint URL.
+        #[arg(long)]
+        endpoint: String,
+        /// S3 region. R2 uses `auto`.
+        #[arg(long, default_value = "auto")]
+        region: String,
+        /// The source bucket.
+        #[arg(long)]
+        bucket: String,
+        /// The source's `s3.prefix`.
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Use virtual-host addressing, as the source's `s3.virtual_host`.
+        #[arg(long, default_value_t = false)]
+        virtual_host: bool,
+    },
+    /// Remove a link. Refused while a mirror topic uses it.
+    Remove {
+        /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
+        #[arg(long)]
+        broker: Option<String>,
+        /// The link's alias.
+        #[arg(long)]
+        alias: String,
+    },
+    /// Print every link as JSON.
+    List {
+        /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
+        #[arg(long)]
+        broker: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -173,6 +229,57 @@ fn main() -> anyhow::Result<()> {
                     println!("wal shard {id}: leader {leader} voters {voters}");
                 }
             }
+        }
+        Top::Admin(Admin::Mirror(Mirror::Link(Link::Add {
+            broker,
+            alias,
+            endpoint,
+            region,
+            bucket,
+            prefix,
+            virtual_host,
+        }))) => {
+            let broker = broker_addr(broker)?;
+            let link = serde_json::json!({
+                "alias": alias,
+                "endpoint": endpoint,
+                "region": region,
+                "bucket": bucket,
+                "prefix": prefix,
+                "virtual_host": virtual_host,
+            });
+            let (status, body) = post(&broker, "/admin/mirror/links", &link)?;
+            if !status.is_success() {
+                eprintln!("{broker} refused ({status}): {body}");
+                std::process::exit(1);
+            }
+            println!("linked {alias}");
+        }
+        Top::Admin(Admin::Mirror(Mirror::Link(Link::Remove { broker, alias }))) => {
+            // The alias goes into the URL path; refuse what a link can't be named.
+            anyhow::ensure!(
+                !alias.is_empty()
+                    && alias.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'-'),
+                "alias must be 1-32 characters of [a-z0-9-]"
+            );
+            let broker = broker_addr(broker)?;
+            let response = reqwest::blocking::Client::new()
+                .delete(format!("http://{broker}/admin/mirror/links/{alias}"))
+                .send()?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text()?;
+                eprintln!("{broker} refused ({status}): {body}");
+                std::process::exit(1);
+            }
+            println!("removed {alias}");
+        }
+        Top::Admin(Admin::Mirror(Mirror::Link(Link::List { broker }))) => {
+            let broker = broker_addr(broker)?;
+            let links = get_json(&broker, "/admin/mirror/links")?;
+            println!("{}", serde_json::to_string_pretty(&links)?);
         }
         Top::Admin(Admin::Config { broker, topic }) => {
             let broker = broker_addr(broker)?;

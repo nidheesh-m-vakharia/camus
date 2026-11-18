@@ -8,7 +8,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
 use camus_protocol::frame;
@@ -1158,4 +1158,310 @@ pub fn fetch_in_epoch(addr: &str, current_leader_epoch: i32, offset: i64) -> i16
             .with_topics(vec![topic]),
     );
     recv::<FetchResponse>(&mut stream, 11).responses[0].partitions[0].error_code
+}
+
+/// Go binaries and javac output reused across tests. Nextest runs each test
+/// in its own process, so the artifacts live under `target/` and a lock file
+/// makes one module compile once. At most [`CLIENT_BUILD_CAP`] artifacts.
+const CLIENT_BUILD_CAP: usize = 16;
+
+/// `.go`, `go.mod`, and `go.sum` files read while deciding whether a binary
+/// is stale. A module larger than this is not a test client.
+const GO_SOURCE_SCAN_CAP: usize = 64;
+
+/// `javac` or `java`. Homebrew's JDK 21 when it is installed, otherwise the
+/// name on `PATH`.
+pub fn jdk_tool(tool: &str) -> PathBuf {
+    let homebrew = PathBuf::from(format!("/opt/homebrew/opt/openjdk@21/bin/{tool}"));
+    if homebrew.is_file() {
+        homebrew
+    } else {
+        PathBuf::from(tool)
+    }
+}
+
+/// Compile `module` (a directory with a `go.mod`) once and return the binary.
+/// A later call with the same sources returns the binary already built.
+pub fn go_build(module: &Path) -> std::io::Result<PathBuf> {
+    let root = client_root()?;
+    let name = dir_artifact("go", module)?;
+    let out = root.join(&name);
+    let newest = newest_go_source(module)?;
+    if is_fresh(&out, newest) {
+        return Ok(out);
+    }
+    let lock = FileLock::acquire(&sibling(&out, "lock")?)?;
+    if is_fresh(&out, newest) {
+        drop(lock);
+        return Ok(out);
+    }
+    ensure_new_slot(&root, &out)?;
+    let tmp = sibling(&out, &format!("tmp.{}", std::process::id()))?;
+    let output = Command::new(go_toolchain()?)
+        .args(["build", "-o"])
+        .arg(&tmp)
+        .arg(".")
+        .current_dir(module)
+        .env("GOTOOLCHAIN", "local")
+        .output()?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(std::io::Error::other(format!(
+            "go build {} failed\n{}",
+            module.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    std::fs::rename(&tmp, &out)?;
+    drop(lock);
+    Ok(out)
+}
+
+/// Compile `source` once. The returned classpath is the class directory plus
+/// `jars` (a colon-separated jar list).
+pub fn java_classpath(source: &Path, jars: &str) -> std::io::Result<String> {
+    let root = client_root()?;
+    let name = file_artifact("java", source)?;
+    let classes = root.join(&name);
+    let cp = format!("{}:{jars}", classes.display());
+    let stamp = classes.join(".built");
+    let source_time = source.metadata()?.modified()?;
+    if is_fresh(&stamp, source_time) {
+        return Ok(cp);
+    }
+    let lock = FileLock::acquire(&sibling(&classes, "lock")?)?;
+    if is_fresh(&stamp, source_time) {
+        drop(lock);
+        return Ok(cp);
+    }
+    ensure_new_slot(&root, &classes)?;
+    std::fs::create_dir_all(&classes)?;
+    let output = Command::new(jdk_tool("javac"))
+        .args(["--release", "17", "-cp", &cp, "-d"])
+        .arg(&classes)
+        .arg(source)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "javac {} failed\n{}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    std::fs::File::create(&stamp)?;
+    drop(lock);
+    Ok(cp)
+}
+
+fn client_root() -> std::io::Result<PathBuf> {
+    let base = match std::env::var("CARGO_TARGET_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"),
+    };
+    let root = base.join("camus-test-clients");
+    std::fs::create_dir_all(&root)?;
+    root.canonicalize()
+}
+
+fn go_toolchain() -> std::io::Result<PathBuf> {
+    let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
+    if go.is_file() {
+        Ok(go)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("missing {}", go.display()),
+        ))
+    }
+}
+
+fn dir_artifact(kind: &str, dir: &Path) -> std::io::Result<String> {
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} has no directory name", dir.display()),
+            )
+        })?;
+    Ok(format!("{kind}-{name}"))
+}
+
+fn file_artifact(kind: &str, path: &Path) -> std::io::Result<String> {
+    let file = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} has no file name", path.display()),
+            )
+        })?;
+    let parent = path
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("root");
+    Ok(format!("{kind}-{parent}-{file}"))
+}
+
+fn sibling(artifact: &Path, suffix: &str) -> std::io::Result<PathBuf> {
+    let name = artifact
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no name")
+        })?;
+    let parent = artifact.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact has no directory",
+        )
+    })?;
+    Ok(parent.join(format!("{name}.{suffix}")))
+}
+
+fn is_fresh(artifact: &Path, source_time: SystemTime) -> bool {
+    artifact
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|built| built >= source_time)
+}
+
+fn newest_go_source(module: &Path) -> std::io::Result<SystemTime> {
+    let mut newest = SystemTime::UNIX_EPOCH;
+    let mut seen = 0usize;
+    let mut stack = vec![module.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let ext = path.extension().and_then(|ext| ext.to_str());
+            let name = path.file_name().and_then(|name| name.to_str());
+            let source = ext == Some("go") || name == Some("go.mod") || name == Some("go.sum");
+            if !source {
+                continue;
+            }
+            seen += 1;
+            if seen > GO_SOURCE_SCAN_CAP {
+                return Err(std::io::Error::other(format!(
+                    "{} has more than {GO_SOURCE_SCAN_CAP} Go sources",
+                    module.display()
+                )));
+            }
+            newest = newest.max(path.metadata()?.modified()?);
+        }
+    }
+    Ok(newest)
+}
+
+fn ensure_new_slot(root: &Path, artifact: &Path) -> std::io::Result<()> {
+    if artifact.exists() {
+        return Ok(());
+    }
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".lock") || name.contains(".tmp.") {
+            continue;
+        }
+        count += 1;
+    }
+    if count >= CLIENT_BUILD_CAP {
+        return Err(std::io::Error::other(format!(
+            "client build directory is capped at {CLIENT_BUILD_CAP} artifacts"
+        )));
+    }
+    Ok(())
+}
+
+/// One writer for an artifact. The file contains the holder's pid so a crash
+/// does not leave the next test waiting.
+struct FileLock {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        let pid = std::process::id();
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    if let Err(err) = writeln!(file, "{pid}") {
+                        let _ = std::fs::remove_file(path);
+                        return Err(err);
+                    }
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                        pid,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::other(format!(
+                            "timed out waiting for {}",
+                            path.display()
+                        )));
+                    }
+                    if lock_is_stale(path) {
+                        let _ = std::fs::remove_file(path);
+                        continue;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
+        if text.trim() == self.pid.to_string() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        let Ok(modified) = path.metadata().and_then(|meta| meta.modified()) else {
+            return false;
+        };
+        let Ok(age) = modified.elapsed() else {
+            return false;
+        };
+        return age > Duration::from_secs(5);
+    }
+    let Ok(pid) = text.parse::<u32>() else {
+        return true;
+    };
+    !process_alive(pid)
+}
+
+fn process_alive(pid: u32) -> bool {
+    match Command::new("kill").args(["-0", &pid.to_string()]).status() {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
 }

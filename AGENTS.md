@@ -30,7 +30,7 @@ edit that crate.
 
 ```
 cargo build --workspace
-cargo test --workspace --locked            # what CI runs
+cargo nextest run --workspace --locked     # what CI runs
 cargo test -p <crate> --test <file>        # one suite
 scripts/agent-check.sh                     # rules below + tests, before a PR
 ```

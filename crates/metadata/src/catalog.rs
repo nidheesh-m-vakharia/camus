@@ -35,6 +35,10 @@ pub struct Topic {
     /// absent uses its default. The typed fields above mirror their entries.
     #[serde(default)]
     pub overrides: BTreeMap<String, String>,
+    /// The source this topic mirrors, if it is a mirror (ADR 0018). A mirror
+    /// is read-only to clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_of: Option<crate::mirror::MirrorOf>,
 }
 
 impl Topic {
@@ -50,6 +54,7 @@ impl Topic {
             retention_bytes: default_retention_bytes(),
             cleanup_policy: default_cleanup(),
             overrides: BTreeMap::new(),
+            mirror_of: None,
         }
     }
 
@@ -367,6 +372,13 @@ pub(crate) fn extent_keys_through(
         .collect())
 }
 
+/// Every topic name, in creation order.
+pub(crate) fn topic_names(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+) -> Result<Vec<String>, String> {
+    names(get(TOPICS)?)
+}
+
 fn names(raw: Option<String>) -> Result<Vec<String>, String> {
     match raw {
         None => Ok(Vec::new()),
@@ -444,6 +456,19 @@ pub fn create_topic(
     durability: &str,
     configs: &[(String, Option<String>)],
 ) -> Result<Outcome, String> {
+    create_topic_as(get, name, id, partitions, durability, configs, None)
+}
+
+/// [`create_topic`], with `mirror_of` set on the new topic.
+pub(crate) fn create_topic_as(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    name: &str,
+    id: &str,
+    partitions: i32,
+    durability: &str,
+    configs: &[(String, Option<String>)],
+    mirror_of: Option<crate::mirror::MirrorOf>,
+) -> Result<Outcome, String> {
     if id.is_empty() {
         return Ok(Outcome::Reject(42));
     }
@@ -455,6 +480,7 @@ pub fn create_topic(
     }
     let id = id.to_string();
     let mut topic = Topic::new(name, &id, partitions, durability);
+    topic.mirror_of = mirror_of;
     for (config, value) in configs {
         if config == "durability.mode" {
             continue;
@@ -571,6 +597,12 @@ pub fn publish(
             Some(raw) => serde_json::from_str::<Topic>(&raw).map_err(|err| err.to_string())?,
             None => return Ok(Outcome::Reject(3)),
         };
+        // A mirror takes no client data, whatever a stale broker believed
+        // when it accepted the batch. Unknown-topic is what a deleted topic
+        // gets, so the uploader handles it the same way (ADR 0018).
+        if topic.mirror_of.is_some() {
+            return Ok(Outcome::Reject(3));
+        }
         if part.partition < 0 || part.partition >= topic.partitions {
             return Ok(Outcome::Reject(3));
         }
