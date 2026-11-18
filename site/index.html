@@ -61,13 +61,14 @@
     <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">GitHub</a>
   </header>
   <main id="content" class="home-main">
-    <section class="home-hero">
-      <div class="home-hero-text">
-        <h1>A broker compatible with Apache Kafka. The log stays in object storage.</h1>
-        <p class="lede">Producers, consumers, and admin clients speak the Kafka wire protocol. The durable log lives in Cloudflare R2, or any S3-compatible bucket. A small set of Rust binaries replicates metadata, and a short write-ahead log, with Raft.</p>
-        <p class="home-actions"><a class="button" href="run.html">Run one broker</a><a href="durability.html">How a produce is acknowledged</a></p>
-      </div>
-      <figure class="plate">
+    <section class="band band-hero">
+      <div class="band-inner home-hero">
+        <div class="home-hero-text">
+          <h1>A broker compatible with Apache Kafka. The log stays in object storage.</h1>
+          <p class="lede">Producers, consumers, and admin clients speak the Kafka wire protocol. The durable log lives in Cloudflare R2, or any S3-compatible bucket. A small set of Rust binaries replicates metadata, and a short write-ahead log, with Raft.</p>
+          <p class="home-actions"><a class="button" href="run.html">Run one broker</a><a href="durability.html">How a produce is acknowledged</a></p>
+        </div>
+        <figure class="plate">
 <!-- diagram:tail -->
 <svg class="dg dg-tail" viewBox="0 72 560 304" fill="none" stroke="currentColor" stroke-width="1" focusable="false" style="overflow:visible;font-family:inherit;font-optical-sizing:auto;font-synthesis:none;font-weight:400" role="img" aria-labelledby="dg-tail-title" aria-describedby="dg-tail-desc">
 <title id="dg-tail-title">One log, a short tail on disk</title>
@@ -84,15 +85,20 @@
 <g fill="currentColor" stroke="none" font-size="10" text-anchor="start" opacity="0.5"><text x="516" y="232">upload</text></g>
 </svg>
 <!-- /diagram:tail -->
-        <figcaption>One log. Its sealed body is objects in the bucket. Each broker keeps only the newest stretch on disk, until the uploader moves it.</figcaption>
-      </figure>
+          <figcaption>One log. Its sealed body is objects in the bucket. Each broker keeps only the newest stretch on disk, until the uploader moves it.</figcaption>
+        </figure>
+      </div>
     </section>
 
-    <section class="home-section">
-      <h2>How a write is kept</h2>
-      <p class="home-section-lede">A produce lands first in a short write-ahead log that the brokers replicate with Raft. When the producer hears back depends on the topic&rsquo;s durability mode.</p>
-      <div class="plates">
-        <figure class="plate" data-mode="wal">
+    <section class="band" aria-labelledby="kept">
+      <div class="band-inner">
+        <header class="band-head">
+          <p class="band-index">01</p>
+          <h2 id="kept">How a write is kept</h2>
+          <p>A produce lands first in a short write-ahead log that the brokers replicate with Raft. When the producer hears back depends on the topic&rsquo;s durability mode.</p>
+        </header>
+        <div class="plates">
+          <figure class="plate" data-mode="wal">
 <!-- diagram:acks -->
 <svg class="dg dg-acks" viewBox="0 100 560 280" fill="none" stroke="currentColor" stroke-width="1" focusable="false" style="overflow:visible;font-family:inherit;font-optical-sizing:auto;font-synthesis:none;font-weight:400" role="img" aria-labelledby="dg-acks-title" aria-describedby="dg-acks-desc">
 <title id="dg-acks-title">Two places to acknowledge</title>
@@ -105,16 +111,16 @@
 <g fill="currentColor" stroke="none" font-size="10" text-anchor="start" opacity="0.5"><text x="80" y="360">time, not to scale</text></g>
 </svg>
 <!-- /diagram:acks -->
-          <div class="modes" role="group" aria-label="Durability mode">
-            <button type="button" data-mode="wal" aria-pressed="true"><code>wal</code></button>
-            <button type="button" data-mode="r2" aria-pressed="false"><code>r2</code></button>
-          </div>
-          <figcaption>
-            <span data-for="wal"><code>wal</code>, the default: acknowledged once a majority of brokers has the batch on disk. The upload follows.</span>
-            <span data-for="r2"><code>r2</code>: acknowledged only after the object is stored and its extent is committed to metadata.</span>
-          </figcaption>
-        </figure>
-        <figure class="plate">
+            <div class="modes" role="group" aria-label="Durability mode">
+              <button type="button" data-mode="wal" aria-pressed="true"><code>wal</code></button>
+              <button type="button" data-mode="r2" aria-pressed="false"><code>r2</code></button>
+            </div>
+            <figcaption>
+              <span data-for="wal"><code>wal</code>, the default: acknowledged once a majority of brokers has the batch on disk. The upload follows.</span>
+              <span data-for="r2"><code>r2</code>: acknowledged only after the object is stored and its extent is committed to metadata.</span>
+            </figcaption>
+          </figure>
+          <figure class="plate">
 <!-- diagram:quorum -->
 <svg class="dg dg-quorum" viewBox="0 72 560 296" fill="none" stroke="currentColor" stroke-width="1" focusable="false" style="overflow:visible;font-family:inherit;font-optical-sizing:auto;font-synthesis:none;font-weight:400" role="img" aria-labelledby="dg-quorum-title" aria-describedby="dg-quorum-desc">
 <title id="dg-quorum-title">Committed where two of three agree</title>
@@ -129,18 +135,21 @@
 <g fill="currentColor" stroke="none" font-size="11" text-anchor="middle" opacity="0.72"><text x="384" y="94">commit index</text></g>
 </svg>
 <!-- /diagram:quorum -->
-          <figcaption>An entry is committed once two of the three brokers have fsynced it. The third catches up from the leader. Once uploaded, that slice of the log is truncated.</figcaption>
-        </figure>
+            <figcaption>An entry is committed once two of the three brokers have fsynced it. The third catches up from the leader. Once uploaded, that slice of the log is truncated.</figcaption>
+          </figure>
+        </div>
       </div>
     </section>
 
-    <section class="home-section home-split">
-      <div class="home-split-text">
-        <h2>One process</h2>
-        <p>Every broker runs the same binary with a different node id. The Kafka listener, the metadata Raft group, the write-ahead log, and the uploader are parts of it, not services beside it.</p>
-        <p>A deployment adds no JVM, no ZooKeeper or KRaft quorum, and no separate database for metadata.</p>
-      </div>
-      <figure class="plate">
+    <section class="band" aria-labelledby="process">
+      <div class="band-inner home-split">
+        <header class="band-head">
+          <p class="band-index">02</p>
+          <h2 id="process">One process</h2>
+          <p>Every broker runs the same binary with a different node id. The Kafka listener, the metadata Raft group, the write-ahead log, and the uploader are parts of it, not services beside it.</p>
+          <p>A deployment adds no JVM, no ZooKeeper or KRaft quorum, and no separate database for metadata.</p>
+        </header>
+        <figure class="plate">
 <!-- diagram:process -->
 <svg class="dg dg-process" viewBox="0 64 560 324" fill="none" stroke="currentColor" stroke-width="1" focusable="false" style="overflow:visible;font-family:inherit;font-optical-sizing:auto;font-synthesis:none;font-weight:400" role="img" aria-labelledby="dg-process-title" aria-describedby="dg-process-desc">
 <title id="dg-process-title">Four parts, one process</title>
@@ -154,15 +163,18 @@
 <g fill="currentColor" stroke="none" font-size="10" text-anchor="middle" opacity="0.5"><text x="89" y="362">JVM</text><text x="181" y="362">ZooKeeper</text><text x="273" y="362">KRaft</text><text x="387" y="362">separate database</text></g>
 </svg>
 <!-- /diagram:process -->
-      </figure>
+        </figure>
+      </div>
     </section>
 
-    <section class="home-section home-split home-split-flip">
-      <div class="home-split-text">
-        <h2>Your client, unchanged</h2>
-        <p>What you point a client at is the bootstrap server. Compatibility is pinned to Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. Where a KIP and that tree disagree, the tree wins. kafka-clients, librdkafka through confluent-kafka, and franz-go produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> stays unmarked until that client has really passed the call.</p>
-      </div>
-      <figure class="plate">
+    <section class="band" aria-labelledby="client">
+      <div class="band-inner home-split home-split-flip">
+        <header class="band-head">
+          <p class="band-index">03</p>
+          <h2 id="client">Your client, unchanged</h2>
+          <p>What you point a client at is the bootstrap server. Compatibility is pinned to Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. Where a KIP and that tree disagree, the tree wins. kafka-clients, librdkafka through confluent-kafka, and franz-go produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> stays unmarked until that client has really passed the call.</p>
+        </header>
+        <figure class="plate">
 <!-- diagram:address -->
 <svg class="dg dg-address" viewBox="0 48 560 344" fill="none" stroke="currentColor" stroke-width="1" focusable="false" style="overflow:visible;font-family:inherit;font-optical-sizing:auto;font-synthesis:none;font-weight:400" role="img" aria-labelledby="dg-address-title" aria-describedby="dg-address-desc">
 <title id="dg-address-title">One address changes</title>
@@ -174,16 +186,19 @@
 <g fill="currentColor" stroke="none" font-size="11" text-anchor="start" opacity="0.72"><text x="370" y="286">Camus</text><text x="74" y="276">your client</text></g>
 </svg>
 <!-- /diagram:address -->
-      </figure>
+        </figure>
+      </div>
     </section>
 
-    <section class="home-section home-split">
-      <div class="home-split-text">
-        <h2>Inside one ack</h2>
-        <p>On three <code>i4i.2xlarge</code> brokers with local NVMe, a <code>wal</code> ack takes 0.93 ms on average, and 2.47 ms at p99.99 over 100,000 acks. The leader&rsquo;s write and fsync, 0.17 ms, run inside the 0.48 ms round trip to the followers.</p>
-        <p><a href="benchmarks.html">All benchmarks</a></p>
-      </div>
-      <figure class="plate">
+    <section class="band" aria-labelledby="ack">
+      <div class="band-inner home-split">
+        <header class="band-head">
+          <p class="band-index">04</p>
+          <h2 id="ack">Inside one ack</h2>
+          <p>On three <code>i4i.2xlarge</code> brokers with local NVMe, a <code>wal</code> ack takes 0.93 ms on average, and 2.47 ms at p99.99 over 100,000 acks. The leader&rsquo;s write and fsync, 0.17 ms, run inside the 0.48 ms round trip to the followers.</p>
+          <p><a href="benchmarks.html">All benchmarks</a></p>
+        </header>
+        <figure class="plate">
 <!-- diagram:ack -->
 <svg class="dg dg-ack" viewBox="0 76 560 352" fill="none" stroke="currentColor" stroke-width="1" focusable="false" style="overflow:visible;font-family:inherit;font-optical-sizing:auto;font-synthesis:none;font-weight:400" role="img" aria-labelledby="dg-ack-title" aria-describedby="dg-ack-desc">
 <title id="dg-ack-title">Inside one ack</title>
@@ -198,11 +213,65 @@
 <g fill="currentColor" stroke="none" font-size="10" text-anchor="start" opacity="0.5"><text x="193.23" y="330">0.17 ms, inside the append</text><text x="80" y="410">means of 100,000 acks, 3 × i4i.2xlarge; bars start together</text></g>
 </svg>
 <!-- /diagram:ack -->
-      </figure>
+        </figure>
+      </div>
     </section>
 
-    <section class="home-section">
-      <h2>Roadmap</h2>
+    <section class="band" aria-labelledby="faq">
+      <div class="band-inner home-split home-faq">
+        <header class="band-head">
+          <p class="band-index">05</p>
+          <h2 id="faq">Questions</h2>
+          <p>What people ask before they point a client at Camus. The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> and <a href="limits.html">Production</a> have the long answers.</p>
+        </header>
+        <div class="faq">
+          <details class="faq-item">
+            <summary><span class="faq-n">01</span><span class="faq-q">Do my Kafka clients work unchanged?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <div class="faq-a"><p>Yes, apart from the bootstrap address. Camus speaks the Apache Kafka 4.4.0 wire protocol. Every pull request runs kafka-clients 4.4.0, confluent-kafka 2.16.1, and franz-go v1.22.0 against it; KafkaJS, confluent-kafka-go, confluent-kafka-dotnet, Kafka Connect, Kafka Streams, MirrorMaker 2, Schema Registry, and Debezium run every night.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary><span class="faq-n">02</span><span class="faq-q">What is not implemented?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <div class="faq-a"><p>Delegation tokens, client quotas, partition reassignment, and share groups. An unimplemented API answers with an error rather than a partial imitation. The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> lists every API and each deliberate difference.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary><span class="faq-n">03</span><span class="faq-q">When is a produce acknowledged?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <div class="faq-a"><p>In <code>wal</code> mode, the default, once a majority of the shard&rsquo;s brokers has the batch on disk. In <code>r2</code> mode, only after the object is stored and its extent committed to metadata. <code>acks=1</code> waits for the same barrier as <code>acks=all</code>.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary><span class="faq-n">04</span><span class="faq-q">What happens if the bucket goes down after an ack?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <div class="faq-a"><p>Nothing acknowledged is lost: the ack already meant a majority fsync, and the bucket is not on that path. Uploads retry until it is back, consumers read the recent tail from the write-ahead log, and producers keep getting acks until the unsealed log reaches its disk limit. Past that, new writes are held, never acknowledged without durability.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary><span class="faq-n">05</span><span class="faq-q">What if a majority of brokers is lost?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <div class="faq-a"><p>That shard&rsquo;s partitions stay offline until a lost broker returns. An operator can instead run <code>camus admin truncate-to-sealed</code>, which resumes at the sealed end and drops acknowledged batches that were not yet sealed. If every broker disk is gone and the bucket remains, <code>camus admin restore-cluster</code> rebuilds from the newest metadata snapshot. <a href="recovery.html">Recovery</a> has the steps.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary><span class="faq-n">06</span><span class="faq-q">How fast is an ack?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <div class="faq-a"><p>On three AWS <code>i4i.2xlarge</code> brokers with local NVMe, a <code>wal</code> ack took 0.93 ms at the median and 2.47 ms at p99.99 over 100,000 acks. An <code>r2</code> ack waits for the object store, about 280 ms there. <a href="benchmarks.html">Benchmarks</a> has every run and its machine.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary><span class="faq-n">07</span><span class="faq-q">Are transactions and exactly-once supported?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <div class="faq-a"><p>Yes. <code>read_committed</code> hides a batch until its transaction commits, and an aborted range is skipped as on Kafka. Kafka Streams with <code>exactly_once_v2</code> and Debezium with exactly-once source tasks run every night.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary><span class="faq-n">08</span><span class="faq-q">Do I need ZooKeeper, KRaft, or a JVM?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <div class="faq-a"><p>No. Metadata replicates with Raft inside the broker, and the broker is one Rust binary. A cluster is three copies of it and a bucket.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary><span class="faq-n">09</span><span class="faq-q">Can one cluster span regions?</span><span class="faq-mark" aria-hidden="true"></span></summary>
+            <div class="faq-a"><p>No. Run one cluster per region and copy between them with MirrorMaker 2, which is tested every night in both directions with consumer offsets translated. <a href="limits.html">Production</a> explains why.</p></div>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="roadmap">
+      <div class="band-inner home-split">
+        <header class="band-head">
+          <p class="band-index">06</p>
+          <h2 id="roadmap">Roadmap</h2>
+          <p>From one broker on a laptop to a cluster you would trust with a workload, in the order the docs take it.</p>
+        </header>
         <ol class="roadmap">
           <li><a href="run.html"><span>Run</span> Start one broker with Docker, or from a checkout. It listens for Kafka and forms a one-node group by itself.</a></li>
           <li><a href="minio.html"><span>Bucket</span> Give it a bucket before you care about the sealed log. Locally that is MinIO, until you point it at R2 or another S3 store.</a></li>
@@ -210,6 +279,7 @@
           <li><a href="durability.html"><span>Durability</span> Choose when a produce is acknowledged. <code>wal</code> answers after a disk majority. <code>r2</code> answers only after the object is stored.</a></li>
           <li><a href="limits.html"><span>Production</span> See what is still sharp, and when not to use Camus, before you trust it with a real workload.</a></li>
         </ol>
+      </div>
     </section>
   </main>
   <footer class="site-footer">

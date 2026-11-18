@@ -434,7 +434,7 @@ td.num {
   align-self: center;
 }
 
-.home-split-text .ports {
+.band-head .ports {
   overflow-wrap: anywhere;
 }
 
@@ -471,23 +471,96 @@ td.num {
 }
 
 .home-main {
+  width: 100%;
+}
+
+/* The home page is a stack of bands, each at least a screen tall on a wide
+   screen, with its content centred and a hairline between bands. */
+.band {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  max-width: none;
+  padding-block: 6rem;
+  border-block-start: 1px solid var(--gray-5);
+}
+
+.band-hero {
+  border-block-start: 0;
+}
+
+.band-inner {
   width: min(var(--page), calc(100% - 2.5rem));
   margin-inline: auto;
-  padding-block: 3.5rem 1rem;
+}
+
+@media (min-width: 52.01rem) and (min-height: 40rem) {
+  .band {
+    min-block-size: 100svh;
+    padding-block: 8rem;
+  }
+
+  .band-hero {
+    min-block-size: calc(100svh - 4rem);
+    padding-block: 4rem 6rem;
+  }
+}
+
+.band-head {
+  max-width: 34rem;
+}
+
+.band-inner > .band-head {
+  margin-block-end: 5rem;
+}
+
+.band-index {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0 0 1.75rem;
+  color: var(--muted);
+  font-size: var(--step-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.band-index::after {
+  content: "";
+  inline-size: 2.5rem;
+  block-size: 1px;
+  background: var(--gray-8);
+}
+
+.band-head h2 {
+  margin: 0 0 1.5rem;
+  font-size: var(--step-3up);
+  line-height: 1.3;
+}
+
+.band-head p:not(.band-index) {
+  margin: 0;
+  text-wrap: pretty;
+}
+
+.band-head p:not(.band-index) + p {
+  margin-block-start: 1rem;
 }
 
 .home-hero {
-  max-width: none;
   display: grid;
   grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
   align-items: center;
-  gap: 3rem;
+  gap: 5rem;
+}
+
+.home-hero .lede {
+  margin-block-end: 2.5rem;
 }
 
 .home-hero h1 {
-  margin-block-end: 1.25rem;
-  font-size: var(--step-4up);
-  line-height: 1.25;
+  margin-block-end: 1.75rem;
+  font-size: var(--step-5up);
+  line-height: 1.2;
 }
 
 .home-actions {
@@ -545,33 +618,112 @@ td.num {
   text-wrap: pretty;
 }
 
-.home-section {
-  max-width: none;
-  margin-block-start: 5.5rem;
-}
-
-.home-section h2 {
-  margin-block-start: 0;
-}
-
-.home-section-lede {
-  max-width: var(--measure);
-  margin: 0 0 2rem;
-  text-wrap: pretty;
-}
-
 .plates {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 3rem;
+  gap: 4rem 6rem;
   align-items: start;
 }
 
 .home-split {
   display: grid;
-  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
   align-items: center;
-  gap: 3rem;
+  gap: 4rem 7rem;
+}
+
+.home-faq {
+  align-items: start;
+}
+
+@media (min-width: 52.01rem) {
+  .home-faq > .band-head {
+    position: sticky;
+    inset-block-start: 6rem;
+  }
+}
+
+/* Questions, ruled like a drawing's schedule: a number, the question, and a
+   plus drawn from two hairlines that loses its upright when open. */
+.faq {
+  border-block-start: 1px solid var(--gray-6);
+}
+
+.faq-item {
+  border-block-end: 1px solid var(--gray-6);
+}
+
+.faq-item summary {
+  display: grid;
+  grid-template-columns: 2.25rem minmax(0, 1fr) 0.75rem;
+  align-items: baseline;
+  gap: 1rem;
+  padding-block: 1.6rem;
+  color: var(--text-strong);
+  cursor: pointer;
+  list-style: none;
+}
+
+.faq-item summary::-webkit-details-marker {
+  display: none;
+}
+
+.faq-n {
+  color: var(--muted);
+  font-size: var(--step-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.faq-q {
+  text-wrap: balance;
+}
+
+.faq-mark {
+  position: relative;
+  align-self: center;
+  inline-size: 0.75rem;
+  block-size: 0.75rem;
+  color: var(--muted);
+}
+
+.faq-mark::before,
+.faq-mark::after {
+  content: "";
+  position: absolute;
+  background: currentColor;
+}
+
+.faq-mark::before {
+  inset-inline: 0;
+  inset-block-start: calc(50% - 0.5px);
+  block-size: 1px;
+}
+
+.faq-mark::after {
+  inset-block: 0;
+  inset-inline-start: calc(50% - 0.5px);
+  inline-size: 1px;
+  transition: transform 200ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.faq-item[open] .faq-mark::after {
+  transform: scaleY(0);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .faq-item summary:hover .faq-mark {
+    color: var(--text-strong);
+  }
+}
+
+.faq-a {
+  padding: 0 1.75rem 2rem 3.25rem;
+}
+
+.faq-a p {
+  max-width: 60ch;
+  margin: 0;
+  text-wrap: pretty;
 }
 
 .home-split-flip {
@@ -582,15 +734,6 @@ td.num {
   .home-split-flip > .plate {
     order: -1;
   }
-}
-
-.home-split-text p {
-  margin: 0;
-  text-wrap: pretty;
-}
-
-.home-split-text p + p {
-  margin-block-start: 0.85rem;
 }
 
 /* The durability figure: the reader picks which acknowledgement the drawing
@@ -783,9 +926,29 @@ td.num {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .home-main {
+  .band-inner {
     width: calc(100% - 2rem);
-    padding-block-start: 2rem;
+  }
+
+  .band {
+    padding-block: 4.5rem;
+  }
+
+  .band-hero {
+    padding-block: 2.5rem 4.5rem;
+  }
+
+  .home-hero,
+  .home-split {
+    gap: 3.5rem;
+  }
+
+  .band-inner > .band-head {
+    margin-block-end: 3.5rem;
+  }
+
+  .faq-a {
+    padding-inline: 3.25rem 0;
   }
 
   .site-header.nav-collapsible {
@@ -1156,7 +1319,8 @@ footer {
   .nav-toggle svg,
   .github,
   .dg-wait-wal,
-  .dg-wait-r2 {
+  .dg-wait-r2,
+  .faq-mark::after {
     transition: none;
   }
 }
