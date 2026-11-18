@@ -14,9 +14,16 @@
     toggle.setAttribute("aria-expanded", "false");
     toggle.setAttribute("aria-controls", "nav-pages");
     pages.id = "nav-pages";
-    toggle.innerHTML =
-      '<span></span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>';
-    toggle.firstChild.textContent = current ? current.textContent : "Menu";
+    if (nav.classList.contains("site-header")) {
+      toggle.classList.add("nav-hamburger");
+      toggle.setAttribute("aria-label", "Menu");
+      toggle.innerHTML =
+        '<span class="nav-hamburger-box" aria-hidden="true"><span></span><span></span><span></span></span>';
+    } else {
+      toggle.innerHTML =
+        '<span></span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>';
+      toggle.firstChild.textContent = current ? current.textContent : "Menu";
+    }
     nav.querySelector(".mark").after(toggle);
     nav.classList.add("nav-collapsible");
 
@@ -41,6 +48,20 @@
       toggle.focus();
     });
   }
+  var stars = document.querySelector("[data-stars]");
+  if (stars) {
+    fetch("https://api.github.com/repos/nidheesh-m-vakharia/camus")
+      .then(function (response) {
+        return response.json();
+      })
+      .then(function (repo) {
+        if (typeof repo.stargazers_count === "number") {
+          stars.textContent = String(repo.stargazers_count);
+        }
+      })
+      .catch(function () {});
+  }
+
   var main = document.querySelector("main");
   if (!main) return;
 

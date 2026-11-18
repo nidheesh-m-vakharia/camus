@@ -3,19 +3,19 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Camus — compatible with Apache Kafka, log in object storage</title>
+  <title>Camus. Compatible with Apache Kafka, log in object storage</title>
   <meta name="description" content="Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
   <link rel="canonical" href="https://camus.nidheesh.dev/">
   <meta name="robots" content="index,follow">
   <meta property="og:site_name" content="Camus">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Camus — compatible with Apache Kafka, log in object storage">
+  <meta property="og:title" content="Camus. Compatible with Apache Kafka, log in object storage">
   <meta property="og:description" content="Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
   <meta property="og:url" content="https://camus.nidheesh.dev/">
   <meta property="og:image" content="https://camus.nidheesh.dev/banner.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:image" content="https://camus.nidheesh.dev/banner.png">
-  <meta name="twitter:title" content="Camus — compatible with Apache Kafka, log in object storage">
+  <meta name="twitter:title" content="Camus. Compatible with Apache Kafka, log in object storage">
   <meta name="twitter:description" content="Camus is a broker compatible with Apache Kafka, in one Rust binary. The log lives in R2 or any S3 bucket. Clients change the bootstrap address.">
   <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
@@ -39,6 +39,15 @@
 <body class="home">
   <a class="skip" href="#content">Skip to content</a>
   <header class="site-header">
+    <div class="header-blur" aria-hidden="true">
+      <div></div>
+      <div></div>
+      <div></div>
+      <div></div>
+      <div></div>
+      <div></div>
+      <div class="header-blur-fade"></div>
+    </div>
       <a class="mark" href="index.html">
         <svg class="mark-svg" viewBox="0 0 32 28" fill="currentColor" aria-hidden="true">
           <circle cx="4.6" cy="4.6" r="2.7"/>
@@ -58,15 +67,15 @@
       <li><a href="setup.html">Setup</a></li>
       <li><a href="docs.html">Docs</a></li>
     </ul>
-    <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">GitHub</a>
+    <a class="github" href="https://github.com/nidheesh-m-vakharia/camus">GitHub <span class="stars"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.2l1.7 3.9 4.3.4-3.2 2.9.9 4.2L8 10.5 4.3 12.6l.9-4.2L2 5.5l4.3-.4z"/></svg><span data-stars>29</span></span></a>
   </header>
   <main id="content" class="home-main">
     <section class="band band-hero">
       <div class="band-inner home-hero">
         <div class="home-hero-text">
           <h1>A broker compatible with Apache Kafka. The log stays in object storage.</h1>
-          <p class="lede">Producers, consumers, and admin clients speak the Kafka wire protocol. The durable log lives in Cloudflare R2, or any S3-compatible bucket. A small set of Rust binaries replicates metadata, and a short write-ahead log, with Raft.</p>
-          <p class="home-actions"><a class="button" href="run.html">Run one broker</a><a href="durability.html">How a produce is acknowledged</a></p>
+          <p class="lede">Producers, consumers, and admin clients speak the Kafka wire protocol. The durable log lives in Cloudflare R2, or any S3-compatible bucket. One Rust binary replicates metadata and a short write-ahead log with Raft.</p>
+          <p class="home-actions"><a class="button" href="run.html">Run one broker</a><a class="button button-line" href="durability.html">How a produce is acknowledged</a></p>
         </div>
         <figure class="plate">
 <!-- diagram:tail -->
@@ -114,7 +123,7 @@
       <div class="band-inner">
         <header class="band-head">
           <h2 id="kept">How a write is kept</h2>
-          <p>A produce lands first in a short write-ahead log that the brokers replicate with Raft. When the producer hears back depends on the topic&rsquo;s durability mode.</p>
+          <p>A produce lands first in a short write-ahead log. The brokers replicate that log with Raft. The topic&rsquo;s durability mode decides when the producer hears back.</p>
         </header>
         <div class="plates">
           <figure class="plate" data-mode="wal">
@@ -207,7 +216,9 @@
       <div class="band-inner home-split home-split-flip">
         <header class="band-head">
           <h2 id="client">Your client, unchanged</h2>
-          <p>What you point a client at is the bootstrap server. Compatibility is pinned to Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. Where a KIP and that tree disagree, the tree wins. kafka-clients, librdkafka through confluent-kafka, and franz-go produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> stays unmarked until that client has really passed the call.</p>
+          <p>Change <code>bootstrap.servers</code>. The client code and the rest of its configuration stay as they are.</p>
+          <p>The reference is Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. When a KIP and that tree disagree, the tree wins.</p>
+          <p>kafka-clients 4.4.0, librdkafka through confluent-kafka 2.16.1, and franz-go v1.22.0 have been run against it. They produce, fetch, join groups, run transactions, compact a log, and call the admin APIs those libraries expose. A cell in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> stays empty until that client has passed the call.</p>
         </header>
         <figure class="plate">
 <!-- diagram:address -->
@@ -262,7 +273,7 @@
       <div class="band-inner home-split home-faq">
         <header class="band-head">
           <h2 id="faq">Questions</h2>
-          <p>What people ask before they point a client at Camus. The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> and <a href="limits.html">Production</a> have the long answers.</p>
+          <p>Read these before you point a client at Camus. The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> and <a href="limits.html">Production</a> have the longer versions.</p>
         </header>
         <div class="faq">
           <details class="faq-item">
@@ -279,7 +290,7 @@
           </details>
           <details class="faq-item">
             <summary><span class="faq-q">What happens if the bucket goes down after an ack?</span><span class="faq-mark" aria-hidden="true"></span></summary>
-            <div class="faq-a"><p>Nothing acknowledged is lost: the ack already meant a majority fsync, and the bucket is not on that path. Uploads retry until it is back, consumers read the recent tail from the write-ahead log, and producers keep getting acks until the unsealed log reaches its disk limit. Past that, new writes are held, never acknowledged without durability.</p></div>
+            <div class="faq-a"><p>Nothing acknowledged is lost. The ack already meant a majority fsync, and the bucket is not on that path. Uploads retry until it is back. Consumers read the recent tail from the write-ahead log, and producers keep getting acks until the unsealed log reaches its disk limit. Past that, new writes wait. Camus does not acknowledge a write it cannot keep.</p></div>
           </details>
           <details class="faq-item">
             <summary><span class="faq-q">What if a majority of brokers is lost?</span><span class="faq-mark" aria-hidden="true"></span></summary>
@@ -309,14 +320,14 @@
       <div class="band-inner home-split">
         <header class="band-head">
           <h2 id="roadmap">Roadmap</h2>
-          <p>From one broker on a laptop to a cluster you would trust with a workload, in the order the docs take it.</p>
+          <p>Start with one broker. The later pages are what you check before a real workload.</p>
         </header>
         <ol class="roadmap">
           <li><a href="run.html"><span>Run</span> Start one broker with Docker, or from a checkout. It listens for Kafka and forms a one-node group by itself.</a></li>
           <li><a href="minio.html"><span>Bucket</span> Give it a bucket before you care about the sealed log. Locally that is MinIO, until you point it at R2 or another S3 store.</a></li>
           <li><a href="clients.html"><span>Clients</span> Change the bootstrap address and keep the client you already have. kafka-clients, librdkafka, and franz-go have been run against the broker.</a></li>
           <li><a href="durability.html"><span>Durability</span> Choose when a produce is acknowledged. <code>wal</code> answers after a disk majority. <code>r2</code> answers only after the object is stored.</a></li>
-          <li><a href="limits.html"><span>Production</span> See what is still sharp, and when not to use Camus, before you trust it with a real workload.</a></li>
+          <li><a href="limits.html"><span>Production</span> Read what is still unfinished, and when not to use Camus, before a real workload.</a></li>
         </ol>
       </div>
     </section>
