@@ -93,7 +93,6 @@
     <section class="band" aria-labelledby="kept">
       <div class="band-inner">
         <header class="band-head">
-          <p class="band-index">01</p>
           <h2 id="kept">How a write is kept</h2>
           <p>A produce lands first in a short write-ahead log that the brokers replicate with Raft. When the producer hears back depends on the topic&rsquo;s durability mode.</p>
         </header>
@@ -144,7 +143,6 @@
     <section class="band" aria-labelledby="process">
       <div class="band-inner home-split">
         <header class="band-head">
-          <p class="band-index">02</p>
           <h2 id="process">One process</h2>
           <p>Every broker runs the same binary with a different node id. The Kafka listener, the metadata Raft group, the write-ahead log, and the uploader are parts of it, not services beside it.</p>
           <p>A deployment adds no JVM, no ZooKeeper or KRaft quorum, and no separate database for metadata.</p>
@@ -170,7 +168,6 @@
     <section class="band" aria-labelledby="client">
       <div class="band-inner home-split home-split-flip">
         <header class="band-head">
-          <p class="band-index">03</p>
           <h2 id="client">Your client, unchanged</h2>
           <p>What you point a client at is the bootstrap server. Compatibility is pinned to Apache Kafka 4.4.0, commit <span class="ports">1156b2752aaa28eafc0b4c4d387e63356793268d</span>. Where a KIP and that tree disagree, the tree wins. kafka-clients, librdkafka through confluent-kafka, and franz-go produce, fetch, join groups, run transactions, compact a log, and call the admin APIs their libraries expose. A column in the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> stays unmarked until that client has really passed the call.</p>
         </header>
@@ -193,7 +190,6 @@
     <section class="band" aria-labelledby="ack">
       <div class="band-inner home-split">
         <header class="band-head">
-          <p class="band-index">04</p>
           <h2 id="ack">Inside one ack</h2>
           <p>On three <code>i4i.2xlarge</code> brokers with local NVMe, a <code>wal</code> ack takes 0.93 ms on average, and 2.47 ms at p99.99 over 100,000 acks. The leader&rsquo;s write and fsync, 0.17 ms, run inside the 0.48 ms round trip to the followers.</p>
           <p><a href="benchmarks.html">All benchmarks</a></p>
@@ -220,7 +216,6 @@
     <section class="band" aria-labelledby="faq">
       <div class="band-inner home-split home-faq">
         <header class="band-head">
-          <p class="band-index">05</p>
           <h2 id="faq">Questions</h2>
           <p>What people ask before they point a client at Camus. The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> and <a href="limits.html">Production</a> have the long answers.</p>
         </header>
@@ -268,7 +263,6 @@
     <section class="band" aria-labelledby="roadmap">
       <div class="band-inner home-split">
         <header class="band-head">
-          <p class="band-index">06</p>
           <h2 id="roadmap">Roadmap</h2>
           <p>From one broker on a laptop to a cluster you would trust with a workload, in the order the docs take it.</p>
         </header>
