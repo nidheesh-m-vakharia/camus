@@ -158,8 +158,14 @@ fn run_fjall(
         let payload = owned.clone();
         let id = next.fetch_add(1, Ordering::Relaxed);
         let path = dir.path().join(id.to_string());
-        let keyspace = fjall::Config::new(&path).open().unwrap();
-        let partition = keyspace.open_partition("log", Default::default()).unwrap();
+        let keyspace = match fjall::Database::builder(&path).open() {
+            Ok(db) => db,
+            Err(err) => panic!("open fjall: {err}"),
+        };
+        let partition = match keyspace.keyspace("log", fjall::KeyspaceCreateOptions::default) {
+            Ok(partition) => partition,
+            Err(err) => panic!("open fjall keyspace: {err}"),
+        };
         let mut index = 1u64;
         move || {
             for offset in 0..batch {
