@@ -372,6 +372,14 @@ pub enum Command {
         /// Slices in commit order.
         parts: Vec<PublishPart>,
     },
+    /// Drop a mirror partition's copy so the copier starts it again at the
+    /// source's log start (ADR 0018). Loses what the mirror held.
+    ResetMirrorPartition {
+        /// Mirror topic name.
+        topic: String,
+        /// Partition index.
+        partition: i32,
+    },
 }
 
 /// State-machine response for [`Command`].
@@ -796,6 +804,11 @@ mod command_tests {
         };
         assert_eq!(first(&create)?, 31);
         assert_eq!(first(&Command::PublishMirror { parts: Vec::new() })?, 32);
+        let reset = Command::ResetMirrorPartition {
+            topic: "t".into(),
+            partition: 0,
+        };
+        assert_eq!(first(&reset)?, 33);
         Ok(())
     }
 }

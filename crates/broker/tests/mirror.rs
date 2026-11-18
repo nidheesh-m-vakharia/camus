@@ -533,3 +533,144 @@ fn a_mirror_copies_the_source_and_outlives_it() -> TestResult {
     assert!(copied > 0, "{copied} bytes copied");
     Ok(())
 }
+
+/// `camus_mirror_stalled_partitions` on `http`.
+fn stalled(http: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let metrics = reqwest::blocking::Client::new()
+        .get(format!("http://{http}/metrics"))
+        .send()?
+        .text()?;
+    Ok(metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("camus_mirror_stalled_partitions "))
+        .ok_or("no stalled series")?
+        .parse()?)
+}
+
+/// A mirror whose source deleted records it had not copied stalls, and a
+/// reset starts it again at the source's log start.
+#[test]
+fn a_stalled_mirror_starts_again_after_a_reset() -> TestResult {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("mirror reset test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let source_prefix = format!("mirror-reset-src-{pid}/");
+    let source_dir = tempfile::tempdir()?;
+    let source = spawn_under(source_dir.path(), &source_prefix, &[]);
+    let source_addr = kafka_addr(&source);
+    for at in 0..40 {
+        assert_eq!(produce(&source_addr, &format!("record-{at}")), (0, at));
+    }
+    support::wait_sealed(&source.http, 40);
+
+    let dest_dir = tempfile::tempdir()?;
+    let dest_opts = |copy_ms: &str| {
+        Opts::default()
+            .env("CAMUS_S3_PREFIX", &format!("mirror-reset-dst-{pid}/"))
+            .env("CAMUS_MIRROR_COPY_MS", copy_ms)
+            .env("CAMUS_MIRROR_US_EAST_ACCESS_KEY", "camus")
+            .env("CAMUS_MIRROR_US_EAST_SECRET_KEY", "camus-dev-secret")
+    };
+    let mut dest = support::Node::with(1, dest_dir.path(), dest_opts("200"));
+    support::init(std::slice::from_ref(&dest), &[1]);
+    support::wait_settled(&[&dest]);
+    let client = reqwest::blocking::Client::new();
+    let link = MirrorLink {
+        alias: "us-east".into(),
+        endpoint: "http://127.0.0.1:9100".into(),
+        region: "us-east-1".into(),
+        bucket: "camus".into(),
+        prefix: source_prefix.clone(),
+        virtual_host: false,
+    };
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/links", dest.http))
+            .json(&link)
+            .send()
+    })?;
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/topics", dest.http))
+            .json(&serde_json::json!({ "alias": "us-east", "topic": support::TOPIC }))
+            .send()
+    })?;
+    support::wait_sealed(&dest.http, 40);
+
+    // Pause copying, then let the source move its log start past 40.
+    dest.restart_with(dest_opts("3600000"));
+    support::wait_settled(&[&dest]);
+    for at in 40..60 {
+        assert_eq!(produce(&source_addr, &format!("record-{at}")), (0, at));
+    }
+    support::wait_sealed(&source.http, 60);
+    let mut cut = DeleteRecordsTopic::default();
+    cut.name = TopicName(StrBytes::from_static_str(support::TOPIC));
+    cut.partitions = vec![DeleteRecordsPartition::default()
+        .with_partition_index(0)
+        .with_offset(50)];
+    let mut stream = connect(&source_addr);
+    send(
+        &mut stream,
+        ApiKey::DeleteRecords,
+        2,
+        &DeleteRecordsRequest::default()
+            .with_topics(vec![cut])
+            .with_timeout_ms(5_000),
+    );
+    let deleted = recv::<DeleteRecordsResponse>(&mut stream, 2);
+    assert_eq!(deleted.topics[0].partitions[0].error_code, 0);
+    // A snapshot that shows the new log start.
+    std::thread::sleep(std::time::Duration::from_millis(1_000));
+
+    dest.restart_with(dest_opts("200"));
+    support::wait_settled(&[&dest]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while stalled(&dest.http)? != 1 {
+        if std::time::Instant::now() > deadline {
+            return Err("the mirror never reported a stall".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(
+        support::sealed_end(&dest.http),
+        40,
+        "a stalled mirror does not jump"
+    );
+
+    let reset = |accept: bool| {
+        client
+            .post(format!("http://{}/admin/mirror/reset", dest.http))
+            .json(&serde_json::json!({
+                "topic": support::TOPIC,
+                "partition": 0,
+                "i_accept_data_loss": accept,
+            }))
+            .send()
+    };
+    assert_eq!(reset(false)?.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(reset(true)?.status(), StatusCode::OK);
+    support::wait_sealed(&dest.http, 60);
+    let raw = support::read_key(
+        &dest.http,
+        &camus_metadata::topic_storage_key(support::TOPIC),
+    )
+    .ok_or("no topic")?;
+    let id = camus_metadata::parse_topic(&raw)?.id;
+    let part = support::read_key(&dest.http, &camus_metadata::partition_storage_key(&id, 0))
+        .ok_or("no partition")?;
+    assert_eq!(camus_metadata::parse_partition(&part)?.log_start, 50);
+    let (code, values) = support::fetch_at(&kafka_addr(&dest), 50);
+    assert_eq!(code, 0);
+    assert_eq!(values.first().map(String::as_str), Some("record-50"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while stalled(&dest.http)? != 0 {
+        if std::time::Instant::now() > deadline {
+            return Err("the mirror stayed stalled after the reset".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(())
+}

@@ -258,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
                     axum::routing::delete(remove_mirror_link),
                 )
                 .route("/admin/mirror/topics", post(create_mirror_topic))
+                .route("/admin/mirror/reset", post(reset_mirror_partition))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
                 .route("/wal/{shard}/txn-span", post(shard_txn_span))
@@ -1647,6 +1648,34 @@ fn source_error(alias: &str, err: &anyhow::Error) -> (StatusCode, String) {
 }
 
 #[derive(Deserialize)]
+struct MirrorReset {
+    topic: String,
+    partition: i32,
+    #[serde(default)]
+    i_accept_data_loss: bool,
+}
+
+/// Drop a stalled mirror partition's copy so the copier starts it again at
+/// the source's log start. Refused without `i_accept_data_loss`.
+async fn reset_mirror_partition(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<MirrorReset>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !body.i_accept_data_loss {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a reset drops what the mirror holds; pass i_accept_data_loss".into(),
+        ));
+    }
+    let what = format!("mirror {} partition {}", body.topic, body.partition);
+    let command = Command::ResetMirrorPartition {
+        topic: body.topic,
+        partition: body.partition,
+    };
+    mirror_outcome(&admin, command, &what).await
+}
+
+#[derive(Deserialize)]
 struct MirrorCreate {
     alias: String,
     topic: String,
@@ -1718,6 +1747,7 @@ async fn mirror_outcome(
             StatusCode::CONFLICT,
             format!("{what}: the alias names another bucket, or a mirror topic still uses it"),
         )),
+        3 => Err((StatusCode::NOT_FOUND, format!("{what}: no such topic or partition"))),
         36 => Err((StatusCode::CONFLICT, format!("{what}: the topic exists"))),
         code => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

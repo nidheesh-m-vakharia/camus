@@ -161,6 +161,47 @@ pub fn create_topic(
     catalog::create_topic_as(get, name, id, partitions, "r2", &[], Some(of.clone()))
 }
 
+/// Drop a mirror partition's copy, for a partition whose source retention
+/// passed its end. The log start moves up to the next offset and the
+/// extents below it go, so the partition holds nothing. The copier then
+/// starts it again at the source's log start. Refused on a plain topic.
+pub fn reset_partition(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    scan: catalog::Scan,
+    name: &str,
+    partition: i32,
+) -> Result<Outcome, String> {
+    let Some(raw) = get(&catalog::topic_storage_key(name))? else {
+        return Ok(Outcome::Reject(3));
+    };
+    let topic = catalog::parse_topic(&raw)?;
+    if topic.mirror_of.is_none() {
+        return Ok(Outcome::Reject(INVALID_REQUEST));
+    }
+    if partition < 0 || partition >= topic.partitions {
+        return Ok(Outcome::Reject(3));
+    }
+    let key = catalog::partition_storage_key(&topic.id, partition);
+    let Some(raw) = get(&key)? else {
+        return Ok(Outcome::Reject(3));
+    };
+    let mut state = catalog::parse_partition(&raw)?;
+    let mut put = Vec::new();
+    catalog::migrate_extents(&topic.id, partition, &mut state, &mut put)?;
+    state.log_start = state.next_offset;
+    let del = catalog::extent_keys_through(scan, &topic.id, partition, state.log_start)?;
+    catalog::prune_spans(&mut state);
+    put.push((
+        key,
+        serde_json::to_string(&state).map_err(|err| err.to_string())?,
+    ));
+    Ok(Outcome::Change {
+        put,
+        del,
+        value: None,
+    })
+}
+
 /// Whether a mirror topic may go from `before` to `after`. Only retention is
 /// the destination's own; every other config follows the source. Configs
 /// compare by value, so a legacy `AlterConfigs` that drops an override equal
@@ -390,6 +431,52 @@ mod tests {
         let created = catalog::create_topic(&get, "plain", "plain-id", 1, "r2", &[])?;
         assert_eq!(apply(&mut map, created)?, 0);
         assert_eq!(publish_copied(&mut map, &[part("plain", 0, 10)])?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_reset_empties_a_mirror_partition_for_a_fresh_start() -> TestResult {
+        let mut map = HashMap::new();
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(mirror(&mut map, "events", "us-east")?, 0);
+        assert_eq!(publish_copied(&mut map, &[part("events", 0, 40)])?, 0);
+        let scan_of = |map: &HashMap<String, String>, from: &str, to: &str, limit: usize| {
+            let mut rows: Vec<(String, String)> = map
+                .iter()
+                .filter(|(key, _)| key.as_str() >= from && key.as_str() < to)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            rows.sort();
+            rows.truncate(limit);
+            rows
+        };
+        assert!(!scan_of(&map, "ext/", "ext0", 10).is_empty());
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let scan = |from: &str, to: &str, limit: usize| Ok(scan_of(&snapshot, from, to, limit));
+        let reset = reset_partition(&get, &scan, "events", 0)?;
+        assert_eq!(apply(&mut map, reset)?, 0);
+        let state = partition(&map, "events")?;
+        assert_eq!((state.log_start, state.next_offset), (40, 40));
+        assert!(
+            scan_of(&map, "ext/", "ext0", 10).is_empty(),
+            "the copy is dropped"
+        );
+        // Empty again, so the copier may start at the source's log start.
+        assert_eq!(publish_copied(&mut map, &[part("events", 90, 100)])?, 0);
+        assert_eq!(partition(&map, "events")?.log_start, 90);
+
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let scan = |_: &str, _: &str, _: usize| Ok(Vec::new());
+        assert!(matches!(
+            reset_partition(&get, &scan, "events", 5)?,
+            Outcome::Reject(3)
+        ));
+        assert!(matches!(
+            reset_partition(&get, &scan, "nope", 0)?,
+            Outcome::Reject(3)
+        ));
         Ok(())
     }
 

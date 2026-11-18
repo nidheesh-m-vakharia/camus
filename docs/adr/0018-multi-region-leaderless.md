@@ -611,5 +611,27 @@ Phase 1, third part: the copier.
      batch's, and answers `OffsetForLeaderEpoch` for that epoch with 60.
   6. With every source broker gone, the mirror still serves all 60 and
      refuses produce.
-- Not built yet: `camus admin mirror reset` for a stalled partition,
-  transaction spans and consumer group offsets (phase 2), and promotion.
+- Not built yet: transaction spans, consumer group offsets, and promotion
+  (phase 2).
+
+Phase 1, fourth part: reset.
+
+- `camus admin mirror reset --topic --partition --i-accept-data-loss`, or
+  `POST /admin/mirror/reset`, commits `ResetMirrorPartition` (log position
+  33).
+- The reset moves the partition's log start up to its next offset, drops
+  its extents, and prunes its transaction spans, so the partition holds
+  nothing. It does not read the source. The copier's empty-partition rule
+  then starts the partition again at the source's log start.
+- It is refused without the flag (400), on a plain topic (400), and for
+  an unknown topic or partition (404).
+- The MinIO test `a_stalled_mirror_starts_again_after_a_reset` covers it:
+  1. A mirror copies 40 records, and copying pauses.
+  2. The source takes 20 more and deletes the records below 50.
+  3. The mirror reports one stalled partition and stays at 40.
+  4. After the reset, the mirror starts at 50, catches up to 60, and
+     serves `record-50` first.
+
+Phase 1 is complete. A Camus cluster can mirror another Camus cluster's
+non-transactional topics with the same offsets and bytes, and keeps them
+after the source is gone.

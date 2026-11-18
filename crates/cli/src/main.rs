@@ -120,6 +120,22 @@ enum Mirror {
         #[arg(long)]
         topic: String,
     },
+    /// Drop a stalled mirror partition's copy, so it starts again at the
+    /// source's log start. For a partition the source's retention passed.
+    Reset {
+        /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
+        #[arg(long)]
+        broker: Option<String>,
+        /// The mirror topic.
+        #[arg(long)]
+        topic: String,
+        /// The partition.
+        #[arg(long)]
+        partition: i32,
+        /// Required: the mirror's copy of the partition is deleted.
+        #[arg(long, default_value_t = false)]
+        i_accept_data_loss: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -302,6 +318,31 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             println!("mirroring {topic} from {alias}");
+        }
+        Top::Admin(Admin::Mirror(Mirror::Reset {
+            broker,
+            topic,
+            partition,
+            i_accept_data_loss,
+        })) => {
+            confirm(
+                i_accept_data_loss,
+                "reset",
+                "reset deletes this mirror's copy of the partition; it starts again at \
+                 the source's log start.",
+            )?;
+            let broker = broker_addr(broker)?;
+            let body = serde_json::json!({
+                "topic": topic,
+                "partition": partition,
+                "i_accept_data_loss": true,
+            });
+            let (status, text) = post(&broker, "/admin/mirror/reset", &body)?;
+            if !status.is_success() {
+                eprintln!("{broker} refused ({status}): {text}");
+                std::process::exit(1);
+            }
+            println!("reset {topic} partition {partition}");
         }
         Top::Admin(Admin::Mirror(Mirror::Link(Link::List { broker }))) => {
             let broker = broker_addr(broker)?;
