@@ -622,7 +622,13 @@ Phase 1, fourth part: reset.
 - The reset moves the partition's log start up to its next offset, drops
   its extents, and prunes its transaction spans, so the partition holds
   nothing. It does not read the source. The copier's empty-partition rule
-  then starts the partition again at the source's log start.
+  then goes on from the later of the old end and the source's log start.
+  For a stalled partition, that is the source's log start, past the gap.
+  A partition that was not stalled only loses its history and goes on
+  from where it was.
+- The reset deletes every extent key of the partition in one apply, as
+  `DeleteRecords` to the high watermark would. The partition's own
+  retention bounds how many there are.
 - It is refused without the flag (400), on a plain topic (400), and for
   an unknown topic or partition (404).
 - The MinIO test `a_stalled_mirror_starts_again_after_a_reset` covers it:

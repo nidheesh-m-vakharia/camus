@@ -622,8 +622,50 @@ fn a_stalled_mirror_starts_again_after_a_reset() -> TestResult {
     );
     let deleted = recv::<DeleteRecordsResponse>(&mut stream, 2);
     assert_eq!(deleted.topics[0].partitions[0].error_code, 0);
-    // A snapshot that shows the new log start.
-    std::thread::sleep(std::time::Duration::from_millis(1_000));
+    // Wait until `CURRENT`, which the copier reads, names a snapshot taken
+    // after the delete. An older one still names the records below 50, and
+    // their objects are still there, so copying from it is fine but would
+    // not stall.
+    let applied: u64 = client
+        .get(format!("http://{}/metrics", source.http))
+        .send()?
+        .text()?
+        .lines()
+        .find_map(|line| line.strip_prefix("camus_raft_last_applied "))
+        .ok_or("no applied series")?
+        .parse()?;
+    let bucket = camus_storage::Bucket::connect(&camus_storage::BucketConfig {
+        endpoint: "http://127.0.0.1:9100".into(),
+        bucket: "camus".into(),
+        region: "us-east-1".into(),
+        access_key: "camus".into(),
+        secret_key: "camus-dev-secret".into(),
+        prefix: source_prefix.clone(),
+        virtual_hosted: false,
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let (pointer, _) = runtime.block_on(bucket.get_tail("meta/snap/CURRENT", 1024))?;
+        let named = String::from_utf8(pointer.to_vec())?;
+        // `meta/snap/{term}-{index}.snap`
+        let index: u64 = named
+            .trim()
+            .trim_end_matches(".snap")
+            .rsplit('-')
+            .next()
+            .ok_or("no index")?
+            .parse()?;
+        if index >= applied {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("CURRENT stayed at {named}").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
     dest.restart_with(dest_opts("200"));
     support::wait_settled(&[&dest]);

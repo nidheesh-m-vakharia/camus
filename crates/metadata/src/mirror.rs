@@ -164,7 +164,9 @@ pub fn create_topic(
 /// Drop a mirror partition's copy, for a partition whose source retention
 /// passed its end. The log start moves up to the next offset and the
 /// extents below it go, so the partition holds nothing. The copier then
-/// starts it again at the source's log start. Refused on a plain topic.
+/// goes on from the later of that offset and the source's log start: past
+/// the gap for a stalled partition, from where it was for one that was not.
+/// Refused on a plain topic.
 pub fn reset_partition(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     scan: catalog::Scan,
@@ -187,8 +189,10 @@ pub fn reset_partition(
     };
     let mut state = catalog::parse_partition(&raw)?;
     let mut put = Vec::new();
-    catalog::migrate_extents(&topic.id, partition, &mut state, &mut put)?;
+    // Move the log start first, as `delete_records` does, so migrating
+    // legacy extents writes none of the ones this drops.
     state.log_start = state.next_offset;
+    catalog::migrate_extents(&topic.id, partition, &mut state, &mut put)?;
     let del = catalog::extent_keys_through(scan, &topic.id, partition, state.log_start)?;
     catalog::prune_spans(&mut state);
     put.push((

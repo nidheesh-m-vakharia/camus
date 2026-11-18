@@ -1672,7 +1672,24 @@ async fn reset_mirror_partition(
         topic: body.topic,
         partition: body.partition,
     };
-    mirror_outcome(&admin, command, &what).await
+    let response = metadata_apply(&admin, command)
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    match response.error_code {
+        0 => Ok(StatusCode::OK),
+        3 => Err((
+            StatusCode::NOT_FOUND,
+            format!("{what}: no such topic or partition"),
+        )),
+        camus_metadata::mirror::INVALID_REQUEST => Err((
+            StatusCode::BAD_REQUEST,
+            format!("{what}: not a mirror topic"),
+        )),
+        code => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{what}: error code {code}"),
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1747,7 +1764,6 @@ async fn mirror_outcome(
             StatusCode::CONFLICT,
             format!("{what}: the alias names another bucket, or a mirror topic still uses it"),
         )),
-        3 => Err((StatusCode::NOT_FOUND, format!("{what}: no such topic or partition"))),
         36 => Err((StatusCode::CONFLICT, format!("{what}: the topic exists"))),
         code => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

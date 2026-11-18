@@ -120,8 +120,9 @@ enum Mirror {
         #[arg(long)]
         topic: String,
     },
-    /// Drop a stalled mirror partition's copy, so it starts again at the
-    /// source's log start. For a partition the source's retention passed.
+    /// Drop a stalled mirror partition's copy. Copying goes on from the later
+    /// of its old end and the source's log start. For a partition the
+    /// source's retention passed.
     Reset {
         /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
         #[arg(long)]
@@ -328,8 +329,8 @@ fn main() -> anyhow::Result<()> {
             confirm(
                 i_accept_data_loss,
                 "reset",
-                "reset deletes this mirror's copy of the partition; it starts again at \
-                 the source's log start.",
+                "reset deletes this mirror's copy of the partition; copying goes on from \
+                 the later of its old end and the source's log start.",
             )?;
             let broker = broker_addr(broker)?;
             let body = serde_json::json!({
