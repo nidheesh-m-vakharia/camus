@@ -38,6 +38,30 @@ class Drawing:
         # whole 560 x 440 canvas.
         self.crop = crop
         self.layers = {}
+        self.base = self.layers
+        # Named groups the page's script moves as one piece:
+        # (class, layers, inline_only). An inline-only group starts hidden,
+        # so the still is the drawing without it.
+        self.groups = []
+        # (x, top, width): reveal everything below `top` from left to right.
+        self.reveal = None
+
+    def group(self, cls, inline_only=False, clip=None, data=None):
+        """Marks drawn inside go to one `<g class=cls>`. `clip` (x, y, w, h)
+        limits the group to that region on the page; `data` adds
+        `data-*` attributes for the page's script."""
+        drawing = self
+
+        class Scope:
+            def __enter__(self):
+                layers = {}
+                drawing.groups.append((cls, layers, inline_only, clip, data or {}))
+                drawing.layers = layers
+
+            def __exit__(self, *exc):
+                drawing.layers = drawing.base
+
+        return Scope()
 
     def _add(self, key, mark):
         self.layers.setdefault(key, []).append(mark)
@@ -99,6 +123,33 @@ class Drawing:
         self.path(f"M{fmt(x1 - 4)} {fmt(y + 4)}l8-8M{fmt(x2 - 4)} {fmt(y + 4)}l8-8", SECONDARY)
         self.text(mid, y + 3.5, label, VALUE, "middle")
 
+    def render(self, layers, standalone):
+        order = sorted(
+            layers.items(),
+            key=lambda item: {"h": 0, "p": 1, "t": 2}[item[0][0]] * 10
+            - (item[0][1] if item[0][0] == "p" else 0),
+        )
+        groups = []
+        for key, marks in order:
+            kind = key[0]
+            if kind == "h":
+                attrs = f'fill="currentColor" fill-opacity="{HIGHLIGHT}" stroke="none"'
+            elif kind == "p":
+                _, opacity, dash = key
+                attrs = f'opacity="{fmt(opacity)}"'
+                if dash:
+                    attrs += f' stroke-dasharray="{dash}"'
+            else:
+                _, role, anchor, size = key
+                attrs = (
+                    f'fill="currentColor" stroke="none" font-size="{size}"'
+                    f' text-anchor="{anchor}" opacity="{fmt(role)}"'
+                )
+            if kind == "h":
+                marks = [m for m, shown in marks if shown or not standalone]
+            groups.append(f"<g {attrs}>" + "".join(marks) + "</g>")
+        return groups
+
     def svg(self, standalone):
         ident = f"dg-{self.name}"
         out = []
@@ -119,29 +170,35 @@ class Drawing:
         )
         out.append(f'<title id="{ident}-title">{escape(self.title)}</title>')
         out.append(f'<desc id="{ident}-desc">{escape(self.desc)}</desc>')
-        order = sorted(
-            self.layers.items(),
-            key=lambda item: {"h": 0, "p": 1, "t": 2}[item[0][0]] * 10
-            - (item[0][1] if item[0][0] == "p" else 0),
-        )
-        for key, marks in order:
-            kind = key[0]
-            if kind == "h":
-                attrs = f'fill="currentColor" fill-opacity="{HIGHLIGHT}" stroke="none"'
-            elif kind == "p":
-                _, opacity, dash = key
-                attrs = f'opacity="{fmt(opacity)}"'
-                if dash:
-                    attrs += f' stroke-dasharray="{dash}"'
-            else:
-                _, role, anchor, size = key
-                attrs = (
-                    f'fill="currentColor" stroke="none" font-size="{size}"'
-                    f' text-anchor="{anchor}" opacity="{fmt(role)}"'
+        body = self.render(self.base, standalone)
+        defs = []
+        for n, (cls, layers, inline_only, clip, data) in enumerate(self.groups):
+            if inline_only and standalone:
+                continue
+            attrs = ' style="opacity:0"' if inline_only else ""
+            attrs += "".join(f' data-{k}="{v}"' for k, v in data.items())
+            if clip and not standalone:
+                cid = f"{ident}-clip-{n}"
+                x, y, w, h = clip
+                defs.append(
+                    f'<clipPath id="{cid}"><rect x="{fmt(x)}" y="{fmt(y)}" width="{fmt(w)}" height="{fmt(h)}"/></clipPath>'
                 )
-            if kind == "h":
-                marks = [m for m, shown in marks if shown or not standalone]
-            out.append(f"<g {attrs}>" + "".join(marks) + "</g>")
+                body.append(f'<g clip-path="url(#{cid})">')
+            body.append(f'<g class="{cls}"{attrs}>' + "".join(self.render(layers, standalone)) + "</g>")
+            if clip and not standalone:
+                body.append("</g>")
+        if defs:
+            out.append("<defs>" + "".join(defs) + "</defs>")
+        if self.reveal and not standalone:
+            x, top, width = self.reveal
+            clip = f"{ident}-reveal"
+            out.append(
+                f'<defs><clipPath id="{clip}"><rect x="0" y="0" width="560" height="{fmt(top)}"/>'
+                f'<rect class="dg-reveal" x="{fmt(x)}" y="{fmt(top)}" width="{fmt(width)}" height="{fmt(440 - top)}"/>'
+                "</clipPath></defs>"
+            )
+            body = [f'<g clip-path="url(#{clip})">'] + body + ["</g>"]
+        out.extend(body)
         out.append("</svg>")
         return "\n".join(out)
 
@@ -161,8 +218,11 @@ def tail():
     log_y = 296
     # The bucket and the sealed log inside it.
     d.rect(44, 280, 456, 56, SECONDARY)
-    d.rect(start, log_y, sealed - start, h)
-    d.path("".join(f"M{x} {log_y}v{h}" for x in range(start + cell, sealed, cell)))
+    # On the page the sealed log slides left as each upload is sealed, and
+    # the oldest objects pass out of view at the log's start.
+    with d.group("dg-log", clip=(start, log_y - 4, end - start, h + 8)):
+        d.rect(start, log_y, sealed - start, h)
+        d.path("".join(f"M{x} {log_y}v{h}" for x in range(start + cell, sealed, cell)))
     # The tail's place in the log, not yet uploaded.
     d.path(
         f"M{sealed} {log_y}h{end - sealed}v{h}h{sealed - end}"
@@ -175,14 +235,41 @@ def tail():
     # Three brokers, each with the same tail.
     rows = [124, 164, 204]
     for i, y in enumerate(rows):
-        d.rect(sealed, y, end - sealed, h)
-        d.path("".join(f"M{x} {y}v{h}" for x in range(sealed + cell, end, cell)))
         d.text(sealed - 12, y + 16, f"broker {i + 1}", NAME, "end")
-    d.highlight(f"M{sealed} {rows[0]}h{end - sealed}v{rows[-1] + h - rows[0]}h{sealed - end}Z")
+    # The tail itself, which the page lifts away and refills.
+    with d.group("dg-tail-static"):
+        for y in rows:
+            d.rect(sealed, y, end - sealed, h)
+            d.path("".join(f"M{x} {y}v{h}" for x in range(sealed + cell, end, cell)))
+        d.highlight(f"M{sealed} {rows[0]}h{end - sealed}v{rows[-1] + h - rows[0]}h{sealed - end}Z")
+    # Moves on the page: the brokers' empty slots while the tail is away.
+    with d.group("dg-a-slots", inline_only=True):
+        for y in rows:
+            d.path(
+                f"M{sealed} {y}h{end - sealed}v{h}h{sealed - end}Z"
+                + "".join(f"M{x} {y}v{h}" for x in range(sealed + cell, end, cell)),
+                SECONDARY,
+                ABSENT,
+            )
+    # Moves on the page: each batch, one cell per broker, as it arrives.
+    # Batches arrive left to right, so each cell's left edge belongs to the
+    # cell before it; only the first draws its own.
+    for col in range(5):
+        x = sealed + col * cell
+        for row, y in enumerate(rows):
+            with d.group("dg-a-cell", inline_only=True, data={"row": row, "col": col}):
+                if col == 0:
+                    d.rect(x, y, cell, h)
+                else:
+                    d.path(f"M{x} {y}h{cell}v{h}h{-cell}")
     d.hdim(sealed, end, 96, "unsealed tail", ext_from=rows[0])
     # The sealed end, carried down through the bucket.
     d.line(sealed, rows[-1] + h + 8, sealed, log_y - 8, GUIDE)
     d.line(end, rows[-1] + h + 8, end, log_y - 8, GUIDE)
+    # Moves on the page: a copy of the tail, carried into the bucket.
+    with d.group("dg-a-upload", inline_only=True):
+        d.rect(sealed, rows[-1], end - sealed, h)
+        d.path("".join(f"M{x} {rows[-1]}v{h}" for x in range(sealed + cell, end, cell)))
     # The uploader moves the tail down.
     d.arrow(508, rows[1] + h / 2, 508, log_y + h / 2, SECONDARY)
     d.text(516, 232, "upload", VALUE)
@@ -219,6 +306,16 @@ def acks():
     # What each mode waits for, highlighted by the page's toggle.
     d.highlight(f"M{t0} {y}h{wal - t0}v{h}h{t0 - wal}Z", "dg-wait-wal")
     d.highlight(f"M{t0} {y}h{r2 - t0}v{h}h{t0 - r2}Z", "dg-wait-r2", standalone=False)
+    # Moves on the page: a time cursor, and each acknowledgement brightening
+    # when the cursor reaches it.
+    # Moves on the page: three batches in a steady stream along the band,
+    # clear of the interval names.
+    for _ in range(3):
+        with d.group("dg-a-batch", inline_only=True):
+            d.rect(t0 - 6, y + 6, 12, 12)
+    for mode, x in (("wal", wal), ("r2", r2)):
+        with d.group(f"dg-a-ack dg-a-ack-{mode}", inline_only=True):
+            d.line(x, y - 8, x, 136)
     # Events under the band.
     for x, label in ((t0, "produce"), (wal, "majority fsync"), (put, "upload"), (r2, "metadata commit")):
         d.line(x, y + h + 4, x, y + h + 14, SECONDARY)
@@ -242,25 +339,43 @@ def quorum():
     rows = [(140, 9, "broker 1, leader"), (192, 8, "broker 2"), (244, 5, "broker 3")]
     commit = x0 + 8 * cell
     for y, n, label in rows:
-        end = x0 + n * cell
-        d.rect(x0, y, end - x0, h)
-        d.path("".join(f"M{x} {y}v{h}" for x in range(x0 + cell, end, cell)))
         d.text(x0 - 12, y + 16, label, NAME, "end")
-        if end < commit:
-            d.path(
-                f"M{end} {y}h{commit - end}v{h}h{end - commit}"
-                + "".join(f"M{x} {y}v{h}" for x in range(end + cell, commit, cell)),
-                SECONDARY,
-                ABSENT,
-            )
+    # The logs. On the page they index left by one entry each cycle, and the
+    # oldest entry passes out of view at the start of the log.
+    with d.group("dg-logs", clip=(x0, 132, 11 * cell, 140)):
+        for y, n, label in rows:
+            end = x0 + n * cell
+            d.rect(x0, y, end - x0, h)
+            d.path("".join(f"M{x} {y}v{h}" for x in range(x0 + cell, end, cell)))
+        # Committed: the entries a majority holds.
+        d.highlight(f"M{x0} 140h{commit - x0}v{h}h{x0 - commit}ZM{x0} 192h{commit - x0}v{h}h{x0 - commit}Z")
+    # Broker 3's missing entries, up to the commit index.
+    end3 = x0 + 5 * cell
+    d.path(
+        f"M{end3} 244h{commit - end3}v{h}h{end3 - commit}"
+        + "".join(f"M{x} 244v{h}" for x in range(end3 + cell, commit, cell)),
+        SECONDARY,
+        ABSENT,
+    )
     d.text(x0 + 5 * cell + 3 * cell / 2, 244 + h + 18, "catching up", VALUE, "middle")
-    d.text(x0 + 9 * cell + 10, 140 + 16, "leader only", VALUE)
-    # Committed: the entries a majority holds.
-    d.highlight(f"M{x0} 140h{commit - x0}v{h}h{x0 - commit}ZM{x0} 192h{commit - x0}v{h}h{x0 - commit}Z")
-    d.line(commit, 104, commit, 132, SECONDARY)
-    d.line(commit, 300, commit, 324, SECONDARY)
-    d.text(commit, 94, "commit index", NAME, "middle")
-    d.hdim(x0, commit, 344, "committed on two of three", ext_from=284)
+    with d.group("dg-note"):
+        d.text(x0 + 9 * cell + 10, 140 + 16, "leader only", VALUE)
+    with d.group("dg-commit"):
+        d.line(commit, 104, commit, 132, SECONDARY)
+        d.line(commit, 300, commit, 324, SECONDARY)
+        d.text(commit, 94, "commit index", NAME, "middle")
+    with d.group("dg-dim"):
+        d.hdim(x0, commit, 344, "committed on two of three", ext_from=284)
+    # Moves on the page, one cycle: a new entry on the leader; entry 9 copied
+    # to broker 2, which commits it; entry 6 copied to broker 3.
+    with d.group("dg-a-new", inline_only=True):
+        d.path(f"M{x0 + 9 * cell} 140h{cell}v{h}h{-cell}")
+    with d.group("dg-a-rep", inline_only=True):
+        d.path(f"M{x0 + 8 * cell} 140h{cell}v{h}h{-cell}")
+    with d.group("dg-a-catch", inline_only=True):
+        d.rect(x0 + 5 * cell, 140, cell, h)
+    with d.group("dg-a-commit", inline_only=True):
+        d.highlight(f"M{commit} 140h{cell}v{h}h{-cell}ZM{commit} 192h{cell}v{h}h{-cell}Z")
     return d
 
 
@@ -276,13 +391,17 @@ def process():
     )
     parts = ["Kafka listener", "Metadata Raft", "Write-ahead log", "Uploader"]
     h, gap = 36, 14
-    lx, lw = 56, 150
+    lx, lw = 56, 164
     px, pw, py = 316, 188, 84
-    # Exploded parts.
+    # Exploded parts, the same size as their slots.
     for i, name in enumerate(parts):
         y = py + 22 + i * (h + gap)
         d.rect(lx, y, lw, h, SECONDARY)
         d.text(lx + 12, y + 22, name, VALUE)
+        # Moves on the page: the part, carried into its slot.
+        with d.group("dg-a-part", inline_only=True):
+            d.rect(lx, y, lw, h)
+            d.text(lx + 12, y + 22, name, NAME)
     # The process they fit: one outline, the same four rows.
     rows_top = py + 22
     total = 4 * h + 3 * gap
@@ -293,7 +412,9 @@ def process():
         d.rect(px + 12, y, pw - 24, h)
         d.text(px + 24, y + 22, name, NAME)
         # Each part projects onto its place.
-        d.arrow(lx + lw + 8, y + h / 2, px + 4, y + h / 2, SECONDARY)
+        with d.group("dg-flow"):
+            d.arrow(lx + lw + 8, y + h / 2, px + 4, y + h / 2, SECONDARY)
+
     # What a deployment does not add.
     absent = [("JVM", 56), ("ZooKeeper", 138), ("KRaft", 240), ("separate database", 322)]
     by = 344
@@ -346,20 +467,24 @@ def address():
         t = top + i * pitch
         s += f"V{fmt(t)}h{depth}v{size}h{-depth}"
     s += f"V{camus_y + bh}H{cx}Z"
-    d.path(s)
-    d.text(cx + 14, camus_y + 46, "your client", NAME)
-    d.text(cx + 14, camus_y + 62, "unchanged", VALUE)
+    # On the page the client slides across and its tabs seat in the sockets.
+    with d.group("dg-client"):
+        d.path(s)
+        d.text(cx + 14, camus_y + 46, "your client", NAME)
+        d.text(cx + 14, camus_y + 62, "unchanged", VALUE)
     # The sockets line up: the same protocol on both brokers.
     d.line(bx, kafka_y + bh + 8, bx, camus_y - 8, GUIDE)
     d.line(bx + depth, kafka_y + bh + 8, bx + depth, camus_y - 8, GUIDE)
     d.text(bx + depth + 8, 200, "same wire protocol", VALUE)
     # The address: where it pointed, and where it points now.
-    d.line(cx + cw / 2, camus_y - 8, cx + cw / 2, kafka_y + bh / 2, SECONDARY, ABSENT)
-    d.line(cx + cw / 2, kafka_y + bh / 2, bx - 8, kafka_y + bh / 2, SECONDARY, ABSENT)
+    with d.group("dg-route"):
+        d.line(cx + cw / 2, camus_y - 8, cx + cw / 2, kafka_y + bh / 2, SECONDARY, ABSENT)
+        d.line(cx + cw / 2, kafka_y + bh / 2, bx - 8, kafka_y + bh / 2, SECONDARY, ABSENT)
     # Each tab meets its socket: the client fits either broker unchanged.
-    for i in tabs:
-        t = top + i * pitch + size / 2
-        d.line(cx + cw + depth + 8, t, bx - 8, t, GUIDE)
+    with d.group("dg-fit"):
+        for i in tabs:
+            t = top + i * pitch + size / 2
+            d.line(cx + cw + depth + 8, t, bx - 8, t, GUIDE)
     d.text(cx, 372, "bootstrap.servers moves to Camus; nothing else does", VALUE)
     return d
 
@@ -400,6 +525,11 @@ def ack():
     d.hdim(r0, r1, 368 - 4, "0.48 ms", ext_from=292 + 44)
     d.text(f1 + 10, 330, "0.17 ms, inside the append", VALUE)
     d.text(x0, 410, "means of 100,000 acks, 3 × i4i.2xlarge; bars start together", VALUE)
+    # On the page a cursor sweeps the 0.93 ms at constant speed, revealing
+    # each bar as time reaches it.
+    d.reveal = (x0 - 4, 108, 560 - x0 + 4)
+    with d.group("dg-a-cursor", inline_only=True):
+        d.line(x0, 112, x0, 344)
     return d
 
 
