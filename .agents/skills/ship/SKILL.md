@@ -17,4 +17,4 @@ description: Branch, commit, and open a pull request for Camus, matching the rep
    `## Test plan`. List the exact commands run, and any gated tests that
    were skipped.
 6. CI runs `cargo fmt --all --check`, `scripts/agent-check.sh --no-test`,
-   and `cargo test --workspace --locked`, then builds the image.
+   and `cargo nextest run --workspace --locked`, then builds the image.

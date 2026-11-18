@@ -564,27 +564,22 @@ fn librdkafka_round_trip() {
 }
 
 #[test]
-fn franz_go_round_trip() {
+fn franz_go_round_trip() -> std::io::Result<()> {
     if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
         support::skipped("franz-go; set CAMUS_MINIO=1");
-        return;
+        return Ok(());
     }
-    let go = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
-    if !go.is_file() {
-        support::skipped(&format!("franz-go; missing {}", go.display()));
-        return;
+    let toolchain = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/go/bin/go");
+    if !toolchain.is_file() {
+        support::skipped(&format!("franz-go; missing {}", toolchain.display()));
+        return Ok(());
     }
     let (dir, node, cert) = boot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/go");
-    let ran = Command::new(go)
-        .args(["run", "."])
-        .arg(&node.kafka)
-        .arg(&cert)
-        .current_dir(&source)
-        .env("GOTOOLCHAIN", "local")
-        .output()
-        .unwrap();
+    let bin = support::go_build(&source)?;
+    let ran = Command::new(bin).arg(&node.kafka).arg(&cert).output()?;
     assert_client(dir.path(), ran, "franz-go");
+    Ok(())
 }
 
 fn s3_endpoint() -> String {
