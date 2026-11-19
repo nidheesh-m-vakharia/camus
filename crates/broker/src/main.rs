@@ -436,6 +436,9 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          # HELP camus_mirror_stalled_partitions Mirror partitions the last copy round could not advance.\n\
          # TYPE camus_mirror_stalled_partitions gauge\n\
          camus_mirror_stalled_partitions {}\n\
+         # HELP camus_mirror_waiting_partitions Mirror partitions waiting at a transaction the source has not ended.\n\
+         # TYPE camus_mirror_waiting_partitions gauge\n\
+         camus_mirror_waiting_partitions {}\n\
          # HELP camus_mirror_copy_errors_total Mirror copy rounds, sources, or partitions that failed and will be retried.\n\
          # TYPE camus_mirror_copy_errors_total counter\n\
          camus_mirror_copy_errors_total {}\n\
@@ -478,6 +481,7 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
         mirror::COPIED_BYTES.load(Relaxed),
         mirror::STALLED.load(Relaxed),
+        mirror::WAITING.load(Relaxed),
         mirror::COPY_ERRORS.load(Relaxed),
         store.puts.calls.load(Relaxed),
         store.gets.calls.load(Relaxed),

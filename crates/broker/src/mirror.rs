@@ -99,6 +99,11 @@ impl SourceSnapshot {
         Ok(Self { bucket, key, index })
     }
 
+    /// The snapshot object's key. A newer snapshot has another.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     /// Every row with a key in `from..to`, from one ranged GET of at most
     /// [`MAX_RUN_BYTES`]. A wider run is refused, not read.
     pub async fn rows(&self, from: &str, to: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -193,6 +198,20 @@ pub static COPIED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Mirror partitions the last round could not advance: a gap at the source,
 /// a batch the copier cannot carry yet, or a source it could not read.
 pub static STALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Mirror partitions the last round left waiting at a transaction the
+/// source has not ended. One that waits long has a source that cannot end
+/// it, such as one whose brokers are gone.
+pub static WAITING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Most partitions remembered as waiting. Past it the memory is cleared, and
+/// those partitions are read again once.
+const MAX_WAITS: usize = 65_536;
+
+/// Partitions waiting at an open transaction, by mirror topic id and
+/// partition, with the source snapshot they waited in. Until the source
+/// writes a newer snapshot nothing can have changed, so the copier does not
+/// read the extent again.
+type Waits = std::collections::HashMap<(String, i32), String>;
 /// Rounds or partitions that failed with an error and will be retried.
 pub static COPY_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -201,15 +220,24 @@ pub static COPY_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub async fn run_copier(node: std::sync::Arc<camus_metadata::MetadataNode>, dest: Bucket) {
     use std::sync::atomic::Ordering::Relaxed;
     let interval = copy_interval();
+    let mut waits = Waits::new();
     loop {
         tokio::time::sleep(interval).await;
         let metrics = node.raft.metrics().borrow().clone();
         if metrics.current_leader != Some(metrics.id) {
             STALLED.store(0, Relaxed);
+            WAITING.store(0, Relaxed);
+            waits.clear();
             continue;
         }
-        match copy_round(&node, &dest).await {
-            Ok(stalled) => STALLED.store(stalled, Relaxed),
+        if waits.len() > MAX_WAITS {
+            waits.clear();
+        }
+        match copy_round(&node, &dest, &mut waits).await {
+            Ok((stalled, waiting)) => {
+                STALLED.store(stalled, Relaxed);
+                WAITING.store(waiting, Relaxed);
+            }
             Err(err) => {
                 COPY_ERRORS.fetch_add(1, Relaxed);
                 tracing::warn!(error = format!("{err:#}"), "mirror copy round failed");
@@ -218,8 +246,13 @@ pub async fn run_copier(node: std::sync::Arc<camus_metadata::MetadataNode>, dest
     }
 }
 
-/// One pass over every link and mirror. Returns the stalled partitions.
-async fn copy_round(node: &camus_metadata::MetadataNode, dest: &Bucket) -> anyhow::Result<u64> {
+/// One pass over every link and mirror. Returns the stalled and the waiting
+/// partitions.
+async fn copy_round(
+    node: &camus_metadata::MetadataNode,
+    dest: &Bucket,
+    waits: &mut Waits,
+) -> anyhow::Result<(u64, u64)> {
     use std::sync::atomic::Ordering::Relaxed;
     let links = node.scan_local(camus_metadata::mirror::links_prefix())?;
     let mut mirrors = Vec::new();
@@ -230,6 +263,7 @@ async fn copy_round(node: &camus_metadata::MetadataNode, dest: &Bucket) -> anyho
         }
     }
     let mut stalled = 0;
+    let mut waiting = 0;
     for (_, raw) in links {
         let link: MirrorLink = serde_json::from_str(&raw)?;
         let linked: Vec<&Topic> = mirrors
@@ -266,7 +300,26 @@ async fn copy_round(node: &camus_metadata::MetadataNode, dest: &Bucket) -> anyho
         };
         for topic in linked {
             for partition in 0..topic.partitions {
-                match copy_partition(node, dest, &source, topic, partition).await {
+                let at = (topic.id.clone(), partition);
+                if waits.get(&at).is_some_and(|key| key == source.key()) {
+                    waiting += 1;
+                    continue;
+                }
+                let copied = copy_partition(node, dest, &source, topic, partition).await;
+                if !matches!(copied, Ok(Copied::Waiting)) {
+                    waits.remove(&at);
+                }
+                match copied {
+                    Ok(Copied::Waiting) => {
+                        waiting += 1;
+                        if waits.insert(at, source.key().to_string()).is_none() {
+                            tracing::info!(
+                                topic = topic.name,
+                                partition,
+                                "mirror partition waits for the source to end a transaction"
+                            );
+                        }
+                    }
                     Ok(Copied::Stalled(why)) => {
                         stalled += 1;
                         tracing::warn!(
@@ -290,7 +343,7 @@ async fn copy_round(node: &camus_metadata::MetadataNode, dest: &Bucket) -> anyho
             }
         }
     }
-    Ok(stalled)
+    Ok((stalled, waiting))
 }
 
 /// What one partition's copy did.
@@ -302,6 +355,8 @@ enum Copied {
     Some,
     /// Cannot go on without an operator or a later phase.
     Stalled(String),
+    /// At a transaction the source has not ended.
+    Waiting,
 }
 
 /// Copy up to [`WINDOWS_PER_ROUND`] windows of `topic`'s `partition`.
@@ -384,7 +439,7 @@ async fn copy_partition(
             Window::Raced => return Ok(Copied::Some),
             // A transaction the source has not ended: the next snapshot
             // that shows its span lets the copy go on.
-            Window::Waiting => return Ok(Copied::CaughtUp),
+            Window::Waiting => return Ok(Copied::Waiting),
             Window::Stalled(why) => return Ok(Copied::Stalled(why)),
         }
     }
@@ -651,8 +706,8 @@ async fn publish(
     let published = node
         .apply(camus_metadata::Command::PublishMirror {
             parts,
-            committed: spans.committed,
-            aborted: spans.aborted,
+            committed: spans.committed.iter().map(Into::into).collect(),
+            aborted: spans.aborted.iter().map(Into::into).collect(),
         })
         .await?;
     match published.error_code {

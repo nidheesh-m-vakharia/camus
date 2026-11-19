@@ -432,7 +432,7 @@ fn a_mirror_copies_the_source_and_outlives_it() -> TestResult {
 
     // The destination has no `orders` of its own: the mirror takes the name.
     let dest_dir = tempfile::tempdir()?;
-    let dest = support::Node::with(
+    let mut dest = support::Node::with(
         1,
         dest_dir.path(),
         Opts::default()
@@ -531,20 +531,68 @@ fn a_mirror_copies_the_source_and_outlives_it() -> TestResult {
         .ok_or("no copied-bytes series")?
         .parse::<u64>()?;
     assert!(copied > 0, "{copied} bytes copied");
+
+    // A mirror's retention is its own: it moves the mirror's log start,
+    // though a client's DeleteRecords may not. The test records' timestamps
+    // are old, so retention runs only from here on.
+    let opts = dest.opts.clone().env("CAMUS_RETENTION_CHECK_MS", "200");
+    dest.restart_with(opts);
+    support::wait_settled(&[&dest]);
+    let mut retention = AlterConfigsResource::default();
+    retention.resource_type = 2;
+    retention.resource_name = StrBytes::from_static_str(support::TOPIC);
+    retention.configs = vec![AlterableConfig::default()
+        .with_name(StrBytes::from_static_str("retention.bytes"))
+        .with_value(Some(StrBytes::from_static_str("1")))];
+    let mut stream = connect(&dest_addr);
+    send(
+        &mut stream,
+        ApiKey::AlterConfigs,
+        2,
+        &AlterConfigsRequest::default().with_resources(vec![retention]),
+    );
+    assert_eq!(
+        recv::<AlterConfigsResponse>(&mut stream, 2).responses[0].error_code,
+        0
+    );
+    let raw = support::read_key(
+        &dest.http,
+        &camus_metadata::topic_storage_key(support::TOPIC),
+    )
+    .ok_or("no topic")?;
+    let id = camus_metadata::parse_topic(&raw)?.id;
+    let log_start = || -> Result<i64, Box<dyn std::error::Error>> {
+        let raw = support::read_key(&dest.http, &camus_metadata::partition_storage_key(&id, 0))
+            .ok_or("no partition")?;
+        Ok(camus_metadata::parse_partition(&raw)?.log_start)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while log_start()? == 0 {
+        if std::time::Instant::now() > deadline {
+            return Err("retention never moved the mirror's log start".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
     Ok(())
 }
 
-/// `camus_mirror_stalled_partitions` on `http`.
-fn stalled(http: &str) -> Result<u64, Box<dyn std::error::Error>> {
+/// The value of the unlabelled series `name` on `http`.
+fn series(http: &str, name: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let metrics = reqwest::blocking::Client::new()
         .get(format!("http://{http}/metrics"))
         .send()?
         .text()?;
     Ok(metrics
         .lines()
-        .find_map(|line| line.strip_prefix("camus_mirror_stalled_partitions "))
-        .ok_or("no stalled series")?
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .ok_or_else(|| format!("no series {name}"))?
         .parse()?)
+}
+
+/// `camus_mirror_stalled_partitions` on `http`.
+fn stalled(http: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    series(http, "camus_mirror_stalled_partitions")
 }
 
 /// A mirror whose source deleted records it had not copied stalls, and a
@@ -962,9 +1010,17 @@ fn a_mirror_copies_ended_transactions_and_waits_at_an_open_one() -> TestResult {
             .send()
     })?;
 
-    // Copied up to the open transaction, and no further.
+    // The source has sealed the open transaction's batch, so the copier
+    // reaches it, and waits there rather than stopping for want of data.
+    support::wait_sealed(&source.http, 4);
     support::wait_sealed(&dest.http, 3);
-    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while series(&dest.http, "camus_mirror_waiting_partitions")? != 1 {
+        if std::time::Instant::now() > deadline {
+            return Err("the mirror never reported waiting".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     assert_eq!(
         support::sealed_end(&dest.http),
         3,
@@ -990,6 +1046,13 @@ fn a_mirror_copies_ended_transactions_and_waits_at_an_open_one() -> TestResult {
 
     producer.end(true)?;
     support::wait_sealed(&dest.http, 4);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while series(&dest.http, "camus_mirror_waiting_partitions")? != 0 {
+        if std::time::Instant::now() > deadline {
+            return Err("the mirror stayed waiting".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     let mut after = committed;
     after.push((3, "open".to_string()));
     assert_eq!(records_at(&dest_addr, 1)?, after);

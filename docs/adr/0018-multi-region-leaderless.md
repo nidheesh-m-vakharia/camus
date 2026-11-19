@@ -671,3 +671,33 @@ Phase 2, first part: transactions.
 
   With the spans left out, `read_committed` on the mirror returns
   nothing, and the test fails.
+- Spans travel in `PublishMirror` as `CopiedSpan`, which always writes
+  `producer_id`. `Span` leaves out a `None` producer id, as spans stored
+  before ADR 0015 have, and the Raft log's postcard encoding cannot skip a
+  field. A test round-trips the command with a `None` span. `TxnSpan` in
+  `NoteTxn` carries the same attribute. It is a latent issue for spans
+  without a producer, outside this change.
+- A mirror's own retention now applies. Retention used to send its cuts
+  as `DeleteRecords`, which a mirror refuses, so a mirror kept every
+  extent and span forever. It now sends a mirror's cuts as `TrimMirror`
+  (log position 34): the same cut and span pruning, accepted only for a
+  mirror. A client's `DeleteRecords` on a mirror is still refused. The
+  empty-partition jump also prunes spans that end below the new start.
+- `camus_mirror_waiting_partitions` counts the partitions waiting at an
+  open transaction, and the copier logs once when a partition starts
+  waiting. While the source's snapshot key has not changed, a waiting
+  partition is not read again. That memory is capped at 65,536
+  partitions and cleared when it is full.
+- While a transaction is open at the source, the mirror's high watermark,
+  and so `read_uncommitted` and `ListOffsets` latest, stop at that
+  transaction's first batch. At the source they go past it. A source that
+  can no longer end the transaction, because its brokers are gone while
+  its bucket is readable, holds the partition there indefinitely. A reset
+  does not move it past the transaction. Promotion (phase 2) is the way
+  out.
+- The MinIO test checks that the source has sealed the open
+  transaction's batch, that the mirror reports one waiting partition, and
+  that the gauge clears after the commit. The acceptance test also sets
+  `retention.bytes` on the mirror and waits for its log start to move.
+  With mirror cuts sent as `DeleteRecords`, the log start never moves and
+  the test fails.

@@ -58,6 +58,40 @@ pub struct MirrorOf {
     pub topic_id: String,
 }
 
+/// A transaction span as `PublishMirror` carries it. Unlike
+/// [`catalog::Span`], it always writes `producer_id`: the Raft log is
+/// postcard, which cannot skip a field, and a source span stored before
+/// ADR 0015 has none.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CopiedSpan {
+    /// Inclusive.
+    pub start: i64,
+    /// Exclusive.
+    pub end: i64,
+    /// The span's producer, or `None` for a span that matches any.
+    pub producer_id: Option<i64>,
+}
+
+impl From<&catalog::Span> for CopiedSpan {
+    fn from(span: &catalog::Span) -> Self {
+        Self {
+            start: span.start,
+            end: span.end,
+            producer_id: span.producer_id,
+        }
+    }
+}
+
+impl From<&CopiedSpan> for catalog::Span {
+    fn from(span: &CopiedSpan) -> Self {
+        Self {
+            start: span.start,
+            end: span.end,
+            producer_id: span.producer_id,
+        }
+    }
+}
+
 /// Metadata key of a link.
 pub fn link_key(alias: &str) -> String {
     format!("{}{alias}", links_prefix())

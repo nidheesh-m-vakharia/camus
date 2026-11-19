@@ -122,6 +122,7 @@ Histogram buckets are 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms, and
 | `camus_meta_snapshot_unix_ms` | gauge | Unix milliseconds of that snapshot, or 0. |
 | `camus_mirror_copied_bytes_total` | counter | Batch bytes the mirror copier published into mirror topics (ADR 0018). |
 | `camus_mirror_stalled_partitions` | gauge | Mirror partitions the last copy round could not advance. 0 on a broker that does not lead metadata. |
+| `camus_mirror_waiting_partitions` | gauge | Mirror partitions waiting at a transaction the source has not ended. One that stays up has a source that cannot end it. |
 | `camus_mirror_copy_errors_total` | counter | Mirror copy rounds, sources, or partitions that failed and will be retried. |
 
 The snapshot gauges are set by the broker that uploaded the snapshot, so

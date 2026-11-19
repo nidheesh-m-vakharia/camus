@@ -661,6 +661,8 @@ fn publish_into(
         if mirror && part.start > state.next_offset && state.log_start == state.next_offset {
             state.log_start = part.start;
             state.next_offset = part.start;
+            // A span copied before a reset can reach below the new start.
+            prune_spans(state);
         }
         if part.start != state.next_offset {
             return Ok(Outcome::Reject(1));

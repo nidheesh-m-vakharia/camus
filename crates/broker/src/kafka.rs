@@ -1712,18 +1712,31 @@ impl Kafka {
                 }
             }
         }
-        if cuts.is_empty() {
-            return;
-        }
-        let count = cuts.len() as u64;
-        match self.meta_apply(Command::DeleteRecords { cuts }).await {
-            Ok(_) => {
-                camus_compactor::STATS
-                    .retention_cuts
-                    .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-                tracing::info!(partitions = count, "retention moved log starts");
+        // Mirrors refuse `DeleteRecords`; their own retention goes through
+        // `TrimMirror` (ADR 0018).
+        let (mirrors, plain): (Vec<_>, Vec<_>) = cuts.into_iter().partition(|cut| {
+            self.topic(&cut.topic)
+                .is_some_and(|topic| topic.mirror_of.is_some())
+        });
+        for (cuts, mirror) in [(plain, false), (mirrors, true)] {
+            if cuts.is_empty() {
+                continue;
             }
-            Err(err) => tracing::warn!(%err, "retention commit failed"),
+            let count = cuts.len() as u64;
+            let command = if mirror {
+                Command::TrimMirror { cuts }
+            } else {
+                Command::DeleteRecords { cuts }
+            };
+            match self.meta_apply(command).await {
+                Ok(_) => {
+                    camus_compactor::STATS
+                        .retention_cuts
+                        .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(partitions = count, mirror, "retention moved log starts");
+                }
+                Err(err) => tracing::warn!(%err, "retention commit failed"),
+            }
         }
     }
 
