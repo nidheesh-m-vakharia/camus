@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="dg dg-address" viewBox="0 0 560 440" width="560" height="440" fill="none" stroke="currentColor" stroke-width="1" focusable="false" style="overflow:visible;font-family:Pollen, sans-serif;font-optical-sizing:auto;font-synthesis:none;font-weight:400;color:#171717" role="img" aria-labelledby="dg-address-title" aria-describedby="dg-address-desc">
+<title id="dg-address-title">One address changes</title>
+<desc id="dg-address-desc">A Kafka client keeps its code and its configuration. Camus presents the same Kafka 4.4.0 wire protocol as the broker it replaces, so only the bootstrap address moves.</desc>
+<g opacity="1"><path d="M340 230V250h12v12h-12V274h12v12h-12V298h12v12h-12V330H500V230Z"/></g>
+<g opacity="0.32" stroke-dasharray="3 5"><path d="M340 70V90h12v12h-12V114h12v12h-12V138h12v12h-12V170H500V70Z"/></g>
+<g opacity="0.14"><path d="M340 178L340 222"/><path d="M352 178L352 222"/></g>
+<g fill="currentColor" stroke="none" font-size="10" text-anchor="start" opacity="0.5"><text x="370" y="126">Apache Kafka 4.4.0</text><text x="360" y="200">same wire protocol</text><text x="60" y="372">bootstrap.servers moves to Camus; nothing else does</text></g>
+<g fill="currentColor" stroke="none" font-size="11" text-anchor="start" opacity="0.72"><text x="370" y="286">Camus</text></g>
+<g class="dg-client"><g opacity="1"><path d="M60 230H220V250h12v12h-12V274h12v12h-12V298h12v12h-12V330H60Z"/></g><g fill="currentColor" stroke="none" font-size="11" text-anchor="start" opacity="0.72"><text x="74" y="276">your client</text></g><g fill="currentColor" stroke="none" font-size="10" text-anchor="start" opacity="0.5"><text x="74" y="292">unchanged</text></g></g>
+<g class="dg-route"><g opacity="0.32" stroke-dasharray="3 5"><path d="M140 222L140 120"/><path d="M140 120L332 120"/></g></g>
+<g class="dg-fit"><g opacity="0.14"><path d="M240 256L332 256"/><path d="M240 280L332 280"/><path d="M240 304L332 304"/></g></g>
+</svg>

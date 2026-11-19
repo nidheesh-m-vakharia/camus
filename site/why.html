@@ -83,16 +83,16 @@
 
       <p class="lede">The protocol is the part worth keeping. The disk layout, the JVM, and a separate coordination service are the part that is expensive to operate. Camus speaks the wire protocol and stores the long-term log in object storage.</p>
       <h2>What stays</h2>
-      <p>Producers, consumers, and admin tools keep working by changing the bootstrap address. The broker accepts the Kafka request framing those clients already send. It does not ask you to adopt a new client SDK.</p>
-      <p>That compatibility is pinned, not aspirational. The reference is the Apache Kafka 4.4.0 tree. A later KIP does not override that tree. Unimplemented APIs return a Kafka error. They do not pretend to succeed.</p>
+      <p>Producers, consumers, and admin tools keep working if you change the bootstrap address. The broker accepts the Kafka request framing those clients already send. You keep the client you have.</p>
+      <p>The reference is the Apache Kafka 4.4.0 tree. A later KIP does not override that tree. An unimplemented API returns a Kafka error. It does not pretend the call worked.</p>
       <h2>What moves</h2>
-      <p>Record batches that have been sealed live as objects in Cloudflare R2, or in any S3-compatible bucket. MinIO is the local stand-in. The broker does not keep a full replica of the log on its own disk in the long run.</p>
+      <p>The uploader writes sealed record batches as objects in Cloudflare R2, or in any S3-compatible bucket. MinIO is the local stand-in. The broker does not keep a full copy of the log on its own disk in the long run.</p>
       <p>Metadata is different from the log. Topics, group membership, committed offsets, and transaction ranges have to be agreed quickly and exactly. Those live in a Raft group, encoded so that every broker applies the same commands in the same order.</p>
       <h2>Why there is still a write-ahead log</h2>
       <p>Waiting for an object upload on every produce makes acknowledgements as slow as the bucket. The default <code>wal</code> mode replicates a short log to a majority of a shard, fsyncs it, and acknowledges then. The upload follows. Once the range is sealed, that slice of the write-ahead log is truncated. It is a buffer, not the system of record.</p>
       <p>The other mode, <code>r2</code>, skips that buffer. The produce is acknowledged only after the object is stored and the metadata group has committed the offsets. Brokers in that mode hold no log bytes. You take that trade when you would rather wait on the bucket than keep a local log. Both modes are described on the <a href="durability.html">durability</a> page.</p>
       <h2>What a deployment looks like</h2>
-      <p>A handful of copies of the same binary. One of them can run alone, which is the Docker image: it listens, then forms a one-node group by itself. Three of them, started with <a href="brokers.html">the brokers profile</a>, elect a leader and keep accepting metadata writes after that leader is gone.</p>
+      <p>One copy of the binary can run alone. The Docker image does that. It listens, then forms a one-node group by itself. Three copies, started with <a href="brokers.html">the brokers profile</a>, elect a leader and keep accepting metadata writes after that leader is gone.</p>
 
       <footer>
         <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>

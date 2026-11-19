@@ -3,17 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bucket — Camus</title>
+  <title>Bucket. Camus</title>
   <meta name="description" content="Run MinIO from this repo and point Camus at the bucket.">
   <link rel="canonical" href="https://camus.nidheesh.dev/minio">
   <meta name="robots" content="index,follow">
   <meta property="og:site_name" content="Camus">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Bucket — Camus">
+  <meta property="og:title" content="Bucket. Camus">
   <meta property="og:description" content="Run MinIO from this repo and point Camus at the bucket.">
   <meta property="og:url" content="https://camus.nidheesh.dev/minio">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="Bucket — Camus">
+  <meta name="twitter:title" content="Bucket. Camus">
   <meta name="twitter:description" content="Run MinIO from this repo and point Camus at the bucket.">
   <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
@@ -95,8 +95,8 @@
         <li><code>CAMUS_S3_SECRET_KEY</code></li>
       </ul>
       <h2>From inside the Camus container</h2>
-      <p><span class="ports">127.0.0.1</span> inside the container is the container, not the host where MinIO is published. Point <code>CAMUS_S3_ENDPOINT</code> at the host, for example <code>http://host.docker.internal:9100</code>. On a shared Docker network the hostname is the compose service, <code>http://minio:9000</code>, because that name uses the container port rather than the published one.</p>
-      <p>Connecting does not dial the bucket at process start. The failure shows up when an upload or a read of a sealed object needs it. That is why a <a href="run.html">one-broker run</a> can look healthy and still lose the seal.</p>
+      <p><span class="ports">127.0.0.1</span> inside the container is the container, not the host where MinIO is published. Point <code>CAMUS_S3_ENDPOINT</code> at the host, for example <code>http://host.docker.internal:9100</code>. On a shared Docker network the hostname is the compose service, <code>http://minio:9000</code>. That name uses the container port, not the published one.</p>
+      <p>The broker does not dial the bucket at startup. The failure shows up on the first upload, or the first read of a sealed object. A <a href="run.html">one-broker run</a> can look healthy and still lose the seal.</p>
 
       <footer>
         <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>

@@ -100,7 +100,7 @@ curl -sf -X POST http://127.0.0.1:18080/admin/init \
   -H 'content-type: application/json' \
   -d '[{"id":1,"addr":"127.0.0.1:18080"}]'</code></pre>
       <p>The init body is the group: each member's id and the address the others use to reach its HTTP admin port. For one node, that address is the host and port you just bound. Do not point it at the Kafka port.</p>
-      <h2>Know that it is up</h2>
+      <h2>Check that it is up</h2>
       <p><code>GET /admin/metrics</code> returns JSON. Before you produce, <code>current_leader</code> and <code>wal_leader</code> should both be <span class="ports">1</span> on this one-node group. <code>GET /metrics</code> is the same process in Prometheus text. The address in the init body is the HTTP admin port the other brokers dial, not the Kafka port.</p>
       <h2>The bucket is separate</h2>
       <p>The process will start without MinIO. A <code>wal</code> produce can be acknowledged after the disk quorum, and the later upload will fail if there is no bucket. Create the bucket before you care about the sealed log. The defaults and the container caveat are on the <a href="minio.html">bucket</a> page.</p>

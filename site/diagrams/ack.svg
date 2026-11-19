@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="dg dg-ack" viewBox="0 0 560 440" width="560" height="440" fill="none" stroke="currentColor" stroke-width="1" focusable="false" style="overflow:visible;font-family:Pollen, sans-serif;font-optical-sizing:auto;font-synthesis:none;font-weight:400;color:#171717" role="img" aria-labelledby="dg-ack-title" aria-describedby="dg-ack-desc">
+<title id="dg-ack-title">Inside one ack</title>
+<desc id="dg-ack-desc">Means over 100,000 wal acks on three i4i.2xlarge brokers: a 0.93 ms round trip, of which the leader&#x27;s 0.17 ms write and fsync runs inside the 0.48 ms append round trip to the followers.</desc>
+<g fill="currentColor" fill-opacity="0.055" stroke="none"><path d="M110.11 264h73.12v28h-73.12Z"/></g>
+<g opacity="1"><path d="M80 120h400v28h-400Z"/><path d="M110.11 168h339.78v28h-339.78Z"/><path d="M110.11 216h322.58v28h-322.58Z"/><path d="M110.11 264h206.45v28h-206.45Z"/><path d="M110.11 312h73.12v28h-73.12Z"/></g>
+<g opacity="0.32"><path d="M80 116L80 92"/><path d="M480 116L480 92"/><path d="M80 96L256.1 96"/><path d="M303.9 96L480 96"/><path d="M76 100l8-8M476 100l8-8"/><path d="M110.11 340L110.11 368"/><path d="M316.56 340L316.56 368"/><path d="M110.11 364L189.43 364"/><path d="M237.23 364L316.56 364"/><path d="M106.11 368l8-8M312.56 368l8-8"/></g>
+<g opacity="0.14"><path d="M183.23 300L183.23 308"/></g>
+<g fill="currentColor" stroke="none" font-size="11" text-anchor="start" opacity="0.72"><text x="90" y="138">client round trip</text><text x="120.11" y="186">produce handler</text><text x="120.11" y="234">Raft commit and apply</text><text x="120.11" y="282">append to followers</text><text x="120.11" y="330">fsync</text></g>
+<g fill="currentColor" stroke="none" font-size="10" text-anchor="end" opacity="0.5"><text x="439.89" y="186">0.79 ms</text><text x="422.69" y="234">0.75 ms</text></g>
+<g fill="currentColor" stroke="none" font-size="10" text-anchor="middle" opacity="0.5"><text x="280" y="99.5">0.93 ms</text><text x="213.33" y="367.5">0.48 ms</text></g>
+<g fill="currentColor" stroke="none" font-size="10" text-anchor="start" opacity="0.5"><text x="193.23" y="330">0.17 ms, inside the append</text><text x="80" y="410">means of 100,000 acks, 3 × i4i.2xlarge; bars start together</text></g>
+</svg>
