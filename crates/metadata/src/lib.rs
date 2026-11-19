@@ -247,8 +247,9 @@ pub enum Command {
         topic: String,
         /// Partition.
         partition: i32,
-        /// First offset of the range. `None` replaces the prefix.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// First offset of the range. `None` replaces the prefix. Always
+        /// written: the Raft log is postcard, which cannot skip a field.
+        #[serde(default)]
         covered_start: Option<i64>,
         /// Exclusive end of the range being replaced.
         covered_end: i64,
@@ -795,6 +796,48 @@ mod command_tests {
         };
         assert_eq!(first(&create)?, 31);
         assert_eq!(first(&Command::PublishMirror { parts: Vec::new() })?, 32);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod log_encoding_tests {
+    use super::*;
+
+    /// Every field of a logged command must survive postcard, which reads
+    /// fields by position: a field left out shifts every one after it.
+    #[test]
+    fn optional_fields_survive_the_log_encoding() -> Result<(), Box<dyn std::error::Error>> {
+        let commands = [
+            Command::NoteTxn {
+                transactional_id: "t".into(),
+                producer_id: 1,
+                producer_epoch: 0,
+                span: txn::TxnSpan {
+                    topic: "orders".into(),
+                    partition: 0,
+                    start: 0,
+                    end: 1,
+                    producer_id: None,
+                },
+                skip_published: true,
+            },
+            Command::Compact {
+                topic: "orders".into(),
+                partition: 0,
+                covered_start: None,
+                covered_end: 10,
+                object_key: "seg/x".into(),
+                file_offset: 0,
+                length: 10,
+                base_timestamp: 0,
+                max_timestamp: 0,
+            },
+        ];
+        for command in commands {
+            let back: Command = camus_raft::codec::decode(&camus_raft::codec::encode(&command)?)?;
+            assert_eq!(back, command);
+        }
         Ok(())
     }
 }

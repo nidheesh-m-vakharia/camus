@@ -27,7 +27,9 @@ pub struct TxnSpan {
     /// Exclusive.
     pub end: i64,
     /// Producer that wrote the batches. Absent on spans stored before ADR 0015.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Always written, even as `None`: `NoteTxn` and `EndTransaction` carry
+    /// this in the Raft log, which is postcard and cannot skip a field.
+    #[serde(default)]
     pub producer_id: Option<i64>,
 }
 
