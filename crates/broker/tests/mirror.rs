@@ -1,6 +1,8 @@
-//! Mirror links and mirror topics on one broker (ADR 0018, phase 1): links
-//! are added, listed, and removed over the admin HTTP routes, and a mirror
-//! topic refuses produce and every admin change but retention.
+//! Mirror links and mirror topics (ADR 0018, phase 1). On one broker: a
+//! mirror topic refuses produce and every admin change but retention, and a
+//! link a mirror names cannot be removed. With MinIO: `link add` reads the
+//! source's snapshot before it commits, and `mirror create` takes the
+//! source topic's partition count and id from it.
 
 mod support;
 
@@ -82,12 +84,25 @@ fn a_mirror_topic_is_read_only_and_holds_its_link() -> TestResult {
     let addr = kafka_addr(&node);
     let client = reqwest::blocking::Client::new();
 
-    assert_eq!(add(&node.http, &link("logs"))?, StatusCode::OK);
-    assert_eq!(add(&node.http, &link("logs"))?, StatusCode::OK, "a retry");
-    assert_eq!(add(&node.http, &link("other"))?, StatusCode::CONFLICT);
+    // This broker has no CAMUS_MIRROR_US_EAST_* keys, so `link add` cannot
+    // check the source and refuses before committing anything.
+    let refused = client
+        .post(format!("http://{}/admin/mirror/links", node.http))
+        .json(&link("logs"))
+        .send()?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text()?.contains("CAMUS_MIRROR_US_EAST_ACCESS_KEY"));
     let mut bad = link("logs");
     bad.alias = "US_EAST".into();
     assert_eq!(add(&node.http, &bad)?, StatusCode::BAD_REQUEST);
+
+    // Commit the link directly; the source check has its own MinIO test.
+    let linked: camus_metadata::Response = client
+        .post(format!("http://{}/admin/apply", node.http))
+        .json(&Command::AddMirrorLink { link: link("logs") })
+        .send()?
+        .json()?;
+    assert_eq!(linked.error_code, 0);
     let listed: Vec<MirrorLink> = client
         .get(format!("http://{}/admin/mirror/links", node.http))
         .send()?
@@ -187,5 +202,132 @@ fn a_mirror_topic_is_read_only_and_holds_its_link() -> TestResult {
         StatusCode::CONFLICT,
         "a mirror still names the link"
     );
+    Ok(())
+}
+
+/// Start a broker whose bucket keys live under `prefix`, with snapshots
+/// every 200 ms and `env` added.
+fn spawn_under(dir: &std::path::Path, prefix: &str, env: &[(&str, &str)]) -> support::Node {
+    let mut opts = Opts::default()
+        .env("CAMUS_S3_PREFIX", prefix)
+        .env("CAMUS_META_SNAPSHOT_MS", "200");
+    for (key, value) in env {
+        opts = opts.env(key, value);
+    }
+    single(dir, opts)
+}
+
+/// Retry `post` until it answers 200 or 15 seconds pass. The source's first
+/// snapshot, or the one naming a new topic, can take a few intervals.
+fn until_ok(
+    post: impl Fn() -> Result<reqwest::blocking::Response, reqwest::Error>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let response = post()?;
+        if response.status() == StatusCode::OK {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("{}: {}", response.status(), response.text()?).into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn a_mirror_is_created_from_the_source_snapshot() -> TestResult {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("mirror source test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let source_prefix = format!("mirror-src-{pid}/");
+    let source_dir = tempfile::tempdir()?;
+    let source = spawn_under(source_dir.path(), &source_prefix, &[]);
+    support::create_topic_named(&kafka_addr(&source), "events", "r2", 3);
+
+    let dest_dir = tempfile::tempdir()?;
+    let dest = spawn_under(
+        dest_dir.path(),
+        &format!("mirror-dst-{pid}/"),
+        &[
+            ("CAMUS_MIRROR_US_EAST_ACCESS_KEY", "camus"),
+            ("CAMUS_MIRROR_US_EAST_SECRET_KEY", "camus-dev-secret"),
+            ("CAMUS_MIRROR_WRONG_ACCESS_KEY", "camus"),
+            ("CAMUS_MIRROR_WRONG_SECRET_KEY", "not-the-secret"),
+        ],
+    );
+    let client = reqwest::blocking::Client::new();
+    let link_to = |alias: &str| MirrorLink {
+        alias: alias.into(),
+        endpoint: "http://127.0.0.1:9100".into(),
+        region: "us-east-1".into(),
+        bucket: "camus".into(),
+        prefix: source_prefix.clone(),
+        virtual_host: false,
+    };
+
+    let wrong = client
+        .post(format!("http://{}/admin/mirror/links", dest.http))
+        .json(&link_to("wrong"))
+        .send()?;
+    assert_eq!(
+        wrong.status(),
+        StatusCode::BAD_GATEWAY,
+        "a wrong key is refused"
+    );
+    let said = wrong.text()?;
+    for leak in ["Signature", "StringToSign", "AccessKeyId", "<?xml"] {
+        assert!(
+            !said.contains(leak),
+            "the 502 echoes the store's reply: {said}"
+        );
+    }
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/links", dest.http))
+            .json(&link_to("us-east"))
+            .send()
+    })?;
+    let listed: Vec<MirrorLink> = client
+        .get(format!("http://{}/admin/mirror/links", dest.http))
+        .send()?
+        .json()?;
+    assert_eq!(listed, vec![link_to("us-east")]);
+
+    let create = || {
+        client
+            .post(format!("http://{}/admin/mirror/topics", dest.http))
+            .json(&serde_json::json!({ "alias": "us-east", "topic": "events" }))
+            .send()
+    };
+    until_ok(create)?;
+    assert_eq!(
+        create()?.status(),
+        StatusCode::CONFLICT,
+        "the mirror exists"
+    );
+    let missing = client
+        .post(format!("http://{}/admin/mirror/topics", dest.http))
+        .json(&serde_json::json!({ "alias": "us-east", "topic": "nope" }))
+        .send()?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let row = |http: &str| -> Result<camus_metadata::Topic, Box<dyn std::error::Error>> {
+        let raw = support::read_key(http, &camus_metadata::topic_storage_key("events"))
+            .ok_or("no topic row")?;
+        Ok(camus_metadata::parse_topic(&raw)?)
+    };
+    let (source_topic, mirror) = (row(&source.http)?, row(&dest.http)?);
+    assert_eq!(mirror.partitions, 3);
+    assert_eq!(
+        mirror.mirror_of,
+        Some(MirrorOf {
+            alias: "us-east".into(),
+            topic_id: source_topic.id.clone(),
+        })
+    );
+    assert_ne!(mirror.id, source_topic.id, "the mirror has its own id");
     Ok(())
 }

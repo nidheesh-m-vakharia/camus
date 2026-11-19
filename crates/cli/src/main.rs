@@ -107,6 +107,19 @@ enum Mirror {
     /// Links to source clusters' buckets.
     #[command(subcommand)]
     Link(Link),
+    /// Create a read-only mirror of a source topic, under the same name, with
+    /// the source's partition count. Reads the source's newest snapshot.
+    Create {
+        /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
+        #[arg(long)]
+        broker: Option<String>,
+        /// The link to the source cluster.
+        #[arg(long)]
+        alias: String,
+        /// The source topic.
+        #[arg(long)]
+        topic: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -275,6 +288,20 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             println!("removed {alias}");
+        }
+        Top::Admin(Admin::Mirror(Mirror::Create {
+            broker,
+            alias,
+            topic,
+        })) => {
+            let broker = broker_addr(broker)?;
+            let body = serde_json::json!({ "alias": alias, "topic": topic });
+            let (status, text) = post(&broker, "/admin/mirror/topics", &body)?;
+            if !status.is_success() {
+                eprintln!("{broker} refused ({status}): {text}");
+                std::process::exit(1);
+            }
+            println!("mirroring {topic} from {alias}");
         }
         Top::Admin(Admin::Mirror(Mirror::Link(Link::List { broker }))) => {
             let broker = broker_addr(broker)?;

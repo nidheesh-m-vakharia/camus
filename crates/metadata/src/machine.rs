@@ -59,22 +59,22 @@ const SNAPSHOT_MAGIC: &[u8; 8] = b"CAMUSKV2";
 /// [`IndexEntry`] per block, then a [`TRAILER_LEN`]-byte trailer.
 /// `build_snapshot` writes it. Brokers read it from the release before, so a
 /// rolling upgrade from that release installs every snapshot this one builds.
-const INDEXED_MAGIC: &[u8; 8] = b"CAMUSKV3";
+pub(crate) const INDEXED_MAGIC: &[u8; 8] = b"CAMUSKV3";
 
 /// Index offset (u64 LE), index length (u64 LE), CRC32C of the index
 /// (u32 LE), then [`INDEXED_MAGIC`].
-const TRAILER_LEN: usize = 8 + 8 + 4 + 8;
+pub(crate) const TRAILER_LEN: usize = 8 + 8 + 4 + 8;
 
 /// One block of an indexed body: its first row's key, that row's byte offset
 /// in the body, and the CRC32C of the block's bytes. A block runs from its
 /// offset to the next block's, or to the index.
-type IndexEntry = (String, u64, u32);
+pub(crate) type IndexEntry = (String, u64, u32);
 
 /// A row starts a new block once it is this far past the last block's start.
 /// The index holds one entry per block, so it is about 1/65536 of the body.
 const BLOCK_BYTES: u64 = 64 * 1024;
 
-const CRC32C: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+pub(crate) const CRC32C: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
 
 /// Longest time between durable applies.
 const DURABLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -274,6 +274,25 @@ fn indexed_parts(bytes: &[u8]) -> Result<(usize, &[u8]), String> {
     let trailer = bytes
         .get(trailer_at..)
         .ok_or("snapshot trailer is missing")?;
+    let (index_at, index_len, crc) = parse_trailer(trailer, bytes.len() as u64)?;
+    let index_at = usize::try_from(index_at).map_err(|err| err.to_string())?;
+    let index_len = usize::try_from(index_len).map_err(|err| err.to_string())?;
+    let index = bytes
+        .get(index_at..index_at + index_len)
+        .ok_or("snapshot index is out of bounds")?;
+    if CRC32C.checksum(index) != crc {
+        return Err("snapshot index fails its CRC32C".into());
+    }
+    Ok((index_at, index))
+}
+
+/// The index offset, index length, and index CRC32C from an indexed body's
+/// last [`TRAILER_LEN`] bytes, checked against the body's length: the index
+/// must start after the magic and end where the trailer starts.
+pub(crate) fn parse_trailer(trailer: &[u8], body_len: u64) -> Result<(u64, u64, u32), String> {
+    if trailer.len() != TRAILER_LEN {
+        return Err("snapshot trailer is truncated".into());
+    }
     let le_u64 = |at: usize| -> Option<u64> {
         let field: [u8; 8] = trailer.get(at..at + 8)?.try_into().ok()?;
         Some(u64::from_le_bytes(field))
@@ -288,25 +307,19 @@ fn indexed_parts(bytes: &[u8]) -> Result<(usize, &[u8]), String> {
     if trailer.get(20..) != Some(INDEXED_MAGIC.as_slice()) {
         return Err("snapshot trailer does not end in its magic".into());
     }
-    let index_at = usize::try_from(index_at).map_err(|err| err.to_string())?;
-    let index_len = usize::try_from(index_len).map_err(|err| err.to_string())?;
-    if index_at.checked_add(index_len) != Some(trailer_at) || index_at < INDEXED_MAGIC.len() {
+    let trailer_at = body_len.saturating_sub(TRAILER_LEN as u64);
+    if index_at.checked_add(index_len) != Some(trailer_at) || index_at < INDEXED_MAGIC.len() as u64
+    {
         return Err(format!(
             "snapshot index at {index_at}, {index_len} bytes, does not end at the trailer {trailer_at}"
         ));
     }
-    let index = bytes
-        .get(index_at..trailer_at)
-        .ok_or("snapshot index is out of bounds")?;
-    if CRC32C.checksum(index) != u32::from_le_bytes(crc) {
-        return Err("snapshot index fails its CRC32C".into());
-    }
-    Ok((index_at, index))
+    Ok((index_at, index_len, u32::from_le_bytes(crc)))
 }
 
 /// Encode `rows`, in key order, as an [`INDEXED_MAGIC`] body.
 #[cfg(test)]
-fn encode_indexed(rows: &[(&str, &str)]) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_indexed(rows: &[(&str, &str)]) -> Result<Vec<u8>, String> {
     let mut body = IndexedBody::new(rows.len() as u64);
     for (key, value) in rows {
         body.row(key, value);
