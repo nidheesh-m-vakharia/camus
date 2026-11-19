@@ -3661,9 +3661,6 @@ impl Kafka {
         let Some(topic) = topic else {
             return Err(UNKNOWN_TOPIC);
         };
-        if topic.mirror_of.is_some() {
-            return Err(INVALID_TOPIC);
-        }
         if self.restore_offline(&topic.id, partition) {
             return Err(LEADER_NOT_AVAILABLE);
         }
@@ -3679,6 +3676,12 @@ impl Kafka {
         }
         if !self.leader() {
             return Err(NOT_LEADER);
+        }
+        // A mirror is always `r2`. Checked after leadership, so a broker
+        // that has not applied a promotion yet sends the producer to the
+        // leader, which has, instead of failing it for good (ADR 0018).
+        if topic.mirror_of.is_some() {
+            return Err(INVALID_TOPIC);
         }
         if partition < 0 || partition >= topic.partitions {
             return Err(UNKNOWN_TOPIC);

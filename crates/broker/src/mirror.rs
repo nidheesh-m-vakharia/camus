@@ -314,6 +314,10 @@ async fn copy_round(
                     continue;
                 }
                 let copied = copy_partition(node, dest, &source, topic, partition).await;
+                if matches!(copied, Ok(Copied::Gone)) {
+                    waits.retain(|(id, _), _| *id != topic.id);
+                    break;
+                }
                 if !matches!(copied, Ok(Copied::Waiting)) {
                     waits.remove(&at);
                 }
@@ -479,10 +483,8 @@ async fn sync_group(
     }
     let count = offsets.len() as u64;
     let committed = node
-        .apply(camus_metadata::Command::CommitOffsets {
+        .apply(camus_metadata::Command::SyncMirrorOffsets {
             group: group.to_string(),
-            generation: -1,
-            member_id: String::new(),
             offsets,
         })
         .await?;
@@ -491,10 +493,12 @@ async fn sync_group(
         // List the group here, as a commit through OffsetCommit would.
         coordinator.touch(group);
     } else {
+        // 3: a topic was promoted after this round began. Otherwise a
+        // member has joined.
         tracing::info!(
             group,
             code = committed.error_code,
-            "mirror group sync refused, as a member has joined"
+            "mirror group sync refused"
         );
     }
     Ok(())
@@ -511,6 +515,8 @@ enum Copied {
     Stalled(String),
     /// At a transaction the source has not ended.
     Waiting,
+    /// The topic stopped being a mirror during the round.
+    Gone,
 }
 
 /// Copy up to [`WINDOWS_PER_ROUND`] windows of `topic`'s `partition`.
@@ -591,6 +597,7 @@ async fn copy_partition(
                 resume = Some((extent.key.clone(), pos, next_end(node, topic, partition)?))
             }
             Window::Raced => return Ok(Copied::Some),
+            Window::Gone => return Ok(Copied::Gone),
             // A transaction the source has not ended: the next snapshot
             // that shows its span lets the copy go on.
             Window::Waiting => return Ok(Copied::Waiting),
@@ -643,6 +650,9 @@ enum Window {
     Published { pos: u64 },
     /// Another copier published first. Stop this partition for the round.
     Raced,
+    /// The topic is no longer a mirror: it was promoted, or deleted, since
+    /// the round began.
+    Gone,
     /// The next batch belongs to a transaction the source has not ended.
     Waiting,
     /// Cannot go on.
@@ -873,6 +883,7 @@ async fn publish(
         // Another copier, such as a leader before this one, published first.
         // An object put for this attempt is an orphan for the sweep.
         1 => Ok(Window::Raced),
+        3 => Ok(Window::Gone),
         code => anyhow::bail!("publishing into {} failed with {code}", topic.name),
     }
 }

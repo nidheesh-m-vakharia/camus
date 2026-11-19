@@ -776,17 +776,44 @@ Phase 2, third part: promotion and the fork check.
   is not a mirror 400, and on an unknown topic 404. Records the source
   acked and had not sealed into a snapshot this cluster read are not
   here, which is why the flag is required.
-- A promoted topic keeps the mirror's epoch rule: its epoch is the larger
-  of the metadata term and the newest copied source epoch. `r2` produce
-  stamps batches with that epoch, not the bare term, so a new batch never
-  carries a lower epoch than a copied one before it.
+- Promotion starts a new leader epoch at each partition's promotion
+  offset, one past the newest copied epoch, as a Kafka leader change
+  does. A promoted topic keeps the mirror's epoch rule: its epoch is the
+  larger of the metadata term and the newest epoch in its history. `r2`
+  produce stamps batches with that epoch, so the first record this
+  cluster writes is in the new epoch. The new epoch matters to a consumer
+  that fetched records the source acked past the promotion offset, and
+  then fails over keeping its position. When it asks `OffsetForLeaderEpoch`
+  for the copied epoch, the answer ends at the promotion offset, and the
+  consumer truncates there. Without the new epoch it would skip what this
+  cluster wrote at those offsets.
+- A promote that is retried, for example after its response was lost,
+  changes nothing and returns 200. A partition row missing at promotion
+  rejects the command, rather than failing the apply.
+- The group sync commits through `SyncMirrorOffsets` (log position 37). It
+  applies as a commit with no generation, but only while every topic it
+  names is still a mirror. A sync that was in flight when its topic was
+  promoted is refused, so it cannot write a source offset over offsets
+  this cluster has since produced.
+- A copy that was in flight during a promotion is refused with 3, the
+  topic left the mirror set. The copier stops that topic for the round
+  without counting an error. One orphan object at most is left for the
+  sweep.
+- Produce checks `mirror_of` after leadership. A broker that has not yet
+  applied a promotion sends the producer to the leader with a retriable
+  error. It does not fail the producer with `INVALID_TOPIC_EXCEPTION`.
 - `camus admin mirror fork-check --topic`, or `GET
   /admin/mirror/fork-check`, is the issue 151 check. It reads only. It
   reads the old source through the link, which must still exist, and
   reports each partition's `promoted_at` and the source's end. The source
   has forked a partition when its end is past `promoted_at`: it holds
-  records at offsets this cluster has since assigned again. The CLI exits
-  1 when any partition has forked.
+  records at offsets this cluster has since assigned again.
+  - The source's end comes from its newest snapshot, which the response
+    names as `source_snapshot`. Records it acked and had not yet sealed
+    into that snapshot are not seen, so `forked: false` means no fork yet.
+  - A partition the source has no row for is reported as unknown
+    (`forked: null`, `unknown: true`).
+  - The CLI exits 1 on a fork or an unknown.
 - Mirroring back into the old source is not built. That cluster's topic
   already exists, and a topic that exists cannot become a mirror, so
   failing back still goes through MirrorMaker 2, or through a new topic.
@@ -794,7 +821,11 @@ Phase 2, third part: promotion and the fork check.
   covers this:
   1. A promote without the flag returns 400.
   2. After the promote, the topic takes a produce at offset 40 and still
-     serves `record-39`.
+     serves `record-39`. A retried promote returns 200. The record at 40
+     is in a newer epoch than the copied record at 39, and
+     `OffsetForLeaderEpoch` for the copied epoch ends at 40. Without the
+     new epoch at promotion, both records share an epoch and the test
+     fails.
   3. The old source writes on to 42, and the fork check reports
      `promoted_at` 40, `source_end` 42, and a fork, while the promoted
      topic stays at 41.

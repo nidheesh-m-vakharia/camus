@@ -1305,8 +1305,8 @@ fn a_promoted_mirror_is_writable_and_a_fork_is_reported() -> TestResult {
     assert_eq!(promote(true)?.status(), StatusCode::OK);
     assert_eq!(
         promote(true)?.status(),
-        StatusCode::BAD_REQUEST,
-        "no longer a mirror"
+        StatusCode::OK,
+        "a retried promote succeeds"
     );
 
     let dest_addr = kafka_addr(&dest);
@@ -1318,6 +1318,30 @@ fn a_promoted_mirror_is_writable_and_a_fork_is_reported() -> TestResult {
     let (code, values) = support::fetch_at(&dest_addr, 39);
     assert_eq!(code, 0);
     assert_eq!(values.first().map(String::as_str), Some("record-39"));
+
+    // Promotion starts a new epoch at 40: the copied epoch ends there, and
+    // the record produced at 40 carries a newer one.
+    let log = raw_log(&dest_addr, 41)?;
+    let batches = camus_protocol::batch::inspect(&log, camus_protocol::batch::MAX_BATCH_CEILING)
+        .map_err(|err| format!("{err:?}"))?;
+    let mut epochs = Vec::new();
+    let mut at = 0;
+    for batch in &batches {
+        epochs.push(camus_protocol::batch::leader_epoch(
+            log.get(at..).ok_or("short")?,
+        ));
+        at += batch.len;
+    }
+    let (copied, produced) = (epochs[39], epochs[40]);
+    assert!(
+        produced > copied,
+        "epoch {produced} at 40 is not past the copied {copied}"
+    );
+    let current = support::partition_epoch(&dest_addr);
+    assert_eq!(
+        support::epoch_end(&dest_addr, current, copied),
+        (0, copied, 40)
+    );
 
     // The old source writes on: the same offsets now hold other records.
     for at in 40..42 {
@@ -1344,6 +1368,10 @@ fn a_promoted_mirror_is_writable_and_a_fork_is_reported() -> TestResult {
     };
     assert_eq!(report["partitions"][0]["promoted_at"], 40);
     assert_eq!(report["partitions"][0]["source_end"], 42);
+    assert_eq!(report["unknown"], false);
+    assert!(report["source_snapshot"]
+        .as_str()
+        .is_some_and(|key| key.starts_with("meta/snap/")));
     assert_eq!(
         support::sealed_end(&dest.http),
         41,

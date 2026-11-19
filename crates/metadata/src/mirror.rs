@@ -162,7 +162,14 @@ pub struct Promoted {
 }
 
 /// Make a mirror topic writable: copying stops, and each partition's next
-/// offset is kept as where it was promoted. Refused on a plain topic.
+/// offset is kept as where it was promoted. Refused on a plain topic; a
+/// topic already promoted changes nothing, so a retried promote succeeds.
+///
+/// Each partition that holds copied batches starts a new epoch at its
+/// promotion offset, one past the newest copied epoch, as a Kafka leader
+/// change does. A consumer that fetched records the source acked past that
+/// offset then sees its epoch end there and truncates, rather than skipping
+/// what this cluster writes at those offsets.
 pub fn promote(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     name: &str,
@@ -172,23 +179,62 @@ pub fn promote(
     };
     let mut topic = catalog::parse_topic(&raw)?;
     let Some(of) = topic.mirror_of.take() else {
+        if topic.promoted.is_some() {
+            return Ok(unchanged());
+        }
         return Ok(Outcome::Reject(INVALID_REQUEST));
     };
     let mut at = Vec::with_capacity(topic.partitions.max(0) as usize);
+    let mut put = Vec::new();
     for partition in 0..topic.partitions {
-        let raw = get(&catalog::partition_storage_key(&topic.id, partition))?
-            .ok_or_else(|| format!("{name} has no partition {partition}"))?;
-        at.push(catalog::parse_partition(&raw)?.next_offset);
+        let key = catalog::partition_storage_key(&topic.id, partition);
+        let Some(raw) = get(&key)? else {
+            return Ok(Outcome::Reject(3));
+        };
+        let mut state = catalog::parse_partition(&raw)?;
+        at.push(state.next_offset);
+        if let Some(last) = state.epochs.last().cloned() {
+            state.epochs.push(catalog::EpochStart {
+                epoch: last.epoch.saturating_add(1),
+                start: state.next_offset,
+            });
+            put.push((
+                key,
+                serde_json::to_string(&state).map_err(|err| err.to_string())?,
+            ));
+        }
     }
     topic.promoted = Some(Promoted { of, at });
+    put.push((
+        catalog::topic_storage_key(name),
+        serde_json::to_string(&topic).map_err(|err| err.to_string())?,
+    ));
     Ok(Outcome::Change {
-        put: vec![(
-            catalog::topic_storage_key(name),
-            serde_json::to_string(&topic).map_err(|err| err.to_string())?,
-        )],
+        put,
         del: Vec::new(),
         value: None,
     })
+}
+
+/// Whether every topic id in `topic_ids` is still a mirror. A group sync
+/// commits only then, so one that was in flight when a topic was promoted
+/// cannot write a source offset into what this cluster has since produced.
+pub fn all_mirrors<'a>(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    topic_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<bool, String> {
+    for id in topic_ids {
+        let Some(name) = get(&catalog::id_key(id))? else {
+            return Ok(false);
+        };
+        let Some(raw) = get(&catalog::topic_storage_key(&name))? else {
+            return Ok(false);
+        };
+        if catalog::parse_topic(&raw)?.mirror_of.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Metadata key of a link.
@@ -703,15 +749,23 @@ mod tests {
             topic.promoted.as_ref().map(|it| it.at.clone()),
             Some(vec![40, 0, 0])
         );
+        let epochs = partition(&map, "events")?.epochs;
+        assert_eq!(
+            epochs.last().map(|last| (last.epoch, last.start)),
+            Some((1, 40)),
+            "a new epoch starts where it was promoted"
+        );
+        let get = |key: &str| Ok(map.get(key).cloned());
+        assert!(!all_mirrors(&get, [topic.id.as_str()])?);
         // No longer a mirror: copies are refused, the link can go.
         assert_eq!(publish_copied(&mut map, &[part("events", 40, 41)])?, 3);
         assert_eq!(remove(&mut map, "us-east")?, 0);
         let snapshot = map.clone();
         let get = |key: &str| Ok(snapshot.get(key).cloned());
-        assert!(matches!(
-            promote(&get, "events")?,
-            Outcome::Reject(INVALID_REQUEST)
-        ));
+        assert!(
+            matches!(promote(&get, "events")?, Outcome::Change { ref put, .. } if put.is_empty()),
+            "a retried promote changes nothing"
+        );
         assert!(matches!(promote(&get, "nope")?, Outcome::Reject(3)));
         Ok(())
     }

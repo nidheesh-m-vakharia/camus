@@ -1702,9 +1702,14 @@ struct ForkQuery {
 }
 
 /// For a promoted mirror, each partition's offset at promotion and the old
-/// source's end now, read through the link. A source that went past the
+/// source's end, read through the link. A source that went past the
 /// promotion has records at offsets this cluster assigned again: a fork
 /// (issue 151). Reads only.
+///
+/// The source's end is from its newest snapshot, named in the response, so
+/// records it acked and had not sealed into that snapshot are not counted:
+/// `forked: false` means none yet. A partition the source has no row for is
+/// unknown, `forked: null`.
 async fn fork_check(
     State(admin): State<Arc<Admin>>,
     Query(query): Query<ForkQuery>,
@@ -1738,6 +1743,7 @@ async fn fork_check(
     let source = source_snapshot(&link).await?;
     let mut partitions = Vec::new();
     let mut forked = false;
+    let mut unknown = false;
     for (partition, at) in promoted.at.iter().enumerate() {
         let key = camus_metadata::partition_storage_key(&promoted.of.topic_id, partition as i32);
         let end = match source
@@ -1752,8 +1758,9 @@ async fn fork_check(
             ),
             None => None,
         };
-        let past = end.is_some_and(|end| end > *at);
-        forked |= past;
+        let past = end.map(|end| end > *at);
+        forked |= past == Some(true);
+        unknown |= past.is_none();
         partitions.push(serde_json::json!({
             "partition": partition,
             "promoted_at": at,
@@ -1764,7 +1771,9 @@ async fn fork_check(
     Ok(Json(serde_json::json!({
         "topic": query.topic,
         "alias": alias,
+        "source_snapshot": source.key(),
         "forked": forked,
+        "unknown": unknown,
         "partitions": partitions,
     })))
 }

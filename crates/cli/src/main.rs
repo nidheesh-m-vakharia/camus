@@ -148,8 +148,10 @@ enum Mirror {
         i_accept_data_loss: bool,
     },
     /// For a promoted topic, compare each partition's offset at promotion
-    /// with the old source's end. Exits 1 when the source went past it: the
-    /// two clusters hold different records at the same offsets.
+    /// with the old source's end in its newest snapshot. Exits 1 when the
+    /// source went past it, as the two clusters then hold different records
+    /// at the same offsets, or when a partition cannot be checked. Records
+    /// the source has not sealed into a snapshot are not seen yet.
     ForkCheck {
         /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
         #[arg(long)]
@@ -396,7 +398,9 @@ fn main() -> anyhow::Result<()> {
             let broker = broker_addr(broker)?;
             let report = get_json(&broker, &format!("/admin/mirror/fork-check?topic={topic}"))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
-            if report["forked"].as_bool().unwrap_or(false) {
+            let forked = report["forked"].as_bool().unwrap_or(true);
+            let unknown = report["unknown"].as_bool().unwrap_or(true);
+            if forked || unknown {
                 std::process::exit(1);
             }
         }

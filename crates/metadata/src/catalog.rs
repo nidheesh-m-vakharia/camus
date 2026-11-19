@@ -263,7 +263,7 @@ fn topic_key(name: &str) -> String {
     format!("topic/{name}")
 }
 
-fn id_key(id: &str) -> String {
+pub(crate) fn id_key(id: &str) -> String {
     format!("id/{id}")
 }
 
