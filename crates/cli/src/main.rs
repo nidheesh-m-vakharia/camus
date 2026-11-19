@@ -120,6 +120,20 @@ enum Mirror {
         #[arg(long)]
         topic: String,
     },
+    /// Set the consumer groups whose committed offsets are synced from the
+    /// link's source into its mirrors, while a group has no members here.
+    /// Pass no `--group` to stop syncing.
+    Groups {
+        /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
+        #[arg(long)]
+        broker: Option<String>,
+        /// The link to the source cluster.
+        #[arg(long)]
+        alias: String,
+        /// A group id. Repeat for each group.
+        #[arg(long = "group")]
+        groups: Vec<String>,
+    },
     /// Drop a stalled mirror partition's copy. Copying goes on from the later
     /// of its old end and the source's log start. For a partition the
     /// source's retention passed.
@@ -319,6 +333,20 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             println!("mirroring {topic} from {alias}");
+        }
+        Top::Admin(Admin::Mirror(Mirror::Groups {
+            broker,
+            alias,
+            groups,
+        })) => {
+            let broker = broker_addr(broker)?;
+            let body = serde_json::json!({ "alias": alias, "groups": groups });
+            let (status, text) = post(&broker, "/admin/mirror/groups", &body)?;
+            if !status.is_success() {
+                eprintln!("{broker} refused ({status}): {text}");
+                std::process::exit(1);
+            }
+            println!("{alias} syncs {} groups", groups.len());
         }
         Top::Admin(Admin::Mirror(Mirror::Reset {
             broker,

@@ -624,6 +624,9 @@ fn apply_command(
                 let aborted: Vec<catalog::Span> = aborted.iter().map(Into::into).collect();
                 catalog::publish_mirror(&read, &parts, &committed, &aborted)
             }
+            Command::SetMirrorGroups { alias, groups } => {
+                mirror::set_groups(&read, &alias, &groups)
+            }
             Command::TrimMirror { cuts } => {
                 admin::trim_mirror(&read, &scan, &cuts).and_then(admin::outcome)
             }

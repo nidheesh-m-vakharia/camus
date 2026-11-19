@@ -390,6 +390,14 @@ pub enum Command {
         /// One per partition.
         cuts: Vec<admin::RecordCut>,
     },
+    /// Set the consumer groups whose committed offsets the mirror copier
+    /// syncs from a link's source (ADR 0018). Empty stops syncing.
+    SetMirrorGroups {
+        /// The link's alias.
+        alias: String,
+        /// Group ids.
+        groups: Vec<String>,
+    },
 }
 
 /// State-machine response for [`Command`].
@@ -846,6 +854,11 @@ mod command_tests {
         };
         assert_eq!(first(&reset)?, 33);
         assert_eq!(first(&Command::TrimMirror { cuts: Vec::new() })?, 34);
+        let groups = Command::SetMirrorGroups {
+            alias: "a".into(),
+            groups: Vec::new(),
+        };
+        assert_eq!(first(&groups)?, 35);
         Ok(())
     }
 }

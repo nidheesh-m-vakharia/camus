@@ -92,6 +92,64 @@ impl From<&CopiedSpan> for catalog::Span {
     }
 }
 
+/// Most consumer groups one link syncs. The copier reads each group's
+/// offsets from the source every round.
+pub const MAX_GROUPS: usize = 256;
+
+/// Longest group id a link syncs.
+const MAX_GROUP_BYTES: usize = 1024;
+
+/// Metadata key of the groups a link syncs: a JSON list of group ids.
+pub fn groups_key(alias: &str) -> String {
+    format!("mirror-groups/{alias}")
+}
+
+/// Set the consumer groups whose committed offsets the copier syncs from a
+/// link's source into its mirrors. An empty list stops syncing. The link
+/// must exist; at most [`MAX_GROUPS`] ids, each 1 to 1024 bytes.
+pub fn set_groups(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    alias: &str,
+    groups: &[String],
+) -> Result<Outcome, String> {
+    let sized = groups
+        .iter()
+        .all(|group| !group.is_empty() && group.len() <= MAX_GROUP_BYTES);
+    if get(&link_key(alias))?.is_none() || groups.len() > MAX_GROUPS || !sized {
+        return Ok(Outcome::Reject(INVALID_REQUEST));
+    }
+    let mut groups = groups.to_vec();
+    groups.sort();
+    groups.dedup();
+    let key = groups_key(alias);
+    if groups.is_empty() {
+        return Ok(Outcome::Change {
+            put: Vec::new(),
+            del: vec![key],
+            value: None,
+        });
+    }
+    Ok(Outcome::Change {
+        put: vec![(
+            key,
+            serde_json::to_string(&groups).map_err(|err| err.to_string())?,
+        )],
+        del: Vec::new(),
+        value: None,
+    })
+}
+
+/// The consumer groups a link syncs.
+pub fn groups_of(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    alias: &str,
+) -> Result<Vec<String>, String> {
+    match get(&groups_key(alias))? {
+        Some(raw) => serde_json::from_str(&raw).map_err(|err| err.to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Metadata key of a link.
 pub fn link_key(alias: &str) -> String {
     format!("{}{alias}", links_prefix())
@@ -175,7 +233,7 @@ pub fn remove_link(
     }
     Ok(Outcome::Change {
         put: Vec::new(),
-        del: vec![key],
+        del: vec![key, groups_key(alias)],
         value: None,
     })
 }
@@ -541,6 +599,47 @@ mod tests {
             reset_partition(&get, &scan, "nope", 0)?,
             Outcome::Reject(3)
         ));
+        Ok(())
+    }
+
+    fn set(map: &mut HashMap<String, String>, alias: &str, groups: &[&str]) -> Result<i16, String> {
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let groups: Vec<String> = groups.iter().map(|group| group.to_string()).collect();
+        let outcome = set_groups(&get, alias, &groups)?;
+        apply(map, outcome)
+    }
+
+    #[test]
+    fn a_link_syncs_a_capped_list_of_groups() -> TestResult {
+        let mut map = HashMap::new();
+        assert_eq!(
+            set(&mut map, "us-east", &["g"])?,
+            INVALID_REQUEST,
+            "no link yet"
+        );
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(set(&mut map, "us-east", &["b", "a", "b"])?, 0);
+        let get = |key: &str| Ok(map.get(key).cloned());
+        assert_eq!(
+            groups_of(&get, "us-east")?,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        let many: Vec<String> = (0..=MAX_GROUPS).map(|at| format!("g{at}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(set(&mut map, "us-east", &many)?, INVALID_REQUEST);
+        assert_eq!(set(&mut map, "us-east", &[""])?, INVALID_REQUEST);
+        assert_eq!(set(&mut map, "us-east", &[])?, 0);
+        assert!(
+            !map.contains_key(&groups_key("us-east")),
+            "an empty list clears it"
+        );
+        assert_eq!(set(&mut map, "us-east", &["a"])?, 0);
+        assert_eq!(remove(&mut map, "us-east")?, 0);
+        assert!(
+            !map.contains_key(&groups_key("us-east")),
+            "removed with its link"
+        );
         Ok(())
     }
 

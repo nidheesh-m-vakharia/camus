@@ -701,3 +701,40 @@ Phase 2, first part: transactions.
   `retention.bytes` on the mirror and waits for its log start to move.
   With mirror cuts sent as `DeleteRecords`, the log start never moves and
   the test fails.
+
+Phase 2, second part: consumer group offsets.
+
+- `camus admin mirror groups --alias --group …`, or
+  `POST /admin/mirror/groups`, commits `SetMirrorGroups` (log position
+  35). That stores the link's group list at `mirror-groups/{alias}`, at
+  most 256 ids of 1 to 1024 bytes each, sorted and deduplicated. An empty
+  list stops the sync. Removing the link removes the list.
+- Each copy round, after a link's partitions, `sync_groups` handles each
+  listed group:
+  1. It skips the group if it has members here, because a group consuming
+     the mirror owns its own offsets.
+  2. It reads the group's committed offsets from the source snapshot in
+     one ranged read of its `offset/{group}/` keys.
+  3. For each offset on a source topic this link mirrors, it clamps the
+     offset to the mirror partition's next offset.
+  4. It writes the offset only when it moves the group forward, in one
+     `CommitOffsets` with no generation.
+
+  Mirror offsets equal source offsets, so nothing is translated, and the
+  sync is as fine-grained as the source's commits. MirrorMaker 2 can be up
+  to `offset.lag.max` behind. A commit with no generation is refused once
+  the group has members, so a consumer that joins between the check and
+  the commit wins.
+- `camus_mirror_group_offsets_synced_total` counts the offsets written.
+- The MinIO test `a_mirror_syncs_a_groups_offsets_forward_only` covers
+  the sync:
+  1. A listed group's source commits of 25 and then 30 appear on the
+     mirror.
+  2. A consumer then commits 35 on the mirror, and the source's 32 does
+     not pull it back.
+  3. A source commit of 1000 is clamped to the mirror's end, 40.
+  4. A group list for an unknown link returns 400.
+
+  The skip for a group with members rests on the metadata group's commit
+  check, which has its own tests. This test does not join a member.
+

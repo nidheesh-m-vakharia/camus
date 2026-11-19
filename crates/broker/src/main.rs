@@ -259,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route("/admin/mirror/topics", post(create_mirror_topic))
                 .route("/admin/mirror/reset", post(reset_mirror_partition))
+                .route("/admin/mirror/groups", post(set_mirror_groups))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
                 .route("/wal/{shard}/txn-span", post(shard_txn_span))
@@ -439,6 +440,9 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          # HELP camus_mirror_waiting_partitions Mirror partitions waiting at a transaction the source has not ended.\n\
          # TYPE camus_mirror_waiting_partitions gauge\n\
          camus_mirror_waiting_partitions {}\n\
+         # HELP camus_mirror_group_offsets_synced_total Committed offsets the mirror copier synced from sources.\n\
+         # TYPE camus_mirror_group_offsets_synced_total counter\n\
+         camus_mirror_group_offsets_synced_total {}\n\
          # HELP camus_mirror_copy_errors_total Mirror copy rounds, sources, or partitions that failed and will be retried.\n\
          # TYPE camus_mirror_copy_errors_total counter\n\
          camus_mirror_copy_errors_total {}\n\
@@ -482,6 +486,7 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         mirror::COPIED_BYTES.load(Relaxed),
         mirror::STALLED.load(Relaxed),
         mirror::WAITING.load(Relaxed),
+        mirror::GROUP_OFFSETS.load(Relaxed),
         mirror::COPY_ERRORS.load(Relaxed),
         store.puts.calls.load(Relaxed),
         store.gets.calls.load(Relaxed),
@@ -1649,6 +1654,42 @@ fn source_error(alias: &str, err: &anyhow::Error) -> (StatusCode, String) {
             camus_storage::public_reason(err)
         ),
     )
+}
+
+#[derive(Deserialize)]
+struct MirrorGroups {
+    alias: String,
+    groups: Vec<String>,
+}
+
+/// Set the consumer groups whose offsets the copier syncs from a link's
+/// source. An empty list stops syncing.
+async fn set_mirror_groups(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<MirrorGroups>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let alias = body.alias.clone();
+    let command = Command::SetMirrorGroups {
+        alias: body.alias,
+        groups: body.groups,
+    };
+    let response = metadata_apply(&admin, command)
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    match response.error_code {
+        0 => Ok(StatusCode::OK),
+        camus_metadata::mirror::INVALID_REQUEST => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "link {alias}: the link must exist, with at most {} groups of 1-1024 bytes",
+                camus_metadata::mirror::MAX_GROUPS
+            ),
+        )),
+        code => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("link {alias}: error code {code}"),
+        )),
+    }
 }
 
 #[derive(Deserialize)]

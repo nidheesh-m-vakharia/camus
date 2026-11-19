@@ -203,6 +203,9 @@ pub static STALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// it, such as one whose brokers are gone.
 pub static WAITING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Committed offsets the copier has synced into mirrors.
+pub static GROUP_OFFSETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Most partitions remembered as waiting. Past it the memory is cleared, and
 /// those partitions are read again once.
 const MAX_WAITS: usize = 65_536;
@@ -298,7 +301,7 @@ async fn copy_round(
                 continue;
             }
         };
-        for topic in linked {
+        for topic in linked.iter().copied() {
             for partition in 0..topic.partitions {
                 let at = (topic.id.clone(), partition);
                 if waits.get(&at).is_some_and(|key| key == source.key()) {
@@ -342,8 +345,96 @@ async fn copy_round(
                 }
             }
         }
+        if let Err(err) = sync_groups(node, &source, &link.alias, &linked).await {
+            COPY_ERRORS.fetch_add(1, Relaxed);
+            tracing::warn!(
+                alias = link.alias,
+                error = format!("{err:#}"),
+                "mirror group sync failed"
+            );
+        }
     }
     Ok((stalled, waiting))
+}
+
+/// Sync the committed offsets of the groups `alias` lists from the source
+/// into the mirrors in `linked`, as MirrorMaker 2's
+/// `sync.group.offsets.enabled` does. A group with members here is
+/// consuming the mirror, so its offsets are its own and are left alone; the
+/// commit has no generation, so a member that joins before it applies
+/// makes the group refuse it. Mirror offsets equal source offsets, so
+/// nothing is translated. Each offset is clamped to the mirror's end, and
+/// only one that moves the group forward is written.
+async fn sync_groups(
+    node: &camus_metadata::MetadataNode,
+    source: &SourceSnapshot,
+    alias: &str,
+    linked: &[&Topic],
+) -> anyhow::Result<()> {
+    use camus_metadata::groups::{self, OffsetCommit, OffsetRecord};
+    use std::sync::atomic::Ordering::Relaxed;
+    let get = |key: &str| node.read_local(key).map_err(|err| err.to_string());
+    let listed =
+        camus_metadata::mirror::groups_of(&get, alias).map_err(|err| anyhow::anyhow!(err))?;
+    for group in listed {
+        let here = groups::read_group(&get, &group).map_err(|err| anyhow::anyhow!(err))?;
+        if here.is_some_and(|record| !record.members.is_empty()) {
+            continue;
+        }
+        let prefix = groups::offset_prefix(&group);
+        // `0` sorts right after `/`, so this bounds the group's keys.
+        let end = format!("{}0", prefix.trim_end_matches('/'));
+        let mut offsets = Vec::new();
+        for (key, raw) in source.rows(&prefix, &end).await? {
+            let Some((topic_id, partition)) = groups::offset_from_key(&group, &key) else {
+                continue;
+            };
+            let Some(topic) = linked.iter().find(|topic| {
+                topic
+                    .mirror_of
+                    .as_ref()
+                    .is_some_and(|of| of.topic_id == topic_id)
+            }) else {
+                continue;
+            };
+            if partition < 0 || partition >= topic.partitions {
+                continue;
+            }
+            let record: OffsetRecord = serde_json::from_str(&raw)?;
+            if record.offset < 0 {
+                continue;
+            }
+            let offset = record.offset.min(next_end(node, topic, partition)?);
+            let mine = get(&groups::offset_key(&group, &topic.id, partition))
+                .map_err(|err| anyhow::anyhow!(err))?
+                .map(|raw| serde_json::from_str::<OffsetRecord>(&raw))
+                .transpose()?;
+            if mine.is_some_and(|mine| mine.offset >= offset) {
+                continue;
+            }
+            offsets.push(OffsetCommit {
+                topic_id: topic.id.clone(),
+                partition,
+                record: OffsetRecord { offset, ..record },
+            });
+        }
+        if offsets.is_empty() {
+            continue;
+        }
+        let count = offsets.len() as u64;
+        let committed = node
+            .apply(camus_metadata::Command::CommitOffsets {
+                group,
+                generation: -1,
+                member_id: String::new(),
+                offsets,
+            })
+            .await?;
+        if committed.error_code == 0 {
+            GROUP_OFFSETS.fetch_add(count, Relaxed);
+        }
+    }
+    Ok(())
 }
 
 /// What one partition's copy did.
