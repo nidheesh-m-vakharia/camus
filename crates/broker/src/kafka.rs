@@ -1284,7 +1284,9 @@ impl Kafka {
     /// the larger of the term and the newest epoch it copied. Both only grow.
     fn r2_epoch(&self, topic: &Topic, partition: i32) -> i32 {
         let term = self.metadata_epoch();
-        if topic.mirror_of.is_none() {
+        // A promoted mirror keeps the source epochs of what it copied, and
+        // its own batches must not go below them.
+        if topic.mirror_of.is_none() && topic.promoted.is_none() {
             return term;
         }
         self.partition_state(topic, partition)
@@ -4205,7 +4207,7 @@ impl Kafka {
                 return fail(items, UNKNOWN_TOPIC);
             };
             next.insert(key.clone(), state.next_offset);
-            epochs.insert(key, self.metadata_epoch());
+            epochs.insert(key, self.r2_epoch(&topic, item.partition));
             let id = Uuid::parse_str(&topic.id).unwrap_or_else(|_| Uuid::nil());
             ids.insert(item.topic.clone(), *id.as_bytes());
         }

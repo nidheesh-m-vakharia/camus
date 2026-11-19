@@ -398,6 +398,12 @@ pub enum Command {
         /// Group ids.
         groups: Vec<String>,
     },
+    /// Make a mirror topic writable and stop copying it, keeping where
+    /// each partition stopped (ADR 0018).
+    PromoteMirror {
+        /// Mirror topic name.
+        topic: String,
+    },
 }
 
 /// State-machine response for [`Command`].
@@ -859,6 +865,8 @@ mod command_tests {
             groups: Vec::new(),
         };
         assert_eq!(first(&groups)?, 35);
+        let promote = Command::PromoteMirror { topic: "t".into() };
+        assert_eq!(first(&promote)?, 36);
         Ok(())
     }
 }

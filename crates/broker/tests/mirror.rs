@@ -1241,3 +1241,118 @@ fn a_mirror_syncs_a_groups_offsets_forward_only() -> TestResult {
     );
     Ok(())
 }
+
+/// A promoted mirror takes produces from where it stopped copying, copies
+/// no more, and the fork check sees a source that went on past that point.
+#[test]
+fn a_promoted_mirror_is_writable_and_a_fork_is_reported() -> TestResult {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("mirror promotion test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let source_prefix = format!("mirror-promote-src-{pid}/");
+    let source_dir = tempfile::tempdir()?;
+    let source = spawn_under(source_dir.path(), &source_prefix, &[]);
+    let source_addr = kafka_addr(&source);
+    for at in 0..40 {
+        assert_eq!(produce(&source_addr, &format!("record-{at}")), (0, at));
+    }
+    support::wait_sealed(&source.http, 40);
+
+    let dest_dir = tempfile::tempdir()?;
+    let dest = support::Node::with(
+        1,
+        dest_dir.path(),
+        Opts::default()
+            .env("CAMUS_S3_PREFIX", &format!("mirror-promote-dst-{pid}/"))
+            .env("CAMUS_MIRROR_COPY_MS", "200")
+            .env("CAMUS_MIRROR_US_EAST_ACCESS_KEY", "camus")
+            .env("CAMUS_MIRROR_US_EAST_SECRET_KEY", "camus-dev-secret"),
+    );
+    support::init(std::slice::from_ref(&dest), &[1]);
+    support::wait_settled(&[&dest]);
+    let client = reqwest::blocking::Client::new();
+    let link = MirrorLink {
+        alias: "us-east".into(),
+        endpoint: "http://127.0.0.1:9100".into(),
+        region: "us-east-1".into(),
+        bucket: "camus".into(),
+        prefix: source_prefix.clone(),
+        virtual_host: false,
+    };
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/links", dest.http))
+            .json(&link)
+            .send()
+    })?;
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/topics", dest.http))
+            .json(&serde_json::json!({ "alias": "us-east", "topic": support::TOPIC }))
+            .send()
+    })?;
+    support::wait_sealed(&dest.http, 40);
+
+    let promote = |accept: bool| {
+        client
+            .post(format!("http://{}/admin/mirror/promote", dest.http))
+            .json(&serde_json::json!({ "topic": support::TOPIC, "i_accept_data_loss": accept }))
+            .send()
+    };
+    assert_eq!(promote(false)?.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(promote(true)?.status(), StatusCode::OK);
+    assert_eq!(
+        promote(true)?.status(),
+        StatusCode::BAD_REQUEST,
+        "no longer a mirror"
+    );
+
+    let dest_addr = kafka_addr(&dest);
+    assert_eq!(
+        produce(&dest_addr, "after-0"),
+        (0, 40),
+        "writable from where it stopped"
+    );
+    let (code, values) = support::fetch_at(&dest_addr, 39);
+    assert_eq!(code, 0);
+    assert_eq!(values.first().map(String::as_str), Some("record-39"));
+
+    // The old source writes on: the same offsets now hold other records.
+    for at in 40..42 {
+        assert_eq!(produce(&source_addr, &format!("source-{at}")), (0, at));
+    }
+    support::wait_sealed(&source.http, 42);
+    let check = || -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        Ok(client
+            .get(format!("http://{}/admin/mirror/fork-check", dest.http))
+            .query(&[("topic", support::TOPIC)])
+            .send()?
+            .json()?)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let report = loop {
+        let report = check()?;
+        if report["forked"].as_bool() == Some(true) {
+            break report;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("no fork reported: {report}").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(report["partitions"][0]["promoted_at"], 40);
+    assert_eq!(report["partitions"][0]["source_end"], 42);
+    assert_eq!(
+        support::sealed_end(&dest.http),
+        41,
+        "the source's later records are not copied in"
+    );
+    let removed = client
+        .delete(format!("http://{}/admin/mirror/links/us-east", dest.http))
+        .send()?
+        .status();
+    assert_eq!(removed, StatusCode::OK, "no mirror names the link any more");
+    Ok(())
+}

@@ -134,6 +134,30 @@ enum Mirror {
         #[arg(long = "group")]
         groups: Vec<String>,
     },
+    /// Make a mirror topic writable and stop copying it. Records the source
+    /// acked and had not sealed are not on this cluster.
+    Promote {
+        /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
+        #[arg(long)]
+        broker: Option<String>,
+        /// The mirror topic.
+        #[arg(long)]
+        topic: String,
+        /// Required: unsealed source records are lost to this cluster.
+        #[arg(long, default_value_t = false)]
+        i_accept_data_loss: bool,
+    },
+    /// For a promoted topic, compare each partition's offset at promotion
+    /// with the old source's end. Exits 1 when the source went past it: the
+    /// two clusters hold different records at the same offsets.
+    ForkCheck {
+        /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
+        #[arg(long)]
+        broker: Option<String>,
+        /// The promoted topic.
+        #[arg(long)]
+        topic: String,
+    },
     /// Drop a stalled mirror partition's copy. Copying goes on from the later
     /// of its old end and the source's log start. For a partition the
     /// source's retention passed.
@@ -347,6 +371,34 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             println!("{alias} syncs {} groups", groups.len());
+        }
+        Top::Admin(Admin::Mirror(Mirror::Promote {
+            broker,
+            topic,
+            i_accept_data_loss,
+        })) => {
+            confirm(
+                i_accept_data_loss,
+                "promote",
+                "promote makes the mirror writable; records the source acked and had not \
+                 sealed are not on this cluster.",
+            )?;
+            let broker = broker_addr(broker)?;
+            let body = serde_json::json!({ "topic": topic, "i_accept_data_loss": true });
+            let (status, text) = post(&broker, "/admin/mirror/promote", &body)?;
+            if !status.is_success() {
+                eprintln!("{broker} refused ({status}): {text}");
+                std::process::exit(1);
+            }
+            println!("promoted {topic}");
+        }
+        Top::Admin(Admin::Mirror(Mirror::ForkCheck { broker, topic })) => {
+            let broker = broker_addr(broker)?;
+            let report = get_json(&broker, &format!("/admin/mirror/fork-check?topic={topic}"))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if report["forked"].as_bool().unwrap_or(false) {
+                std::process::exit(1);
+            }
         }
         Top::Admin(Admin::Mirror(Mirror::Reset {
             broker,

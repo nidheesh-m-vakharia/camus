@@ -763,3 +763,40 @@ Phase 2, second part: consumer group offsets.
   The skip for a group with members rests on the metadata group's commit
   check, which has its own tests. This test does not join a member.
 
+Phase 2, third part: promotion and the fork check.
+
+- `camus admin mirror promote --topic --i-accept-data-loss`, or
+  `POST /admin/mirror/promote`, commits `PromoteMirror` (log position 36).
+  It clears `mirror_of` and stores `promoted`: the link, the source topic
+  id, and each partition's next offset at that moment as `at`. The
+  copier, retention's `TrimMirror`, reset, and group sync all key on
+  `mirror_of`, so they leave the topic alone. Its own retention goes
+  through `DeleteRecords`, and produce and the admin APIs work as on any
+  `r2` topic. Without the flag the promote returns 400, on a topic that
+  is not a mirror 400, and on an unknown topic 404. Records the source
+  acked and had not sealed into a snapshot this cluster read are not
+  here, which is why the flag is required.
+- A promoted topic keeps the mirror's epoch rule: its epoch is the larger
+  of the metadata term and the newest copied source epoch. `r2` produce
+  stamps batches with that epoch, not the bare term, so a new batch never
+  carries a lower epoch than a copied one before it.
+- `camus admin mirror fork-check --topic`, or `GET
+  /admin/mirror/fork-check`, is the issue 151 check. It reads only. It
+  reads the old source through the link, which must still exist, and
+  reports each partition's `promoted_at` and the source's end. The source
+  has forked a partition when its end is past `promoted_at`: it holds
+  records at offsets this cluster has since assigned again. The CLI exits
+  1 when any partition has forked.
+- Mirroring back into the old source is not built. That cluster's topic
+  already exists, and a topic that exists cannot become a mirror, so
+  failing back still goes through MirrorMaker 2, or through a new topic.
+- The MinIO test `a_promoted_mirror_is_writable_and_a_fork_is_reported`
+  covers this:
+  1. A promote without the flag returns 400.
+  2. After the promote, the topic takes a produce at offset 40 and still
+     serves `record-39`.
+  3. The old source writes on to 42, and the fork check reports
+     `promoted_at` 40, `source_end` 42, and a fork, while the promoted
+     topic stays at 41.
+  4. The link can then be removed.
+
