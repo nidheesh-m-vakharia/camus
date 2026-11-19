@@ -723,8 +723,27 @@ Phase 2, second part: consumer group offsets.
   Mirror offsets equal source offsets, so nothing is translated, and the
   sync is as fine-grained as the source's commits. MirrorMaker 2 can be up
   to `offset.lag.max` behind. A commit with no generation is refused once
-  the group has members, so a consumer that joins between the check and
-  the commit wins.
+  the group's members are stored, so a consumer that has joined wins. A
+  classic group still in its first JoinGroup round holds its members only
+  in memory, and can take one synced commit first. Its members then fetch
+  that offset, as they would one committed just before they joined.
+- Each synced record is stamped with this broker's clock, not the
+  source's, as MirrorMaker 2's commit through the target coordinator is.
+  The mirror's offset retention then counts from the sync, so a row that
+  is old at the source does not expire on arrival and get written again
+  every round. A group here that has been empty longer than the retention
+  still expires offsets that are synced into it. That matches Kafka 4.4.0,
+  which counts an empty group's retention from when it became empty.
+- A clamped offset names a record the mirror does not hold yet, so it is
+  written with leader epoch -1. A failed-over consumer then has no epoch
+  to validate against, and never reads the clamp as truncation. An
+  unclamped offset keeps its epoch, which the mirror holds.
+- A successful sync tells this broker's coordinator about the group, as
+  OffsetCommit does, so `ListGroups` on the mirror shows it.
+- Groups sync one at a time. An error in one is logged and counted, and
+  the rest go on. A group's offsets are read a snapshot block at a time,
+  up to 65,536 per round, so a group with offsets on many source topics
+  does not overrun a single read. A refused commit is logged.
 - `camus_mirror_group_offsets_synced_total` counts the offsets written.
 - The MinIO test `a_mirror_syncs_a_groups_offsets_forward_only` covers
   the sync:
@@ -734,6 +753,12 @@ Phase 2, second part: consumer group offsets.
      not pull it back.
   3. A source commit of 1000 is clamped to the mirror's end, 40.
   4. A group list for an unknown link returns 400.
+
+  The test also checks two more things:
+  - The synced group appears in `ListGroups` on the mirror. The
+    coordinator there is loaded before the sync. Without the coordinator
+    notice the group is missing, and the test fails.
+  - The clamped offset carries epoch -1.
 
   The skip for a group with members rests on the metadata group's commit
   check, which has its own tests. This test does not join a member.

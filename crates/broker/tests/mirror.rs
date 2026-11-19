@@ -1090,6 +1090,29 @@ fn commit(addr: &str, group: &'static str, offset: i64) -> Result<(), Box<dyn st
 
 /// `group`'s committed offset on `TOPIC` partition 0, or -1.
 fn committed(addr: &str, group: &'static str) -> i64 {
+    committed_with_epoch(addr, group).0
+}
+
+/// The group ids `ListGroups` reports on `addr`.
+fn listed_groups(addr: &str) -> Vec<String> {
+    use camus_protocol::messages::list_groups_response::ListGroupsResponse;
+    use camus_protocol::messages::ListGroupsRequest;
+    let mut stream = connect(addr);
+    send(
+        &mut stream,
+        ApiKey::ListGroups,
+        4,
+        &ListGroupsRequest::default(),
+    );
+    recv::<ListGroupsResponse>(&mut stream, 4)
+        .groups
+        .iter()
+        .map(|group| group.group_id.0.to_string())
+        .collect()
+}
+
+/// `group`'s committed offset and its leader epoch on `TOPIC` partition 0.
+fn committed_with_epoch(addr: &str, group: &'static str) -> (i64, i32) {
     use camus_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
     use camus_protocol::messages::offset_fetch_response::OffsetFetchResponse;
     use camus_protocol::messages::{GroupId, OffsetFetchRequest};
@@ -1104,7 +1127,9 @@ fn committed(addr: &str, group: &'static str) -> i64 {
                 .with_name(TopicName(StrBytes::from_static_str(support::TOPIC)))
                 .with_partition_indexes(vec![0])])),
     );
-    recv::<OffsetFetchResponse>(&mut stream, 7).topics[0].partitions[0].committed_offset
+    let response = recv::<OffsetFetchResponse>(&mut stream, 7);
+    let part = &response.topics[0].partitions[0];
+    (part.committed_offset, part.committed_leader_epoch)
 }
 
 /// Wait until `group`'s offset on `addr` is `offset`.
@@ -1183,11 +1208,18 @@ fn a_mirror_syncs_a_groups_offsets_forward_only() -> TestResult {
             .json(&serde_json::json!({ "alias": alias, "groups": ["billing"] }))
             .send()
     };
+    // Load the mirror's coordinator before the sync, so a group it lists
+    // later can only have come from the sync telling it.
+    let dest_addr = kafka_addr(&dest);
+    assert!(!listed_groups(&dest_addr).contains(&"billing".to_string()));
     assert_eq!(set_groups("nope")?.status(), StatusCode::BAD_REQUEST);
     assert_eq!(set_groups("us-east")?.status(), StatusCode::OK);
     support::wait_sealed(&dest.http, 40);
-    let dest_addr = kafka_addr(&dest);
     wait_committed(&dest_addr, "billing", 25)?;
+    assert!(
+        listed_groups(&dest_addr).contains(&"billing".to_string()),
+        "a synced group is listed on the mirror"
+    );
 
     commit(&source_addr, "billing", 30)?;
     wait_committed(&dest_addr, "billing", 30)?;
@@ -1202,5 +1234,10 @@ fn a_mirror_syncs_a_groups_offsets_forward_only() -> TestResult {
     // An offset past what the mirror holds is clamped to its end.
     commit(&source_addr, "billing", 1_000)?;
     wait_committed(&dest_addr, "billing", 40)?;
+    assert_eq!(
+        committed_with_epoch(&dest_addr, "billing").1,
+        -1,
+        "a clamped offset names no epoch the mirror holds"
+    );
     Ok(())
 }

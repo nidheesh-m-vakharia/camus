@@ -2292,6 +2292,7 @@ impl Kafka {
         tokio::spawn(crate::mirror::run_copier(
             Arc::clone(&self.node),
             self.bucket.clone(),
+            Arc::clone(&self.coordinator),
         ));
         let flush = Arc::clone(&self);
         tokio::spawn(async move {
