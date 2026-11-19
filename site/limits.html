@@ -3,18 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Production — Camus</title>
-  <meta name="description" content="What Camus can be trusted for, the limits that are still real, and the workloads it is a poor fit for.">
+  <title>Production. Camus</title>
+  <meta name="description" content="Three brokers in one region, a bucket, and a client that can retry. Then the things that are still unfinished.">
   <link rel="canonical" href="https://camus.nidheesh.dev/limits">
   <meta name="robots" content="index,follow">
   <meta property="og:site_name" content="Camus">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Production — Camus">
-  <meta property="og:description" content="What Camus can be trusted for, the limits that are still real, and the workloads it is a poor fit for.">
+  <meta property="og:title" content="Production. Camus">
+  <meta property="og:description" content="Three brokers in one region, a bucket, and a client that can retry. Then the things that are still unfinished.">
   <meta property="og:url" content="https://camus.nidheesh.dev/limits">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="Production — Camus">
-  <meta name="twitter:description" content="What Camus can be trusted for, the limits that are still real, and the workloads it is a poor fit for.">
+  <meta name="twitter:title" content="Production. Camus">
+  <meta name="twitter:description" content="Three brokers in one region, a bucket, and a client that can retry. Then the things that are still unfinished.">
   <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -66,9 +66,9 @@
     </nav>
     <main id="content">
       <header class="hero entrance">
-        <h1 style="--n: 0">What you would want to see before trusting it.</h1>
+        <h1 style="--n: 0">What has to be true before you trust it.</h1>
       </header>
-      <p class="lede">Three brokers in one region, a bucket, and a client that can retry. The rest of this page is the list of things that are still sharp edges.</p>
+      <p class="lede">Three brokers in one region, a bucket, and a client that can retry. The rest of this page is what is still unfinished.</p>
 
       <h2>Three brokers</h2>
       <p>Metadata commits through a majority, and a <code>wal</code> produce acknowledges after a majority of its shard has fsynced. One process can die and the remaining majority still commits. That is the same shape as the <a href="brokers.html">three-broker</a> profile and the <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/broker/tests/cluster.rs">cluster test</a>. A single broker has nothing to fail over to.</p>
@@ -87,7 +87,7 @@
       <p>On a pull request, the required job runs <code>cargo fmt --all --check</code> and <code>cargo test --workspace --locked</code>. It does not start MinIO. A separate job starts MinIO and runs the broker tests with <code>CAMUS_MINIO=1</code>. The ecosystem suite (Kafka CLI, Connect, Streams, MirrorMaker 2 in both directions) is nightly, not that required job. <a href="tests.html">Tests</a> has the commands.</p>
 
       <h2 id="when-not">When not to use Camus</h2>
-      <p>The honest fit is a log with several independent consumers and replay, without a full replica of that log on every broker disk. These are the workloads that want something else.</p>
+      <p>Camus fits a log with several independent consumers and replay, without a full copy of that log on every broker disk. These workloads want something else.</p>
       <ul>
         <li>A produce that must finish with a p99 under 10 ms on the object-storage path. The measured <code>r2</code> p99 is 576.16 ms on the Linux OrbStack run and 284.75 ms on the Mac (<a href="benchmarks.html">benchmarks</a>, <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/README.md">README</a>). <code>wal</code> on that Linux run is 16.55 ms p99. A budget under 10 ms wants a broker that acknowledges from local disks.</li>
         <li>One cluster stretched across regions. The election window above is 400–800 ms. Run one cluster per region and copy between them with MirrorMaker 2.</li>
