@@ -586,6 +586,27 @@ pub fn publish(
     parts: &[PublishPart],
     notes: &[crate::ProducerNote],
 ) -> Result<Outcome, String> {
+    publish_into(get, parts, notes, false)
+}
+
+/// Publish batches a mirror copier copied from its source (ADR 0018). Every
+/// part's topic must be a mirror. A part may start past the partition's
+/// next offset only while the partition holds nothing (`log_start` equals
+/// `next_offset`): a new mirror begins at the source's log start, and the
+/// offsets below it read as deleted, not as a gap.
+pub fn publish_mirror(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    parts: &[PublishPart],
+) -> Result<Outcome, String> {
+    publish_into(get, parts, &[], true)
+}
+
+fn publish_into(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    parts: &[PublishPart],
+    notes: &[crate::ProducerNote],
+    mirror: bool,
+) -> Result<Outcome, String> {
     let mut pending: BTreeMap<(String, i32), Partition> = BTreeMap::new();
     let mut ids: BTreeMap<String, String> = BTreeMap::new();
     let mut put = Vec::new();
@@ -599,8 +620,9 @@ pub fn publish(
         };
         // A mirror takes no client data, whatever a stale broker believed
         // when it accepted the batch. Unknown-topic is what a deleted topic
-        // gets, so the uploader handles it the same way (ADR 0018).
-        if topic.mirror_of.is_some() {
+        // gets, so the uploader handles it the same way (ADR 0018). Only
+        // the copier publishes into a mirror, and only into a mirror.
+        if topic.mirror_of.is_some() != mirror {
             return Ok(Outcome::Reject(3));
         }
         if part.partition < 0 || part.partition >= topic.partitions {
@@ -615,14 +637,23 @@ pub fn publish(
             migrate_extents(&topic.id, part.partition, &mut state, &mut put)?;
             pending.insert(key.clone(), state);
         }
-        let state = pending.get_mut(&key).expect("inserted");
+        let Some(state) = pending.get_mut(&key) else {
+            return Err("partition state was not loaded".into());
+        };
+        if mirror && part.start > state.next_offset && state.log_start == state.next_offset {
+            state.log_start = part.start;
+            state.next_offset = part.start;
+        }
         if part.start != state.next_offset {
             return Ok(Outcome::Reject(1));
         }
         // `DeleteRecords` may have moved the log start past records that were
         // still in the WAL. Their extent is not kept; the sweep removes the
         // object once nothing else points into it.
-        if part.end > state.log_start {
+        // A copied part with no bytes covers offsets a source compaction
+        // dropped: it moves the next offset and stores no extent.
+        let holds_bytes = !(mirror && part.length == 0);
+        if part.end > state.log_start && holds_bytes {
             let extent = Extent {
                 start: part.start,
                 end: part.end,

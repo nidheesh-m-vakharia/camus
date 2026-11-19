@@ -366,6 +366,12 @@ pub enum Command {
         /// The link and the source topic id.
         of: mirror::MirrorOf,
     },
+    /// Publish batches the mirror copier copied into this cluster's bucket.
+    /// Only a mirror topic takes them, at its next offset (ADR 0018).
+    PublishMirror {
+        /// Slices in commit order.
+        parts: Vec<PublishPart>,
+    },
 }
 
 /// State-machine response for [`Command`].
@@ -789,6 +795,7 @@ mod command_tests {
             of,
         };
         assert_eq!(first(&create)?, 31);
+        assert_eq!(first(&Command::PublishMirror { parts: Vec::new() })?, 32);
         Ok(())
     }
 }

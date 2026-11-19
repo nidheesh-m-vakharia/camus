@@ -333,6 +333,66 @@ mod tests {
         Ok(())
     }
 
+    fn part(topic: &str, start: i64, end: i64) -> catalog::PublishPart {
+        catalog::PublishPart {
+            epoch: 0,
+            topic: topic.into(),
+            partition: 0,
+            start,
+            end,
+            object_key: "bundle/copied.seg".into(),
+            file_offset: 0,
+            length: 10,
+            base_timestamp: 0,
+            max_timestamp: 0,
+        }
+    }
+
+    fn publish_copied(
+        map: &mut HashMap<String, String>,
+        parts: &[catalog::PublishPart],
+    ) -> Result<i16, String> {
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let outcome = catalog::publish_mirror(&get, parts)?;
+        apply(map, outcome)
+    }
+
+    fn partition(map: &HashMap<String, String>, topic: &str) -> Result<catalog::Partition, String> {
+        let raw = map
+            .get(&catalog::topic_storage_key(topic))
+            .ok_or("no topic")?;
+        let topic = catalog::parse_topic(raw)?;
+        let raw = map
+            .get(&catalog::partition_storage_key(&topic.id, 0))
+            .ok_or("no partition")?;
+        catalog::parse_partition(raw)
+    }
+
+    #[test]
+    fn a_copy_publishes_only_into_a_mirror_and_in_order() -> TestResult {
+        let mut map = HashMap::new();
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(mirror(&mut map, "events", "us-east")?, 0);
+        // A new mirror starts at the source's log start, 100.
+        assert_eq!(publish_copied(&mut map, &[part("events", 100, 150)])?, 0);
+        let state = partition(&map, "events")?;
+        assert_eq!((state.log_start, state.next_offset), (100, 150));
+        // After that, only the next offset.
+        assert_eq!(publish_copied(&mut map, &[part("events", 160, 170)])?, 1);
+        assert_eq!(publish_copied(&mut map, &[part("events", 140, 170)])?, 1);
+        assert_eq!(publish_copied(&mut map, &[part("events", 150, 170)])?, 0);
+        assert_eq!(partition(&map, "events")?.next_offset, 170);
+
+        // A plain topic takes no copied batches.
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let created = catalog::create_topic(&get, "plain", "plain-id", 1, "r2", &[])?;
+        assert_eq!(apply(&mut map, created)?, 0);
+        assert_eq!(publish_copied(&mut map, &[part("plain", 0, 10)])?, 3);
+        Ok(())
+    }
+
     #[test]
     fn an_unused_link_is_removed() -> TestResult {
         let mut map = HashMap::new();

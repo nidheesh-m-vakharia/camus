@@ -1273,8 +1273,23 @@ impl Kafka {
             self.shard_view(self.partition_shard(topic, partition))
                 .epoch
         } else {
-            self.metadata_epoch()
+            self.r2_epoch(topic, partition)
         }
+    }
+
+    /// The epoch of an `r2` partition: the metadata group's term. A mirror's
+    /// batches carry its source's epochs (ADR 0018), and a client that
+    /// fetched one must find that epoch at or below the current one, or
+    /// `OffsetForLeaderEpoch` reads it as truncation. So a mirror's epoch is
+    /// the larger of the term and the newest epoch it copied. Both only grow.
+    fn r2_epoch(&self, topic: &Topic, partition: i32) -> i32 {
+        let term = self.metadata_epoch();
+        if topic.mirror_of.is_none() {
+            return term;
+        }
+        self.partition_state(topic, partition)
+            .and_then(|state| state.epochs.last().map(|last| last.epoch))
+            .map_or(term, |copied| copied.max(term))
     }
 
     /// Kafka's check of a client's `current_leader_epoch`: `-1` skips it, an
@@ -1303,7 +1318,7 @@ impl Kafka {
         if topic.durability == "wal" {
             self.shard_epoch(self.partition_shard(topic, partition))
         } else {
-            self.metadata_epoch()
+            self.r2_epoch(topic, partition)
         }
     }
 
@@ -2261,6 +2276,10 @@ impl Kafka {
     pub async fn run(self: Arc<Self>, listener: TcpListener) {
         let snaps = Arc::clone(&self);
         tokio::spawn(async move { snaps.metadata_snapshots().await });
+        tokio::spawn(crate::mirror::run_copier(
+            Arc::clone(&self.node),
+            self.bucket.clone(),
+        ));
         let flush = Arc::clone(&self);
         tokio::spawn(async move {
             loop {
