@@ -471,13 +471,7 @@ Phase 1, first part: links and read-only mirrors. Copying is not built.
   `DELETE /admin/mirror/links/{alias}`. The CLI commands are
   `camus admin mirror link add`, `remove`, and `list`. They return 400
   and 409 for the two refusal codes.
-- Not built yet:
-  - `link add` does not yet read the source's `CURRENT` and trailer to
-    check the link. That check comes with the copier, which also reads
-    the `CAMUS_MIRROR_<ALIAS>_*` keys.
-  - `camus admin mirror create` does not exist yet, because it reads the
-    source's partition count from the source snapshot.
-    `CreateMirrorTopic` exists and is what the copier PR will call.
+- Copying is not built yet.
 - Upgrade order: a broker older than this release cannot decode the three
   commands, and it drops `mirror_of` when it parses a topic row. Every
   broker must run this release before the first `link add`. A test pins
@@ -487,3 +481,51 @@ Phase 1, first part: links and read-only mirrors. Copying is not built.
 - `crates/broker/tests/mirror.rs` is the end-to-end test. Only one path
   has no test: forwarding a link command from a broker that does not lead
   metadata. It uses the same leader lookup as `metadata_write`.
+
+Phase 1, second part: reading the source.
+
+- `crates/metadata/src/snapshot.rs` reads part of a `CAMUSKV3` body.
+  `index_span` parses the trailer from the body's tail and refuses an
+  index over 4 MiB. `SnapshotIndex::parse` checks the index CRC and that
+  the entries are in order. `run(from, to)` names the blocks that can hold
+  a key range, and `rows` checks each of those blocks against its CRC32C
+  before decoding it. Trailer parsing is shared with the full-body reader
+  in `machine.rs`.
+- `Bucket::get_tail` reads an object's last bytes and its size in one GET.
+- In the broker, `crates/broker/src/mirror.rs` opens a link's bucket with
+  the `CAMUS_MIRROR_<ALIAS>_ACCESS_KEY` and `_SECRET_KEY` keys from the
+  broker's environment. A missing key is an error that names the
+  variable. `SourceSnapshot::open` takes two or three GETs:
+  1. `CURRENT`
+  2. the snapshot's last 64 KiB
+  3. the index, only when the index and trailer together are over 64 KiB,
+     which is a source of roughly 70 MiB or more
+
+  After that, `rows` reads each key range with one ranged GET. A source
+  whose snapshot is not `CAMUSKV3` is refused.
+- Every read from a source is bounded by the bytes received, not only by
+  the size the server claims:
+  - `CURRENT` is at most 1 KiB, the tail 64 KiB, and the index 4 MiB with
+    at most 131,072 entries, checked before decoding.
+  - One `rows` run is at most 8 MiB.
+  - `get_tail` and `get_exact` stop reading once a response passes the
+    length asked for.
+- A failed source read returns 502. The response body gives only the
+  kind of failure, from `camus_storage::public_reason`, because an S3
+  error body can echo the access key id and the signed string. The full
+  error goes to the broker log.
+- `link add` now opens the source before it commits. It returns 400 when
+  this broker lacks the keys, and 502 when the source cannot be read,
+  including with a wrong key.
+- `camus admin mirror create --alias --topic`, or
+  `POST /admin/mirror/topics`, reads the source's `topic/{name}` row and
+  commits `CreateMirrorTopic`. The mirror takes the same name, the
+  source's partition count and topic id in `mirror_of`, and a new id of
+  its own. It returns 404 for an unknown link or source topic, and 409
+  when the topic already exists here.
+- `crates/broker/tests/mirror.rs` has a MinIO test,
+  `a_mirror_is_created_from_the_source_snapshot`. It runs two brokers,
+  each under its own key prefix in one bucket, and checks three things:
+  that a link with a wrong secret is refused, that the link is added once
+  the source has a snapshot, and that the mirror's row names the source
+  topic's id.
