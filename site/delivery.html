@@ -3,17 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Delivery — Camus</title>
+  <title>Delivery. Camus</title>
   <meta name="description" content="Ordering, idempotent produce, at-least-once consumption, transactions, and the loss window of each durability mode.">
   <link rel="canonical" href="https://camus.nidheesh.dev/delivery">
   <meta name="robots" content="index,follow">
   <meta property="og:site_name" content="Camus">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Delivery — Camus">
+  <meta property="og:title" content="Delivery. Camus">
   <meta property="og:description" content="Ordering, idempotent produce, at-least-once consumption, transactions, and the loss window of each durability mode.">
   <meta property="og:url" content="https://camus.nidheesh.dev/delivery">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="Delivery — Camus">
+  <meta name="twitter:title" content="Delivery. Camus">
   <meta name="twitter:description" content="Ordering, idempotent produce, at-least-once consumption, transactions, and the loss window of each durability mode.">
   <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
@@ -68,7 +68,7 @@
       <header class="hero entrance">
         <h1 style="--n: 0">What a consumer is allowed to assume.</h1>
       </header>
-      <p class="lede">An agent pipeline that treats the log as an audit trail needs the order, the retry rule, and the loss window written down. Each claim below points at the test or the ADR that owns it.</p>
+      <p class="lede">If the log is an audit trail, you need the order, the retry rule, and the loss window. Each claim below points at the test or the ADR that owns it.</p>
 
       <h2>Order is per partition</h2>
       <p>Records on one partition stay in commit order. Two producers that both write that partition interleave as their batches commit. A producer that sends one batch at a time keeps its own sequence inside that interleaving. Key by agent or session so one agent's events share a partition. <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/crates/broker/tests/ordering.rs"><code>concurrent_producers_keep_each_send_order</code></a> is the test. Offsets themselves are <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/adr/0009-offsets-and-record-batches.md">ADR 0009</a>.</p>

@@ -3,17 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Docs — Camus</title>
+  <title>Docs. Camus</title>
   <meta name="description" content="The plan, the ADRs, and the Kafka 4.4.0 compatibility matrix.">
   <link rel="canonical" href="https://camus.nidheesh.dev/docs">
   <meta name="robots" content="index,follow">
   <meta property="og:site_name" content="Camus">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Docs — Camus">
+  <meta property="og:title" content="Docs. Camus">
   <meta property="og:description" content="The plan, the ADRs, and the Kafka 4.4.0 compatibility matrix.">
   <meta property="og:url" content="https://camus.nidheesh.dev/docs">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="Docs — Camus">
+  <meta name="twitter:title" content="Docs. Camus">
   <meta name="twitter:description" content="The plan, the ADRs, and the Kafka 4.4.0 compatibility matrix.">
   <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
@@ -89,8 +89,8 @@
       <h2>Compatibility</h2>
       <p>The <a href="https://github.com/nidheesh-m-vakharia/camus/blob/main/docs/compatibility.md">compatibility doc</a> is the 4.4.0 pin and every API. A tested-client column stays empty until kafka-clients, librdkafka, or franz-go has actually passed that call. The summary of what those clients can do is on the <a href="clients.html">clients</a> page.</p>
       <h2>Crates</h2>
-      <p>The workspace is <code>protocol</code>, <code>broker</code>, <code>raft</code>, <code>metadata</code>, <code>wal</code>, <code>storage</code>, <code>uploader</code>, <code>coordinator</code>, <code>compactor</code>, <code>cli</code>, and <code>engine-bench</code>. <code>camus-broker</code> is the binary you run. The uploader, coordinator, and compactor crates are part of that process. They are not empty placeholders.</p>
-      <p>Losing a majority of a write-ahead log shard is not a test failure you retry. It is <a href="recovery.html">recovery</a>, and it drops acknowledged data that was not sealed yet. What is safe to trust, and the workloads that want a different system, are on the <a href="limits.html">production</a> page. Ordering, retries, and the loss window are on <a href="delivery.html">delivery</a>. Other brokers people compare are on the <a href="compare.html">compare</a> page. A month of R2, disk, and network for a workload you type in is the <a href="cost.html">cost</a> page.</p>
+      <p>The workspace is <code>protocol</code>, <code>broker</code>, <code>raft</code>, <code>metadata</code>, <code>wal</code>, <code>storage</code>, <code>uploader</code>, <code>coordinator</code>, <code>compactor</code>, <code>cli</code>, and <code>engine-bench</code>. <code>camus-broker</code> is the binary you run. The uploader, coordinator, and compactor crates are part of that process.</p>
+      <p>Losing a majority of a write-ahead log shard is <a href="recovery.html">recovery</a>. It drops acknowledged data that was not sealed yet. <a href="limits.html">Production</a> is what is safe to trust, and the workloads that want a different system. <a href="delivery.html">Delivery</a> is ordering, retries, and the loss window. <a href="compare.html">Compare</a> is the other brokers people put next to this one. <a href="cost.html">Cost</a> is a month of R2, disk, and network for a workload you type in.</p>
 
       <footer>
         <p>License Apache-2.0. Pollen is used under the <a href="fonts/OFL.txt">SIL Open Font License</a>. Copyright 2026 Nidheesh Vakharia, from Open Runde by Laurids Kern and Inter by Rasmus Andersson.</p>

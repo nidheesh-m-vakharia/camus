@@ -3,18 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Benchmarks — Camus</title>
-  <meta name="description" content="Preliminary latency, throughput and memory numbers for Camus, from one laptop with MinIO on the same machine.">
+  <title>Benchmarks. Camus</title>
+  <meta name="description" content="Latency, throughput, and memory from one laptop, with MinIO on the same machine. Not yet run over a network or against a remote bucket.">
   <link rel="canonical" href="https://camus.nidheesh.dev/benchmarks">
   <meta name="robots" content="index,follow">
   <meta property="og:site_name" content="Camus">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Benchmarks — Camus">
-  <meta property="og:description" content="Preliminary latency, throughput and memory numbers for Camus, from one laptop with MinIO on the same machine.">
+  <meta property="og:title" content="Benchmarks. Camus">
+  <meta property="og:description" content="Latency, throughput, and memory from one laptop, with MinIO on the same machine. Not yet run over a network or against a remote bucket.">
   <meta property="og:url" content="https://camus.nidheesh.dev/benchmarks">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="Benchmarks — Camus">
-  <meta name="twitter:description" content="Preliminary latency, throughput and memory numbers for Camus, from one laptop with MinIO on the same machine.">
+  <meta name="twitter:title" content="Benchmarks. Camus">
+  <meta name="twitter:description" content="Latency, throughput, and memory from one laptop, with MinIO on the same machine. Not yet run over a network or against a remote bucket.">
   <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -78,7 +78,7 @@
     </nav>
     <main id="content">
       <aside class="notice" aria-label="Preliminary results">
-        <p>These benchmarks are preliminary. They were run on one laptop, with the object store on the same machine. Benchmarks over a real network, against real object storage, are coming.</p>
+        <p>These benchmarks are preliminary. They were run on one laptop, with the object store on the same machine. They have not been run over a network, or against a remote bucket.</p>
       </aside>
       <header class="hero entrance">
         <h1 style="--n: 0">What one machine measured.</h1>
@@ -89,7 +89,7 @@
       <p>2026-11-10, commit <span class="ports">56f0c3a</span>. Apple M4 Pro, macOS, APFS on the internal SSD. Release build. MinIO in Docker on the same machine. The machine was otherwise idle, and each benchmark ran once.</p>
       <p>The baseline is 2026-11-05, commit <span class="ports">97cd9f3</span>, on the same machine. All brokers share one SSD, and on macOS <code>fsync</code> is a full device flush. Numbers with three brokers are pessimistic for that reason.</p>
       <h2>What an acknowledgement is</h2>
-      <p>A producer sends a batch and waits for the broker to answer. That answer is the acknowledgement, or ack. It is the broker's promise that the batch is safe, and it is what every latency below measures: the time from sending a batch to its ack. A producer asks for a promise with the <code>acks</code> setting:</p>
+      <p>A producer sends a batch and waits for the broker to answer. That answer is the acknowledgement, or ack. It is the broker's promise that the batch is safe. Every latency below is the time from sending a batch to its ack. A producer asks for that promise with the <code>acks</code> setting:</p>
       <div class="table-scroll">
         <table>
           <thead>
@@ -305,7 +305,7 @@
       </figure>
       <p>Idle was 20.7 MiB in the <code>wal</code> latency run. Followers peaked at 36.7 to 38.4 MiB in the heaviest 3-broker run.</p>
       <h2>Costs changed in #117 to #128</h2>
-      <p>These benchmarks were added with the changes they measure. Each "before" comes from that pull request's own run, on a different day, so read the comparison as indicative.</p>
+      <p>These benchmarks were added with the changes they measure. Each "before" comes from that pull request's own run, on a different day. The comparison is not a matched pair.</p>
       <div class="table-scroll">
         <table>
           <thead>

@@ -746,6 +746,38 @@ impl Shard {
         })
     }
 
+    /// Shut the shard down and release its database.
+    ///
+    /// `Raft::shutdown` returns once the core task has finished. The state
+    /// machine worker drops the redb file only after it next runs and sees
+    /// that the command channel closed. Opening this directory again before
+    /// that drop fails with "Database already open".
+    pub async fn close(self) -> anyhow::Result<()> {
+        let Shard {
+            raft,
+            machine,
+            queue,
+            _alive,
+            ..
+        } = self;
+        raft.shutdown().await?;
+        drop(raft);
+        drop(queue);
+        drop(_alive);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&machine) > 1 {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "wal state machine still held after shutdown ({} refs)",
+                    Arc::strong_count(&machine)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        drop(machine);
+        Ok(())
+    }
+
     /// Create the shard with these voters. Call once, on one voter. Fails when
     /// this log already has a membership.
     pub async fn initialize(&self, nodes: BTreeMap<NodeId, BasicNode>) -> anyhow::Result<()> {
@@ -1339,7 +1371,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reopened_shard_recovers_batches_from_the_log() {
+    async fn reopened_shard_recovers_batches_from_the_log() -> anyhow::Result<()> {
         let dir = tempfile::tempdir().unwrap();
         {
             let shard = Shard::open(1, dir.path()).await.unwrap();
@@ -1347,7 +1379,7 @@ mod tests {
             for value in [b"a", b"b", b"c"] {
                 shard.append(append_of(value)).await.unwrap();
             }
-            shard.raft.shutdown().await.unwrap();
+            shard.close().await?;
         }
         let shard = Shard::open(1, dir.path()).await.unwrap();
         shard.ensure_voter().await.unwrap();
@@ -1364,6 +1396,7 @@ mod tests {
             3
         );
         assert_eq!(shard.append(append_of(b"d")).await.unwrap().base_offset, 3);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1443,7 +1476,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_purge_keeps_unsealed_batches_in_the_log_across_a_restart() {
+    async fn a_purge_keeps_unsealed_batches_in_the_log_across_a_restart() -> anyhow::Result<()> {
         let dir = tempfile::tempdir().unwrap();
         let last = {
             let shard = Shard::open(1, dir.path()).await.unwrap();
@@ -1462,7 +1495,7 @@ mod tests {
                 purged < Some(oldest),
                 "purged to {purged:?}, into the unsealed entry at {oldest}"
             );
-            shard.raft.shutdown().await.unwrap();
+            shard.close().await?;
             last
         };
         let shard = Shard::open(1, dir.path()).await.unwrap();
@@ -1489,6 +1522,7 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

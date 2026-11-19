@@ -3,17 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Three brokers — Camus</title>
+  <title>Three brokers. Camus</title>
   <meta name="description" content="Start MinIO and three Camus brokers, and form a Raft group.">
   <link rel="canonical" href="https://camus.nidheesh.dev/brokers">
   <meta name="robots" content="index,follow">
   <meta property="og:site_name" content="Camus">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Three brokers — Camus">
+  <meta property="og:title" content="Three brokers. Camus">
   <meta property="og:description" content="Start MinIO and three Camus brokers, and form a Raft group.">
   <meta property="og:url" content="https://camus.nidheesh.dev/brokers">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="Three brokers — Camus">
+  <meta name="twitter:title" content="Three brokers. Camus">
   <meta name="twitter:description" content="Start MinIO and three Camus brokers, and form a Raft group.">
   <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
@@ -81,7 +81,7 @@
         <h1 style="--n: 0">Three brokers, one group.</h1>
       </header>
 
-      <p class="lede">The brokers profile is the smallest setup that can lose a process and still commit metadata. It is not a Kafka listener. The single-broker image is the one that opens port <span class="ports">9092</span>.</p>
+      <p class="lede">The brokers profile is the smallest setup that can lose a process and still commit metadata. It does not open a Kafka port. The single-broker image is the one that opens port <span class="ports">9092</span>.</p>
       <pre><code>docker compose --profile brokers up</code></pre>
       <h2>What comes up</h2>
       <p>Compose builds MinIO and three brokers from this repo. The broker command is flags only: a node id, an HTTP address, and a data directory. An init container waits, then posts <code>/admin/init</code> to the first broker with all three members.</p>
