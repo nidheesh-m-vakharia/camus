@@ -615,6 +615,7 @@ fn apply_command(
                 partitions,
                 of,
             } => mirror::create_topic(&read, &name, &id, partitions, &of),
+            Command::PublishMirror { parts } => catalog::publish_mirror(&read, &parts),
             Command::Publish { parts } => catalog::publish(&read, &parts, &[]),
             Command::PublishWithProducers { parts, producers } => {
                 catalog::publish(&read, &parts, &producers)

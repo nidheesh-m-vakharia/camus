@@ -331,3 +331,205 @@ fn a_mirror_is_created_from_the_source_snapshot() -> TestResult {
     assert_ne!(mirror.id, source_topic.id, "the mirror has its own id");
     Ok(())
 }
+
+/// Every batch byte of `TOPIC` partition 0 below `end`, fetched in order.
+fn raw_log(addr: &str, end: i64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use camus_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
+    use camus_protocol::messages::fetch_response::FetchResponse;
+    use camus_protocol::messages::FetchRequest;
+    let mut stream = connect(addr);
+    let mut log = Vec::new();
+    let mut offset = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while offset < end {
+        if std::time::Instant::now() > deadline {
+            return Err(format!("stuck at {offset} of {end}").into());
+        }
+        let mut part = FetchPartition::default();
+        part.partition = 0;
+        part.fetch_offset = offset;
+        part.partition_max_bytes = 1024 * 1024;
+        let mut topic = FetchTopic::default();
+        topic.topic = TopicName(StrBytes::from_static_str(support::TOPIC));
+        topic.partitions = vec![part];
+        send(
+            &mut stream,
+            ApiKey::Fetch,
+            11,
+            &FetchRequest::default()
+                .with_max_wait_ms(0)
+                .with_topics(vec![topic]),
+        );
+        let fetched = recv::<FetchResponse>(&mut stream, 11);
+        let row = &fetched.responses[0].partitions[0];
+        assert_eq!(row.error_code, 0);
+        let Some(bytes) = row.records.clone() else {
+            continue;
+        };
+        let batches =
+            camus_protocol::batch::inspect(&bytes, camus_protocol::batch::MAX_BATCH_CEILING)
+                .map_err(|err| format!("{err:?}"))?;
+        let mut at = 0;
+        for batch in batches {
+            if batch.base_offset >= offset && batch.base_offset < end {
+                log.extend_from_slice(bytes.get(at..at + batch.len).ok_or("short batch")?);
+                offset = batch.last_offset + 1;
+            }
+            at += batch.len;
+        }
+    }
+    Ok(log)
+}
+
+/// Phase 1's acceptance test (ADR 0018): a mirror has the source's offsets
+/// and records, follows new produces, and keeps serving all of it after
+/// every source broker is gone.
+#[test]
+fn a_mirror_copies_the_source_and_outlives_it() -> TestResult {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("mirror copy test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let source_prefix = format!("mirror-copy-src-{pid}/");
+    // Three source brokers, so the WAL leader can fail over and raise the
+    // leader epoch the copied batches carry.
+    let source_dirs = [
+        tempfile::tempdir()?,
+        tempfile::tempdir()?,
+        tempfile::tempdir()?,
+    ];
+    let mut sources: Vec<support::Node> = source_dirs
+        .iter()
+        .zip(1..)
+        .map(|(dir, id)| {
+            support::Node::with(
+                id,
+                dir.path(),
+                Opts::default()
+                    .env("CAMUS_S3_PREFIX", &source_prefix)
+                    .env("CAMUS_META_SNAPSHOT_MS", "200"),
+            )
+        })
+        .collect();
+    support::init(&sources, &[1, 2, 3]);
+    support::wait_settled(&sources.iter().collect::<Vec<_>>());
+    support::create_wal_topic(&kafka_addr(&sources[0]));
+    let (leader, source_addr) = support::partition_leader(&kafka_addr(&sources[0]), None);
+    let mut sent = Vec::new();
+    for at in 0..40 {
+        let value = format!("record-{at}");
+        let (code, offset) = produce(&source_addr, &value);
+        assert_eq!((code, offset), (0, at), "produce {at}");
+        sent.push(value);
+    }
+    let survivor = sources
+        .iter()
+        .find(|node| node.id != leader)
+        .map(|node| node.http.clone())
+        .ok_or("no survivor")?;
+    support::wait_sealed(&survivor, 40);
+
+    // The destination has no `orders` of its own: the mirror takes the name.
+    let dest_dir = tempfile::tempdir()?;
+    let dest = support::Node::with(
+        1,
+        dest_dir.path(),
+        Opts::default()
+            .env("CAMUS_S3_PREFIX", &format!("mirror-copy-dst-{pid}/"))
+            .env("CAMUS_MIRROR_COPY_MS", "200")
+            .env("CAMUS_MIRROR_US_EAST_ACCESS_KEY", "camus")
+            .env("CAMUS_MIRROR_US_EAST_SECRET_KEY", "camus-dev-secret"),
+    );
+    support::init(std::slice::from_ref(&dest), &[1]);
+    support::wait_settled(&[&dest]);
+    let client = reqwest::blocking::Client::new();
+    let link = MirrorLink {
+        alias: "us-east".into(),
+        endpoint: "http://127.0.0.1:9100".into(),
+        region: "us-east-1".into(),
+        bucket: "camus".into(),
+        prefix: source_prefix.clone(),
+        virtual_host: false,
+    };
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/links", dest.http))
+            .json(&link)
+            .send()
+    })?;
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/topics", dest.http))
+            .json(&serde_json::json!({ "alias": "us-east", "topic": support::TOPIC }))
+            .send()
+    })?;
+
+    support::wait_sealed(&dest.http, 40);
+    let dest_addr = kafka_addr(&dest);
+    assert_eq!(
+        support::read_all(&dest_addr, 40),
+        sent,
+        "same records, same offsets"
+    );
+
+    // New produces at the source reach the mirror at the same offsets.
+    // Fail the WAL leader over: later batches carry a higher epoch than
+    // the destination's own term, as any source that has failed over has.
+    let epoch_before = support::partition_epoch(&source_addr);
+    sources.retain(|node| node.id != leader);
+    let via = kafka_addr(&sources[0]);
+    let (_, source_addr) = support::partition_leader(&via, Some(leader));
+    for at in 40..60 {
+        let value = format!("record-{at}");
+        assert_eq!(support::produce_retrying(&via, &value).1, at);
+        sent.push(value);
+    }
+    assert!(
+        support::partition_epoch(&source_addr) > epoch_before,
+        "the epoch rose"
+    );
+    support::wait_sealed(&sources[0].http, 60);
+    support::wait_sealed(&dest.http, 60);
+
+    assert_eq!(
+        raw_log(&dest_addr, 60)?,
+        raw_log(&source_addr, 60)?,
+        "the mirror serves the source's batch bytes, offsets and epochs included"
+    );
+    // A consumer that fetched the last batch asks for its epoch's end: the
+    // mirror must know that epoch, or the client reads it as truncation.
+    let log = raw_log(&dest_addr, 60)?;
+    let batches = camus_protocol::batch::inspect(&log, camus_protocol::batch::MAX_BATCH_CEILING)
+        .map_err(|err| format!("{err:?}"))?;
+    let last_at = log.len() - batches.last().ok_or("no batch")?.len;
+    let last_epoch = camus_protocol::batch::leader_epoch(log.get(last_at..).ok_or("short")?);
+    let current = support::partition_epoch(&dest_addr);
+    assert!(
+        current >= last_epoch,
+        "mirror epoch {current} is below a copied batch's {last_epoch}"
+    );
+    assert_eq!(
+        support::epoch_end(&dest_addr, current, last_epoch),
+        (0, last_epoch, 60)
+    );
+    drop(sources);
+    assert_eq!(
+        support::read_all(&dest_addr, 60),
+        sent,
+        "the mirror serves everything it published with every source broker gone"
+    );
+    assert_eq!(produce(&dest_addr, "refused").0, INVALID_TOPIC);
+
+    let metrics = client
+        .get(format!("http://{}/metrics", dest.http))
+        .send()?
+        .text()?;
+    let copied = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("camus_mirror_copied_bytes_total "))
+        .ok_or("no copied-bytes series")?
+        .parse::<u64>()?;
+    assert!(copied > 0, "{copied} bytes copied");
+    Ok(())
+}
