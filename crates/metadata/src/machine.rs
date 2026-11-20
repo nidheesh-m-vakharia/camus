@@ -615,7 +615,18 @@ fn apply_command(
                 partitions,
                 of,
             } => mirror::create_topic(&read, &name, &id, partitions, &of),
-            Command::PublishMirror { parts } => catalog::publish_mirror(&read, &parts),
+            Command::PublishMirror {
+                parts,
+                committed,
+                aborted,
+            } => {
+                let committed: Vec<catalog::Span> = committed.iter().map(Into::into).collect();
+                let aborted: Vec<catalog::Span> = aborted.iter().map(Into::into).collect();
+                catalog::publish_mirror(&read, &parts, &committed, &aborted)
+            }
+            Command::TrimMirror { cuts } => {
+                admin::trim_mirror(&read, &scan, &cuts).and_then(admin::outcome)
+            }
             Command::ResetMirrorPartition { topic, partition } => {
                 mirror::reset_partition(&read, &scan, &topic, partition)
             }

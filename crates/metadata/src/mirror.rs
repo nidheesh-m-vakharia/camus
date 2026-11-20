@@ -58,6 +58,40 @@ pub struct MirrorOf {
     pub topic_id: String,
 }
 
+/// A transaction span as `PublishMirror` carries it. Unlike
+/// [`catalog::Span`], it always writes `producer_id`: the Raft log is
+/// postcard, which cannot skip a field, and a source span stored before
+/// ADR 0015 has none.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CopiedSpan {
+    /// Inclusive.
+    pub start: i64,
+    /// Exclusive.
+    pub end: i64,
+    /// The span's producer, or `None` for a span that matches any.
+    pub producer_id: Option<i64>,
+}
+
+impl From<&catalog::Span> for CopiedSpan {
+    fn from(span: &catalog::Span) -> Self {
+        Self {
+            start: span.start,
+            end: span.end,
+            producer_id: span.producer_id,
+        }
+    }
+}
+
+impl From<&CopiedSpan> for catalog::Span {
+    fn from(span: &CopiedSpan) -> Self {
+        Self {
+            start: span.start,
+            end: span.end,
+            producer_id: span.producer_id,
+        }
+    }
+}
+
 /// Metadata key of a link.
 pub fn link_key(alias: &str) -> String {
     format!("{}{alias}", links_prefix())
@@ -399,7 +433,7 @@ mod tests {
     ) -> Result<i16, String> {
         let snapshot = map.clone();
         let get = |key: &str| Ok(snapshot.get(key).cloned());
-        let outcome = catalog::publish_mirror(&get, parts)?;
+        let outcome = catalog::publish_mirror(&get, parts, &[], &[])?;
         apply(map, outcome)
     }
 
@@ -435,6 +469,32 @@ mod tests {
         let created = catalog::create_topic(&get, "plain", "plain-id", 1, "r2", &[])?;
         assert_eq!(apply(&mut map, created)?, 0);
         assert_eq!(publish_copied(&mut map, &[part("plain", 0, 10)])?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_copy_carries_the_source_spans_once() -> TestResult {
+        let mut map = HashMap::new();
+        assert_eq!(add(&mut map, &link("us-east", "logs"))?, 0);
+        assert_eq!(mirror(&mut map, "events", "us-east")?, 0);
+        let span = |start, end| catalog::Span {
+            start,
+            end,
+            producer_id: Some(7),
+        };
+        for parts in [[part("events", 0, 10)], [part("events", 10, 20)]] {
+            let snapshot = map.clone();
+            let get = |key: &str| Ok(snapshot.get(key).cloned());
+            let outcome = catalog::publish_mirror(&get, &parts, &[span(2, 3)], &[span(0, 1)])?;
+            assert_eq!(apply(&mut map, outcome)?, 0);
+        }
+        let state = partition(&map, "events")?;
+        assert_eq!(
+            state.txn_committed,
+            vec![span(2, 3)],
+            "a span copied twice is held once"
+        );
+        assert_eq!(state.txn_aborted, vec![span(0, 1)]);
         Ok(())
     }
 

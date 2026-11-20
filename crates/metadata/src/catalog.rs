@@ -586,27 +586,33 @@ pub fn publish(
     parts: &[PublishPart],
     notes: &[crate::ProducerNote],
 ) -> Result<Outcome, String> {
-    publish_into(get, parts, notes, false)
+    publish_into(get, parts, notes, None)
 }
 
 /// Publish batches a mirror copier copied from its source (ADR 0018). Every
 /// part's topic must be a mirror. A part may start past the partition's
 /// next offset only while the partition holds nothing (`log_start` equals
 /// `next_offset`): a new mirror begins at the source's log start, and the
-/// offsets below it read as deleted, not as a gap.
+/// offsets below it read as deleted, not as a gap. `committed` and
+/// `aborted` are the source's transaction spans over the copied offsets;
+/// each partition a part names gains those it does not already hold, so
+/// `read_committed` on the mirror reads as on the source.
 pub fn publish_mirror(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     parts: &[PublishPart],
+    committed: &[Span],
+    aborted: &[Span],
 ) -> Result<Outcome, String> {
-    publish_into(get, parts, &[], true)
+    publish_into(get, parts, &[], Some((committed, aborted)))
 }
 
 fn publish_into(
     get: &dyn Fn(&str) -> Result<Option<String>, String>,
     parts: &[PublishPart],
     notes: &[crate::ProducerNote],
-    mirror: bool,
+    copied: Option<(&[Span], &[Span])>,
 ) -> Result<Outcome, String> {
+    let mirror = copied.is_some();
     let mut pending: BTreeMap<(String, i32), Partition> = BTreeMap::new();
     let mut ids: BTreeMap<String, String> = BTreeMap::new();
     let mut put = Vec::new();
@@ -635,6 +641,18 @@ fn publish_into(
                 .ok_or_else(|| "missing partition".to_string())?;
             let mut state: Partition = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
             migrate_extents(&topic.id, part.partition, &mut state, &mut put)?;
+            if let Some((committed, aborted)) = copied {
+                for span in committed {
+                    if !state.txn_committed.contains(span) {
+                        state.txn_committed.push(span.clone());
+                    }
+                }
+                for span in aborted {
+                    if !state.txn_aborted.contains(span) {
+                        state.txn_aborted.push(span.clone());
+                    }
+                }
+            }
             pending.insert(key.clone(), state);
         }
         let Some(state) = pending.get_mut(&key) else {
@@ -643,6 +661,8 @@ fn publish_into(
         if mirror && part.start > state.next_offset && state.log_start == state.next_offset {
             state.log_start = part.start;
             state.next_offset = part.start;
+            // A span copied before a reset can reach below the new start.
+            prune_spans(state);
         }
         if part.start != state.next_offset {
             return Ok(Outcome::Reject(1));

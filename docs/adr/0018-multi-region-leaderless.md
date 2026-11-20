@@ -581,9 +581,8 @@ Phase 1, third part: the copier.
   - the source's next extent starts past its end
   - the source has no such partition
   - its end falls inside a source batch
-  - a batch does not fit its extent, or is transactional. Spans are
-    copied in phase 2. Copying the batch now would show aborted records
-    to `read_committed`.
+  - a batch does not fit its extent. Phase 1 also stalled on
+    transactional batches; phase 2 replaced that with waiting, below.
 - Metrics:
   - `camus_mirror_stalled_partitions` counts the partitions stalled in
     the last round.
@@ -641,3 +640,64 @@ Phase 1, fourth part: reset.
 Phase 1 is complete. A Camus cluster can mirror another Camus cluster's
 non-transactional topics with the same offsets and bytes, and keeps them
 after the source is gone.
+
+Phase 2, first part: transactions.
+
+- The copier copies a transactional batch only once the source's snapshot
+  holds a committed or aborted span over it, matched by offset and
+  producer id. At the first transaction the source has not ended, the
+  window stops just before it.
+  - When that transaction is the window's first batch, the partition
+    waits. Waiting is not a stall, so it does not count in
+    `camus_mirror_stalled_partitions`.
+  - A later snapshot that shows the span lets the copy go on.
+  - Non-transactional records after an open transaction wait with it, as
+    they wait behind the last stable offset for a `read_committed`
+    consumer.
+- `PublishMirror` now carries the source's committed and aborted spans
+  that overlap the published offsets. Applying it adds any the partition
+  does not already hold. A mirror's `read_committed` fetch then reads as
+  the source's (ADR 0021): ABORT markers in place of aborted batches, and
+  committed batches served. A `read_uncommitted` fetch sees everything
+  copied. `PublishMirror` had not shipped, so its shape changed in place.
+- The MinIO test `a_mirror_copies_ended_transactions_and_waits_at_an_open_one`
+  covers this:
+  1. A source writes an aborted transaction, a committed one, a plain
+     record, and a transaction left open.
+  2. The mirror stops at offset 3 and does not report a stall.
+  3. `read_committed` gives the same records on the mirror as on the
+     source.
+  4. After the source commits, the mirror reaches 4.
+
+  With the spans left out, `read_committed` on the mirror returns
+  nothing, and the test fails.
+- Spans travel in `PublishMirror` as `CopiedSpan`, which always writes
+  `producer_id`. `Span` leaves out a `None` producer id, as spans stored
+  before ADR 0015 have, and the Raft log's postcard encoding cannot skip a
+  field. A test round-trips the command with a `None` span. `TxnSpan` in
+  `NoteTxn` carries the same attribute. It is a latent issue for spans
+  without a producer, outside this change.
+- A mirror's own retention now applies. Retention used to send its cuts
+  as `DeleteRecords`, which a mirror refuses, so a mirror kept every
+  extent and span forever. It now sends a mirror's cuts as `TrimMirror`
+  (log position 34): the same cut and span pruning, accepted only for a
+  mirror. A client's `DeleteRecords` on a mirror is still refused. The
+  empty-partition jump also prunes spans that end below the new start.
+- `camus_mirror_waiting_partitions` counts the partitions waiting at an
+  open transaction, and the copier logs once when a partition starts
+  waiting. While the source's snapshot key has not changed, a waiting
+  partition is not read again. That memory is capped at 65,536
+  partitions and cleared when it is full.
+- While a transaction is open at the source, the mirror's high watermark,
+  and so `read_uncommitted` and `ListOffsets` latest, stop at that
+  transaction's first batch. At the source they go past it. A source that
+  can no longer end the transaction, because its brokers are gone while
+  its bucket is readable, holds the partition there indefinitely. A reset
+  does not move it past the transaction. Promotion (phase 2) is the way
+  out.
+- The MinIO test checks that the source has sealed the open
+  transaction's batch, that the mirror reports one waiting partition, and
+  that the gauge clears after the commit. The acceptance test also sets
+  `retention.bytes` on the mirror and waits for its log start to move.
+  With mirror cuts sent as `DeleteRecords`, the log start never moves and
+  the test fails.

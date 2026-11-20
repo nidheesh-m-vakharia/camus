@@ -262,6 +262,26 @@ pub fn delete_records(
     scan: catalog::Scan,
     cuts: &[RecordCut],
 ) -> Result<Done, String> {
+    cut_records(get, scan, cuts, false)
+}
+
+/// Retention's cuts of mirror topics (ADR 0018). A mirror's retention is
+/// its own, but clients may not delete its records, so retention cuts them
+/// through this command. Every cut must name a mirror.
+pub fn trim_mirror(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    scan: catalog::Scan,
+    cuts: &[RecordCut],
+) -> Result<Done, String> {
+    cut_records(get, scan, cuts, true)
+}
+
+fn cut_records(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    scan: catalog::Scan,
+    cuts: &[RecordCut],
+    mirrors: bool,
+) -> Result<Done, String> {
     let mut pending: BTreeMap<(String, i32), Partition> = BTreeMap::new();
     let mut ids: BTreeMap<String, String> = BTreeMap::new();
     let mut items = Vec::new();
@@ -273,7 +293,7 @@ pub fn delete_records(
             });
             continue;
         };
-        if topic.mirror_of.is_some() {
+        if topic.mirror_of.is_some() != mirrors {
             items.push(Item {
                 code: mirror::POLICY_VIOLATION,
                 low: -1,
@@ -737,6 +757,61 @@ mod tests {
         assert_eq!(
             codes(alter_configs(&get, &changes)?),
             vec![0, 0, mirror::POLICY_VIOLATION, mirror::POLICY_VIOLATION]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_trims_a_mirror_through_its_own_command() -> Result<(), String> {
+        let mut map = mirror_world()?;
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let copied = catalog::PublishPart {
+            epoch: 0,
+            topic: "events".into(),
+            partition: 0,
+            start: 0,
+            end: 10,
+            object_key: "bundle/copied.seg".into(),
+            file_offset: 0,
+            length: 10,
+            base_timestamp: 0,
+            max_timestamp: 0,
+        };
+        let Outcome::Change { put, .. } = catalog::publish_mirror(&get, &[copied], &[], &[])?
+        else {
+            return Err("copy refused".into());
+        };
+        map.extend(put);
+        let get = |key: &str| Ok(map.get(key).cloned());
+        let scan = |_: &str, _: &str, _: usize| Ok(Vec::new());
+        let cut = RecordCut {
+            topic: "events".into(),
+            partition: 0,
+            offset: 5,
+            high_watermark: -1,
+        };
+        let codes = |done: Done| {
+            done.items
+                .iter()
+                .map(|item| (item.code, item.low))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            codes(trim_mirror(&get, &scan, &[cut.clone()])?),
+            vec![(0, 5)]
+        );
+        assert_eq!(
+            codes(delete_records(&get, &scan, &[cut.clone()])?),
+            vec![(mirror::POLICY_VIOLATION, -1)],
+            "a client still may not"
+        );
+        let plain = world();
+        let get = |key: &str| Ok(plain.get(key).cloned());
+        assert_eq!(
+            codes(trim_mirror(&get, &scan, &[cut])?),
+            vec![(mirror::POLICY_VIOLATION, -1)],
+            "only mirrors"
         );
         Ok(())
     }

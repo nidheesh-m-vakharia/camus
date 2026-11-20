@@ -371,6 +371,10 @@ pub enum Command {
     PublishMirror {
         /// Slices in commit order.
         parts: Vec<PublishPart>,
+        /// The source's committed transaction spans over these offsets.
+        committed: Vec<mirror::CopiedSpan>,
+        /// The source's aborted transaction spans over these offsets.
+        aborted: Vec<mirror::CopiedSpan>,
     },
     /// Drop a mirror partition's copy so the copier starts it again at the
     /// source's log start (ADR 0018). Loses what the mirror held.
@@ -379,6 +383,12 @@ pub enum Command {
         topic: String,
         /// Partition index.
         partition: i32,
+    },
+    /// Retention's log-start moves on mirror topics, which `DeleteRecords`
+    /// refuses (ADR 0018). Every cut must name a mirror.
+    TrimMirror {
+        /// One per partition.
+        cuts: Vec<admin::RecordCut>,
     },
 }
 
@@ -803,12 +813,39 @@ mod command_tests {
             of,
         };
         assert_eq!(first(&create)?, 31);
-        assert_eq!(first(&Command::PublishMirror { parts: Vec::new() })?, 32);
+        let copied = Command::PublishMirror {
+            parts: Vec::new(),
+            committed: Vec::new(),
+            aborted: Vec::new(),
+        };
+        assert_eq!(first(&copied)?, 32);
+        // A span stored before ADR 0015 has no producer. It must survive the
+        // log's postcard encoding, which cannot skip a field.
+        let spans = vec![
+            mirror::CopiedSpan {
+                start: 1,
+                end: 2,
+                producer_id: None,
+            },
+            mirror::CopiedSpan {
+                start: 3,
+                end: 4,
+                producer_id: Some(5),
+            },
+        ];
+        let copied = Command::PublishMirror {
+            parts: Vec::new(),
+            committed: spans.clone(),
+            aborted: spans,
+        };
+        let back: Command = camus_raft::codec::decode(&camus_raft::codec::encode(&copied)?)?;
+        assert_eq!(back, copied);
         let reset = Command::ResetMirrorPartition {
             topic: "t".into(),
             partition: 0,
         };
         assert_eq!(first(&reset)?, 33);
+        assert_eq!(first(&Command::TrimMirror { cuts: Vec::new() })?, 34);
         Ok(())
     }
 }

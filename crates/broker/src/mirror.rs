@@ -99,6 +99,11 @@ impl SourceSnapshot {
         Ok(Self { bucket, key, index })
     }
 
+    /// The snapshot object's key. A newer snapshot has another.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     /// Every row with a key in `from..to`, from one ranged GET of at most
     /// [`MAX_RUN_BYTES`]. A wider run is refused, not read.
     pub async fn rows(&self, from: &str, to: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -193,6 +198,20 @@ pub static COPIED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Mirror partitions the last round could not advance: a gap at the source,
 /// a batch the copier cannot carry yet, or a source it could not read.
 pub static STALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Mirror partitions the last round left waiting at a transaction the
+/// source has not ended. One that waits long has a source that cannot end
+/// it, such as one whose brokers are gone.
+pub static WAITING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Most partitions remembered as waiting. Past it the memory is cleared, and
+/// those partitions are read again once.
+const MAX_WAITS: usize = 65_536;
+
+/// Partitions waiting at an open transaction, by mirror topic id and
+/// partition, with the source snapshot they waited in. Until the source
+/// writes a newer snapshot nothing can have changed, so the copier does not
+/// read the extent again.
+type Waits = std::collections::HashMap<(String, i32), String>;
 /// Rounds or partitions that failed with an error and will be retried.
 pub static COPY_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -201,15 +220,24 @@ pub static COPY_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub async fn run_copier(node: std::sync::Arc<camus_metadata::MetadataNode>, dest: Bucket) {
     use std::sync::atomic::Ordering::Relaxed;
     let interval = copy_interval();
+    let mut waits = Waits::new();
     loop {
         tokio::time::sleep(interval).await;
         let metrics = node.raft.metrics().borrow().clone();
         if metrics.current_leader != Some(metrics.id) {
             STALLED.store(0, Relaxed);
+            WAITING.store(0, Relaxed);
+            waits.clear();
             continue;
         }
-        match copy_round(&node, &dest).await {
-            Ok(stalled) => STALLED.store(stalled, Relaxed),
+        if waits.len() > MAX_WAITS {
+            waits.clear();
+        }
+        match copy_round(&node, &dest, &mut waits).await {
+            Ok((stalled, waiting)) => {
+                STALLED.store(stalled, Relaxed);
+                WAITING.store(waiting, Relaxed);
+            }
             Err(err) => {
                 COPY_ERRORS.fetch_add(1, Relaxed);
                 tracing::warn!(error = format!("{err:#}"), "mirror copy round failed");
@@ -218,8 +246,13 @@ pub async fn run_copier(node: std::sync::Arc<camus_metadata::MetadataNode>, dest
     }
 }
 
-/// One pass over every link and mirror. Returns the stalled partitions.
-async fn copy_round(node: &camus_metadata::MetadataNode, dest: &Bucket) -> anyhow::Result<u64> {
+/// One pass over every link and mirror. Returns the stalled and the waiting
+/// partitions.
+async fn copy_round(
+    node: &camus_metadata::MetadataNode,
+    dest: &Bucket,
+    waits: &mut Waits,
+) -> anyhow::Result<(u64, u64)> {
     use std::sync::atomic::Ordering::Relaxed;
     let links = node.scan_local(camus_metadata::mirror::links_prefix())?;
     let mut mirrors = Vec::new();
@@ -230,6 +263,7 @@ async fn copy_round(node: &camus_metadata::MetadataNode, dest: &Bucket) -> anyho
         }
     }
     let mut stalled = 0;
+    let mut waiting = 0;
     for (_, raw) in links {
         let link: MirrorLink = serde_json::from_str(&raw)?;
         let linked: Vec<&Topic> = mirrors
@@ -266,7 +300,26 @@ async fn copy_round(node: &camus_metadata::MetadataNode, dest: &Bucket) -> anyho
         };
         for topic in linked {
             for partition in 0..topic.partitions {
-                match copy_partition(node, dest, &source, topic, partition).await {
+                let at = (topic.id.clone(), partition);
+                if waits.get(&at).is_some_and(|key| key == source.key()) {
+                    waiting += 1;
+                    continue;
+                }
+                let copied = copy_partition(node, dest, &source, topic, partition).await;
+                if !matches!(copied, Ok(Copied::Waiting)) {
+                    waits.remove(&at);
+                }
+                match copied {
+                    Ok(Copied::Waiting) => {
+                        waiting += 1;
+                        if waits.insert(at, source.key().to_string()).is_none() {
+                            tracing::info!(
+                                topic = topic.name,
+                                partition,
+                                "mirror partition waits for the source to end a transaction"
+                            );
+                        }
+                    }
                     Ok(Copied::Stalled(why)) => {
                         stalled += 1;
                         tracing::warn!(
@@ -290,7 +343,7 @@ async fn copy_round(node: &camus_metadata::MetadataNode, dest: &Bucket) -> anyho
             }
         }
     }
-    Ok(stalled)
+    Ok((stalled, waiting))
 }
 
 /// What one partition's copy did.
@@ -302,6 +355,8 @@ enum Copied {
     Some,
     /// Cannot go on without an operator or a later phase.
     Stalled(String),
+    /// At a transaction the source has not ended.
+    Waiting,
 }
 
 /// Copy up to [`WINDOWS_PER_ROUND`] windows of `topic`'s `partition`.
@@ -371,15 +426,20 @@ async fn copy_partition(
             Some((key, pos, at)) if *key == extent.key && *at == start => Some(*pos),
             _ => None,
         };
-        match copy_window(
-            node, dest, source, topic, partition, &extent, start, empty, from,
-        )
-        .await?
-        {
+        let at = Place {
+            extent: &extent,
+            start,
+            empty,
+            from,
+        };
+        match copy_window(node, dest, source, &from_source, topic, partition, at).await? {
             Window::Published { pos } => {
                 resume = Some((extent.key.clone(), pos, next_end(node, topic, partition)?))
             }
             Window::Raced => return Ok(Copied::Some),
+            // A transaction the source has not ended: the next snapshot
+            // that shows its span lets the copy go on.
+            Window::Waiting => return Ok(Copied::Waiting),
             Window::Stalled(why) => return Ok(Copied::Stalled(why)),
         }
     }
@@ -429,26 +489,43 @@ enum Window {
     Published { pos: u64 },
     /// Another copier published first. Stop this partition for the round.
     Raced,
+    /// The next batch belongs to a transaction the source has not ended.
+    Waiting,
     /// Cannot go on.
     Stalled(String),
 }
 
-/// Copy whole batches of `extent` from offset `start` on, at most one
-/// window, into a new object here, and publish them. `from` is a byte
-/// position inside the extent to read on from, when an earlier window of
-/// the same extent ended there.
-#[allow(clippy::too_many_arguments)]
+/// Where a window starts.
+struct Place<'a> {
+    /// The source extent to read.
+    extent: &'a camus_metadata::Extent,
+    /// The first offset to publish.
+    start: i64,
+    /// The mirror partition holds nothing.
+    empty: bool,
+    /// A byte position inside the extent to read on from, when an earlier
+    /// window of the same extent ended there.
+    from: Option<u64>,
+}
+
+/// Copy whole batches of the extent `at` names, from its start offset on,
+/// at most one window, into a new object here, and publish them with the
+/// source's transaction spans over them, from `from_source`.
 async fn copy_window(
     node: &camus_metadata::MetadataNode,
     dest: &Bucket,
     source: &SourceSnapshot,
+    from_source: &camus_metadata::Partition,
     topic: &Topic,
     partition: i32,
-    extent: &camus_metadata::Extent,
-    start: i64,
-    empty: bool,
-    from: Option<u64>,
+    at: Place<'_>,
 ) -> anyhow::Result<Window> {
+    let Place {
+        extent,
+        start,
+        empty,
+        from,
+    } = at;
     let extent_end = extent
         .file_offset
         .checked_add(u64::from(extent.length))
@@ -471,6 +548,7 @@ async fn copy_window(
                 start,
                 extent.end,
                 pos,
+                Spans::default(),
             )
             .await;
         }
@@ -505,19 +583,66 @@ async fn copy_window(
         ));
         at += info.len;
     }
-    let runs = match plan(&infos, &epochs, start, extent.end, to_end, empty) {
+    // Each transactional batch's producer, to find its span at the source.
+    let producers: Vec<i64> = if infos.iter().any(|info| info.transactional) {
+        camus_protocol::batch::producer_batches(&window, camus_protocol::batch::MAX_BATCH_CEILING)
+            .map_err(|err| anyhow::anyhow!("{}: {err:?}", extent.key))?
+            .iter()
+            .map(|batch| batch.producer_id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ended = |offset: i64, producer: i64| {
+        from_source
+            .txn_committed
+            .iter()
+            .chain(&from_source.txn_aborted)
+            .any(|span| span.covers(offset, producer))
+    };
+    let planned = plan(
+        &infos, &epochs, &producers, &ended, start, extent.end, to_end, empty,
+    );
+    let runs = match planned {
+        Ok(runs) if runs.is_empty() => return Ok(Window::Waiting),
         Ok(runs) => runs,
         Err(why) => return Ok(Window::Stalled(format!("{}: {why}", extent.key))),
     };
-    let next = pos + window.len() as u64;
+    let first = runs.first().map_or(start, |run| run.start);
+    let last = runs.last().map_or(start, |run| run.end);
+    let over = |span: &&camus_metadata::Span| span.start < last && span.end > first;
+    let spans = Spans {
+        committed: from_source
+            .txn_committed
+            .iter()
+            .filter(over)
+            .cloned()
+            .collect(),
+        aborted: from_source
+            .txn_aborted
+            .iter()
+            .filter(over)
+            .cloned()
+            .collect(),
+    };
+    let copied: usize = runs.iter().map(|run| run.bytes.len()).sum();
+    let next = pos + copied as u64;
     publish(
-        node, dest, topic, partition, &runs, &window, start, extent.end, next,
+        node, dest, topic, partition, &runs, &window, start, extent.end, next, spans,
     )
     .await
 }
 
-/// Put `runs` of `window` into a new object and commit them. With no runs,
-/// commit only the move of the next offset from `start` to `empty_end`.
+/// The source's transaction spans over a copied range.
+#[derive(Default)]
+struct Spans {
+    committed: Vec<camus_metadata::Span>,
+    aborted: Vec<camus_metadata::Span>,
+}
+
+/// Put `runs` of `window` into a new object and commit them with `spans`.
+/// With no runs, commit only the move of the next offset from `start` to
+/// `empty_end`.
 #[allow(clippy::too_many_arguments)]
 async fn publish(
     node: &camus_metadata::MetadataNode,
@@ -529,6 +654,7 @@ async fn publish(
     start: i64,
     empty_end: i64,
     pos: u64,
+    spans: Spans,
 ) -> anyhow::Result<Window> {
     use std::sync::atomic::Ordering::Relaxed;
     let parts: Vec<camus_metadata::PublishPart> = if runs.is_empty() {
@@ -578,7 +704,11 @@ async fn publish(
             .collect()
     };
     let published = node
-        .apply(camus_metadata::Command::PublishMirror { parts })
+        .apply(camus_metadata::Command::PublishMirror {
+            parts,
+            committed: spans.committed.iter().map(Into::into).collect(),
+            aborted: spans.aborted.iter().map(Into::into).collect(),
+        })
         .await?;
     match published.error_code {
         0 => {
@@ -607,24 +737,39 @@ struct Run {
 
 /// Plan the parts for `infos`, whole batches of one window whose CRCs were
 /// checked, in order, the first ending at or after `start`. `epochs` holds
-/// each batch's leader epoch. `extent_end` is the source extent's exclusive
-/// end offset, and `to_end` says the window reaches its last byte.
-/// `new_mirror` lets the first batch begin below `start`: a new mirror
-/// starts at a source log start that can fall inside a batch, as Kafka's
-/// can. `Err` is why the copy stalls.
+/// each batch's leader epoch, and `producers` each batch's producer id when
+/// any batch is transactional. `ended(offset, producer)` says the source
+/// has a committed or aborted span over that batch. `extent_end` is the
+/// source extent's exclusive end offset, and `to_end` says the window
+/// reaches its last byte. `new_mirror` lets the first batch begin below
+/// `start`: a new mirror starts at a source log start that can fall inside
+/// a batch, as Kafka's can.
+///
+/// The plan stops before the first transactional batch the source has not
+/// ended; an empty plan means wait for it. `Err` is why the copy stalls.
+#[allow(clippy::too_many_arguments)]
 fn plan(
     infos: &[camus_protocol::batch::BatchInfo],
     epochs: &[i32],
+    producers: &[i64],
+    ended: &dyn Fn(i64, i64) -> bool,
     start: i64,
     extent_end: i64,
     to_end: bool,
     new_mirror: bool,
 ) -> Result<Vec<Run>, String> {
-    if infos.iter().any(|info| info.transactional) {
-        return Err("transactional batches are copied once their spans are (phase 2)".into());
-    }
+    let open = infos.iter().enumerate().position(|(index, info)| {
+        info.transactional
+            && !producers
+                .get(index)
+                .is_some_and(|producer| ended(info.base_offset, *producer))
+    });
+    let (infos, to_end) = match open {
+        Some(at) => (infos.get(..at).unwrap_or_default(), false),
+        None => (infos, to_end),
+    };
     let Some(first) = infos.first() else {
-        return Err("no batch at or after the start".into());
+        return Ok(Vec::new());
     };
     if first.base_offset < start && !new_mirror {
         return Err(format!(
@@ -742,10 +887,14 @@ mod tests {
         }
     }
 
+    fn none(_: i64, _: i64) -> bool {
+        false
+    }
+
     #[test]
     fn a_plan_splits_parts_where_the_epoch_changes() -> Result<(), String> {
         let infos = [info(0, 4, 10), info(5, 9, 20), info(10, 14, 30)];
-        let runs = plan(&infos, &[3, 3, 4], 0, 15, false, false)?;
+        let runs = plan(&infos, &[3, 3, 4], &[], &none, 0, 15, false, false)?;
         assert_eq!(
             runs,
             vec![
@@ -773,9 +922,9 @@ mod tests {
     #[test]
     fn the_last_part_of_an_extent_ends_where_the_extent_does() -> Result<(), String> {
         // A compaction dropped 15..20 from the extent's tail.
-        let runs = plan(&[info(0, 14, 10)], &[1], 0, 20, true, false)?;
+        let runs = plan(&[info(0, 14, 10)], &[1], &[], &none, 0, 20, true, false)?;
         assert_eq!(runs.last().map(|run| run.end), Some(20));
-        let short = plan(&[info(0, 14, 10)], &[1], 0, 20, false, false)?;
+        let short = plan(&[info(0, 14, 10)], &[1], &[], &none, 0, 20, false, false)?;
         assert_eq!(
             short.last().map(|run| run.end),
             Some(15),
@@ -790,6 +939,8 @@ mod tests {
         let runs = plan(
             &[info(0, 4, 10), info(10, 14, 10)],
             &[1, 1],
+            &[],
+            &none,
             0,
             15,
             true,
@@ -802,8 +953,8 @@ mod tests {
     #[test]
     fn a_start_inside_a_batch_stalls_unless_the_mirror_is_new() -> Result<(), String> {
         let infos = [info(0, 9, 10)];
-        assert!(plan(&infos, &[1], 5, 10, true, false).is_err());
-        let runs = plan(&infos, &[1], 5, 10, true, true)?;
+        assert!(plan(&infos, &[1], &[], &none, 5, 10, true, false).is_err());
+        let runs = plan(&infos, &[1], &[], &none, 5, 10, true, true)?;
         assert_eq!(
             (runs[0].start, runs[0].end),
             (5, 10),
@@ -813,23 +964,51 @@ mod tests {
     }
 
     #[test]
-    fn transactional_batches_stall() {
-        let mut batch = info(0, 4, 10);
-        batch.transactional = true;
-        let err = plan(&[batch], &[1], 0, 5, true, false)
-            .err()
-            .unwrap_or_default();
-        assert!(err.contains("phase 2"), "{err}");
+    fn a_plan_stops_before_an_open_transaction() -> Result<(), String> {
+        let txn = |base, last| {
+            let mut batch = info(base, last, 10);
+            batch.transactional = true;
+            batch
+        };
+        let infos = [info(0, 4, 10), txn(5, 9), txn(10, 14), info(15, 19, 10)];
+        let producers = [-1, 7, 8, 9];
+        // Producer 7's transaction ended at the source; producer 8's did not.
+        let ended = |offset: i64, producer: i64| producer == 7 && (5..10).contains(&offset);
+        let runs = plan(&infos, &[1; 4], &producers, &ended, 0, 20, true, false)?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (runs[0].start, runs[0].end, runs[0].bytes.clone()),
+            (0, 10, 0..20)
+        );
+        // Waiting at the very first batch is an empty plan, not a stall.
+        let waiting = plan(
+            &infos[2..],
+            &[1; 2],
+            &producers[2..],
+            &ended,
+            10,
+            20,
+            true,
+            false,
+        )?;
+        assert!(waiting.is_empty());
+        // Every transaction ended: the whole window, to the extent's end.
+        let all = |_: i64, _: i64| true;
+        let runs = plan(&infos, &[1; 4], &producers, &all, 0, 20, true, false)?;
+        assert_eq!(runs.last().map(|run| run.end), Some(20));
+        Ok(())
     }
 
     #[test]
     fn batches_that_do_not_fit_their_extent_stall() {
         // Past the extent's end: publishing would claim offsets twice.
-        assert!(plan(&[info(0, 149, 10)], &[1], 0, 100, true, false).is_err());
+        assert!(plan(&[info(0, 149, 10)], &[1], &[], &none, 0, 100, true, false).is_err());
         // Going backwards.
         assert!(plan(
             &[info(0, 9, 10), info(5, 12, 10)],
             &[1, 1],
+            &[],
+            &none,
             0,
             20,
             true,
@@ -837,7 +1016,7 @@ mod tests {
         )
         .is_err());
         // Last below base.
-        assert!(plan(&[info(5, 4, 10)], &[1], 0, 20, true, false).is_err());
+        assert!(plan(&[info(5, 4, 10)], &[1], &[], &none, 0, 20, true, false).is_err());
     }
 
     #[test]
