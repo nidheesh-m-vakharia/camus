@@ -4,7 +4,8 @@ Records 0001–0013 were accepted on 2026-11-05 and are implemented, with the
 amendments their files note. 0014, 0015, 0016, and 0017 are accepted. 0016
 sends votes, empty heartbeats, and shard announcements over QUIC when
 `CAMUS_QUIC` is `on`; it is off by default. 0018, 0019, 0020, and 0021 are
-accepted. 0018 is not built yet. 0022, 0024, 0025, and 0026 are proposed.
+accepted. 0018 is built through phase 2; its phase 3 is not. 0022, 0024,
+0025, and 0026 are proposed.
 
 | ADR | Title |
 | --- | --- |
