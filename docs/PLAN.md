@@ -15,9 +15,13 @@ idempotent produce and its admin APIs are in. Phase 5 transactions,
 `kafka-clients` 4.4.0, librdkafka, and franz-go pass the transaction,
 compaction, and ACL checks, and exercise the implemented admin APIs
 their libraries expose. The ADRs under `docs/adr/` are accepted, except
-0022, 0024, 0025, and 0026, which are proposed. 0018 is accepted and not
-built: a destination cluster mirrors a topic with the source's offsets,
-copying sealed objects from the source bucket. 0019 is accepted: a
+0022, 0024, 0025, and 0026, which are proposed. 0018 is accepted and
+built through phase 2: a destination cluster mirrors a Camus topic with
+the source's offsets and bytes, copying sealed objects and transaction
+spans from the source bucket. It also syncs listed groups' offsets, and
+can promote a mirror and check the old source for a fork. Phase 3, one
+failover cut across several source regions on clock bounds, is not built.
+0019 is accepted: a
 transactional produce commits once, on the WAL, and metadata learns the
 span at `EndTxn`. 0021 is accepted: Camus
 stores no transaction markers, and a `read_committed` fetch sends an ABORT
