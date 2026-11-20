@@ -39,6 +39,10 @@ pub struct Topic {
     /// is read-only to clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror_of: Option<crate::mirror::MirrorOf>,
+    /// Where a promoted mirror stopped copying (ADR 0018). It is writable,
+    /// and its batches below these offsets carry the source's epochs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted: Option<crate::mirror::Promoted>,
 }
 
 impl Topic {
@@ -55,6 +59,7 @@ impl Topic {
             cleanup_policy: default_cleanup(),
             overrides: BTreeMap::new(),
             mirror_of: None,
+            promoted: None,
         }
     }
 
@@ -258,7 +263,7 @@ fn topic_key(name: &str) -> String {
     format!("topic/{name}")
 }
 
-fn id_key(id: &str) -> String {
+pub(crate) fn id_key(id: &str) -> String {
     format!("id/{id}")
 }
 
