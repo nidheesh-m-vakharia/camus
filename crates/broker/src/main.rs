@@ -259,6 +259,9 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .route("/admin/mirror/topics", post(create_mirror_topic))
                 .route("/admin/mirror/reset", post(reset_mirror_partition))
+                .route("/admin/mirror/groups", post(set_mirror_groups))
+                .route("/admin/mirror/promote", post(promote_mirror))
+                .route("/admin/mirror/fork-check", get(fork_check))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
                 .route("/wal/{shard}/txn-span", post(shard_txn_span))
@@ -439,6 +442,9 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          # HELP camus_mirror_waiting_partitions Mirror partitions waiting at a transaction the source has not ended.\n\
          # TYPE camus_mirror_waiting_partitions gauge\n\
          camus_mirror_waiting_partitions {}\n\
+         # HELP camus_mirror_group_offsets_synced_total Committed offsets the mirror copier synced from sources.\n\
+         # TYPE camus_mirror_group_offsets_synced_total counter\n\
+         camus_mirror_group_offsets_synced_total {}\n\
          # HELP camus_mirror_copy_errors_total Mirror copy rounds, sources, or partitions that failed and will be retried.\n\
          # TYPE camus_mirror_copy_errors_total counter\n\
          camus_mirror_copy_errors_total {}\n\
@@ -482,6 +488,7 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         mirror::COPIED_BYTES.load(Relaxed),
         mirror::STALLED.load(Relaxed),
         mirror::WAITING.load(Relaxed),
+        mirror::GROUP_OFFSETS.load(Relaxed),
         mirror::COPY_ERRORS.load(Relaxed),
         store.puts.calls.load(Relaxed),
         store.gets.calls.load(Relaxed),
@@ -1649,6 +1656,162 @@ fn source_error(alias: &str, err: &anyhow::Error) -> (StatusCode, String) {
             camus_storage::public_reason(err)
         ),
     )
+}
+
+#[derive(Deserialize)]
+struct MirrorPromote {
+    topic: String,
+    #[serde(default)]
+    i_accept_data_loss: bool,
+}
+
+/// Make a mirror topic writable and stop copying it. Records the source
+/// acked and had not sealed into a snapshot this cluster read are not
+/// here, so it is refused without `i_accept_data_loss`.
+async fn promote_mirror(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<MirrorPromote>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !body.i_accept_data_loss {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "records the source has not sealed are not here; pass i_accept_data_loss".into(),
+        ));
+    }
+    let what = format!("mirror {}", body.topic);
+    let response = metadata_apply(&admin, Command::PromoteMirror { topic: body.topic })
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    match response.error_code {
+        0 => Ok(StatusCode::OK),
+        3 => Err((StatusCode::NOT_FOUND, format!("{what}: no such topic"))),
+        camus_metadata::mirror::INVALID_REQUEST => Err((
+            StatusCode::BAD_REQUEST,
+            format!("{what}: not a mirror topic"),
+        )),
+        code => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{what}: error code {code}"),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct ForkQuery {
+    topic: String,
+}
+
+/// For a promoted mirror, each partition's offset at promotion and the old
+/// source's end, read through the link. A source that went past the
+/// promotion has records at offsets this cluster assigned again: a fork
+/// (issue 151). Reads only.
+///
+/// The source's end is from its newest snapshot, named in the response, so
+/// records it acked and had not sealed into that snapshot are not counted:
+/// `forked: false` means none yet. A partition the source has no row for is
+/// unknown, `forked: null`.
+async fn fork_check(
+    State(admin): State<Arc<Admin>>,
+    Query(query): Query<ForkQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let raw = admin
+        .node
+        .read_local(&camus_metadata::topic_storage_key(&query.topic))
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no topic {}", query.topic)))?;
+    let topic = camus_metadata::parse_topic(&raw)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let Some(promoted) = topic.promoted else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{} was not promoted from a mirror", query.topic),
+        ));
+    };
+    let alias = promoted.of.alias.clone();
+    let raw = admin
+        .node
+        .read_local(&camus_metadata::mirror::link_key(&alias))
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("link {alias} is gone; add it again to check the source"),
+            )
+        })?;
+    let link: camus_metadata::mirror::MirrorLink = serde_json::from_str(&raw)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let source = source_snapshot(&link).await?;
+    let mut partitions = Vec::new();
+    let mut forked = false;
+    let mut unknown = false;
+    for (partition, at) in promoted.at.iter().enumerate() {
+        let key = camus_metadata::partition_storage_key(&promoted.of.topic_id, partition as i32);
+        let end = match source
+            .row(&key)
+            .await
+            .map_err(|err| source_error(&alias, &err))?
+        {
+            Some(raw) => Some(
+                camus_metadata::parse_partition(&raw)
+                    .map_err(|err| (StatusCode::BAD_GATEWAY, err))?
+                    .next_offset,
+            ),
+            None => None,
+        };
+        let past = end.map(|end| end > *at);
+        forked |= past == Some(true);
+        unknown |= past.is_none();
+        partitions.push(serde_json::json!({
+            "partition": partition,
+            "promoted_at": at,
+            "source_end": end,
+            "forked": past,
+        }));
+    }
+    Ok(Json(serde_json::json!({
+        "topic": query.topic,
+        "alias": alias,
+        "source_snapshot": source.key(),
+        "forked": forked,
+        "unknown": unknown,
+        "partitions": partitions,
+    })))
+}
+
+#[derive(Deserialize)]
+struct MirrorGroups {
+    alias: String,
+    groups: Vec<String>,
+}
+
+/// Set the consumer groups whose offsets the copier syncs from a link's
+/// source. An empty list stops syncing.
+async fn set_mirror_groups(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<MirrorGroups>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let alias = body.alias.clone();
+    let command = Command::SetMirrorGroups {
+        alias: body.alias,
+        groups: body.groups,
+    };
+    let response = metadata_apply(&admin, command)
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    match response.error_code {
+        0 => Ok(StatusCode::OK),
+        camus_metadata::mirror::INVALID_REQUEST => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "link {alias}: the link must exist, with at most {} groups of 1-1024 bytes",
+                camus_metadata::mirror::MAX_GROUPS
+            ),
+        )),
+        code => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("link {alias}: error code {code}"),
+        )),
+    }
 }
 
 #[derive(Deserialize)]

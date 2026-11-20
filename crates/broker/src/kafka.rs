@@ -1284,7 +1284,9 @@ impl Kafka {
     /// the larger of the term and the newest epoch it copied. Both only grow.
     fn r2_epoch(&self, topic: &Topic, partition: i32) -> i32 {
         let term = self.metadata_epoch();
-        if topic.mirror_of.is_none() {
+        // A promoted mirror keeps the source epochs of what it copied, and
+        // its own batches must not go below them.
+        if topic.mirror_of.is_none() && topic.promoted.is_none() {
             return term;
         }
         self.partition_state(topic, partition)
@@ -2292,6 +2294,7 @@ impl Kafka {
         tokio::spawn(crate::mirror::run_copier(
             Arc::clone(&self.node),
             self.bucket.clone(),
+            Arc::clone(&self.coordinator),
         ));
         let flush = Arc::clone(&self);
         tokio::spawn(async move {
@@ -3658,9 +3661,6 @@ impl Kafka {
         let Some(topic) = topic else {
             return Err(UNKNOWN_TOPIC);
         };
-        if topic.mirror_of.is_some() {
-            return Err(INVALID_TOPIC);
-        }
         if self.restore_offline(&topic.id, partition) {
             return Err(LEADER_NOT_AVAILABLE);
         }
@@ -3676,6 +3676,12 @@ impl Kafka {
         }
         if !self.leader() {
             return Err(NOT_LEADER);
+        }
+        // A mirror is always `r2`. Checked after leadership, so a broker
+        // that has not applied a promotion yet sends the producer to the
+        // leader, which has, instead of failing it for good (ADR 0018).
+        if topic.mirror_of.is_some() {
+            return Err(INVALID_TOPIC);
         }
         if partition < 0 || partition >= topic.partitions {
             return Err(UNKNOWN_TOPIC);
@@ -4204,7 +4210,7 @@ impl Kafka {
                 return fail(items, UNKNOWN_TOPIC);
             };
             next.insert(key.clone(), state.next_offset);
-            epochs.insert(key, self.metadata_epoch());
+            epochs.insert(key, self.r2_epoch(&topic, item.partition));
             let id = Uuid::parse_str(&topic.id).unwrap_or_else(|_| Uuid::nil());
             ids.insert(item.topic.clone(), *id.as_bytes());
         }

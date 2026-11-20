@@ -203,6 +203,9 @@ pub static STALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// it, such as one whose brokers are gone.
 pub static WAITING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Committed offsets the copier has synced into mirrors.
+pub static GROUP_OFFSETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Most partitions remembered as waiting. Past it the memory is cleared, and
 /// those partitions are read again once.
 const MAX_WAITS: usize = 65_536;
@@ -217,7 +220,11 @@ pub static COPY_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 /// Copy sealed batches from each link's source into its mirror topics, on
 /// the metadata leader, until the process stops (ADR 0018).
-pub async fn run_copier(node: std::sync::Arc<camus_metadata::MetadataNode>, dest: Bucket) {
+pub async fn run_copier(
+    node: std::sync::Arc<camus_metadata::MetadataNode>,
+    dest: Bucket,
+    coordinator: std::sync::Arc<camus_coordinator::Coordinator>,
+) {
     use std::sync::atomic::Ordering::Relaxed;
     let interval = copy_interval();
     let mut waits = Waits::new();
@@ -233,7 +240,7 @@ pub async fn run_copier(node: std::sync::Arc<camus_metadata::MetadataNode>, dest
         if waits.len() > MAX_WAITS {
             waits.clear();
         }
-        match copy_round(&node, &dest, &mut waits).await {
+        match copy_round(&node, &dest, &coordinator, &mut waits).await {
             Ok((stalled, waiting)) => {
                 STALLED.store(stalled, Relaxed);
                 WAITING.store(waiting, Relaxed);
@@ -251,6 +258,7 @@ pub async fn run_copier(node: std::sync::Arc<camus_metadata::MetadataNode>, dest
 async fn copy_round(
     node: &camus_metadata::MetadataNode,
     dest: &Bucket,
+    coordinator: &camus_coordinator::Coordinator,
     waits: &mut Waits,
 ) -> anyhow::Result<(u64, u64)> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -298,7 +306,7 @@ async fn copy_round(
                 continue;
             }
         };
-        for topic in linked {
+        for topic in linked.iter().copied() {
             for partition in 0..topic.partitions {
                 let at = (topic.id.clone(), partition);
                 if waits.get(&at).is_some_and(|key| key == source.key()) {
@@ -306,6 +314,10 @@ async fn copy_round(
                     continue;
                 }
                 let copied = copy_partition(node, dest, &source, topic, partition).await;
+                if matches!(copied, Ok(Copied::Gone)) {
+                    waits.retain(|(id, _), _| *id != topic.id);
+                    break;
+                }
                 if !matches!(copied, Ok(Copied::Waiting)) {
                     waits.remove(&at);
                 }
@@ -342,8 +354,154 @@ async fn copy_round(
                 }
             }
         }
+        if let Err(err) = sync_groups(node, coordinator, &source, &link.alias, &linked).await {
+            COPY_ERRORS.fetch_add(1, Relaxed);
+            tracing::warn!(
+                alias = link.alias,
+                error = format!("{err:#}"),
+                "mirror group sync failed"
+            );
+        }
     }
     Ok((stalled, waiting))
+}
+
+/// Most committed offsets read for one group per round, a block of the
+/// source snapshot at a time. A group with more is synced up to here.
+const MAX_GROUP_OFFSETS: usize = 65_536;
+
+/// Sync the committed offsets of the groups `alias` lists from the source
+/// into the mirrors in `linked`, as MirrorMaker 2's
+/// `sync.group.offsets.enabled` does. Each group is synced on its own, so
+/// one that fails does not hold up the rest.
+async fn sync_groups(
+    node: &camus_metadata::MetadataNode,
+    coordinator: &camus_coordinator::Coordinator,
+    source: &SourceSnapshot,
+    alias: &str,
+    linked: &[&Topic],
+) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let get = |key: &str| node.read_local(key).map_err(|err| err.to_string());
+    let listed =
+        camus_metadata::mirror::groups_of(&get, alias).map_err(|err| anyhow::anyhow!(err))?;
+    for group in listed {
+        if let Err(err) = sync_group(node, coordinator, source, &group, linked).await {
+            COPY_ERRORS.fetch_add(1, Relaxed);
+            tracing::warn!(
+                alias,
+                group,
+                error = format!("{err:#}"),
+                "mirror group sync failed"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Sync one group. A group with members here is consuming the mirror, so
+/// its offsets are its own and are left alone. Mirror offsets equal source
+/// offsets, so nothing is translated. Each offset is clamped to the mirror's
+/// end, and only one that moves the group forward is written. The commit
+/// is stamped with this broker's clock, as a commit made here would be, so
+/// the mirror's offset retention counts from the sync, not from the source.
+async fn sync_group(
+    node: &camus_metadata::MetadataNode,
+    coordinator: &camus_coordinator::Coordinator,
+    source: &SourceSnapshot,
+    group: &str,
+    linked: &[&Topic],
+) -> anyhow::Result<()> {
+    use camus_metadata::groups::{self, OffsetCommit, OffsetRecord};
+    use std::sync::atomic::Ordering::Relaxed;
+    let get = |key: &str| node.read_local(key).map_err(|err| err.to_string());
+    let here = groups::read_group(&get, group).map_err(|err| anyhow::anyhow!(err))?;
+    if here.is_some_and(|record| !record.members.is_empty()) {
+        return Ok(());
+    }
+    let prefix = groups::offset_prefix(group);
+    // `0` sorts right after `/`, so this bounds the group's keys.
+    let end = format!("{}0", prefix.trim_end_matches('/'));
+    let rows = source.first_rows(&prefix, &end, MAX_GROUP_OFFSETS).await?;
+    if rows.len() == MAX_GROUP_OFFSETS {
+        tracing::warn!(
+            group,
+            "mirror group sync read its first {MAX_GROUP_OFFSETS} offsets only"
+        );
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64);
+    let mut offsets = Vec::new();
+    for (key, raw) in rows {
+        let Some((topic_id, partition)) = groups::offset_from_key(group, &key) else {
+            continue;
+        };
+        let Some(topic) = linked.iter().find(|topic| {
+            topic
+                .mirror_of
+                .as_ref()
+                .is_some_and(|of| of.topic_id == topic_id)
+        }) else {
+            continue;
+        };
+        if partition < 0 || partition >= topic.partitions {
+            continue;
+        }
+        let record: OffsetRecord = serde_json::from_str(&raw)?;
+        if record.offset < 0 {
+            continue;
+        }
+        let offset = record.offset.min(next_end(node, topic, partition)?);
+        let mine = get(&groups::offset_key(group, &topic.id, partition))
+            .map_err(|err| anyhow::anyhow!(err))?
+            .map(|raw| serde_json::from_str::<OffsetRecord>(&raw))
+            .transpose()?;
+        if mine.is_some_and(|mine| mine.offset >= offset) {
+            continue;
+        }
+        // A clamped offset names a record the mirror does not hold yet, so
+        // its epoch is not one the mirror can answer for.
+        let leader_epoch = if offset < record.offset {
+            -1
+        } else {
+            record.leader_epoch
+        };
+        offsets.push(OffsetCommit {
+            topic_id: topic.id.clone(),
+            partition,
+            record: OffsetRecord {
+                offset,
+                leader_epoch,
+                metadata: record.metadata,
+                commit_timestamp: now_ms,
+            },
+        });
+    }
+    if offsets.is_empty() {
+        return Ok(());
+    }
+    let count = offsets.len() as u64;
+    let committed = node
+        .apply(camus_metadata::Command::SyncMirrorOffsets {
+            group: group.to_string(),
+            offsets,
+        })
+        .await?;
+    if committed.error_code == 0 {
+        GROUP_OFFSETS.fetch_add(count, Relaxed);
+        // List the group here, as a commit through OffsetCommit would.
+        coordinator.touch(group);
+    } else {
+        // 3: a topic was promoted after this round began. Otherwise a
+        // member has joined.
+        tracing::info!(
+            group,
+            code = committed.error_code,
+            "mirror group sync refused"
+        );
+    }
+    Ok(())
 }
 
 /// What one partition's copy did.
@@ -357,6 +515,8 @@ enum Copied {
     Stalled(String),
     /// At a transaction the source has not ended.
     Waiting,
+    /// The topic stopped being a mirror during the round.
+    Gone,
 }
 
 /// Copy up to [`WINDOWS_PER_ROUND`] windows of `topic`'s `partition`.
@@ -437,6 +597,7 @@ async fn copy_partition(
                 resume = Some((extent.key.clone(), pos, next_end(node, topic, partition)?))
             }
             Window::Raced => return Ok(Copied::Some),
+            Window::Gone => return Ok(Copied::Gone),
             // A transaction the source has not ended: the next snapshot
             // that shows its span lets the copy go on.
             Window::Waiting => return Ok(Copied::Waiting),
@@ -489,6 +650,9 @@ enum Window {
     Published { pos: u64 },
     /// Another copier published first. Stop this partition for the round.
     Raced,
+    /// The topic is no longer a mirror: it was promoted, or deleted, since
+    /// the round began.
+    Gone,
     /// The next batch belongs to a transaction the source has not ended.
     Waiting,
     /// Cannot go on.
@@ -719,6 +883,7 @@ async fn publish(
         // Another copier, such as a leader before this one, published first.
         // An object put for this attempt is an orphan for the sweep.
         1 => Ok(Window::Raced),
+        3 => Ok(Window::Gone),
         code => anyhow::bail!("publishing into {} failed with {code}", topic.name),
     }
 }

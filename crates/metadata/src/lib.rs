@@ -390,6 +390,29 @@ pub enum Command {
         /// One per partition.
         cuts: Vec<admin::RecordCut>,
     },
+    /// Set the consumer groups whose committed offsets the mirror copier
+    /// syncs from a link's source (ADR 0018). Empty stops syncing.
+    SetMirrorGroups {
+        /// The link's alias.
+        alias: String,
+        /// Group ids.
+        groups: Vec<String>,
+    },
+    /// Make a mirror topic writable and stop copying it, keeping where
+    /// each partition stopped (ADR 0018).
+    PromoteMirror {
+        /// Mirror topic name.
+        topic: String,
+    },
+    /// The mirror copier's sync of a group's committed offsets: applied as a
+    /// commit with no generation, but only while every topic it names is
+    /// still a mirror (ADR 0018).
+    SyncMirrorOffsets {
+        /// Group id.
+        group: String,
+        /// Offsets to store, on mirror topics.
+        offsets: Vec<groups::OffsetCommit>,
+    },
 }
 
 /// State-machine response for [`Command`].
@@ -846,6 +869,18 @@ mod command_tests {
         };
         assert_eq!(first(&reset)?, 33);
         assert_eq!(first(&Command::TrimMirror { cuts: Vec::new() })?, 34);
+        let groups = Command::SetMirrorGroups {
+            alias: "a".into(),
+            groups: Vec::new(),
+        };
+        assert_eq!(first(&groups)?, 35);
+        let promote = Command::PromoteMirror { topic: "t".into() };
+        assert_eq!(first(&promote)?, 36);
+        let sync = Command::SyncMirrorOffsets {
+            group: "g".into(),
+            offsets: Vec::new(),
+        };
+        assert_eq!(first(&sync)?, 37);
         Ok(())
     }
 }

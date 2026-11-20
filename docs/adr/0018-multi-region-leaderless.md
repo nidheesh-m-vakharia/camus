@@ -701,3 +701,133 @@ Phase 2, first part: transactions.
   `retention.bytes` on the mirror and waits for its log start to move.
   With mirror cuts sent as `DeleteRecords`, the log start never moves and
   the test fails.
+
+Phase 2, second part: consumer group offsets.
+
+- `camus admin mirror groups --alias --group …`, or
+  `POST /admin/mirror/groups`, commits `SetMirrorGroups` (log position
+  35). That stores the link's group list at `mirror-groups/{alias}`, at
+  most 256 ids of 1 to 1024 bytes each, sorted and deduplicated. An empty
+  list stops the sync. Removing the link removes the list.
+- Each copy round, after a link's partitions, `sync_groups` handles each
+  listed group:
+  1. It skips the group if it has members here, because a group consuming
+     the mirror owns its own offsets.
+  2. It reads the group's committed offsets from the source snapshot in
+     one ranged read of its `offset/{group}/` keys.
+  3. For each offset on a source topic this link mirrors, it clamps the
+     offset to the mirror partition's next offset.
+  4. It writes the offset only when it moves the group forward, in one
+     `CommitOffsets` with no generation.
+
+  Mirror offsets equal source offsets, so nothing is translated, and the
+  sync is as fine-grained as the source's commits. MirrorMaker 2 can be up
+  to `offset.lag.max` behind. A commit with no generation is refused once
+  the group's members are stored, so a consumer that has joined wins. A
+  classic group still in its first JoinGroup round holds its members only
+  in memory, and can take one synced commit first. Its members then fetch
+  that offset, as they would one committed just before they joined.
+- Each synced record is stamped with this broker's clock, not the
+  source's, as MirrorMaker 2's commit through the target coordinator is.
+  The mirror's offset retention then counts from the sync, so a row that
+  is old at the source does not expire on arrival and get written again
+  every round. A group here that has been empty longer than the retention
+  still expires offsets that are synced into it. That matches Kafka 4.4.0,
+  which counts an empty group's retention from when it became empty.
+- A clamped offset names a record the mirror does not hold yet, so it is
+  written with leader epoch -1. A failed-over consumer then has no epoch
+  to validate against, and never reads the clamp as truncation. An
+  unclamped offset keeps its epoch, which the mirror holds.
+- A successful sync tells this broker's coordinator about the group, as
+  OffsetCommit does, so `ListGroups` on the mirror shows it.
+- Groups sync one at a time. An error in one is logged and counted, and
+  the rest go on. A group's offsets are read a snapshot block at a time,
+  up to 65,536 per round, so a group with offsets on many source topics
+  does not overrun a single read. A refused commit is logged.
+- `camus_mirror_group_offsets_synced_total` counts the offsets written.
+- The MinIO test `a_mirror_syncs_a_groups_offsets_forward_only` covers
+  the sync:
+  1. A listed group's source commits of 25 and then 30 appear on the
+     mirror.
+  2. A consumer then commits 35 on the mirror, and the source's 32 does
+     not pull it back.
+  3. A source commit of 1000 is clamped to the mirror's end, 40.
+  4. A group list for an unknown link returns 400.
+
+  The test also checks two more things:
+  - The synced group appears in `ListGroups` on the mirror. The
+    coordinator there is loaded before the sync. Without the coordinator
+    notice the group is missing, and the test fails.
+  - The clamped offset carries epoch -1.
+
+  The skip for a group with members rests on the metadata group's commit
+  check, which has its own tests. This test does not join a member.
+
+Phase 2, third part: promotion and the fork check.
+
+- `camus admin mirror promote --topic --i-accept-data-loss`, or
+  `POST /admin/mirror/promote`, commits `PromoteMirror` (log position 36).
+  It clears `mirror_of` and stores `promoted`: the link, the source topic
+  id, and each partition's next offset at that moment as `at`. The
+  copier, retention's `TrimMirror`, reset, and group sync all key on
+  `mirror_of`, so they leave the topic alone. Its own retention goes
+  through `DeleteRecords`, and produce and the admin APIs work as on any
+  `r2` topic. Without the flag the promote returns 400, on a topic that
+  is not a mirror 400, and on an unknown topic 404. Records the source
+  acked and had not sealed into a snapshot this cluster read are not
+  here, which is why the flag is required.
+- Promotion starts a new leader epoch at each partition's promotion
+  offset, one past the newest copied epoch, as a Kafka leader change
+  does. A promoted topic keeps the mirror's epoch rule: its epoch is the
+  larger of the metadata term and the newest epoch in its history. `r2`
+  produce stamps batches with that epoch, so the first record this
+  cluster writes is in the new epoch. The new epoch matters to a consumer
+  that fetched records the source acked past the promotion offset, and
+  then fails over keeping its position. When it asks `OffsetForLeaderEpoch`
+  for the copied epoch, the answer ends at the promotion offset, and the
+  consumer truncates there. Without the new epoch it would skip what this
+  cluster wrote at those offsets.
+- A promote that is retried, for example after its response was lost,
+  changes nothing and returns 200. A partition row missing at promotion
+  rejects the command, rather than failing the apply.
+- The group sync commits through `SyncMirrorOffsets` (log position 37). It
+  applies as a commit with no generation, but only while every topic it
+  names is still a mirror. A sync that was in flight when its topic was
+  promoted is refused, so it cannot write a source offset over offsets
+  this cluster has since produced.
+- A copy that was in flight during a promotion is refused with 3, the
+  topic left the mirror set. The copier stops that topic for the round
+  without counting an error. One orphan object at most is left for the
+  sweep.
+- Produce checks `mirror_of` after leadership. A broker that has not yet
+  applied a promotion sends the producer to the leader with a retriable
+  error. It does not fail the producer with `INVALID_TOPIC_EXCEPTION`.
+- `camus admin mirror fork-check --topic`, or `GET
+  /admin/mirror/fork-check`, is the issue 151 check. It reads only. It
+  reads the old source through the link, which must still exist, and
+  reports each partition's `promoted_at` and the source's end. The source
+  has forked a partition when its end is past `promoted_at`: it holds
+  records at offsets this cluster has since assigned again.
+  - The source's end comes from its newest snapshot, which the response
+    names as `source_snapshot`. Records it acked and had not yet sealed
+    into that snapshot are not seen, so `forked: false` means no fork yet.
+  - A partition the source has no row for is reported as unknown
+    (`forked: null`, `unknown: true`).
+  - The CLI exits 1 on a fork or an unknown.
+- Mirroring back into the old source is not built. That cluster's topic
+  already exists, and a topic that exists cannot become a mirror, so
+  failing back still goes through MirrorMaker 2, or through a new topic.
+- The MinIO test `a_promoted_mirror_is_writable_and_a_fork_is_reported`
+  covers this:
+  1. A promote without the flag returns 400.
+  2. After the promote, the topic takes a produce at offset 40 and still
+     serves `record-39`. A retried promote returns 200. The record at 40
+     is in a newer epoch than the copied record at 39, and
+     `OffsetForLeaderEpoch` for the copied epoch ends at 40. Without the
+     new epoch at promotion, both records share an epoch and the test
+     fails.
+  3. The old source writes on to 42, and the fork check reports
+     `promoted_at` 40, `source_end` 42, and a fork, while the promoted
+     topic stays at 41.
+  4. The link can then be removed.
+

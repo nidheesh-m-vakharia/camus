@@ -554,6 +554,30 @@ fn apply_command(
             each,
         });
     }
+    if let Command::SyncMirrorOffsets { group, offsets } = command {
+        let read = |key: &str| -> Result<Option<String>, String> {
+            match kv.get(key) {
+                Ok(Some(guard)) => Ok(Some(guard.value().to_string())),
+                Ok(None) => Ok(None),
+                Err(err) => Err(err.to_string()),
+            }
+        };
+        let ids = offsets.iter().map(|offset| offset.topic_id.as_str());
+        let mirrors = mirror::all_mirrors(&read, ids)
+            .map_err(|err| io(ErrorSubject::StateMachine, &std::io::Error::other(err)))?;
+        if !mirrors {
+            return Ok(Response::reject(3));
+        }
+        return apply_group(
+            kv,
+            Command::CommitOffsets {
+                group,
+                generation: -1,
+                member_id: String::new(),
+                offsets,
+            },
+        );
+    }
     match command {
         Command::SaveGroup { .. }
         | Command::CommitOffsets { .. }
@@ -623,6 +647,11 @@ fn apply_command(
                 let committed: Vec<catalog::Span> = committed.iter().map(Into::into).collect();
                 let aborted: Vec<catalog::Span> = aborted.iter().map(Into::into).collect();
                 catalog::publish_mirror(&read, &parts, &committed, &aborted)
+            }
+            Command::PromoteMirror { topic } => mirror::promote(&read, &topic),
+            Command::SyncMirrorOffsets { .. } => unreachable!("handled above"),
+            Command::SetMirrorGroups { alias, groups } => {
+                mirror::set_groups(&read, &alias, &groups)
             }
             Command::TrimMirror { cuts } => {
                 admin::trim_mirror(&read, &scan, &cuts).and_then(admin::outcome)

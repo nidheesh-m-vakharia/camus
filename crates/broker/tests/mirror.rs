@@ -1059,3 +1059,328 @@ fn a_mirror_copies_ended_transactions_and_waits_at_an_open_one() -> TestResult {
     assert_eq!(records_at(&source_addr, 1)?, after);
     Ok(())
 }
+
+/// Commit `offset` for `group` on `TOPIC` partition 0, outside membership.
+fn commit(addr: &str, group: &'static str, offset: i64) -> Result<(), Box<dyn std::error::Error>> {
+    use camus_protocol::messages::offset_commit_request::{
+        OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+    };
+    use camus_protocol::messages::offset_commit_response::OffsetCommitResponse;
+    use camus_protocol::messages::{GroupId, OffsetCommitRequest};
+    let mut stream = connect(addr);
+    send(
+        &mut stream,
+        ApiKey::OffsetCommit,
+        8,
+        &OffsetCommitRequest::default()
+            .with_group_id(GroupId(StrBytes::from_static_str(group)))
+            .with_generation_id_or_member_epoch(-1)
+            .with_topics(vec![OffsetCommitRequestTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str(support::TOPIC)))
+                .with_partitions(vec![OffsetCommitRequestPartition::default()
+                    .with_partition_index(0)
+                    .with_committed_offset(offset)])]),
+    );
+    let code = recv::<OffsetCommitResponse>(&mut stream, 8).topics[0].partitions[0].error_code;
+    if code != 0 {
+        return Err(format!("OffsetCommit: {code}").into());
+    }
+    Ok(())
+}
+
+/// `group`'s committed offset on `TOPIC` partition 0, or -1.
+fn committed(addr: &str, group: &'static str) -> i64 {
+    committed_with_epoch(addr, group).0
+}
+
+/// The group ids `ListGroups` reports on `addr`.
+fn listed_groups(addr: &str) -> Vec<String> {
+    use camus_protocol::messages::list_groups_response::ListGroupsResponse;
+    use camus_protocol::messages::ListGroupsRequest;
+    let mut stream = connect(addr);
+    send(
+        &mut stream,
+        ApiKey::ListGroups,
+        4,
+        &ListGroupsRequest::default(),
+    );
+    recv::<ListGroupsResponse>(&mut stream, 4)
+        .groups
+        .iter()
+        .map(|group| group.group_id.0.to_string())
+        .collect()
+}
+
+/// `group`'s committed offset and its leader epoch on `TOPIC` partition 0.
+fn committed_with_epoch(addr: &str, group: &'static str) -> (i64, i32) {
+    use camus_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
+    use camus_protocol::messages::offset_fetch_response::OffsetFetchResponse;
+    use camus_protocol::messages::{GroupId, OffsetFetchRequest};
+    let mut stream = connect(addr);
+    send(
+        &mut stream,
+        ApiKey::OffsetFetch,
+        7,
+        &OffsetFetchRequest::default()
+            .with_group_id(GroupId(StrBytes::from_static_str(group)))
+            .with_topics(Some(vec![OffsetFetchRequestTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str(support::TOPIC)))
+                .with_partition_indexes(vec![0])])),
+    );
+    let response = recv::<OffsetFetchResponse>(&mut stream, 7);
+    let part = &response.topics[0].partitions[0];
+    (part.committed_offset, part.committed_leader_epoch)
+}
+
+/// Wait until `group`'s offset on `addr` is `offset`.
+fn wait_committed(
+    addr: &str,
+    group: &'static str,
+    offset: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while committed(addr, group) != offset {
+        if std::time::Instant::now() > deadline {
+            return Err(
+                format!("{group} never reached {offset}: {}", committed(addr, group)).into(),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// A listed group's committed offsets follow the source onto the mirror,
+/// clamped to what the mirror holds, and never move a group backward.
+#[test]
+fn a_mirror_syncs_a_groups_offsets_forward_only() -> TestResult {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("mirror group sync test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let source_prefix = format!("mirror-groups-src-{pid}/");
+    let source_dir = tempfile::tempdir()?;
+    let source = spawn_under(source_dir.path(), &source_prefix, &[]);
+    let source_addr = kafka_addr(&source);
+    for at in 0..40 {
+        assert_eq!(produce(&source_addr, &format!("record-{at}")), (0, at));
+    }
+    support::wait_sealed(&source.http, 40);
+    commit(&source_addr, "billing", 25)?;
+
+    let dest_dir = tempfile::tempdir()?;
+    let dest = support::Node::with(
+        1,
+        dest_dir.path(),
+        Opts::default()
+            .env("CAMUS_S3_PREFIX", &format!("mirror-groups-dst-{pid}/"))
+            .env("CAMUS_MIRROR_COPY_MS", "200")
+            .env("CAMUS_MIRROR_US_EAST_ACCESS_KEY", "camus")
+            .env("CAMUS_MIRROR_US_EAST_SECRET_KEY", "camus-dev-secret"),
+    );
+    support::init(std::slice::from_ref(&dest), &[1]);
+    support::wait_settled(&[&dest]);
+    let client = reqwest::blocking::Client::new();
+    let link = MirrorLink {
+        alias: "us-east".into(),
+        endpoint: "http://127.0.0.1:9100".into(),
+        region: "us-east-1".into(),
+        bucket: "camus".into(),
+        prefix: source_prefix.clone(),
+        virtual_host: false,
+    };
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/links", dest.http))
+            .json(&link)
+            .send()
+    })?;
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/topics", dest.http))
+            .json(&serde_json::json!({ "alias": "us-east", "topic": support::TOPIC }))
+            .send()
+    })?;
+    let set_groups = |alias: &str| {
+        client
+            .post(format!("http://{}/admin/mirror/groups", dest.http))
+            .json(&serde_json::json!({ "alias": alias, "groups": ["billing"] }))
+            .send()
+    };
+    // Load the mirror's coordinator before the sync, so a group it lists
+    // later can only have come from the sync telling it.
+    let dest_addr = kafka_addr(&dest);
+    assert!(!listed_groups(&dest_addr).contains(&"billing".to_string()));
+    assert_eq!(set_groups("nope")?.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(set_groups("us-east")?.status(), StatusCode::OK);
+    support::wait_sealed(&dest.http, 40);
+    wait_committed(&dest_addr, "billing", 25)?;
+    assert!(
+        listed_groups(&dest_addr).contains(&"billing".to_string()),
+        "a synced group is listed on the mirror"
+    );
+
+    commit(&source_addr, "billing", 30)?;
+    wait_committed(&dest_addr, "billing", 30)?;
+
+    // A consumer on the mirror moved ahead; the source going back does not
+    // pull it back.
+    commit(&dest_addr, "billing", 35)?;
+    commit(&source_addr, "billing", 32)?;
+    std::thread::sleep(std::time::Duration::from_millis(2_000));
+    assert_eq!(committed(&dest_addr, "billing"), 35);
+
+    // An offset past what the mirror holds is clamped to its end.
+    commit(&source_addr, "billing", 1_000)?;
+    wait_committed(&dest_addr, "billing", 40)?;
+    assert_eq!(
+        committed_with_epoch(&dest_addr, "billing").1,
+        -1,
+        "a clamped offset names no epoch the mirror holds"
+    );
+    Ok(())
+}
+
+/// A promoted mirror takes produces from where it stopped copying, copies
+/// no more, and the fork check sees a source that went on past that point.
+#[test]
+fn a_promoted_mirror_is_writable_and_a_fork_is_reported() -> TestResult {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("mirror promotion test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let source_prefix = format!("mirror-promote-src-{pid}/");
+    let source_dir = tempfile::tempdir()?;
+    let source = spawn_under(source_dir.path(), &source_prefix, &[]);
+    let source_addr = kafka_addr(&source);
+    for at in 0..40 {
+        assert_eq!(produce(&source_addr, &format!("record-{at}")), (0, at));
+    }
+    support::wait_sealed(&source.http, 40);
+
+    let dest_dir = tempfile::tempdir()?;
+    let dest = support::Node::with(
+        1,
+        dest_dir.path(),
+        Opts::default()
+            .env("CAMUS_S3_PREFIX", &format!("mirror-promote-dst-{pid}/"))
+            .env("CAMUS_MIRROR_COPY_MS", "200")
+            .env("CAMUS_MIRROR_US_EAST_ACCESS_KEY", "camus")
+            .env("CAMUS_MIRROR_US_EAST_SECRET_KEY", "camus-dev-secret"),
+    );
+    support::init(std::slice::from_ref(&dest), &[1]);
+    support::wait_settled(&[&dest]);
+    let client = reqwest::blocking::Client::new();
+    let link = MirrorLink {
+        alias: "us-east".into(),
+        endpoint: "http://127.0.0.1:9100".into(),
+        region: "us-east-1".into(),
+        bucket: "camus".into(),
+        prefix: source_prefix.clone(),
+        virtual_host: false,
+    };
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/links", dest.http))
+            .json(&link)
+            .send()
+    })?;
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/topics", dest.http))
+            .json(&serde_json::json!({ "alias": "us-east", "topic": support::TOPIC }))
+            .send()
+    })?;
+    support::wait_sealed(&dest.http, 40);
+
+    let promote = |accept: bool| {
+        client
+            .post(format!("http://{}/admin/mirror/promote", dest.http))
+            .json(&serde_json::json!({ "topic": support::TOPIC, "i_accept_data_loss": accept }))
+            .send()
+    };
+    assert_eq!(promote(false)?.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(promote(true)?.status(), StatusCode::OK);
+    assert_eq!(
+        promote(true)?.status(),
+        StatusCode::OK,
+        "a retried promote succeeds"
+    );
+
+    let dest_addr = kafka_addr(&dest);
+    assert_eq!(
+        produce(&dest_addr, "after-0"),
+        (0, 40),
+        "writable from where it stopped"
+    );
+    let (code, values) = support::fetch_at(&dest_addr, 39);
+    assert_eq!(code, 0);
+    assert_eq!(values.first().map(String::as_str), Some("record-39"));
+
+    // Promotion starts a new epoch at 40: the copied epoch ends there, and
+    // the record produced at 40 carries a newer one.
+    let log = raw_log(&dest_addr, 41)?;
+    let batches = camus_protocol::batch::inspect(&log, camus_protocol::batch::MAX_BATCH_CEILING)
+        .map_err(|err| format!("{err:?}"))?;
+    let mut epochs = Vec::new();
+    let mut at = 0;
+    for batch in &batches {
+        epochs.push(camus_protocol::batch::leader_epoch(
+            log.get(at..).ok_or("short")?,
+        ));
+        at += batch.len;
+    }
+    let (copied, produced) = (epochs[39], epochs[40]);
+    assert!(
+        produced > copied,
+        "epoch {produced} at 40 is not past the copied {copied}"
+    );
+    let current = support::partition_epoch(&dest_addr);
+    assert_eq!(
+        support::epoch_end(&dest_addr, current, copied),
+        (0, copied, 40)
+    );
+
+    // The old source writes on: the same offsets now hold other records.
+    for at in 40..42 {
+        assert_eq!(produce(&source_addr, &format!("source-{at}")), (0, at));
+    }
+    support::wait_sealed(&source.http, 42);
+    let check = || -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        Ok(client
+            .get(format!("http://{}/admin/mirror/fork-check", dest.http))
+            .query(&[("topic", support::TOPIC)])
+            .send()?
+            .json()?)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let report = loop {
+        let report = check()?;
+        if report["forked"].as_bool() == Some(true) {
+            break report;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("no fork reported: {report}").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(report["partitions"][0]["promoted_at"], 40);
+    assert_eq!(report["partitions"][0]["source_end"], 42);
+    assert_eq!(report["unknown"], false);
+    assert!(report["source_snapshot"]
+        .as_str()
+        .is_some_and(|key| key.starts_with("meta/snap/")));
+    assert_eq!(
+        support::sealed_end(&dest.http),
+        41,
+        "the source's later records are not copied in"
+    );
+    let removed = client
+        .delete(format!("http://{}/admin/mirror/links/us-east", dest.http))
+        .send()?
+        .status();
+    assert_eq!(removed, StatusCode::OK, "no mirror names the link any more");
+    Ok(())
+}
