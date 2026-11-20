@@ -258,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
                     axum::routing::delete(remove_mirror_link),
                 )
                 .route("/admin/mirror/topics", post(create_mirror_topic))
+                .route("/admin/mirror/reset", post(reset_mirror_partition))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
                 .route("/wal/{shard}/txn-span", post(shard_txn_span))
@@ -1644,6 +1645,51 @@ fn source_error(alias: &str, err: &anyhow::Error) -> (StatusCode, String) {
             camus_storage::public_reason(err)
         ),
     )
+}
+
+#[derive(Deserialize)]
+struct MirrorReset {
+    topic: String,
+    partition: i32,
+    #[serde(default)]
+    i_accept_data_loss: bool,
+}
+
+/// Drop a stalled mirror partition's copy so the copier starts it again at
+/// the source's log start. Refused without `i_accept_data_loss`.
+async fn reset_mirror_partition(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<MirrorReset>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !body.i_accept_data_loss {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a reset drops what the mirror holds; pass i_accept_data_loss".into(),
+        ));
+    }
+    let what = format!("mirror {} partition {}", body.topic, body.partition);
+    let command = Command::ResetMirrorPartition {
+        topic: body.topic,
+        partition: body.partition,
+    };
+    let response = metadata_apply(&admin, command)
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    match response.error_code {
+        0 => Ok(StatusCode::OK),
+        3 => Err((
+            StatusCode::NOT_FOUND,
+            format!("{what}: no such topic or partition"),
+        )),
+        camus_metadata::mirror::INVALID_REQUEST => Err((
+            StatusCode::BAD_REQUEST,
+            format!("{what}: not a mirror topic"),
+        )),
+        code => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{what}: error code {code}"),
+        )),
+    }
 }
 
 #[derive(Deserialize)]
