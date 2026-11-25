@@ -118,9 +118,10 @@ openraft::declare_raft_types!(
 fn batch_slices(entry: &openraft::Entry<TypeConfig>) -> Vec<&[u8]> {
     match &entry.payload {
         EntryPayload::Normal(Command::Append(batch)) => vec![batch.raw.as_ref()],
-        EntryPayload::Normal(Command::Appends(batches)) => {
-            batches.iter().map(|batch| batch.raw.as_ref()).collect()
-        }
+        EntryPayload::Normal(Command::Appends(batches))
+        | EntryPayload::Normal(Command::StampedAppends {
+            appends: batches, ..
+        }) => batches.iter().map(|batch| batch.raw.as_ref()).collect(),
         _ => Vec::new(),
     }
 }
@@ -128,7 +129,10 @@ fn batch_slices(entry: &openraft::Entry<TypeConfig>) -> Vec<&[u8]> {
 fn clear_batches(entry: &mut openraft::Entry<TypeConfig>) {
     match &mut entry.payload {
         EntryPayload::Normal(Command::Append(batch)) => batch.raw.clear(),
-        EntryPayload::Normal(Command::Appends(batches)) => {
+        EntryPayload::Normal(Command::Appends(batches))
+        | EntryPayload::Normal(Command::StampedAppends {
+            appends: batches, ..
+        }) => {
             for batch in batches {
                 batch.raw.clear();
             }
@@ -145,7 +149,10 @@ fn fill_batches(entry: &mut openraft::Entry<TypeConfig>, raws: Vec<Vec<u8>>) {
                 batch.raw = bytes::Bytes::from(raw);
             }
         }
-        EntryPayload::Normal(Command::Appends(batches)) => {
+        EntryPayload::Normal(Command::Appends(batches))
+        | EntryPayload::Normal(Command::StampedAppends {
+            appends: batches, ..
+        }) => {
             for batch in batches {
                 if let Some(raw) = raws.next() {
                     batch.raw = bytes::Bytes::from(raw);
@@ -237,6 +244,18 @@ pub enum Command {
         partition: i32,
         /// Producer whose span ends.
         producer_id: i64,
+    },
+    // The log is postcard, which numbers variants by position: new variants
+    // go after every existing one.
+    /// [`Command::Appends`] with each batch's stamp at the same position
+    /// (ADR 0018, phase 3). A voter older than this variant cannot read it,
+    /// so every voter runs the release that reads it before any leader
+    /// writes it.
+    StampedAppends {
+        /// The batches, as in `Appends`.
+        appends: Vec<Append>,
+        /// Each batch's stamp, `None` where the leader had no reading.
+        stamps: Vec<Option<i64>>,
     },
 }
 
@@ -330,6 +349,9 @@ pub struct Shard {
     budget: Arc<tokio::sync::Semaphore>,
     /// The shard's background loop stops once this is dropped.
     _alive: Arc<()>,
+    /// Stamps each entry's batches as the committer forms it, once set
+    /// (ADR 0018, phase 3). Shared with the commit loop.
+    clock: Arc<std::sync::OnceLock<Arc<dyn camus_raft::clock::Clock>>>,
 }
 
 /// One produce batch waiting for the committer. A request's batches for one
@@ -421,6 +443,7 @@ async fn commit_loop(
     raft: Raft<TypeConfig>,
     storage_failed: Arc<AtomicBool>,
     mut queue: tokio::sync::mpsc::UnboundedReceiver<Vec<Queued>>,
+    clock: Arc<std::sync::OnceLock<Arc<dyn camus_raft::clock::Clock>>>,
 ) {
     // Test hook: the entry is already committed. Holding the ack lets a
     // produce time out and still leave the record in the log.
@@ -444,7 +467,7 @@ async fn commit_loop(
             while let Ok(chunk) = queue.try_recv() {
                 ready.extend(chunk);
             }
-            let waiting: usize = ready.iter().map(|(append, _, _, _)| append.raw.len()).sum();
+            let waiting: usize = ready.iter().map(|(append, ..)| append.raw.len()).sum();
             let idle = slots.available_permits() == IN_FLIGHT;
             if waiting >= GROUP_BYTES || ready.len() >= machine::MAX_PACKED || idle {
                 break;
@@ -477,7 +500,20 @@ async fn commit_loop(
             waiters.push(waiter);
             budgets.push(budget);
         }
-        let command = if appends.len() == 1 {
+        // One reading as the entry is formed, just before it goes to Raft,
+        // so a batch's stamp is no older than its wait in the queue. A
+        // frontier must still count entries proposed and not yet applied.
+        let stamp = clock
+            .get()
+            .and_then(|clock| clock.now())
+            .map(|now| now.latest_us);
+        // Unstamped entries stay the ones every release reads.
+        let command = if stamp.is_some() {
+            Command::StampedAppends {
+                stamps: vec![stamp; appends.len()],
+                appends,
+            }
+        } else if appends.len() == 1 {
             Command::Append(appends.into_iter().next().expect("one append"))
         } else {
             Command::Appends(appends)
@@ -733,7 +769,13 @@ impl Shard {
         ));
         let storage_failed = Arc::new(AtomicBool::new(false));
         let (queue, waiting) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(commit_loop(raft.clone(), storage_failed.clone(), waiting));
+        let clock = Arc::new(std::sync::OnceLock::new());
+        tokio::spawn(commit_loop(
+            raft.clone(),
+            storage_failed.clone(),
+            waiting,
+            Arc::clone(&clock),
+        ));
         Ok(Self {
             raft,
             machine,
@@ -743,6 +785,7 @@ impl Shard {
             queue,
             budget: Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTES)),
             _alive: alive,
+            clock,
         })
     }
 
@@ -898,6 +941,14 @@ impl Shard {
     /// The shard's current Raft term.
     pub fn term(&self) -> u64 {
         self.raft.metrics().borrow().current_term
+    }
+
+    /// Stamp every entry the committer forms from now on with `clock`'s
+    /// reading (ADR 0018, phase 3). Set once; a second call changes
+    /// nothing. A shard never given a clock writes the unstamped entries
+    /// every release reads.
+    pub fn stamp_with(&self, clock: Arc<dyn camus_raft::clock::Clock>) {
+        let _ = self.clock.set(clock);
     }
 
     pub fn is_leader(&self) -> bool {
@@ -1618,5 +1669,83 @@ mod tests {
         assert_eq!(starts(shard.pending(2 * one).await.unwrap()), [0, 1]);
         assert_eq!(starts(shard.pending(2 * one + 1).await.unwrap()), [0, 1]);
         assert_eq!(starts(shard.pending(u64::MAX).await.unwrap()), [0, 1, 2, 3]);
+    }
+
+    /// A clock that reads the next scripted `latest`, or no reading for
+    /// `None`. Past the script it has no reading.
+    struct Script(std::sync::Mutex<std::collections::VecDeque<Option<i64>>>);
+
+    impl camus_raft::clock::Clock for Script {
+        fn now(&self) -> Option<camus_raft::clock::Interval> {
+            let latest_us = self.0.lock().ok()?.pop_front().flatten()?;
+            Some(camus_raft::clock::Interval {
+                earliest_us: latest_us - 100,
+                latest_us,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clocked_shard_stamps_batches_and_keeps_them_across_a_restart() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        async fn append(shard: &Shard, value: &[u8]) -> anyhow::Result<Response> {
+            shard
+                .append(append_of(value))
+                .await
+                .map_err(|err| anyhow::anyhow!("append: {err:?}"))
+        }
+        let stamps =
+            |batches: Vec<Batch>| batches.iter().map(|batch| batch.stamp).collect::<Vec<_>>();
+        {
+            let shard = Shard::open(1, dir.path()).await?;
+            shard.ensure_voter().await?;
+            append(&shard, b"before a clock").await?;
+            // 1100, then a clock that stepped back to 1000, then no reading.
+            let script = [Some(1_100), Some(1_000), None];
+            shard.stamp_with(Arc::new(Script(std::sync::Mutex::new(script.into()))));
+            for value in [b"a", b"b", b"c"] {
+                append(&shard, value).await?;
+            }
+            assert_eq!(
+                stamps(shard.pending(u64::MAX).await?),
+                [None, Some(1_100), Some(1_100), None],
+                "raised to the partition's last stamp; none without a reading"
+            );
+            // Durable now, so the reopened shard loads the stamps from its
+            // tables rather than replaying the log.
+            shard
+                .machine
+                .flush()
+                .map_err(|err| anyhow::anyhow!("flush: {err}"))?;
+            shard.close().await?;
+        }
+        let shard = Shard::open(1, dir.path()).await?;
+        shard.ensure_voter().await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while shard.end_offset(&[1; 16], 0) < 4 {
+            anyhow::ensure!(std::time::Instant::now() < deadline, "log not re-applied");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            stamps(shard.pending(u64::MAX).await?),
+            [None, Some(1_100), Some(1_100), None],
+            "stamps survive a restart"
+        );
+        Ok(())
+    }
+
+    /// The log is postcard, which writes a variant's position first.
+    #[test]
+    fn stamped_appends_keep_their_log_position_and_round_trip() -> anyhow::Result<()> {
+        let command = Command::StampedAppends {
+            appends: vec![append_of(b"x")],
+            stamps: vec![Some(7), None],
+        };
+        let bytes = camus_raft::codec::encode(&command)?;
+        assert_eq!(bytes.first(), Some(&5));
+        let back: Command = camus_raft::codec::decode(&bytes)?;
+        assert_eq!(back, command);
+        Ok(())
     }
 }
