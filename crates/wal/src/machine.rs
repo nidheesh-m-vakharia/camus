@@ -36,7 +36,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::{Command, NodeId, Response, TypeConfig};
+use crate::{Append, Command, NodeId, Response, TypeConfig};
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 /// Next offset per partition key.
@@ -50,6 +50,9 @@ const TXN_SPANS: TableDefinition<&str, &[u8]> = TableDefinition::new("txn_spans"
 const SPAN_CAP: usize = 65_536;
 /// Unsealed batch headers by storage key, postcard.
 const HEADS: TableDefinition<u64, &[u8]> = TableDefinition::new("heads");
+/// Each stamped head's stamp, under the head's key (ADR 0018, phase 3). A
+/// table of its own, since heads are postcard and cannot gain a field.
+const STAMPS: TableDefinition<u64, i64> = TableDefinition::new("stamps");
 /// Bytes of unsealed batches whose log entry a snapshot may purge.
 const DETACHED: TableDefinition<u64, &[u8]> = TableDefinition::new("detached");
 /// The latest snapshot, postcard.
@@ -78,6 +81,10 @@ pub struct Batch {
     pub max_timestamp: i64,
     /// Client bytes with base offset and epoch filled in.
     pub bytes: Vec<u8>,
+    /// Upper edge of the leader's clock interval when it appended the
+    /// batch, never below the partition's previous stamp. `None` when the
+    /// leader had no synchronised clock (ADR 0018, phase 3).
+    pub stamp: Option<i64>,
 }
 
 /// What the state machine keeps per unsealed batch.
@@ -100,6 +107,10 @@ struct Head {
     max_timestamp: i64,
     epoch: i32,
     len: u64,
+    /// Kept in [`STAMPS`] and in snapshots beside the heads, never in this
+    /// postcard row.
+    #[serde(skip)]
+    stamp: Option<i64>,
 }
 
 impl Head {
@@ -144,6 +155,20 @@ impl Heads {
         self.by_key.remove(&head.key());
         self.bytes -= head.len;
         Some(head)
+    }
+
+    /// Give the head stored under `key` its stamp.
+    fn set_stamp(&mut self, key: u64, stamp: i64) {
+        let Some((topic_id, partition, start, _)) = self.by_key.get(&key) else {
+            return;
+        };
+        if let Some(head) = self
+            .by_part
+            .get_mut(&(*topic_id, *partition))
+            .and_then(|part| part.get_mut(start))
+        {
+            head.stamp = Some(stamp);
+        }
     }
 
     /// Every head, in commit order.
@@ -277,15 +302,37 @@ struct State {
     /// transaction ends, and never more than [`SPAN_CAP`].
     #[serde(default, skip_serializing)]
     txn_spans: BTreeMap<String, OpenSpan>,
+    /// Each partition's last applied stamp, by `part_key`. Apply raises a
+    /// stamp to this, so stamps never go back within a partition, whichever
+    /// leader took them. One entry per stamped partition.
+    #[serde(default)]
+    stamp_floor: BTreeMap<String, i64>,
     #[serde(skip)]
     heads: Heads,
     #[serde(skip)]
     dirty: Dirty,
 }
 
-/// What a snapshot carries besides openraft's meta.
+/// What a snapshot carries besides openraft's meta. Stamps come last, so a
+/// broker that predates them reads this as [`SnapshotDataV2`] and ignores
+/// them.
 #[derive(Serialize, Deserialize)]
 struct SnapshotData {
+    next: BTreeMap<String, i64>,
+    heads: Vec<Head>,
+    /// Sealed bytes of every head, by storage key.
+    bytes: Vec<(u64, serde_bytes::ByteBuf)>,
+    producers: BTreeMap<String, camus_protocol::idempotence::ProducerSeq>,
+    txn_spans: BTreeMap<String, OpenSpan>,
+    /// Each stamped head's stamp, by storage key.
+    stamps: Vec<(u64, i64)>,
+    /// Each partition's last applied stamp.
+    stamp_floor: BTreeMap<String, i64>,
+}
+
+/// Snapshot body from before stamps.
+#[derive(Deserialize)]
+struct SnapshotDataV2 {
     next: BTreeMap<String, i64>,
     heads: Vec<Head>,
     /// Sealed bytes of every head, by storage key.
@@ -310,6 +357,17 @@ fn decode_snapshot(data: &[u8]) -> Result<SnapshotData, &'static str> {
     if let Ok(parsed) = camus_raft::codec::decode(data) {
         return Ok(parsed);
     }
+    if let Ok(old) = camus_raft::codec::decode::<SnapshotDataV2>(data) {
+        return Ok(SnapshotData {
+            next: old.next,
+            heads: old.heads,
+            bytes: old.bytes,
+            producers: old.producers,
+            txn_spans: old.txn_spans,
+            stamps: Vec::new(),
+            stamp_floor: BTreeMap::new(),
+        });
+    }
     let old: SnapshotDataV1 = camus_raft::codec::decode(data).map_err(|_| "snapshot")?;
     Ok(SnapshotData {
         next: old.next,
@@ -317,6 +375,8 @@ fn decode_snapshot(data: &[u8]) -> Result<SnapshotData, &'static str> {
         bytes: old.bytes,
         producers: BTreeMap::new(),
         txn_spans: BTreeMap::new(),
+        stamps: Vec::new(),
+        stamp_floor: BTreeMap::new(),
     })
 }
 
@@ -584,10 +644,13 @@ impl Machine {
             } else {
                 let raw = match entries.get(&head.log_index) {
                     Some(Command::Append(append)) if head.pos == 0 => &append.raw,
-                    Some(Command::Appends(appends)) => match appends.get(head.pos as usize) {
-                        Some(append) => &append.raw,
-                        None => return Err(missing(&head)),
-                    },
+                    Some(Command::Appends(appends))
+                    | Some(Command::StampedAppends { appends, .. }) => {
+                        match appends.get(head.pos as usize) {
+                            Some(append) => &append.raw,
+                            None => return Err(missing(&head)),
+                        }
+                    }
                     _ => return Err(missing(&head)),
                 };
                 camus_protocol::batch::seal(raw, head.start, head.epoch, MAX_BATCH)
@@ -604,6 +667,7 @@ impl Machine {
                 base_timestamp: head.base_timestamp,
                 max_timestamp: head.max_timestamp,
                 bytes,
+                stamp: head.stamp,
             });
         }
         Ok(out)
@@ -806,6 +870,16 @@ fn load_state(db: &Database) -> Result<State, StorageError<NodeId>> {
         let head: Head = camus_raft::codec::decode(head.value()).map_err(|e| err(&e))?;
         state.heads.insert(head);
     }
+    match txn.open_table(STAMPS) {
+        Ok(table) => {
+            for row in table.iter().map_err(|e| err(&e))? {
+                let (key, stamp) = row.map_err(|e| err(&e))?;
+                state.heads.set_stamp(key.value(), stamp.value());
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(err(&e)),
+    }
     Ok(state)
 }
 
@@ -865,13 +939,18 @@ fn write_changes(
         }
         let mut heads = txn.open_table(HEADS).map_err(|e| err(&e))?;
         let mut detached = txn.open_table(DETACHED).map_err(|e| err(&e))?;
+        let mut stamps = txn.open_table(STAMPS).map_err(|e| err(&e))?;
         for key in &dirty.removed {
             heads.remove(*key).map_err(|e| err(&e))?;
             detached.remove(*key).map_err(|e| err(&e))?;
+            stamps.remove(*key).map_err(|e| err(&e))?;
         }
         for (key, head) in &dirty.added {
             let raw = camus_raft::codec::encode(head).map_err(|e| err(&e))?;
             heads.insert(*key, raw.as_slice()).map_err(|e| err(&e))?;
+            if let Some(stamp) = head.stamp {
+                stamps.insert(*key, stamp).map_err(|e| err(&e))?;
+            }
         }
     }
     txn.commit().map_err(|e| err(&e))?;
@@ -881,7 +960,10 @@ fn write_changes(
 fn batch_offsets(entry: &openraft::Entry<TypeConfig>) -> Vec<u64> {
     let count = match &entry.payload {
         EntryPayload::Normal(Command::Append(_)) => 1,
-        EntryPayload::Normal(Command::Appends(batches)) => batches.len(),
+        EntryPayload::Normal(Command::Appends(batches))
+        | EntryPayload::Normal(Command::StampedAppends {
+            appends: batches, ..
+        }) => batches.len(),
         _ => 0,
     };
     (0..count)
@@ -890,7 +972,39 @@ fn batch_offsets(entry: &openraft::Entry<TypeConfig>) -> Vec<u64> {
 }
 
 fn apply_one(state: &mut State, command: Command, log_index: u64, offsets: &[u64]) -> Response {
-    apply_at(state, command, log_index, 0, offsets)
+    apply_at(state, command, log_index, 0, offsets, None)
+}
+
+/// Apply a packed entry's batches in order, each at its position, with the
+/// stamp at the same position when `stamps` has one.
+fn apply_packed(
+    state: &mut State,
+    batches: Vec<Append>,
+    stamps: &[Option<i64>],
+    log_index: u64,
+    offsets: &[u64],
+) -> Response {
+    let each = batches
+        .into_iter()
+        .take(MAX_PACKED)
+        .enumerate()
+        .map(|(pos, batch)| {
+            let stamp = stamps.get(pos).copied().flatten();
+            apply_at(
+                state,
+                Command::Append(batch),
+                log_index,
+                pos as u32,
+                offsets,
+                stamp,
+            )
+        })
+        .collect();
+    Response {
+        base_offset: -1,
+        error_code: 0,
+        each,
+    }
 }
 
 fn apply_at(
@@ -899,28 +1013,12 @@ fn apply_at(
     log_index: u64,
     pos: u32,
     offsets: &[u64],
+    stamp: Option<i64>,
 ) -> Response {
     match command {
-        Command::Appends(batches) => {
-            let each = batches
-                .into_iter()
-                .take(MAX_PACKED)
-                .enumerate()
-                .map(|(pos, batch)| {
-                    apply_at(
-                        state,
-                        Command::Append(batch),
-                        log_index,
-                        pos as u32,
-                        offsets,
-                    )
-                })
-                .collect();
-            Response {
-                base_offset: -1,
-                error_code: 0,
-                each,
-            }
+        Command::Appends(batches) => apply_packed(state, batches, &[], log_index, offsets),
+        Command::StampedAppends { appends, stamps } => {
+            apply_packed(state, appends, &stamps, log_index, offsets)
         }
         Command::Append(batch) => {
             let key = part_key(&batch.topic_id, batch.partition);
@@ -1007,6 +1105,15 @@ fn apply_at(
                 }
             }
             let end = start + i64::from(batch.records);
+            // Raised to the partition's last stamp, so stamps never go back
+            // in a partition even across leaders whose clocks disagree.
+            let stamp = stamp.map(|stamp| {
+                let floor = state.stamp_floor.get(&key).copied().unwrap_or(i64::MIN);
+                let stamp = stamp.max(floor);
+                state.stamp_floor.insert(key.clone(), stamp);
+                state.dirty.meta = true;
+                stamp
+            });
             state.dirty.next.insert(key.clone());
             state.next.insert(key, end);
             let head = Head {
@@ -1022,6 +1129,7 @@ fn apply_at(
                 epoch: batch.epoch,
                 len: batch.raw.len() as u64,
                 at: offsets.get(pos as usize).copied().unwrap_or(0),
+                stamp,
             };
             state.dirty.add(head.clone());
             state.heads.insert(head);
@@ -1113,6 +1221,12 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<Machine> {
                     bytes,
                     producers: state.producers.clone(),
                     txn_spans: state.txn_spans.clone(),
+                    stamps: state
+                        .heads
+                        .in_commit_order()
+                        .filter_map(|head| Some((head.key(), head.stamp?)))
+                        .collect(),
+                    stamp_floor: state.stamp_floor.clone(),
                 },
                 state.last_applied,
                 state.membership.clone().unwrap_or_default(),
@@ -1231,13 +1345,18 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
         let subject = || ErrorSubject::Snapshot(Some(meta.signature()));
         let parsed =
             decode_snapshot(&data).map_err(|err| io(subject(), &std::io::Error::other(err)))?;
+        let mut heads: Heads = parsed.heads.into_iter().collect();
+        for (key, stamp) in &parsed.stamps {
+            heads.set_stamp(*key, *stamp);
+        }
         let state = State {
             last_applied: meta.last_log_id,
             membership: Some(meta.last_membership.clone()),
             next: parsed.next,
             producers: parsed.producers,
             txn_spans: parsed.txn_spans,
-            heads: parsed.heads.into_iter().collect(),
+            stamp_floor: parsed.stamp_floor,
+            heads,
             dirty: Dirty::default(),
         };
         // Replace every table in one durable commit. The snapshot's bytes
@@ -1272,11 +1391,16 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
                 }
                 let mut heads = txn.open_table(HEADS).map_err(|e| err(&e))?;
                 heads.retain(|_, _| false).map_err(|e| err(&e))?;
+                let mut stamps = txn.open_table(STAMPS).map_err(|e| err(&e))?;
+                stamps.retain(|_, _| false).map_err(|e| err(&e))?;
                 for head in state.heads.in_commit_order() {
                     let raw = camus_raft::codec::encode(head).map_err(|e| err(&e))?;
                     heads
                         .insert(head.key(), raw.as_slice())
                         .map_err(|e| err(&e))?;
+                    if let Some(stamp) = head.stamp {
+                        stamps.insert(head.key(), stamp).map_err(|e| err(&e))?;
+                    }
                 }
                 let mut detached = txn.open_table(DETACHED).map_err(|e| err(&e))?;
                 detached.retain(|_, _| false).map_err(|e| err(&e))?;
@@ -1335,6 +1459,7 @@ mod tests {
             epoch: 0,
             len: (end - start) as u64 * 10,
             at: 0,
+            stamp: None,
         }
     }
 
@@ -1751,5 +1876,49 @@ mod tests {
             floor: 0,
             raw,
         }
+    }
+
+    /// The snapshot body before stamps, as an older broker writes it.
+    #[derive(Serialize)]
+    struct WrittenBeforeStamps {
+        next: BTreeMap<String, i64>,
+        heads: Vec<Head>,
+        bytes: Vec<(u64, serde_bytes::ByteBuf)>,
+        producers: BTreeMap<String, camus_protocol::idempotence::ProducerSeq>,
+        txn_spans: BTreeMap<String, OpenSpan>,
+    }
+
+    #[test]
+    fn snapshots_with_and_without_stamps_read_both_ways() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let next: BTreeMap<String, i64> = [("p/0".to_string(), 4)].into_iter().collect();
+        let floor: BTreeMap<String, i64> = [("p/0".to_string(), 1_100)].into_iter().collect();
+        let stamped = SnapshotData {
+            next: next.clone(),
+            heads: Vec::new(),
+            bytes: Vec::new(),
+            producers: BTreeMap::new(),
+            txn_spans: BTreeMap::new(),
+            stamps: vec![(9, 1_100)],
+            stamp_floor: floor.clone(),
+        };
+        let bytes = camus_raft::codec::encode(&stamped)?;
+        let read = decode_snapshot(&bytes)?;
+        assert_eq!((read.stamps, read.stamp_floor), (vec![(9, 1_100)], floor));
+        // A broker that predates stamps reads the new body and ignores them.
+        let old_reader: SnapshotDataV2 = camus_raft::codec::decode(&bytes)?;
+        assert_eq!(old_reader.next, next);
+        // A body written before stamps still installs, with none.
+        let before = camus_raft::codec::encode(&WrittenBeforeStamps {
+            next: next.clone(),
+            heads: Vec::new(),
+            bytes: Vec::new(),
+            producers: BTreeMap::new(),
+            txn_spans: BTreeMap::new(),
+        })?;
+        let read = decode_snapshot(&before)?;
+        assert_eq!(read.next, next);
+        assert!(read.stamps.is_empty() && read.stamp_floor.is_empty());
+        Ok(())
     }
 }

@@ -6,6 +6,7 @@
 //! machine lives in `camus-metadata` and uses `redb`. This crate does not
 //! choose a leader or speak Kafka.
 
+pub mod clock;
 pub mod codec;
 pub mod layout;
 pub mod quic;

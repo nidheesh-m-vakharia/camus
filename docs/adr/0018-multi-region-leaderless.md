@@ -994,3 +994,43 @@ below some value.
 4. `mirror.commit.wait`, with a test that a waiting topic's
    acknowledgement waits until `earliest` passes its stamp.
 
+### As built
+
+Step 1, reader half, 2026-11-25. Stamps can be taken, stored, and read,
+but no broker takes them yet.
+
+- `camus_raft::clock` holds `Interval`, a `Clock` trait, and `Host`, which
+  reads `ntp_adjtime` on Linux with glibc. That covers the shipped image,
+  which is Debian. `Host` gives no reading on other hosts, on
+  `TIME_ERROR`, or when `STA_UNSYNC` is set. `Fixed` is for tests. The
+  `unsafe` block is the one call, and its safety comment explains why it
+  is sound.
+- The WAL log gains `StampedAppends { appends, stamps }` at position 5,
+  pinned by a test. It is `Appends` with one optional stamp per batch,
+  and every path that handles `Appends` handles it the same way.
+- Apply raises a stamp to the partition's last applied stamp, kept in
+  `stamp_floor` in the shard's JSON state. Stamps therefore never go
+  back within a partition, even across leaders whose clocks disagree.
+- Each unsealed head's stamp is kept in a `STAMPS` table under the head's
+  key, outside the head's postcard row.
+- Snapshots gain the stamps and the floor at the end of the body. An older
+  broker reads the new body as its own shape and ignores them, and a body
+  written before stamps still installs.
+- `Batch.stamp` carries the stamp to the uploader. Nothing writes it to an
+  object yet; that is step 2.
+- A shard stamps only after `Shard::stamp_with(clock)`. It takes one
+  reading per submitted request, and writes `StampedAppends` only when a
+  batch in the group has a stamp. A shard never given a clock writes the
+  same entries as before.
+- The broker does not call `stamp_with` in this release. Every WAL voter
+  must read `StampedAppends` before any leader writes it. The writer half
+  of step 1 calls `stamp_with(Host)` and adds the stamp to the `r2`
+  buffer and the unstamped-batch counter.
+- Tests:
+  - The clock's stamp floor.
+  - A shard with a scripted clock: a reading of 1100, then a clock that
+    stepped back to 1000, then no reading. It stamps 1100, 1100, and
+    none, and keeps those stamps across a restart.
+  - Snapshots read both ways.
+  - The variant's log position.
+
