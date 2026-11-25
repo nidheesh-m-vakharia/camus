@@ -34,6 +34,13 @@ pub static RPC_TIMES: RpcTimes = RpcTimes::new();
 /// over every shard in the process. Fixed counters, so the cost does not grow.
 pub static COMMIT_TIMES: CommitTimes = CommitTimes::new();
 
+/// Batches the committer stamped, and batches it appended unstamped because
+/// a shard given a clock got no reading (ADR 0018, phase 3). Shards with no
+/// clock count in neither.
+pub static STAMPED_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// See [`STAMPED_BATCHES`].
+pub static UNSTAMPED_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// An event at least this long counts as slow in [`StageTime::slow`].
 pub const SLOW_US: u64 = 50_000;
 
@@ -505,8 +512,16 @@ async fn commit_loop(
         // frontier must still count entries proposed and not yet applied.
         let stamp = clock
             .get()
-            .and_then(|clock| clock.now())
-            .map(|now| now.latest_us);
+            .map(|clock| clock.now().map(|now| now.latest_us));
+        if let Some(reading) = &stamp {
+            let counter = if reading.is_some() {
+                &STAMPED_BATCHES
+            } else {
+                &UNSTAMPED_BATCHES
+            };
+            counter.fetch_add(appends.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let stamp = stamp.flatten();
         // Unstamped entries stay the ones every release reads.
         let command = if stamp.is_some() {
             Command::StampedAppends {

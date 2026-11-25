@@ -1055,3 +1055,29 @@ but no broker takes them yet.
   - Snapshots read both ways.
   - The variant's log position.
 
+Step 1, writer half, 2026-11-25. Brokers stamp WAL appends, but only when
+told to.
+
+- `clock.stamps` (`CAMUS_CLOCK_STAMPS`, default `false`) gives every WAL
+  shard the host clock. The step 1 plan had stamping on in this release.
+  An opt-in setting replaces that, for two reasons:
+  - The operator turns it on once every WAL voter runs the reader half.
+    The upgrade order then rests on an action, not on two releases.
+  - A host on systemd-timesyncd leaves it off.
+
+  With it on, a host that gives no reading logs a warning at startup.
+- Every shard the broker holds reaches it through `WalSlot`, both its
+  first shard and any `replace` from opening, truncating, or joining. So
+  `WalSlot` gives each shard the clock, and no path opens one without it.
+- `camus_wal_stamped_batches_total` and `camus_wal_unstamped_batches_total`
+  count the batches of each entry the committer forms on a shard that has
+  a clock. A shard without a clock counts in neither.
+- `r2` produce is not stamped yet. A stamp there has nowhere to go until
+  footer v2 holds it, so it comes with step 2.
+- `crates/broker/tests/clock_stamps.rs` runs two brokers.
+  - With the setting on, the stamped and unstamped counts cover all five
+    batches produced. Which count they land in depends on the host's
+    clock.
+  - With it off, both counts stay at zero.
+  - With the setting ignored, the first assertion fails.
+

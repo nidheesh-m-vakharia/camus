@@ -192,7 +192,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let wal_dir = resolve_wal_dir(wal_explicit, &args.data_dir);
     std::fs::create_dir_all(&wal_dir)?;
-    let wal = Arc::new(WalSlot::new(Shard::open(args.node_id, &wal_dir).await?));
+    let wal = Arc::new(WalSlot::new(
+        Shard::open(args.node_id, &wal_dir).await?,
+        stamp_clock(&settings),
+    ));
     warn_if_rotating_wal(&wal_dir);
     if let Some(endpoint) = camus_raft::quic::current() {
         let node_q = Arc::clone(&node);
@@ -433,6 +436,12 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          # HELP camus_meta_snapshot_unix_ms Unix milliseconds of that snapshot, or 0.\n\
          # TYPE camus_meta_snapshot_unix_ms gauge\n\
          camus_meta_snapshot_unix_ms {}\n\
+         # HELP camus_wal_stamped_batches_total WAL batches stamped with the clock (ADR 0018 phase 3).\n\
+         # TYPE camus_wal_stamped_batches_total counter\n\
+         camus_wal_stamped_batches_total {}\n\
+         # HELP camus_wal_unstamped_batches_total WAL batches appended unstamped with clock.stamps on: the clock gave no reading.\n\
+         # TYPE camus_wal_unstamped_batches_total counter\n\
+         camus_wal_unstamped_batches_total {}\n\
          # HELP camus_mirror_copied_bytes_total Batch bytes the mirror copier published into mirror topics.\n\
          # TYPE camus_mirror_copied_bytes_total counter\n\
          camus_mirror_copied_bytes_total {}\n\
@@ -485,6 +494,8 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         kafka::PRODUCE_HOLD_MS.load(Relaxed),
         kafka::META_SNAPSHOT_INDEX.load(Relaxed),
         kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
+        camus_wal::STAMPED_BATCHES.load(Relaxed),
+        camus_wal::UNSTAMPED_BATCHES.load(Relaxed),
         mirror::COPIED_BYTES.load(Relaxed),
         mirror::STALLED.load(Relaxed),
         mirror::WAITING.load(Relaxed),
@@ -850,6 +861,24 @@ fn shard_dir(wal_dir: &std::path::Path, shard: u32) -> PathBuf {
 
 /// Open every shard in the stored layout that this broker has not opened
 /// yet. A shard this broker is not a voter of stays empty.
+/// The clock WAL shards stamp appends with, when `clock.stamps` is on
+/// (ADR 0018, phase 3). Turn it on only once every WAL voter reads stamped
+/// entries, and only on a host whose time daemon reports a real error bound:
+/// chrony or ntpd, not systemd-timesyncd.
+fn stamp_clock(settings: &settings::Settings) -> Option<Arc<dyn camus_raft::clock::Clock>> {
+    use camus_raft::clock::Clock;
+    if !settings.is_true("clock.stamps") {
+        return None;
+    }
+    if camus_raft::clock::Host.now().is_none() {
+        tracing::warn!(
+            "clock.stamps is on, but this host gives no clock reading: not Linux with \
+             glibc, or the clock is not synchronised; batches go unstamped"
+        );
+    }
+    Some(Arc::new(camus_raft::clock::Host))
+}
+
 async fn open_shards(
     node: Arc<MetadataNode>,
     wal: Arc<WalSlot>,
