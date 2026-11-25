@@ -235,6 +235,11 @@ const SPECS: &[Spec] = &[
         default: "",
     },
     Spec {
+        key: "clock.stamps",
+        env: "CAMUS_CLOCK_STAMPS",
+        default: "false",
+    },
+    Spec {
         key: "log.flush.interval.ms",
         env: "CAMUS_FLUSH_MS",
         default: "250",

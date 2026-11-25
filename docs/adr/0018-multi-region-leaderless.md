@@ -1055,3 +1055,50 @@ but no broker takes them yet.
   - Snapshots read both ways.
   - The variant's log position.
 
+Step 1, writer half, 2026-11-25. Brokers stamp WAL appends, but only when
+told to.
+
+- `clock.stamps` (`CAMUS_CLOCK_STAMPS`, default `false`) gives every WAL
+  shard the host clock. The step 1 plan had stamping on in this release.
+  An opt-in setting replaces that, for two reasons:
+  - The operator turns it on once every WAL voter runs the reader half.
+    The upgrade order then rests on an action, not on two releases.
+  - A host on systemd-timesyncd leaves it off.
+
+  With it on, a host that gives no reading logs a warning at startup.
+- Every shard the broker holds reaches it through `WalSlot`, both its
+  first shard and any `replace` from opening, truncating, or joining. So
+  `WalSlot` gives each shard the clock, and no path opens one without it.
+- A shard stamps only while every member of it, voter or learner, can read
+  stamped entries. Each broker on this release writes
+  `capability/reads-stamped/{node}` to metadata. Each second, `gate_stamps`
+  turns a shard's stamping on only while every member has that key.
+  - The gate fails closed. Brokers on the reader-only release, `341820c`,
+    never write the key, so they keep stamping off until they upgrade.
+  - A member that joins later without the key turns it off again.
+
+  Without the gate, the operator's "every voter reads stamps" would have
+  to stay true for as long as the setting was on. An older broker that
+  joined later would stop replicating at the first stamped entry, and a
+  shard with a majority of those would stop taking writes.
+- Stamped entries stay in a shard's log until they are sealed and purged,
+  even after stamping stops. A broker built before `341820c` cannot read
+  that log, so do not downgrade past it while any remain.
+- Metrics:
+  - `camus_wal_stamping_shards` is the number of shards stamping.
+  - `camus_wal_stamped_batches_total` and
+    `camus_wal_unstamped_batches_total` count batches as the committer
+    proposes them on a stamping shard. A proposal that fails and is
+    retried counts again.
+- `r2` produce is not stamped yet. A stamp there has nowhere to go until
+  footer v2 holds it, so it comes with step 2.
+- `crates/broker/tests/clock_stamps.rs`:
+  - With the setting on, once the shard is stamping, five batches count
+    exactly five between stamped and unstamped. Which count they land in
+    depends on the host's clock.
+  - With the setting off, nothing is counted.
+  - In a three-broker cluster where one broker never writes the
+    capability key, a test failpoint stands in for an older release. No
+    shard stamps. After that broker restarts without the failpoint, the
+    shard starts stamping. With the gate ignored, the first check fails.
+
