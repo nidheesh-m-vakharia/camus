@@ -295,6 +295,15 @@ not a wall-clock instant:
 Camus does not assume a GPS or atomic clock. Google's 1–7 ms sawtooth is
 their measurement on that hardware, not a Camus target.
 
+Amended 2026-11-25. The sketch above stamps an extent when it is sealed.
+That does not give the property it states. A `wal` produce is
+acknowledged at the WAL fsync, often well before its batch is sealed, so
+a record acknowledged first can be stamped later than a record produced
+after it in another region. The sketch also has the commit wait in front
+of the metadata commit, and in `r2` mode that commit is the
+acknowledgement. Both points are replaced by "Phase 3" at the end of this
+record, which was accepted on the same day.
+
 ### Delivery
 
 0. Reading `CAMUSKV3` snapshots, in one release, before any broker
@@ -830,4 +839,158 @@ Phase 2, third part: promotion and the fork check.
      `promoted_at` 40, `source_end` 42, and a fork, while the promoted
      topic stays at 41.
   4. The link can then be removed.
+
+## Phase 3 (proposed 2026-11-25, accepted 2026-11-25)
+
+A destination that mirrors several source regions can promote all its
+mirrors at one cut `c` that is consistent across the sources. This
+section replaces the clock sketch above. It is accepted, and is being
+built in the steps under "Delivery".
+
+### What a consistent cut means
+
+Take two records `y` and `x`, possibly from different sources.
+
+- If `y` was acknowledged before `x` was produced, in real time, then a
+  cut that keeps `x` keeps `y`.
+- A cut never keeps a record without keeping every record before it in
+  the same partition.
+
+A single source snapshot already gives this for that source's own
+partitions. The rest of this section is about pairs across sources.
+
+### Stamps are per batch, taken at append
+
+Each batch gets a stamp `s` when its partition's leader appends it. That
+is the WAL shard leader for `wal`, or the `r2` buffer on the metadata
+leader. The stamp is `latest`, the upper edge of the host's clock
+interval at that moment, raised if needed so stamps never decrease within
+a partition.
+
+Stamping at seal does not work. An acknowledgement comes at the append,
+and sealing can follow it by seconds, or by as long as R2 is down.
+
+### The clock interval
+
+The kernel reports its error bound through `ntp_adjtime(2)`. That is
+`maxerror`, which the kernel grows by the 500 ppm tolerance each second
+between syncs. A sample's interval is `[now − maxerror, now + maxerror]`.
+
+The call lives in one small `unsafe` function behind a safe wrapper, in
+`camus-raft`. That crate already holds the workspace's only `unsafe`, for
+`io_uring`. The broker and the other crates keep `#![forbid(unsafe_code)]`.
+On a host where the call is missing, or reports `TIME_ERROR` or an
+unsynchronised clock, a batch gets no stamp. Stamps are not taken on
+macOS, so development hosts mirror as before and cannot be part of a
+cut.
+
+### Acknowledgements do not wait by default
+
+Waiting for `earliest > s` before acknowledging would give strict
+ordering, but it adds up to `2 × maxerror` to every produce. That is
+milliseconds on a host synced to a nearby source, and far more on one
+that is not.
+
+The default does not wait. Strictly, `y` sorts before `x` whenever `y`'s
+acknowledgement comes more than `2ε` before `x`'s append. `ε` is the
+larger of the two hosts' `maxerror` at their stamps.
+
+A topic config, `mirror.commit.wait` (default `false`), turns on the wait
+for that topic's produces. It is a Camus config with no Kafka
+equivalent. `docs/compatibility.md` lists it.
+
+### Where stamps are kept
+
+- **WAL entries.** An appended batch carries its stamp in a new WAL entry
+  variant. Like the metadata commands, every WAL voter must run the
+  release before any broker stamps.
+- **Object footers.** Today a footer lists one entry per slice, and a
+  slice is one partition's run of batches. Footer v2 adds a list under
+  each slice of `(batch base offset, stamp)`, one pair per batch: 16
+  bytes a batch. The reader takes v1, which has no stamps, and v2. This
+  keeps per-batch data out of metadata. The mirror copier reads the source footer of each
+  object it copies, and writes the stamps into its own footer.
+- **Extents.** Each extent gains `s_min` and `s_max` in its JSON row. A
+  promotion uses these to find the few extents it must open. They travel
+  in a new `PublishStamped` command, because `Publish` is in released
+  logs and its postcard shape cannot change.
+
+### What a source guarantees: its frontier
+
+The cut needs to know that a source has published every batch stamped
+below some value.
+
+- Each WAL shard leader, and the `r2` buffer, reports a frontier `f`
+  about once a second through a `Frontier { shard, f }` command. `f` is
+  the smallest stamp among batches that are acknowledged and not yet
+  published, or the shard's `earliest` when there are none. A batch
+  appended after the report is stamped at least `latest` of a later time,
+  which is above `f`.
+- A source snapshot's watermark `W` is the smallest frontier across its
+  shards. Every batch stamped below `W` is in that snapshot's extents.
+- A shard with an unstamped batch reports no frontier, so its source's
+  `W` stops moving until stamps resume. The source counts this in
+  `camus_mirror_unstamped_batches_total`.
+- The reports cost one small metadata entry per shard each second, and
+  the group commit packs them together.
+
+### The destination's watermark and the cut
+
+- For each source, the copier keeps `applied_w`: the `W` of the newest
+  snapshot whose extents below `W` it has copied in full. It is exported
+  as `camus_mirror_applied_watermark_us{alias}`, with a label per link,
+  capped by the 64-link limit.
+- `camus admin mirror promote --cut c --all` checks that `c < applied_w`
+  for every source a mirror names, and refuses otherwise.
+- It then truncates each mirror partition to the last batch stamped at
+  or below `c`. It reads the footers of the extents whose `s_min ≤ c <
+  s_max`, which is at most the newest few per partition.
+- It commits one `TruncateMirror` per partition, which sets
+  `next_offset` and shortens the last extent. Then it promotes each
+  mirror as in phase 2.
+- A partition holding an unstamped batch at or below the cut refuses the
+  whole promotion. It cannot be ordered.
+
+### Costs and limits
+
+- No acknowledgement waits on a clock unless a topic sets
+  `mirror.commit.wait`.
+- Each WAL entry gains 8 bytes, and each footer gains 16 bytes per batch.
+- Each shard writes one metadata entry per second for its frontier.
+- A promotion makes some extra GETs to read footers.
+- The `2ε` window bounds how close in time two records from different
+  sources can be and still be ordered by the cut, unless their topics
+  wait.
+- A source whose clock loses sync holds every cut at its last frontier.
+  The cut is not wrong; it falls further behind. The unstamped-batch
+  metric shows why.
+
+### Alternatives
+
+- **Stamp at seal, as sketched above.** Set aside. An early `wal`
+  acknowledgement can be stamped after a later produce in another region.
+- **Always wait.** Set aside as the default for the latency above, and
+  kept as the per-topic option.
+- **Per-batch stamps in metadata.** Set aside. One row per batch grows
+  metadata with the data. Footers hold them instead.
+- **Hybrid logical clocks.** Set aside. An HLC orders events that send
+  messages to each other. Sources here never talk to one another, so an
+  HLC adds nothing over the physical bound.
+- **No phase 3.** Each source's snapshot is already a consistent cut for
+  that source. Phase 3 is only worth building for an operator who must
+  fail over several regions to one moment.
+
+### Delivery
+
+1. The clock wrapper and per-batch stamps in WAL entries and the `r2`
+   buffer, with the stamp counters. Nothing reads the stamps yet.
+2. Footer v2, `PublishStamped`, and the frontier reports. The copier
+   carries stamps through to its footers.
+3. `applied_w`, `TruncateMirror`, and `promote --cut --all`. Acceptance
+   test: two MinIO sources and one destination. The test stamps with an
+   injected clock, a test-only fake that implements the same interval
+   interface. Records in a known real-time order across the sources, cut
+   between them, must keep exactly the earlier records.
+4. `mirror.commit.wait`, with a test that a waiting topic's
+   acknowledgement waits until `earliest` passes its stamp.
 
