@@ -53,6 +53,9 @@ const HEADS: TableDefinition<u64, &[u8]> = TableDefinition::new("heads");
 /// Each stamped head's stamp, under the head's key (ADR 0018, phase 3). A
 /// table of its own, since heads are postcard and cannot gain a field.
 const STAMPS: TableDefinition<u64, i64> = TableDefinition::new("stamps");
+/// Each partition's last applied stamp, by `part_key`. Written key by key,
+/// like `NEXT`, so a flush costs what changed, not the partition count.
+const STAMP_FLOOR: TableDefinition<&str, i64> = TableDefinition::new("stamp_floor");
 /// Bytes of unsealed batches whose log entry a snapshot may purge.
 const DETACHED: TableDefinition<u64, &[u8]> = TableDefinition::new("detached");
 /// The latest snapshot, postcard.
@@ -166,6 +169,7 @@ impl Heads {
             .by_part
             .get_mut(&(*topic_id, *partition))
             .and_then(|part| part.get_mut(start))
+            .filter(|head| head.key() == key)
         {
             head.stamp = Some(stamp);
         }
@@ -228,6 +232,8 @@ struct Dirty {
     next: BTreeSet<String>,
     producers: BTreeSet<String>,
     spans: BTreeSet<String>,
+    /// Partitions whose stamp floor moved.
+    floors: BTreeSet<String>,
     /// `last_applied` or the membership moved.
     meta: bool,
 }
@@ -240,6 +246,7 @@ impl Dirty {
             && self.next.is_empty()
             && self.producers.is_empty()
             && self.spans.is_empty()
+            && self.floors.is_empty()
     }
 
     fn add(&mut self, head: Head) {
@@ -268,6 +275,7 @@ impl Dirty {
         self.next.extend(older.next);
         self.producers.extend(older.producers);
         self.spans.extend(older.spans);
+        self.floors.extend(older.floors);
         self.meta |= older.meta;
     }
 }
@@ -304,8 +312,9 @@ struct State {
     txn_spans: BTreeMap<String, OpenSpan>,
     /// Each partition's last applied stamp, by `part_key`. Apply raises a
     /// stamp to this, so stamps never go back within a partition, whichever
-    /// leader took them. One entry per stamped partition.
-    #[serde(default)]
+    /// leader took them. In the `STAMP_FLOOR` table: one entry per stamped
+    /// partition of this shard, as `next` has one per partition.
+    #[serde(skip)]
     stamp_floor: BTreeMap<String, i64>,
     #[serde(skip)]
     heads: Heads,
@@ -470,7 +479,7 @@ impl Machine {
     /// the last flush. Blocks on disk: call it off the async runtime.
     pub fn flush(&self) -> Result<(), StorageError<NodeId>> {
         let _gate = self.flushing.lock().expect("wal flush");
-        let (meta, next, producers, spans, dirty) = {
+        let (meta, next, producers, spans, floors, dirty) = {
             let mut state = self.state.lock().expect("wal state");
             if state.dirty.is_empty() {
                 return Ok(());
@@ -513,9 +522,14 @@ impl Machine {
                     Ok((key.clone(), raw))
                 })
                 .collect::<Result<Vec<_>, StorageError<NodeId>>>()?;
-            (meta, next, producers, spans, dirty)
+            let floors: Vec<(String, Option<i64>)> = dirty
+                .floors
+                .iter()
+                .map(|key| (key.clone(), state.stamp_floor.get(key).copied()))
+                .collect();
+            (meta, next, producers, spans, floors, dirty)
         };
-        let written = write_changes(&self.db, &meta, &next, &producers, &spans, &dirty);
+        let written = write_changes(&self.db, &meta, &next, &producers, &spans, &floors, &dirty);
         if written.is_err() {
             self.state.lock().expect("wal state").dirty.restore(dirty);
         }
@@ -880,6 +894,18 @@ fn load_state(db: &Database) -> Result<State, StorageError<NodeId>> {
         Err(redb::TableError::TableDoesNotExist(_)) => {}
         Err(e) => return Err(err(&e)),
     }
+    match txn.open_table(STAMP_FLOOR) {
+        Ok(table) => {
+            for row in table.iter().map_err(|e| err(&e))? {
+                let (key, floor) = row.map_err(|e| err(&e))?;
+                state
+                    .stamp_floor
+                    .insert(key.value().to_string(), floor.value());
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(err(&e)),
+    }
     Ok(state)
 }
 
@@ -906,6 +932,7 @@ fn write_changes(
     next: &[(String, Option<i64>)],
     producers: &[(String, Option<Vec<u8>>)],
     spans: &[(String, Option<Vec<u8>>)],
+    floors: &[(String, Option<i64>)],
     dirty: &Dirty,
 ) -> Result<(), StorageError<NodeId>> {
     let err = |err: &dyn std::error::Error| io(ErrorSubject::StateMachine, err);
@@ -934,6 +961,14 @@ fn write_changes(
             match raw {
                 Some(raw) => open.insert(key.as_str(), raw.as_slice()).map(|_| ()),
                 None => open.remove(key.as_str()).map(|_| ()),
+            }
+            .map_err(|e| err(&e))?;
+        }
+        let mut floor = txn.open_table(STAMP_FLOOR).map_err(|e| err(&e))?;
+        for (key, value) in floors {
+            match value {
+                Some(value) => floor.insert(key.as_str(), *value).map(|_| ()),
+                None => floor.remove(key.as_str()).map(|_| ()),
             }
             .map_err(|e| err(&e))?;
         }
@@ -1111,7 +1146,7 @@ fn apply_at(
                 let floor = state.stamp_floor.get(&key).copied().unwrap_or(i64::MIN);
                 let stamp = stamp.max(floor);
                 state.stamp_floor.insert(key.clone(), stamp);
-                state.dirty.meta = true;
+                state.dirty.floors.insert(key.clone());
                 stamp
             });
             state.dirty.next.insert(key.clone());
@@ -1391,6 +1426,11 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
                 }
                 let mut heads = txn.open_table(HEADS).map_err(|e| err(&e))?;
                 heads.retain(|_, _| false).map_err(|e| err(&e))?;
+                let mut floor = txn.open_table(STAMP_FLOOR).map_err(|e| err(&e))?;
+                floor.retain(|_, _| false).map_err(|e| err(&e))?;
+                for (key, value) in &state.stamp_floor {
+                    floor.insert(key.as_str(), *value).map_err(|e| err(&e))?;
+                }
                 let mut stamps = txn.open_table(STAMPS).map_err(|e| err(&e))?;
                 stamps.retain(|_, _| false).map_err(|e| err(&e))?;
                 for head in state.heads.in_commit_order() {
@@ -1919,6 +1959,51 @@ mod tests {
         let read = decode_snapshot(&before)?;
         assert_eq!(read.next, next);
         assert!(read.stamps.is_empty() && read.stamp_floor.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_raises_stamps_and_a_rejected_append_leaves_the_floor() -> Result<(), String> {
+        let append = |sequence| match txn_append(false, 4, sequence, 1)? {
+            Command::Append(append) => Ok(append),
+            _ => Err("not an append".to_string()),
+        };
+        let stamps_of = |state: &State| {
+            state
+                .heads
+                .in_commit_order()
+                .map(|head| head.stamp)
+                .collect::<Vec<_>>()
+        };
+        let floor = |state: &State| state.stamp_floor.values().copied().collect::<Vec<_>>();
+        let mut state = State::default();
+        // Two batches and one stamp: the second applies unstamped.
+        let both = Command::StampedAppends {
+            appends: vec![append(0)?, append(1)?],
+            stamps: vec![Some(500)],
+        };
+        let done = apply_one(&mut state, both, 1, &[0, 0]);
+        assert!(done.each.iter().all(|each| each.error_code == 0));
+        assert_eq!(stamps_of(&state), [Some(500), None]);
+        assert_eq!(floor(&state), [500]);
+        // A rejected batch takes no stamp and leaves the floor.
+        let mut corrupt = append(2)?;
+        corrupt.raw = bytes::Bytes::from_static(b"not a batch");
+        let rejected = Command::StampedAppends {
+            appends: vec![corrupt],
+            stamps: vec![Some(900)],
+        };
+        let done = apply_one(&mut state, rejected, 2, &[0]);
+        assert_eq!(done.each.first().map(|each| each.error_code), Some(2));
+        assert_eq!(floor(&state), [500]);
+        // A lower stamp, from a leader whose clock is behind, is raised.
+        let behind = Command::StampedAppends {
+            appends: vec![append(2)?],
+            stamps: vec![Some(100)],
+        };
+        apply_one(&mut state, behind, 3, &[0]);
+        assert_eq!(stamps_of(&state), [Some(500), None, Some(500)]);
+        assert_eq!(floor(&state), [500]);
         Ok(())
     }
 }

@@ -349,8 +349,9 @@ pub struct Shard {
     budget: Arc<tokio::sync::Semaphore>,
     /// The shard's background loop stops once this is dropped.
     _alive: Arc<()>,
-    /// Stamps batches as they are submitted, once set (ADR 0018, phase 3).
-    clock: std::sync::OnceLock<Arc<dyn camus_raft::clock::Clock>>,
+    /// Stamps each entry's batches as the committer forms it, once set
+    /// (ADR 0018, phase 3). Shared with the commit loop.
+    clock: Arc<std::sync::OnceLock<Arc<dyn camus_raft::clock::Clock>>>,
 }
 
 /// One produce batch waiting for the committer. A request's batches for one
@@ -360,7 +361,6 @@ type Queued = (
     tokio::sync::oneshot::Sender<Result<Response, Failure>>,
     Budget,
     std::time::Instant,
-    Option<i64>,
 );
 
 /// A share of a shard's queue budget, released when every batch it covers
@@ -443,6 +443,7 @@ async fn commit_loop(
     raft: Raft<TypeConfig>,
     storage_failed: Arc<AtomicBool>,
     mut queue: tokio::sync::mpsc::UnboundedReceiver<Vec<Queued>>,
+    clock: Arc<std::sync::OnceLock<Arc<dyn camus_raft::clock::Clock>>>,
 ) {
     // Test hook: the entry is already committed. Holding the ack lets a
     // produce time out and still leave the record in the log.
@@ -493,17 +494,25 @@ async fn commit_loop(
         let mut appends = Vec::with_capacity(group.len());
         let mut waiters = Vec::with_capacity(group.len());
         let mut budgets = Vec::with_capacity(group.len());
-        let mut stamps = Vec::with_capacity(group.len());
-        for (append, waiter, budget, queued_at, stamp) in group {
+        for (append, waiter, budget, queued_at) in group {
             COMMIT_TIMES.queued.record(queued_at.elapsed());
             appends.push(append);
             waiters.push(waiter);
             budgets.push(budget);
-            stamps.push(stamp);
         }
-        // Unstamped batches keep the entries every release reads.
-        let command = if stamps.iter().any(Option::is_some) {
-            Command::StampedAppends { appends, stamps }
+        // One reading as the entry is formed, just before it goes to Raft,
+        // so a batch's stamp is no older than its wait in the queue. A
+        // frontier must still count entries proposed and not yet applied.
+        let stamp = clock
+            .get()
+            .and_then(|clock| clock.now())
+            .map(|now| now.latest_us);
+        // Unstamped entries stay the ones every release reads.
+        let command = if stamp.is_some() {
+            Command::StampedAppends {
+                stamps: vec![stamp; appends.len()],
+                appends,
+            }
         } else if appends.len() == 1 {
             Command::Append(appends.into_iter().next().expect("one append"))
         } else {
@@ -760,7 +769,13 @@ impl Shard {
         ));
         let storage_failed = Arc::new(AtomicBool::new(false));
         let (queue, waiting) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(commit_loop(raft.clone(), storage_failed.clone(), waiting));
+        let clock = Arc::new(std::sync::OnceLock::new());
+        tokio::spawn(commit_loop(
+            raft.clone(),
+            storage_failed.clone(),
+            waiting,
+            Arc::clone(&clock),
+        ));
         Ok(Self {
             raft,
             machine,
@@ -770,7 +785,7 @@ impl Shard {
             queue,
             budget: Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTES)),
             _alive: alive,
-            clock: std::sync::OnceLock::new(),
+            clock,
         })
     }
 
@@ -928,10 +943,10 @@ impl Shard {
         self.raft.metrics().borrow().current_term
     }
 
-    /// Stamp every batch submitted from now on with `clock`'s reading
-    /// (ADR 0018, phase 3). Set once; a second call changes nothing. A
-    /// shard never given a clock writes the unstamped entries every release
-    /// reads.
+    /// Stamp every entry the committer forms from now on with `clock`'s
+    /// reading (ADR 0018, phase 3). Set once; a second call changes
+    /// nothing. A shard never given a clock writes the unstamped entries
+    /// every release reads.
     pub fn stamp_with(&self, clock: Arc<dyn camus_raft::clock::Clock>) {
         let _ = self.clock.set(clock);
     }
@@ -968,20 +983,11 @@ impl Shard {
                 .map_err(|_| WriteError::Other(anyhow::anyhow!("wal committer stopped")))?,
         );
         let queued_at = std::time::Instant::now();
-        // One reading for the request: its batches are appended together.
-        let stamp = self
-            .clock
-            .get()
-            .and_then(|clock| clock.now())
-            .map(|now| now.latest_us);
         let (chunk, pending): (Vec<_>, Vec<_>) = batches
             .into_iter()
             .map(|batch| {
                 let (done, wait) = tokio::sync::oneshot::channel();
-                (
-                    (batch, done, budget.clone(), queued_at, stamp),
-                    Pending(wait),
-                )
+                ((batch, done, budget.clone(), queued_at), Pending(wait))
             })
             .unzip();
         self.queue
@@ -1706,6 +1712,12 @@ mod tests {
                 [None, Some(1_100), Some(1_100), None],
                 "raised to the partition's last stamp; none without a reading"
             );
+            // Durable now, so the reopened shard loads the stamps from its
+            // tables rather than replaying the log.
+            shard
+                .machine
+                .flush()
+                .map_err(|err| anyhow::anyhow!("flush: {err}"))?;
             shard.close().await?;
         }
         let shard = Shard::open(1, dir.path()).await?;

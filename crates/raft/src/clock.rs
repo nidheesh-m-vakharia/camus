@@ -87,57 +87,9 @@ impl Clock for Fixed {
     }
 }
 
-/// Stamps for one partition's appends: `latest` of the clock, raised so a
-/// stamp is never below the one before it. A stamp is a promise about the
-/// order of appends, so it must not go backwards even if the clock does.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Stamper {
-    last_us: Option<i64>,
-}
-
-impl Stamper {
-    /// The stamp for an append now, or `None` when the clock gives no
-    /// reading. An unstamped append does not reset the floor.
-    pub fn stamp(&mut self, clock: &dyn Clock) -> Option<i64> {
-        let latest = clock.now()?.latest_us;
-        let stamp = self.last_us.map_or(latest, |last| latest.max(last));
-        self.last_us = Some(stamp);
-        Some(stamp)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn at(earliest_us: i64, latest_us: i64) -> Fixed {
-        Fixed {
-            at: Some(Interval {
-                earliest_us,
-                latest_us,
-            }),
-        }
-    }
-
-    #[test]
-    fn stamps_take_the_latest_edge_and_never_go_back() {
-        let mut stamper = Stamper::default();
-        assert_eq!(stamper.stamp(&at(90, 110)), Some(110));
-        assert_eq!(
-            stamper.stamp(&at(80, 100)),
-            Some(110),
-            "the clock stepped back"
-        );
-        assert_eq!(stamper.stamp(&at(150, 170)), Some(170));
-    }
-
-    #[test]
-    fn no_reading_is_no_stamp_and_keeps_the_floor() {
-        let mut stamper = Stamper::default();
-        assert_eq!(stamper.stamp(&at(0, 200)), Some(200));
-        assert_eq!(stamper.stamp(&Fixed { at: None }), None);
-        assert_eq!(stamper.stamp(&at(0, 100)), Some(200));
-    }
 
     #[test]
     fn a_host_reading_contains_now_when_there_is_one() {

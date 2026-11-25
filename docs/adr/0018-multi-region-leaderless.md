@@ -1005,12 +1005,26 @@ but no broker takes them yet.
   `TIME_ERROR`, or when `STA_UNSYNC` is set. `Fixed` is for tests. The
   `unsafe` block is the one call, and its safety comment explains why it
   is sound.
+- The kernel's `maxerror` is only as honest as the time daemon that sets
+  it. chrony and ntpd derive it from the root distance to their source.
+  As far as we know, systemd-timesyncd, Debian's default, sets it to zero
+  at each adjustment, whatever the real offset. A host that takes part in
+  cuts must therefore run chrony or ntpd. The writer half will say so
+  where the stamps are turned on, and a host on timesyncd must not turn
+  them on.
 - The WAL log gains `StampedAppends { appends, stamps }` at position 5,
   pinned by a test. It is `Appends` with one optional stamp per batch,
   and every path that handles `Appends` handles it the same way.
-- Apply raises a stamp to the partition's last applied stamp, kept in
-  `stamp_floor` in the shard's JSON state. Stamps therefore never go
-  back within a partition, even across leaders whose clocks disagree.
+- Apply raises a stamp to the partition's last applied stamp. Stamps
+  therefore never go back within a partition, even across leaders whose
+  clocks disagree.
+  - The floor is kept in a `STAMP_FLOOR` table, key by key, with a dirty
+    set as `NEXT` has, so a flush costs what changed.
+  - It commits in the same transaction as `last_applied`, so replay after
+    a crash rebuilds it.
+  - A batch rejected before it takes an offset, as corrupt, a replay, or
+    a closed transaction, takes no stamp and leaves the floor where it
+    was.
 - Each unsealed head's stamp is kept in a `STAMPS` table under the head's
   key, outside the head's postcard row.
 - Snapshots gain the stamps and the floor at the end of the body. An older
@@ -1018,19 +1032,26 @@ but no broker takes them yet.
   written before stamps still installs.
 - `Batch.stamp` carries the stamp to the uploader. Nothing writes it to an
   object yet; that is step 2.
-- A shard stamps only after `Shard::stamp_with(clock)`. It takes one
-  reading per submitted request, and writes `StampedAppends` only when a
-  batch in the group has a stamp. A shard never given a clock writes the
-  same entries as before.
+- A shard stamps only after `Shard::stamp_with(clock)`. The committer
+  takes one reading as it forms each entry, just before the entry goes to
+  Raft, so a batch's stamp is no older than its wait in the queue. It
+  writes `StampedAppends` only when that reading exists. A shard never
+  given a clock writes the same entries as before.
+- An entry proposed but not yet applied still holds stamps below a
+  frontier taken in the meantime. Step 2's frontier must therefore count
+  the stamps of entries in flight, as well as those of applied,
+  unpublished batches.
 - The broker does not call `stamp_with` in this release. Every WAL voter
   must read `StampedAppends` before any leader writes it. The writer half
   of step 1 calls `stamp_with(Host)` and adds the stamp to the `r2`
   buffer and the unstamped-batch counter.
 - Tests:
-  - The clock's stamp floor.
   - A shard with a scripted clock: a reading of 1100, then a clock that
     stepped back to 1000, then no reading. It stamps 1100, 1100, and
-    none, and keeps those stamps across a restart.
+    none, and after a flush and reopen it loads those stamps from its
+    tables.
+  - At apply: a short stamp list leaves the later batches unstamped, a
+    corrupt batch leaves the floor, and a lower stamp is raised.
   - Snapshots read both ways.
   - The variant's log position.
 
