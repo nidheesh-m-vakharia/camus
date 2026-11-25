@@ -214,7 +214,7 @@ broker.
 | --- | --- | --- |
 | `CAMUS_S3_ENDPOINT`, `CAMUS_S3_BUCKET`, `CAMUS_S3_ACCESS_KEY`, `CAMUS_S3_SECRET_KEY` | local MinIO, only with `--dev-plaintext` | Object storage |
 | `CAMUS_S3_PREFIX` | empty | Key prefix; one per cluster sharing a bucket |
-| `CAMUS_CLOCK_STAMPS` (`clock.stamps`) | `false` | Stamp WAL appends with the clock's error-bounded time, for cross-source mirror cuts (ADR 0018). Turn on only after every WAL voter runs a release that reads stamped entries, and only on a host running chrony or ntpd |
+| `CAMUS_CLOCK_STAMPS` (`clock.stamps`) | `false` | Stamp WAL appends with the clock's error-bounded time, for cross-source mirror cuts (ADR 0018). Use only on hosts running chrony or ntpd, not systemd-timesyncd. A shard stamps only while every member has recorded that it reads stamps, so older brokers keep it off. Once entries are stamped, a broker built before commit `341820c` (#253), which added the stamp reader, cannot read that log until they are sealed and purged: do not downgrade past it |
 | `CAMUS_MIRROR_COPY_MS` | `5000` | Time between mirror copy rounds on the metadata leader (ADR 0018) |
 | `CAMUS_MIRROR_<ALIAS>_ACCESS_KEY`, `CAMUS_MIRROR_<ALIAS>_SECRET_KEY` | unset | Read-only keys for a mirror link's source bucket (ADR 0018). `<ALIAS>` is the link's alias upper-cased, with `-` as `_`. Set them on every metadata voter, which runs the copier, and on any broker that takes `camus admin mirror` commands, which reads the source to check them |
 | `CAMUS_SASL_USER`, `CAMUS_SASL_PASSWORD` | — | Bootstrap SASL/PLAIN user, always a super user |

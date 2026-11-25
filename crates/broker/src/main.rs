@@ -230,6 +230,8 @@ async fn main() -> anyhow::Result<()> {
         kafka: std::sync::OnceLock::new(),
     });
 
+    tokio::spawn(gate_stamps(Arc::clone(&admin)));
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/admin/write", post(write))
@@ -436,10 +438,13 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          # HELP camus_meta_snapshot_unix_ms Unix milliseconds of that snapshot, or 0.\n\
          # TYPE camus_meta_snapshot_unix_ms gauge\n\
          camus_meta_snapshot_unix_ms {}\n\
-         # HELP camus_wal_stamped_batches_total WAL batches stamped with the clock (ADR 0018 phase 3).\n\
+         # HELP camus_wal_stamping_shards WAL shards stamping entries: clock.stamps on and every member reads stamps.\n\
+         # TYPE camus_wal_stamping_shards gauge\n\
+         camus_wal_stamping_shards {}\n\
+         # HELP camus_wal_stamped_batches_total WAL batches proposed with a clock stamp (ADR 0018 phase 3).\n\
          # TYPE camus_wal_stamped_batches_total counter\n\
          camus_wal_stamped_batches_total {}\n\
-         # HELP camus_wal_unstamped_batches_total WAL batches appended unstamped with clock.stamps on: the clock gave no reading.\n\
+         # HELP camus_wal_unstamped_batches_total WAL batches proposed unstamped on a stamping shard: the clock gave no reading.\n\
          # TYPE camus_wal_unstamped_batches_total counter\n\
          camus_wal_unstamped_batches_total {}\n\
          # HELP camus_mirror_copied_bytes_total Batch bytes the mirror copier published into mirror topics.\n\
@@ -494,6 +499,7 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         kafka::PRODUCE_HOLD_MS.load(Relaxed),
         kafka::META_SNAPSHOT_INDEX.load(Relaxed),
         kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
+        STAMPING_SHARDS.load(Relaxed),
         camus_wal::STAMPED_BATCHES.load(Relaxed),
         camus_wal::UNSTAMPED_BATCHES.load(Relaxed),
         mirror::COPIED_BYTES.load(Relaxed),
@@ -859,12 +865,11 @@ fn shard_dir(wal_dir: &std::path::Path, shard: u32) -> PathBuf {
         .join(shard.to_string())
 }
 
-/// Open every shard in the stored layout that this broker has not opened
-/// yet. A shard this broker is not a voter of stays empty.
 /// The clock WAL shards stamp appends with, when `clock.stamps` is on
-/// (ADR 0018, phase 3). Turn it on only once every WAL voter reads stamped
-/// entries, and only on a host whose time daemon reports a real error bound:
-/// chrony or ntpd, not systemd-timesyncd.
+/// (ADR 0018, phase 3). Use it only on a host whose time daemon reports a
+/// real error bound: chrony or ntpd, not systemd-timesyncd, which this cannot
+/// tell apart. A shard stamps only while every member reads stamped entries;
+/// see [`gate_stamps`].
 fn stamp_clock(settings: &settings::Settings) -> Option<Arc<dyn camus_raft::clock::Clock>> {
     use camus_raft::clock::Clock;
     if !settings.is_true("clock.stamps") {
@@ -872,13 +877,65 @@ fn stamp_clock(settings: &settings::Settings) -> Option<Arc<dyn camus_raft::cloc
     }
     if camus_raft::clock::Host.now().is_none() {
         tracing::warn!(
-            "clock.stamps is on, but this host gives no clock reading: not Linux with \
-             glibc, or the clock is not synchronised; batches go unstamped"
+            "clock.stamps is on, but this host gives no clock reading yet: not Linux with \
+             glibc, or the clock is not synchronised. Batches go unstamped until it is; \
+             camus_wal_unstamped_batches_total counts them"
         );
     }
     Some(Arc::new(camus_raft::clock::Host))
 }
 
+/// Metadata key a broker writes once it runs a release that reads stamped
+/// WAL entries (ADR 0018, phase 3).
+fn reads_stamps_key(node: NodeId) -> String {
+    format!("capability/reads-stamped/{node}")
+}
+
+/// Shards whose entries are being stamped, as `gate_stamps` last set them.
+static STAMPING_SHARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Say in metadata that this broker reads stamped entries, then each second
+/// let each shard stamp only while every member of it, voter or learner, has
+/// said so. A member on an older release cannot read a stamped entry and
+/// would stop replicating at the first one, so a shard with one stops
+/// stamping, including when such a member joins later. Brokers on the
+/// release that only reads stamps never say so, which keeps this closed
+/// until they upgrade.
+async fn gate_stamps(admin: Arc<Admin>) {
+    let mine = reads_stamps_key(admin.node_id);
+    let clock_on = admin.settings.is_true("clock.stamps");
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Test hook: act as a broker on an older release, which never says it
+        // reads stamped entries.
+        let older = std::env::var("CAMUS_FAILPOINT").as_deref() == Ok("no-stamp-capability");
+        if !older && admin.node.read_local(&mine).ok().flatten().is_none() {
+            if let Err(err) = metadata_write(&admin, &mine, "1").await {
+                tracing::debug!(%err, "recording that this broker reads stamped entries");
+            }
+            continue;
+        }
+        let mut stamping = 0;
+        for (_, shard) in admin.wal.all() {
+            let members = shard.members();
+            let all_read = !members.is_empty()
+                && members.iter().all(|member| {
+                    admin
+                        .node
+                        .read_local(&reads_stamps_key(*member))
+                        .ok()
+                        .flatten()
+                        .is_some()
+                });
+            shard.set_stamping(all_read);
+            stamping += u64::from(all_read && clock_on);
+        }
+        STAMPING_SHARDS.store(stamping, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Open every shard in the stored layout that this broker has not opened
+/// yet. A shard this broker is not a voter of stays empty.
 async fn open_shards(
     node: Arc<MetadataNode>,
     wal: Arc<WalSlot>,

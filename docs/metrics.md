@@ -120,8 +120,9 @@ Histogram buckets are 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms, and
 | `camus_produce_hold_ms_total` | counter | Milliseconds produce waited at the WAL disk limit. |
 | `camus_meta_snapshot_index` | gauge | Log index of the newest metadata snapshot in object storage. |
 | `camus_meta_snapshot_unix_ms` | gauge | Unix milliseconds of that snapshot, or 0. |
-| `camus_wal_stamped_batches_total` | counter | WAL batches stamped with the clock while `clock.stamps` is on (ADR 0018, phase 3). |
-| `camus_wal_unstamped_batches_total` | counter | WAL batches appended unstamped while `clock.stamps` is on, because the clock gave no reading. A source with these cannot be part of a cross-source cut. |
+| `camus_wal_stamping_shards` | gauge | WAL shards stamping entries: `clock.stamps` is on and every member has recorded that it reads stamps (ADR 0018, phase 3). 0 while an older broker is a member. |
+| `camus_wal_stamped_batches_total` | counter | WAL batches proposed with a clock stamp on a stamping shard. A proposal that then fails and is retried counts again. |
+| `camus_wal_unstamped_batches_total` | counter | WAL batches proposed unstamped on a stamping shard, because the clock gave no reading. A source with these cannot be part of a cross-source cut. |
 | `camus_mirror_copied_bytes_total` | counter | Batch bytes the mirror copier published into mirror topics (ADR 0018). |
 | `camus_mirror_stalled_partitions` | gauge | Mirror partitions the last copy round could not advance. 0 on a broker that does not lead metadata. |
 | `camus_mirror_waiting_partitions` | gauge | Mirror partitions waiting at a transaction the source has not ended. One that stays up has a source that cannot end it. |
