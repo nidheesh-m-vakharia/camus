@@ -301,9 +301,8 @@ acknowledged at the WAL fsync, often well before its batch is sealed, so
 a record acknowledged first can be stamped later than a record produced
 after it in another region. The sketch also has the commit wait in front
 of the metadata commit, and in `r2` mode that commit is the
-acknowledgement. Both points are replaced by "Phase 3, proposed" at the
-end of this record. Phase 3 stays proposed until that section is
-accepted. Phases 0 to 2 are accepted and built.
+acknowledgement. Both points are replaced by "Phase 3" at the end of this
+record, which was accepted on the same day.
 
 ### Delivery
 
@@ -841,11 +840,12 @@ Phase 2, third part: promotion and the fork check.
      topic stays at 41.
   4. The link can then be removed.
 
-## Phase 3, proposed (2026-11-25)
+## Phase 3 (proposed 2026-11-25, accepted 2026-11-25)
 
 A destination that mirrors several source regions can promote all its
 mirrors at one cut `c` that is consistent across the sources. This
-section replaces the clock sketch above. Nothing in it is built.
+section replaces the clock sketch above. It is accepted, and is being
+built in the steps under "Delivery".
 
 ### What a consistent cut means
 
@@ -980,7 +980,7 @@ below some value.
   that source. Phase 3 is only worth building for an operator who must
   fail over several regions to one moment.
 
-### Delivery, if accepted
+### Delivery
 
 1. The clock wrapper and per-batch stamps in WAL entries and the `r2`
    buffer, with the stamp counters. Nothing reads the stamps yet.
