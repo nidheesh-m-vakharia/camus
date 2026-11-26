@@ -573,6 +573,18 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
             text.push_str(&format!("{name}{{shard=\"{id}\"}} {value}\n"));
         }
     }
+    // Aliases are `[a-z0-9-]`, safe as label values.
+    text.push_str(
+        "# HELP camus_mirror_applied_watermark_us Lowest applied watermark of a link's mirror topics: every batch the source stamped below it is copied (ADR 0018, phase 3).\n\
+         # TYPE camus_mirror_applied_watermark_us gauge\n",
+    );
+    if let Ok(applied) = mirror::APPLIED.lock() {
+        for (alias, watermark) in applied.iter() {
+            text.push_str(&format!(
+                "camus_mirror_applied_watermark_us{{alias=\"{alias}\"}} {watermark}\n"
+            ));
+        }
+    }
     // Seal and upload times, recorded only where this broker led the shard.
     let timings: [(&str, &str, fn(&metrics::ShardTimes) -> &metrics::Histogram); 2] = [
         (

@@ -172,6 +172,87 @@ impl SourceSnapshot {
     }
 }
 
+/// The source's watermark `W` in this snapshot (ADR 0018, phase 3): the
+/// lowest frontier of its WAL shards and its `r2` buffer. Every batch it
+/// stamped below `W` is in this snapshot's extents. `None` while any of
+/// them has not reported.
+async fn source_watermark(source: &SourceSnapshot) -> anyhow::Result<Option<i64>> {
+    let shards = match source.row(camus_metadata::SHARDS).await? {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)?["count"]
+            .as_u64()
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or_else(|| anyhow::anyhow!("the source's shard layout has no count"))?,
+        None => 1,
+    };
+    let keys = (0..shards)
+        .map(Some)
+        .chain([None])
+        .map(camus_metadata::frontier_key);
+    let mut lowest = i64::MAX;
+    for key in keys {
+        let Some(raw) = source.row(&key).await? else {
+            return Ok(None);
+        };
+        lowest = lowest.min(raw.trim().parse::<i64>()?);
+    }
+    Ok(Some(lowest))
+}
+
+/// `topic`'s applied watermark, as this broker has applied it.
+fn applied(node: &camus_metadata::MetadataNode, topic: &Topic) -> anyhow::Result<Option<i64>> {
+    Ok(node
+        .read_local(&camus_metadata::mirror::applied_key(&topic.id))?
+        .and_then(|raw| raw.parse::<i64>().ok()))
+}
+
+/// Raise `topic`'s applied watermark to `watermark`, after every copy this
+/// round committed, through this leader's own log. Never lowers it: a lower
+/// one is also true, and says less. Not for a topic deleted or promoted
+/// since the round read it; one that slips through is removed by
+/// [`drop_stale_applied`] in the next round.
+async fn record_applied(
+    node: &camus_metadata::MetadataNode,
+    topic: &Topic,
+    watermark: i64,
+) -> anyhow::Result<()> {
+    let still = node
+        .read_local(&camus_metadata::topic_storage_key(&topic.name))?
+        .map(|raw| camus_metadata::parse_topic(&raw).map_err(|err| anyhow::anyhow!(err)))
+        .transpose()?
+        .is_some_and(|now| now.id == topic.id && now.mirror_of == topic.mirror_of);
+    if !still || applied(node, topic)?.is_some_and(|held| held >= watermark) {
+        return Ok(());
+    }
+    node.write(
+        camus_metadata::mirror::applied_key(&topic.id),
+        watermark.to_string(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Delete the applied watermark of every topic that is no longer one of
+/// `mirrors`: deleted or promoted. At most one key per mirror topic stays.
+async fn drop_stale_applied(
+    node: &camus_metadata::MetadataNode,
+    mirrors: &[Topic],
+) -> anyhow::Result<()> {
+    let prefix = camus_metadata::mirror::applied_key("");
+    for (key, _) in node.scan_local(&prefix)? {
+        let id = key.strip_prefix(&prefix).unwrap_or_default();
+        if !mirrors.iter().any(|topic| topic.id == id) {
+            node.apply(camus_metadata::Command::Delete { key }).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Each link's lowest applied watermark over its mirror topics, for
+/// `camus_mirror_applied_watermark_us`. Only links seen in the last round,
+/// so at most the 64-link limit.
+pub static APPLIED: std::sync::Mutex<std::collections::BTreeMap<String, i64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// How long the copier waits between rounds on the metadata leader.
 /// `CAMUS_MIRROR_COPY_MS`, 5 s by default. A source snapshot is at most one
 /// snapshot interval old, so copy lag is that plus about one round.
@@ -243,6 +324,9 @@ pub async fn run_copier(
             STALLED.store(0, Relaxed);
             WAITING.store(0, Relaxed);
             waits.clear();
+            if let Ok(mut applied) = APPLIED.lock() {
+                applied.clear();
+            }
             continue;
         }
         if waits.len() > MAX_WAITS {
@@ -278,10 +362,18 @@ async fn copy_round(
             mirrors.push(topic);
         }
     }
+    if let Err(err) = drop_stale_applied(node, &mirrors).await {
+        tracing::warn!(
+            error = format!("{err:#}"),
+            "dropping stale applied watermarks"
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
     let mut stalled = 0;
     let mut waiting = 0;
     for (_, raw) in links {
         let link: MirrorLink = serde_json::from_str(&raw)?;
+        seen.insert(link.alias.clone());
         let linked: Vec<&Topic> = mirrors
             .iter()
             .filter(|topic| {
@@ -314,14 +406,39 @@ async fn copy_round(
                 continue;
             }
         };
+        // Read before copying: a later snapshot can only raise it, and
+        // this one's extents are what the round copies from.
+        let watermark = match source_watermark(&source).await {
+            Ok(watermark) => watermark,
+            Err(err) => {
+                tracing::warn!(
+                    alias = link.alias,
+                    error = format!("{err:#}"),
+                    "reading a mirror source's watermark"
+                );
+                None
+            }
+        };
+        let mut lowest = Some(i64::MAX);
         for topic in linked.iter().copied() {
+            // Every partition caught up with this snapshot, and the source
+            // topic still the one mirrored, with as many partitions.
+            let mut caught_up = match source.topic(&topic.name).await {
+                Ok(Some(at_source)) => {
+                    topic.mirror_of.as_ref().map(|of| &of.topic_id) == Some(&at_source.id)
+                        && at_source.partitions == topic.partitions
+                }
+                _ => false,
+            };
             for partition in 0..topic.partitions {
                 let at = (topic.id.clone(), partition);
                 if waits.get(&at).is_some_and(|key| key == source.key()) {
                     waiting += 1;
+                    caught_up = false;
                     continue;
                 }
                 let copied = copy_partition(node, dest, &source, topic, partition).await;
+                caught_up &= matches!(copied, Ok(Copied::CaughtUp));
                 if matches!(copied, Ok(Copied::Gone)) {
                     waits.retain(|(id, _), _| *id != topic.id);
                     break;
@@ -361,6 +478,23 @@ async fn copy_round(
                     }
                 }
             }
+            if let Some(watermark) = watermark.filter(|_| caught_up) {
+                if let Err(err) = record_applied(node, topic, watermark).await {
+                    tracing::warn!(
+                        topic = topic.name,
+                        error = format!("{err:#}"),
+                        "recording a mirror's applied watermark"
+                    );
+                }
+            }
+            let held = applied(node, topic).ok().flatten();
+            lowest = lowest.zip(held).map(|(lowest, held)| lowest.min(held));
+        }
+        if let Ok(mut applied) = APPLIED.lock() {
+            match lowest {
+                Some(lowest) => applied.insert(link.alias.clone(), lowest),
+                None => applied.remove(&link.alias),
+            };
         }
         if let Err(err) = sync_groups(node, coordinator, &source, &link.alias, &linked).await {
             COPY_ERRORS.fetch_add(1, Relaxed);
@@ -370,6 +504,9 @@ async fn copy_round(
                 "mirror group sync failed"
             );
         }
+    }
+    if let Ok(mut applied) = APPLIED.lock() {
+        applied.retain(|alias, _| seen.contains(alias));
     }
     Ok((stalled, waiting))
 }
