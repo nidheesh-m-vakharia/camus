@@ -1384,3 +1384,167 @@ fn a_promoted_mirror_is_writable_and_a_fork_is_reported() -> TestResult {
     assert_eq!(removed, StatusCode::OK, "no mirror names the link any more");
     Ok(())
 }
+
+/// Every footer entry of `topic`'s extents on `http`, from the bucket under
+/// `prefix`: `(start, end, stamp)`, and each extent's offsets and stamp
+/// range.
+#[allow(clippy::type_complexity)]
+fn footer_stamps(
+    http: &str,
+    prefix: &str,
+    topic: &str,
+) -> Result<
+    (
+        Vec<(i64, i64, Option<i64>)>,
+        Vec<(i64, i64, Option<camus_metadata::StampRange>)>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let bucket = camus_storage::Bucket::connect(&camus_storage::BucketConfig {
+        endpoint: "http://127.0.0.1:9100".into(),
+        bucket: "camus".into(),
+        region: "us-east-1".into(),
+        access_key: "camus".into(),
+        secret_key: "camus-dev-secret".into(),
+        prefix: prefix.into(),
+        virtual_hosted: false,
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let raw =
+        support::read_key(http, &camus_metadata::topic_storage_key(topic)).ok_or("no topic")?;
+    let id = camus_metadata::parse_topic(&raw)?.id;
+    let topic_id = *uuid::Uuid::parse_str(&id)?.as_bytes();
+    let mut entries = Vec::new();
+    let mut ranges = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, raw) in support::scan_keys(http, &format!("ext/{id}/")) {
+        let extent: camus_metadata::Extent = serde_json::from_str(&raw)?;
+        ranges.push((extent.start, extent.end, extent.stamps));
+        if !seen.insert(extent.key.clone()) {
+            continue;
+        }
+        let (body, _) = runtime.block_on(bucket.get_tail(&extent.key, 64 << 20))?;
+        for entry in camus_uploader::decode_footer(&body)? {
+            if entry.topic_id == topic_id && entry.partition == 0 {
+                entries.push((entry.start, entry.end, entry.stamp));
+            }
+        }
+    }
+    entries.sort();
+    Ok((entries, ranges))
+}
+
+/// With stamps on at both ends, the copier gives each copied batch its
+/// source stamp, in the destination's footers, and each mirror extent the
+/// range of its batches' stamps (ADR 0018, phase 3).
+#[test]
+fn a_mirror_carries_the_sources_stamps() -> TestResult {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("mirror stamps test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let source_prefix = format!("mirror-stamps-src-{pid}/");
+    let dest_prefix = format!("mirror-stamps-dst-{pid}/");
+    let stamps = [
+        ("CAMUS_CLOCK_STAMPS", "true"),
+        ("CAMUS_FAILPOINT", "assumed-clock"),
+    ];
+    let source_dir = tempfile::tempdir()?;
+    let source = spawn_under(source_dir.path(), &source_prefix, &stamps);
+    let source_addr = kafka_addr(&source);
+    // Stamping starts once this broker has recorded that it reads stamps.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while series(&source.http, "camus_stamped_objects")? == 0
+        || series(&source.http, "camus_wal_stamping_shards")? == 0
+    {
+        if std::time::Instant::now() > deadline {
+            return Err("the source never started stamping".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for at in 0..10 {
+        assert_eq!(produce(&source_addr, &format!("record-{at}")), (0, at));
+    }
+    support::wait_sealed(&source.http, 10);
+
+    let dest_dir = tempfile::tempdir()?;
+    // The destination has no `orders` of its own: the mirror takes the name.
+    let dest = support::Node::with(
+        1,
+        dest_dir.path(),
+        Opts::default()
+            .env("CAMUS_S3_PREFIX", &dest_prefix)
+            .env("CAMUS_CLOCK_STAMPS", "true")
+            .env("CAMUS_FAILPOINT", "assumed-clock")
+            .env("CAMUS_MIRROR_COPY_MS", "200")
+            .env("CAMUS_MIRROR_US_EAST_ACCESS_KEY", "camus")
+            .env("CAMUS_MIRROR_US_EAST_SECRET_KEY", "camus-dev-secret"),
+    );
+    support::init(std::slice::from_ref(&dest), &[1]);
+    support::wait_settled(&[&dest]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while series(&dest.http, "camus_stamped_objects")? == 0 {
+        if std::time::Instant::now() > deadline {
+            return Err("the destination never took stamped objects".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let client = reqwest::blocking::Client::new();
+    let link = MirrorLink {
+        alias: "us-east".into(),
+        endpoint: "http://127.0.0.1:9100".into(),
+        region: "us-east-1".into(),
+        bucket: "camus".into(),
+        prefix: source_prefix.clone(),
+        virtual_host: false,
+    };
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/links", dest.http))
+            .json(&link)
+            .send()
+    })?;
+    until_ok(|| {
+        client
+            .post(format!("http://{}/admin/mirror/topics", dest.http))
+            .json(&serde_json::json!({ "alias": "us-east", "topic": support::TOPIC }))
+            .send()
+    })?;
+    support::wait_sealed(&dest.http, 10);
+
+    let (from, _) = footer_stamps(&source.http, &source_prefix, support::TOPIC)?;
+    let mut at_source = std::collections::BTreeMap::new();
+    for (start, end, stamp) in from {
+        for offset in start..end {
+            at_source.insert(offset, stamp.ok_or("an unstamped source batch")?);
+        }
+    }
+    let (copied, ranges) = footer_stamps(&dest.http, &dest_prefix, support::TOPIC)?;
+    assert!(!copied.is_empty(), "the mirror has objects");
+    let mut covered = 0;
+    for (start, end, stamp) in copied {
+        let stamp = stamp.ok_or("an unstamped mirror piece")?;
+        for offset in start..end {
+            assert_eq!(
+                at_source.get(&offset),
+                Some(&stamp),
+                "offset {offset} keeps its source stamp"
+            );
+            covered += 1;
+        }
+    }
+    assert_eq!(covered, 10, "every copied offset is in a stamped piece");
+    for (start, end, range) in ranges {
+        let range = range.ok_or("an unstamped mirror extent")?;
+        let inside = || at_source.range(start..end).map(|(_, stamp)| *stamp);
+        assert_eq!(
+            (Some(range.min), Some(range.max)),
+            (inside().min(), inside().max()),
+            "extent {start}..{end} takes its batches' range"
+        );
+    }
+    Ok(())
+}

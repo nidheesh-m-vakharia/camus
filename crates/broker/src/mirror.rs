@@ -193,6 +193,14 @@ const WINDOW_BYTES: u64 = camus_protocol::batch::MAX_BATCH_CEILING as u64;
 /// does not hold up the rest.
 const WINDOWS_PER_ROUND: usize = 8;
 
+/// Bytes read from the end of a source object to find its footer, for the
+/// batches' stamps: at most about 14,500 entries. Partitions are copied one
+/// at a time and each keeps one decoded footer, about 1.3 MiB at most, with
+/// the raw tail live beside it while decoding: about 2.3 MiB at peak. A
+/// larger footer is not read; its extent's own stamp range stands in for
+/// the batches'.
+const FOOTER_TAIL_BYTES: u64 = 1024 * 1024;
+
 /// Bytes of batches the copier has published into mirrors.
 pub static COPIED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Mirror partitions the last round could not advance: a gap at the source,
@@ -543,6 +551,8 @@ async fn copy_partition(
     // Where the last window of an extent stopped, so the next window of the
     // same extent reads on from there instead of from its first byte.
     let mut resume: Option<(String, u64, i64)> = None;
+    // The current source extent's object footer, for its batches' stamps.
+    let mut footer: Option<(String, Vec<camus_uploader::FooterEntry>)> = None;
     for _ in 0..WINDOWS_PER_ROUND {
         let raw = node
             .read_local(&camus_metadata::partition_storage_key(&topic.id, partition))?
@@ -586,11 +596,26 @@ async fn copy_partition(
             Some((key, pos, at)) if *key == extent.key && *at == start => Some(*pos),
             _ => None,
         };
+        // Stamps go on only while every broker here reads them, and only
+        // from a source extent whose batches all have one (ADR 0018, phase
+        // 3).
+        let stamping = crate::kafka::STAMPED_OBJECTS.load(std::sync::atomic::Ordering::Acquire)
+            && extent.stamps.is_some();
+        if stamping && footer.as_ref().map(|(key, _)| key) != Some(&extent.key) {
+            footer = Some((
+                extent.key.clone(),
+                source_footer(&source.bucket, &extent.key).await,
+            ));
+        }
         let at = Place {
             extent: &extent,
             start,
             empty,
             from,
+            footer: footer
+                .as_ref()
+                .filter(|(key, _)| stamping && *key == extent.key)
+                .map(|(_, entries)| entries.as_slice()),
         };
         match copy_window(node, dest, source, &from_source, topic, partition, at).await? {
             Window::Published { pos } => {
@@ -670,6 +695,52 @@ struct Place<'a> {
     /// A byte position inside the extent to read on from, when an earlier
     /// window of the same extent ended there.
     from: Option<u64>,
+    /// The source object's footer, when the copy carries stamps.
+    footer: Option<&'a [camus_uploader::FooterEntry]>,
+}
+
+/// The footer of the source object `key`, from its last
+/// [`FOOTER_TAIL_BYTES`], or nothing when it is not all there or cannot be
+/// read. Stamps are optional, so a failed read never stops the copy.
+async fn source_footer(bucket: &Bucket, key: &str) -> Vec<camus_uploader::FooterEntry> {
+    match bucket.get_tail(key, FOOTER_TAIL_BYTES).await {
+        Ok((tail, _)) => camus_uploader::decode_footer(&tail).unwrap_or_default(),
+        Err(err) => {
+            tracing::debug!(key, %err, "reading a source footer for stamps");
+            Vec::new()
+        }
+    }
+}
+
+/// Each batch's stamp, from the source footer entry its bytes lie in.
+/// `pos` is the first batch's byte position in the source object, and the
+/// batches follow it back to back. `None` unless one entry of this
+/// partition holds the batch's bytes and offsets whole: the footer comes
+/// from another cluster, and a wrong stamp is worse than none.
+fn batch_stamps(
+    footer: &[camus_uploader::FooterEntry],
+    topic_id: [u8; 16],
+    partition: i32,
+    pos: u64,
+    infos: &[camus_protocol::batch::BatchInfo],
+) -> Vec<Option<i64>> {
+    let mut at = pos;
+    infos
+        .iter()
+        .map(|info| {
+            let here = at;
+            at = at.saturating_add(info.len as u64);
+            let after = footer.partition_point(|entry| entry.file_offset <= here);
+            let entry = footer.get(after.checked_sub(1)?)?;
+            let holds = entry.topic_id == topic_id
+                && entry.partition == partition
+                && entry.file_offset <= here
+                && at <= entry.file_offset.saturating_add(u64::from(entry.length))
+                && entry.start <= info.base_offset
+                && info.last_offset < entry.end;
+            entry.stamp.filter(|_| holds)
+        })
+        .collect()
 }
 
 /// Copy whole batches of the extent `at` names, from its start offset on,
@@ -689,6 +760,7 @@ async fn copy_window(
         start,
         empty,
         from,
+        footer,
     } = at;
     let extent_end = extent
         .file_offset
@@ -713,6 +785,7 @@ async fn copy_window(
                 extent.end,
                 pos,
                 Spans::default(),
+                None,
             )
             .await;
         }
@@ -767,11 +840,25 @@ async fn copy_window(
     let planned = plan(
         &infos, &epochs, &producers, &ended, start, extent.end, to_end, empty,
     );
-    let runs = match planned {
+    let mut runs = match planned {
         Ok(runs) if runs.is_empty() => return Ok(Window::Waiting),
         Ok(runs) => runs,
         Err(why) => return Ok(Window::Stalled(format!("{}: {why}", extent.key))),
     };
+    let stamps = match (footer, &topic.mirror_of) {
+        (Some(footer), Some(of)) => batch_stamps(
+            footer,
+            *uuid::Uuid::parse_str(&of.topic_id)?.as_bytes(),
+            partition,
+            pos,
+            &infos,
+        ),
+        _ => Vec::new(),
+    };
+    slice_runs(&mut runs, &infos, &stamps);
+    // The source extent's range covers every batch in it, so it stands in
+    // when the footer does not give each copied batch its stamp.
+    let cover = extent.stamps.filter(|_| footer.is_some());
     let first = runs.first().map_or(start, |run| run.start);
     let last = runs.last().map_or(start, |run| run.end);
     let over = |span: &&camus_metadata::Span| span.start < last && span.end > first;
@@ -792,7 +879,7 @@ async fn copy_window(
     let copied: usize = runs.iter().map(|run| run.bytes.len()).sum();
     let next = pos + copied as u64;
     publish(
-        node, dest, topic, partition, &runs, &window, start, extent.end, next, spans,
+        node, dest, topic, partition, &runs, &window, start, extent.end, next, spans, cover,
     )
     .await
 }
@@ -806,7 +893,9 @@ struct Spans {
 
 /// Put `runs` of `window` into a new object and commit them with `spans`.
 /// With no runs, commit only the move of the next offset from `start` to
-/// `empty_end`.
+/// `empty_end`. Each run's slices are pieces of the object, so the footer
+/// keeps their stamps. Each extent gets its slices' stamp range, or `cover`
+/// when a slice has none.
 #[allow(clippy::too_many_arguments)]
 async fn publish(
     node: &camus_metadata::MetadataNode,
@@ -819,8 +908,10 @@ async fn publish(
     empty_end: i64,
     pos: u64,
     spans: Spans,
+    cover: Option<camus_metadata::StampRange>,
 ) -> anyhow::Result<Window> {
     use std::sync::atomic::Ordering::Relaxed;
+    let mut stamps = Vec::new();
     let parts: Vec<camus_metadata::PublishPart> = if runs.is_empty() {
         vec![camus_metadata::PublishPart {
             epoch: -1,
@@ -838,43 +929,86 @@ async fn publish(
         let topic_id = *uuid::Uuid::parse_str(&topic.id)?.as_bytes();
         let pieces: Vec<camus_uploader::Piece> = runs
             .iter()
-            .map(|run| camus_uploader::Piece {
+            .flat_map(|run| &run.slices)
+            .map(|slice| camus_uploader::Piece {
                 topic_id,
                 partition,
-                start: run.start,
-                end: run.end,
-                base_timestamp: run.base_timestamp,
-                max_timestamp: run.max_timestamp,
-                bytes: window.slice(run.bytes.clone()),
-                stamp: None,
+                start: slice.start,
+                end: slice.end,
+                base_timestamp: slice.base_timestamp,
+                max_timestamp: slice.max_timestamp,
+                bytes: window.slice(slice.bytes.clone()),
+                stamp: slice.stamp,
             })
             .collect();
         let (index, body) = camus_uploader::encode(&pieces);
         let key = camus_uploader::object_key();
         dest.put_new(&key, body).await?;
-        runs.iter()
-            .zip(index)
-            .map(|(run, (file_offset, length))| camus_metadata::PublishPart {
+        // A run's slices are back to back in the object.
+        let mut located = index.into_iter();
+        let mut parts = Vec::with_capacity(runs.len());
+        for run in runs {
+            let mut file_offset = None;
+            let mut length = 0u32;
+            for _ in &run.slices {
+                let (offset, len) = located
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("a slice has no place in the object"))?;
+                file_offset.get_or_insert(offset);
+                length = length
+                    .checked_add(len)
+                    .ok_or_else(|| anyhow::anyhow!("a run overflows its length"))?;
+            }
+            let ranges = run.slices.iter().map(|slice| {
+                slice.stamp.map(|stamp| camus_metadata::StampRange {
+                    min: stamp,
+                    max: stamp,
+                })
+            });
+            if let Some(range) = camus_metadata::StampRange::covering(ranges).or(cover) {
+                stamps.push(camus_metadata::ExtentStamp {
+                    topic: topic.name.clone(),
+                    partition,
+                    end: run.end,
+                    object_key: key.clone(),
+                    stamps: range,
+                });
+            }
+            parts.push(camus_metadata::PublishPart {
                 epoch: run.epoch,
                 topic: topic.name.clone(),
                 partition,
                 start: run.start,
                 end: run.end,
                 object_key: key.clone(),
-                file_offset,
+                file_offset: file_offset.ok_or_else(|| anyhow::anyhow!("a run has no slices"))?,
                 length,
                 base_timestamp: run.base_timestamp,
                 max_timestamp: run.max_timestamp,
-            })
-            .collect()
+            });
+        }
+        parts
     };
-    let published = node
-        .apply(camus_metadata::Command::PublishMirror {
-            parts,
-            committed: spans.committed.iter().map(Into::into).collect(),
-            aborted: spans.aborted.iter().map(Into::into).collect(),
-        })
-        .await?;
+    let copy = camus_metadata::Command::PublishMirror {
+        parts,
+        committed: spans.committed.iter().map(Into::into).collect(),
+        aborted: spans.aborted.iter().map(Into::into).collect(),
+    };
+    // The stamps ride after the publish in one entry, so its extents exist
+    // and a publish that loses its race stamps nothing.
+    let published = if stamps.is_empty() {
+        node.apply(copy).await?
+    } else {
+        let mut both = node
+            .apply(camus_metadata::Command::Batch(vec![
+                copy,
+                camus_metadata::Command::StampExtents { stamps },
+            ]))
+            .await?
+            .each;
+        anyhow::ensure!(!both.is_empty(), "a batched publish gave no result");
+        both.swap_remove(0)
+    };
     match published.error_code {
         0 => {
             let copied: usize = runs.iter().map(|run| run.bytes.len()).sum();
@@ -899,6 +1033,66 @@ struct Run {
     max_timestamp: i64,
     /// Byte range in the window.
     bytes: std::ops::Range<usize>,
+    /// The run's batches, split where their stamp changes, in order. Set by
+    /// [`slice_runs`]; each becomes one piece of the object.
+    slices: Vec<Slice>,
+}
+
+/// Batches of a run that share a stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Slice {
+    start: i64,
+    end: i64,
+    base_timestamp: i64,
+    max_timestamp: i64,
+    /// Byte range in the window.
+    bytes: std::ops::Range<usize>,
+    stamp: Option<i64>,
+}
+
+/// Split each run into slices of batches with one stamp, `stamps` holding
+/// each of `infos`' (none when shorter). The first slice starts where its
+/// run does, each later one where the one before ends, and the last ends
+/// where the run does, so the slices cover the run's offsets as the run
+/// does. Without stamps, a run is one slice.
+fn slice_runs(
+    runs: &mut [Run],
+    infos: &[camus_protocol::batch::BatchInfo],
+    stamps: &[Option<i64>],
+) {
+    let mut at = 0;
+    let mut index = 0;
+    for run in runs {
+        let mut slices: Vec<Slice> = Vec::new();
+        while let Some(info) = infos.get(index).filter(|_| at < run.bytes.end) {
+            let stamp = stamps.get(index).copied().flatten();
+            match slices.last_mut() {
+                Some(slice) if slice.stamp == stamp => {
+                    slice.end = info.last_offset + 1;
+                    slice.base_timestamp = slice.base_timestamp.min(info.base_timestamp);
+                    slice.max_timestamp = slice.max_timestamp.max(info.max_timestamp);
+                    slice.bytes.end = at + info.len;
+                }
+                _ => {
+                    let start = slices.last().map_or(run.start, |slice| slice.end);
+                    slices.push(Slice {
+                        start,
+                        end: info.last_offset + 1,
+                        base_timestamp: info.base_timestamp,
+                        max_timestamp: info.max_timestamp,
+                        bytes: at..at + info.len,
+                        stamp,
+                    });
+                }
+            }
+            at += info.len;
+            index += 1;
+        }
+        if let Some(last) = slices.last_mut() {
+            last.end = run.end;
+        }
+        run.slices = slices;
+    }
 }
 
 /// Plan the parts for `infos`, whole batches of one window whose CRCs were
@@ -978,6 +1172,7 @@ fn plan(
                     base_timestamp: info.base_timestamp,
                     max_timestamp: info.max_timestamp,
                     bytes: at..at + info.len,
+                    slices: Vec::new(),
                 });
             }
         }
@@ -1070,7 +1265,8 @@ mod tests {
                     epoch: 3,
                     base_timestamp: 0,
                     max_timestamp: 9,
-                    bytes: 0..30
+                    bytes: 0..30,
+                    slices: Vec::new(),
                 },
                 Run {
                     start: 10,
@@ -1078,7 +1274,8 @@ mod tests {
                     epoch: 4,
                     base_timestamp: 10,
                     max_timestamp: 14,
-                    bytes: 30..60
+                    bytes: 30..60,
+                    slices: Vec::new(),
                 },
             ]
         );
@@ -1183,6 +1380,107 @@ mod tests {
         .is_err());
         // Last below base.
         assert!(plan(&[info(5, 4, 10)], &[1], &[], &none, 0, 20, true, false).is_err());
+    }
+
+    /// A footer entry of `partition` holding `length` bytes at `at`.
+    fn entry(
+        partition: i32,
+        at: u64,
+        length: u32,
+        stamp: Option<i64>,
+    ) -> camus_uploader::FooterEntry {
+        camus_uploader::FooterEntry {
+            topic_id: [7; 16],
+            partition,
+            start: 0,
+            end: 100,
+            file_offset: at,
+            length,
+            base_timestamp: 0,
+            max_timestamp: 0,
+            stamp,
+        }
+    }
+
+    #[test]
+    fn each_batch_takes_the_stamp_of_the_footer_entry_it_lies_in() {
+        let footer = [
+            entry(0, 0, 20, Some(100)),
+            entry(1, 20, 10, Some(150)),
+            entry(0, 30, 20, Some(200)),
+            entry(0, 50, 10, None),
+        ];
+        // Ten-byte batches from byte 10: the rest of the first entry,
+        // partition 1's entry, two in the third, the unstamped fourth, and
+        // one past every entry.
+        let infos = [
+            info(0, 0, 10),
+            info(1, 1, 10),
+            info(2, 2, 10),
+            info(3, 3, 10),
+            info(4, 4, 10),
+            info(5, 5, 10),
+        ];
+        assert_eq!(
+            batch_stamps(&footer, [7; 16], 0, 10, &infos),
+            [Some(100), None, Some(200), Some(200), None, None]
+        );
+        assert_eq!(
+            batch_stamps(&footer, [8; 16], 0, 10, &infos[..1]),
+            [None],
+            "another topic's entry"
+        );
+        // A batch running past its entry's bytes, or outside its offsets.
+        assert_eq!(batch_stamps(&footer, [7; 16], 0, 15, &infos[..1]), [None]);
+        let narrow = [camus_uploader::FooterEntry {
+            end: 3,
+            ..entry(0, 0, 60, Some(100))
+        }];
+        assert_eq!(
+            batch_stamps(&narrow, [7; 16], 0, 0, &infos[2..4]),
+            [Some(100), None]
+        );
+    }
+
+    #[test]
+    fn runs_split_into_slices_where_the_stamp_changes() -> Result<(), String> {
+        // Offsets 5..9 were compacted away, and the extent ends at 30.
+        let infos = [
+            info(0, 4, 10),
+            info(10, 14, 10),
+            info(15, 19, 10),
+            info(20, 24, 10),
+        ];
+        let mut runs = plan(&infos, &[1, 1, 1, 2], &[], &none, 0, 30, true, false)?;
+        slice_runs(
+            &mut runs,
+            &infos,
+            &[Some(100), Some(100), Some(300), Some(400)],
+        );
+        let slices: Vec<Vec<(i64, i64, std::ops::Range<usize>, Option<i64>)>> = runs
+            .iter()
+            .map(|run| {
+                run.slices
+                    .iter()
+                    .map(|slice| (slice.start, slice.end, slice.bytes.clone(), slice.stamp))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            slices,
+            vec![
+                vec![(0, 15, 0..20, Some(100)), (15, 20, 20..30, Some(300))],
+                vec![(20, 30, 30..40, Some(400))],
+            ]
+        );
+        // Without stamps, a run is one slice, as an unstamped copy was.
+        slice_runs(&mut runs, &infos, &[]);
+        let whole: Vec<(i64, i64, usize)> = runs
+            .iter()
+            .map(|run| (run.start, run.end, run.slices.len()))
+            .collect();
+        assert_eq!(whole, vec![(0, 20, 1), (20, 30, 1)]);
+        Ok(())
     }
 
     #[test]
