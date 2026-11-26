@@ -1546,5 +1546,38 @@ fn a_mirror_carries_the_sources_stamps() -> TestResult {
             "extent {start}..{end} takes its batches' range"
         );
     }
+
+    // The source's frontiers pass every stamp once its batches are sealed,
+    // and the mirror, caught up with a snapshot carrying them, records it.
+    let highest = at_source.values().copied().max().ok_or("no stamps")?;
+    let raw = support::read_key(
+        &dest.http,
+        &camus_metadata::topic_storage_key(support::TOPIC),
+    )
+    .ok_or("no mirror topic")?;
+    let key = camus_metadata::mirror::applied_key(&camus_metadata::parse_topic(&raw)?.id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let applied = loop {
+        let applied = support::read_key(&dest.http, &key)
+            .map(|raw| raw.parse::<i64>())
+            .transpose()?;
+        if let Some(applied) = applied.filter(|applied| *applied > highest) {
+            break applied;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("the applied watermark {applied:?} never passed {highest}").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let metrics = reqwest::blocking::get(format!("http://{}/metrics", dest.http))?.text()?;
+    let shown = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("camus_mirror_applied_watermark_us{alias=\"us-east\"} "))
+        .ok_or("no applied watermark series")?
+        .parse::<i64>()?;
+    assert!(
+        shown >= applied,
+        "the metric shows {shown}, below {applied}"
+    );
     Ok(())
 }

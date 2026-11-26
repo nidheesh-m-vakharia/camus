@@ -1276,3 +1276,39 @@ Step 2, third part, 2026-11-25: the copier carries stamps.
     destination piece with its exact source stamp, and every mirror
     extent's range is the min and max of its offsets' source stamps.
 
+Step 3, first part, 2026-11-25: applied watermarks.
+
+- Each round, the copier reads the source snapshot's watermark `W`. That
+  is the lowest of `frontier/wal/{shard}` for every shard in the
+  source's layout, and `frontier/r2`. With any of them missing there is
+  no `W`.
+- The copier records `W` for a mirror topic only when all of these hold
+  in that round, against that snapshot:
+  - every partition of the topic came back caught up;
+  - none was waiting at an open transaction;
+  - the source topic is still the one mirrored, with as many partitions.
+
+  Every batch stamped below `W` is in that snapshot's extents, so the
+  mirror holds it.
+- The record is `mirror-applied/{topic_id}`, Unix microseconds, written
+  by the leader through its own log after the round's copies. It only
+  rises: a lower `W` is also true, and says less.
+- The watermark covers what the mirror took in. Records removed from a
+  partition's start afterwards are outside it, as with Kafka retention:
+  destination retention, a partition reset, or source retention that ran
+  before the copy. A reset keeps the next offset, so the next round
+  finds the partition caught up and the watermark stands. A cut keeps
+  what is still there.
+- A topic deleted or promoted since the round began gets no watermark.
+  Each round also deletes the watermark of any topic that is no longer
+  a mirror, so the keys stay one per mirror topic.
+- A source that adds partitions, or has not reported every frontier,
+  holds its mirrors' watermarks where they are.
+- `camus_mirror_applied_watermark_us{alias}` is each link's lowest
+  watermark over its mirror topics, on the metadata leader. It is capped
+  by the 64-link limit: links not seen in a round are dropped. A link is
+  absent until each of its mirrors has a watermark.
+- Tests: with MinIO, `a_mirror_carries_the_sources_stamps` now waits for
+  the mirror's watermark to pass every copied stamp, and for the metric
+  to show it.
+

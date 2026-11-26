@@ -104,6 +104,13 @@ pub fn groups_key(alias: &str) -> String {
     format!("mirror-groups/{alias}")
 }
 
+/// Metadata key of a mirror topic's applied watermark (ADR 0018, phase 3):
+/// Unix microseconds in decimal. Every batch its source stamped below it is
+/// copied, as the source snapshot that carried that watermark held it.
+pub fn applied_key(topic_id: &str) -> String {
+    format!("mirror-applied/{topic_id}")
+}
+
 /// Set the consumer groups whose committed offsets the copier syncs from a
 /// link's source into its mirrors. An empty list stops syncing. The link
 /// must exist; at most [`MAX_GROUPS`] ids, each 1 to 1024 bytes.
