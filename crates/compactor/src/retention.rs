@@ -56,6 +56,7 @@ mod tests {
             length,
             base_timestamp: max_timestamp,
             max_timestamp,
+            stamps: None,
         }
     }
 

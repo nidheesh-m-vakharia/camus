@@ -287,6 +287,7 @@ mod expiry_tests {
                 length: 10,
                 base_timestamp: extent_ts,
                 max_timestamp: extent_ts,
+                stamps: None,
             });
         }
         map.insert(part_key, serde_json::to_string(&part).unwrap());

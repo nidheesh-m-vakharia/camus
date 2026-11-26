@@ -150,6 +150,27 @@ struct Item {
     txn_id: Option<String>,
     producer_id: i64,
     producer_epoch: i16,
+    /// The leader's clock stamp, taken as the item joins the buffer (ADR
+    /// 0018, phase 3), when `clock.stamps` is on.
+    stamp: Option<i64>,
+}
+
+/// The clock `r2` produce stamps with, set at startup when `clock.stamps`
+/// is on.
+pub static R2_CLOCK: std::sync::OnceLock<Arc<dyn camus_raft::clock::Clock>> =
+    std::sync::OnceLock::new();
+
+/// The last `r2` stamp this broker took. Stamps never fall below it, so they
+/// rise with the buffer order offsets follow. A new leader starts from its
+/// own clock, which can sit below the old leader's last stamp by up to the
+/// two clocks' error bounds.
+static R2_FLOOR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// An `r2` stamp now, or `None` with stamps off or no clock reading.
+fn r2_stamp() -> Option<i64> {
+    let latest = R2_CLOCK.get()?.now()?.latest_us;
+    let floor = R2_FLOOR.fetch_max(latest, std::sync::atomic::Ordering::AcqRel);
+    Some(latest.max(floor))
 }
 
 enum Reply {
@@ -3717,6 +3738,7 @@ impl Kafka {
                     txn_id: txn.as_ref().map(|(id, _, _)| id.clone()),
                     producer_id: txn.as_ref().map(|(_, id, _)| *id).unwrap_or(-1),
                     producer_epoch: txn.as_ref().map(|(_, _, epoch)| *epoch).unwrap_or(-1),
+                    stamp: None,
                 },
             )
             .await;
@@ -3849,7 +3871,16 @@ impl Kafka {
     async fn put_objects(
         &self,
         upload: Vec<camus_wal::Batch>,
-    ) -> (Vec<PublishPart>, Vec<ProducerNote>, Vec<SealDrop>, bool) {
+    ) -> (
+        Vec<PublishPart>,
+        Vec<ProducerNote>,
+        Vec<SealDrop>,
+        Vec<camus_metadata::ExtentStamp>,
+        bool,
+    ) {
+        // Stamps go into objects and extents only while every broker reads
+        // them (ADR 0018, phase 3); until then objects keep footer version 1.
+        let stamping = STAMPED_OBJECTS.load(std::sync::atomic::Ordering::Acquire);
         let mut chunks: Vec<Vec<camus_wal::Batch>> = Vec::new();
         let mut size = 0usize;
         for batch in upload {
@@ -3877,6 +3908,7 @@ impl Kafka {
                     {
                         notes.extend(extra);
                     }
+                    let stamp = batch.stamp.filter(|_| stamping);
                     heads.push((
                         batch.topic,
                         batch.topic_id,
@@ -3886,6 +3918,7 @@ impl Kafka {
                         batch.base_timestamp,
                         batch.max_timestamp,
                         batch::leader_epoch(&batch.bytes),
+                        stamp,
                     ));
                     pieces.push(Piece {
                         topic_id: batch.topic_id,
@@ -3895,6 +3928,7 @@ impl Kafka {
                         base_timestamp: batch.base_timestamp,
                         max_timestamp: batch.max_timestamp,
                         bytes: Bytes::from(batch.bytes),
+                        stamp,
                     });
                 }
                 let (index, body) = camus_uploader::encode(&pieces);
@@ -3914,6 +3948,7 @@ impl Kafka {
         let mut parts = Vec::new();
         let mut producers = Vec::new();
         let mut seals = Vec::new();
+        let mut stamped = Vec::new();
         let mut all_put = true;
         for (expected, (slot, key, heads, notes, index, stored)) in done.into_iter().enumerate() {
             if !stored || slot != expected || !all_put {
@@ -3922,10 +3957,18 @@ impl Kafka {
             }
             producers.extend(notes);
             for (
-                (topic, topic_id, partition, start, end, base, max, epoch),
+                (topic, topic_id, partition, start, end, base, max, epoch, stamp),
                 (file_offset, length),
             ) in heads.into_iter().zip(index)
             {
+                stamped.push(BatchStamp {
+                    topic: topic.clone(),
+                    partition,
+                    object_key: key.clone(),
+                    start,
+                    end,
+                    stamp,
+                });
                 parts.push(PublishPart {
                     epoch,
                     topic: topic.clone(),
@@ -3946,7 +3989,9 @@ impl Kafka {
                 });
             }
         }
-        (coalesce(parts), producers, seals, all_put)
+        let parts = coalesce(parts);
+        let stamps = extent_stamps(&parts, &stamped);
+        (parts, producers, seals, stamps, all_put)
     }
 
     /// Upload shard `id` for as long as the broker runs: a pass every upload
@@ -4074,8 +4119,12 @@ impl Kafka {
         let times = crate::metrics::shard_times(id);
         if !upload.is_empty() {
             let started = Instant::now();
-            let span_notes = self.seal_span_notes(&upload);
-            let (parts, producers, seals, all_put) = self.put_objects(upload).await;
+            let mut span_notes = self.seal_span_notes(&upload);
+            let (parts, producers, seals, stamps, all_put) = self.put_objects(upload).await;
+            // After the publish in the same entry, so the extents exist.
+            if !stamps.is_empty() {
+                span_notes.push(Command::StampExtents { stamps });
+            }
             if !all_put {
                 ok = false;
             }
@@ -4134,7 +4183,7 @@ impl Kafka {
     /// flush to drain the buffer, until `deadline`. Returns how long it
     /// waited, or, past the deadline, `Err` with that time and nothing
     /// buffered.
-    async fn enqueue(&self, deadline: Instant, item: Item) -> Result<Duration, Duration> {
+    async fn enqueue(&self, deadline: Instant, mut item: Item) -> Result<Duration, Duration> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = Instant::now();
         let size = item.raw.len();
@@ -4154,7 +4203,13 @@ impl Kafka {
             }
         }
         let waited = started.elapsed();
-        self.buf.lock().await.push(item);
+        {
+            // Stamped under the lock, so stamps follow the buffer order that
+            // offsets are assigned in.
+            let mut buffer = self.buf.lock().await;
+            item.stamp = r2_stamp();
+            buffer.push(item);
+        }
         // A full object goes up now, from the flush task, not this producer.
         if self.buffered.fetch_add(size, Relaxed) + size >= FLUSH_BYTES {
             self.flush_now.notify_one();
@@ -4164,6 +4219,9 @@ impl Kafka {
 
     async fn flush(&self) {
         let _gate = self.flush_lock.lock().await;
+        // Stamps go into objects and extents only while every broker reads
+        // them (ADR 0018, phase 3).
+        let stamping = STAMPED_OBJECTS.load(std::sync::atomic::Ordering::Acquire);
         // At most `FLUSH_BYTES` (at least one item) per object, so a full
         // buffer becomes several bounded puts, not one huge one.
         let items: Vec<Item> = {
@@ -4314,6 +4372,7 @@ impl Kafka {
                 base_timestamp: item.base_timestamp,
                 max_timestamp: item.max_timestamp,
                 bytes: sealed,
+                stamp: item.stamp.filter(|_| stamping),
             });
         }
         let mut span_notes = Vec::new();
@@ -4376,8 +4435,17 @@ impl Kafka {
                     None
                 }
             });
+            let mut stamped = Vec::new();
             for (item, (file_offset, length)) in appended.zip(index) {
                 let start = pieces[parts.len()].start;
+                stamped.push(BatchStamp {
+                    topic: item.topic.clone(),
+                    partition: item.partition,
+                    object_key: object_key.clone(),
+                    start,
+                    end: start + i64::from(item.records),
+                    stamp: item.stamp.filter(|_| stamping),
+                });
                 parts.push(PublishPart {
                     epoch: epochs
                         .get(&(item.topic.clone(), item.partition))
@@ -4394,9 +4462,15 @@ impl Kafka {
                     max_timestamp: item.max_timestamp,
                 });
             }
+            let parts = coalesce(parts);
+            let stamps = extent_stamps(&parts, &stamped);
+            // After the publish in the same entry, so the extents exist.
+            if !stamps.is_empty() {
+                span_notes.push(Command::StampExtents { stamps });
+            }
             let published = tokio::time::timeout(
                 COMMIT_TIMEOUT,
-                self.node.publish_with(coalesce(parts), notes, span_notes),
+                self.node.publish_with(parts, notes, span_notes),
             )
             .await;
             let code = match published {
@@ -5242,6 +5316,72 @@ impl Kafka {
     }
 }
 
+/// Whether every broker reads stamped objects and `StampExtents`, as
+/// `gate_stamps` last found: until it does, objects keep footer version 1
+/// and extents carry no stamps (ADR 0018, phase 3).
+pub static STAMPED_OBJECTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One uploaded batch's clock stamp, by the object it went into.
+struct BatchStamp {
+    topic: String,
+    partition: i32,
+    object_key: String,
+    start: i64,
+    end: i64,
+    stamp: Option<i64>,
+}
+
+/// The stamp range of each coalesced extent: the stamps of the batches in
+/// it, when every one of them was stamped. An extent with an unstamped batch
+/// gets none, so a cut cannot rely on it. A batch belongs to the extent its
+/// start falls in, so even an empty one on a boundary is counted once.
+/// Grouped by partition and object, then a binary search per extent, so the
+/// work grows with the batches, not with batches times extents.
+fn extent_stamps(
+    parts: &[PublishPart],
+    batches: &[BatchStamp],
+) -> Vec<camus_metadata::ExtentStamp> {
+    let mut grouped: BTreeMap<(&str, i32, &str), Vec<&BatchStamp>> = BTreeMap::new();
+    for batch in batches {
+        grouped
+            .entry((&batch.topic, batch.partition, &batch.object_key))
+            .or_default()
+            .push(batch);
+    }
+    for group in grouped.values_mut() {
+        group.sort_by_key(|batch| batch.start);
+    }
+    parts
+        .iter()
+        .filter_map(|part| {
+            let group = grouped.get(&(
+                part.topic.as_str(),
+                part.partition,
+                part.object_key.as_str(),
+            ))?;
+            let first = group.partition_point(|batch| batch.start < part.start);
+            let inside = group
+                .get(first..)?
+                .iter()
+                .take_while(|batch| batch.start < part.end);
+            let stamps = camus_metadata::StampRange::covering(inside.map(|batch| {
+                batch.stamp.map(|stamp| camus_metadata::StampRange {
+                    min: stamp,
+                    max: stamp,
+                })
+            }))?;
+            Some(camus_metadata::ExtentStamp {
+                topic: part.topic.clone(),
+                partition: part.partition,
+                end: part.end,
+                object_key: part.object_key.clone(),
+                stamps,
+            })
+        })
+        .collect()
+}
+
 /// Merge parts that continue one another in the same object into one, so a
 /// partition gets one extent per object rather than one per batch. Each
 /// partition's parts stay in offset order.
@@ -5512,7 +5652,7 @@ mod principal_tests {
 
 #[cfg(test)]
 mod upload_due_tests {
-    use super::upload_due;
+    use super::{extent_stamps, upload_due, BatchStamp, PublishPart};
 
     const OBJECT: usize = 8 * 1024 * 1024;
 
@@ -5534,5 +5674,51 @@ mod upload_due_tests {
             return Err("half an object uploads on the busy timer".into());
         }
         Ok(())
+    }
+
+    fn part(start: i64, end: i64) -> PublishPart {
+        PublishPart {
+            epoch: 0,
+            topic: "orders".into(),
+            partition: 0,
+            start,
+            end,
+            object_key: "bundle/a.seg".into(),
+            file_offset: 0,
+            length: 10,
+            base_timestamp: 0,
+            max_timestamp: 0,
+        }
+    }
+
+    fn batch_stamp(start: i64, end: i64, stamp: Option<i64>) -> BatchStamp {
+        BatchStamp {
+            topic: "orders".into(),
+            partition: 0,
+            object_key: "bundle/a.seg".into(),
+            start,
+            end,
+            stamp,
+        }
+    }
+
+    #[test]
+    fn an_extent_takes_the_range_of_its_batches_stamps() {
+        let batches = [
+            batch_stamp(0, 2, Some(300)),
+            batch_stamp(2, 5, Some(100)),
+            batch_stamp(5, 6, Some(200)),
+            batch_stamp(6, 8, None),
+        ];
+        let stamps = extent_stamps(&[part(0, 6), part(6, 8)], &batches);
+        assert_eq!(
+            stamps.len(),
+            1,
+            "an extent with an unstamped batch gets none"
+        );
+        assert_eq!(
+            (stamps[0].end, stamps[0].stamps),
+            (6, camus_metadata::StampRange { min: 100, max: 300 })
+        );
     }
 }

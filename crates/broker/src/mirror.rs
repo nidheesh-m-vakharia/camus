@@ -846,6 +846,7 @@ async fn publish(
                 base_timestamp: run.base_timestamp,
                 max_timestamp: run.max_timestamp,
                 bytes: window.slice(run.bytes.clone()),
+                stamp: None,
             })
             .collect();
         let (index, body) = camus_uploader::encode(&pieces);

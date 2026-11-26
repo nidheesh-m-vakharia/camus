@@ -158,6 +158,55 @@ pub struct Extent {
     pub base_timestamp: i64,
     /// Last batch timestamp in the range.
     pub max_timestamp: i64,
+    /// The lowest and highest clock stamp of the batches in the range (ADR
+    /// 0018, phase 3), when every batch was stamped. Absent on extents
+    /// written before stamps, or with an unstamped batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamps: Option<StampRange>,
+}
+
+/// The lowest and highest clock stamp in an extent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StampRange {
+    /// Lowest stamp.
+    pub min: i64,
+    /// Highest stamp.
+    pub max: i64,
+}
+
+impl StampRange {
+    /// The range covering every one of `ranges`, or `None` if any is `None`
+    /// or there are none: one unstamped batch makes the whole range unknown.
+    pub fn covering(ranges: impl IntoIterator<Item = Option<StampRange>>) -> Option<StampRange> {
+        let mut covered: Option<StampRange> = None;
+        for range in ranges {
+            let range = range?;
+            covered = Some(match covered {
+                Some(so_far) => StampRange {
+                    min: so_far.min.min(range.min),
+                    max: so_far.max.max(range.max),
+                },
+                None => range,
+            });
+        }
+        covered
+    }
+}
+
+/// Set the stamps of one published extent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtentStamp {
+    /// Topic name.
+    pub topic: String,
+    /// Partition.
+    pub partition: i32,
+    /// The extent's exclusive end offset, which keys it.
+    pub end: i64,
+    /// The object the extent must point at. A stamp for an extent that has
+    /// since been replaced, or never committed, changes nothing.
+    pub object_key: String,
+    /// The extent's stamps.
+    pub stamps: StampRange,
 }
 
 /// Per-partition offset state.
@@ -687,6 +736,7 @@ fn publish_into(
                 length: part.length,
                 base_timestamp: part.base_timestamp,
                 max_timestamp: part.max_timestamp,
+                stamps: None,
             };
             put.push(extent_put(&topic.id, part.partition, &extent)?);
         }
@@ -724,6 +774,47 @@ fn publish_into(
             })
         }
     }
+}
+
+/// Set the stamps of published extents (ADR 0018, phase 3). Each one names
+/// the extent by its end and the object it must point at, so a stamp that
+/// rides behind a rejected publish, or arrives after a compaction replaced
+/// the extent, changes nothing.
+pub fn stamp_extents(
+    get: &dyn Fn(&str) -> Result<Option<String>, String>,
+    stamps: &[ExtentStamp],
+) -> Result<Outcome, String> {
+    let mut put: Vec<(String, String)> = Vec::new();
+    for stamp in stamps {
+        let Some(raw) = get(&topic_key(&stamp.topic))? else {
+            continue;
+        };
+        let topic = parse_topic(&raw)?;
+        let key = extent_key(&topic.id, stamp.partition, stamp.end);
+        // An extent stamped earlier in this same command.
+        let earlier = put
+            .iter()
+            .rev()
+            .find(|(at, _)| *at == key)
+            .map(|(_, raw)| raw.clone());
+        let Some(raw) = earlier.or(get(&key)?) else {
+            continue;
+        };
+        let mut extent: Extent = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+        if extent.key != stamp.object_key {
+            continue;
+        }
+        extent.stamps = Some(stamp.stamps);
+        put.push((
+            key,
+            serde_json::to_string(&extent).map_err(|err| err.to_string())?,
+        ));
+    }
+    Ok(Outcome::Change {
+        put,
+        del: Vec::new(),
+        value: None,
+    })
 }
 
 /// Replace one sealed range with one extent.
@@ -779,6 +870,8 @@ pub fn compact_replace(
             }
         }
     }
+    // A compaction merges batches, so their own stamps are gone; the
+    // replacement keeps the range they covered, when all were stamped.
     let replacement = Extent {
         start: range[0].start,
         end: covered_end,
@@ -787,6 +880,7 @@ pub fn compact_replace(
         length,
         base_timestamp,
         max_timestamp,
+        stamps: StampRange::covering(range.iter().map(|extent| extent.stamps)),
     };
     let mut put = Vec::new();
     let mut del = Vec::new();
@@ -1249,6 +1343,7 @@ mod tests {
                 length: 1,
                 base_timestamp: 0,
                 max_timestamp: 0,
+                stamps: None,
             });
         }
         map.insert(key.clone(), serde_json::to_string(&state).unwrap());
@@ -1298,5 +1393,78 @@ mod tests {
         apply(&mut map, outcome);
         let left: Vec<_> = map.keys().filter(|key| key.starts_with("ext/")).collect();
         assert_eq!(left, vec![&extent_key("topic-10", 0, 1)]);
+    }
+
+    #[test]
+    fn stamps_land_only_on_the_extent_they_name() -> Result<(), String> {
+        let mut map: HashMap<String, String> = HashMap::new();
+        let apply = |map: &mut HashMap<String, String>, outcome: Outcome| match outcome {
+            Outcome::Change { put, del, .. } => {
+                for key in del {
+                    map.remove(&key);
+                }
+                map.extend(put);
+                Ok(())
+            }
+            Outcome::Reject(code) => Err(format!("rejected {code}")),
+        };
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        apply(
+            &mut map,
+            create_topic(&get, "events", "topic-1", 1, "r2", &[])?,
+        )?;
+        let part = PublishPart {
+            epoch: 0,
+            topic: "events".into(),
+            partition: 0,
+            start: 0,
+            end: 10,
+            object_key: "bundle/a.seg".into(),
+            file_offset: 0,
+            length: 10,
+            base_timestamp: 0,
+            max_timestamp: 0,
+        };
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        apply(&mut map, publish(&get, &[part], &[])?)?;
+        let stamp = |end: i64, object_key: &str, min: i64| ExtentStamp {
+            topic: "events".into(),
+            partition: 0,
+            end,
+            object_key: object_key.into(),
+            stamps: StampRange { min, max: min + 5 },
+        };
+        let snapshot = map.clone();
+        let get = |key: &str| Ok(snapshot.get(key).cloned());
+        let stamped = stamp_extents(
+            &get,
+            &[
+                stamp(10, "bundle/other.seg", 1),
+                stamp(20, "bundle/a.seg", 2),
+                stamp(10, "bundle/a.seg", 100),
+            ],
+        )?;
+        apply(&mut map, stamped)?;
+        let raw = map.get(&extent_key("topic-1", 0, 10)).ok_or("no extent")?;
+        let extent: Extent = serde_json::from_str(raw).map_err(|err| err.to_string())?;
+        assert_eq!(extent.stamps, Some(StampRange { min: 100, max: 105 }));
+        assert!(
+            !map.contains_key(&extent_key("topic-1", 0, 20)),
+            "no extent is made"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_covering_range_needs_every_part_stamped() {
+        let range = |min, max| Some(StampRange { min, max });
+        assert_eq!(
+            StampRange::covering([range(5, 9), range(1, 4)]),
+            range(1, 9)
+        );
+        assert_eq!(StampRange::covering([range(5, 9), None]), None);
+        assert_eq!(StampRange::covering(Vec::new()), None);
     }
 }

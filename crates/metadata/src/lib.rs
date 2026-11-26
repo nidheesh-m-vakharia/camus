@@ -27,8 +27,8 @@ pub use acl::{
 pub use admin::{ConfigChange, ConfigEdit, Item, OffsetDrop, PartitionIncrease, RecordCut};
 pub use catalog::{
     extent_key, extent_range, extents_after, parse_partition, parse_topic, partition_storage_key,
-    topic_extent_prefix, topic_index_key, topic_storage_key, EpochStart, Extent, Partition,
-    PublishPart, Scan, Span, Topic, SHARDS,
+    topic_extent_prefix, topic_index_key, topic_storage_key, EpochStart, Extent, ExtentStamp,
+    Partition, PublishPart, Scan, Span, StampRange, Topic, SHARDS,
 };
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{
@@ -412,6 +412,13 @@ pub enum Command {
         group: String,
         /// Offsets to store, on mirror topics.
         offsets: Vec<groups::OffsetCommit>,
+    },
+    /// Set the clock stamps of published extents (ADR 0018, phase 3). Sent
+    /// in the same entry as the publish it follows; a stamp for an extent
+    /// that is not there, or points at another object, changes nothing.
+    StampExtents {
+        /// One per extent.
+        stamps: Vec<catalog::ExtentStamp>,
     },
 }
 
@@ -804,6 +811,31 @@ impl MetadataNode {
 mod command_tests {
     use super::*;
 
+    /// A follower forwards publish notes to the leader as JSON
+    /// (`/admin/publish`), so `StampExtents` has to read back from JSON as
+    /// it was written, with its stamps.
+    #[test]
+    fn stamp_extents_round_trips_through_json() -> Result<(), Box<dyn std::error::Error>> {
+        let command = Command::StampExtents {
+            stamps: vec![ExtentStamp {
+                topic: "t".into(),
+                partition: 2,
+                end: 9,
+                object_key: "o".into(),
+                stamps: StampRange { min: -4, max: 7 },
+            }],
+        };
+        let json = serde_json::to_string(&command)?;
+        let back: Command = serde_json::from_str(&json)?;
+        assert_eq!(serde_json::to_string(&back)?, json);
+        let Command::StampExtents { stamps } = back else {
+            return Err("not StampExtents".into());
+        };
+        let stamp = stamps.first().ok_or("no stamp")?;
+        assert_eq!((stamp.end, stamp.stamps.min, stamp.stamps.max), (9, -4, 7));
+        Ok(())
+    }
+
     /// The Raft log is postcard, which writes a variant's position as its
     /// first byte. Moving a variant would change what logged entries mean.
     #[test]
@@ -881,6 +913,8 @@ mod command_tests {
             offsets: Vec::new(),
         };
         assert_eq!(first(&sync)?, 37);
+        let stamps = Command::StampExtents { stamps: Vec::new() };
+        assert_eq!(first(&stamps)?, 38);
         Ok(())
     }
 }

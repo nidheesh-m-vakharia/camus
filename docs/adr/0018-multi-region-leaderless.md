@@ -1102,3 +1102,58 @@ told to.
     shard stamps. After that broker restarts without the failpoint, the
     shard starts stamping. With the gate ignored, the first check fails.
 
+Step 2, first part, 2026-11-25: stamps in objects and extents.
+
+- Footer version 2 adds the stamp to every entry, as an `i64`, with
+  `i64::MIN` for none. An entry is one WAL append or one `r2` produce, so
+  every batch in it shares a stamp. An object with no stamped piece still
+  gets version 1, byte for byte. `decode_footer` reads both, and refuses
+  any other version.
+- Extents gain `stamps: { min, max }` in their JSON row. It is set only
+  when every batch in the extent was stamped.
+- `StampExtents` (log position 38) sets it. Each entry names the extent
+  by its end and the object it must point at. The command rides in the
+  same Raft entry as its publish, after it. A stamp whose publish was
+  rejected, or whose extent a compaction has since replaced, changes
+  nothing.
+- Compaction merges batches, so their own stamps are gone. A compacted
+  extent keeps the range of the extents it replaced, when all of them
+  were stamped. A cut inside that range cannot place the compacted
+  batches, so promotion refuses that partition at that cut.
+- `r2` produce stamps each item as it joins the leader's buffer, under the
+  buffer lock, and offsets follow the same order. Stamps never fall below
+  the last one this leader took. They are not raised at apply as WAL
+  stamps are, so across a metadata leader change they can dip by up to
+  the two clocks' bounds.
+- Every broker reads objects, through fetch and recovery, and every
+  metadata member applies `StampExtents`. So uploads write stamps only
+  while every metadata member has written
+  `capability/reads-stamped-objects/{node}`. `gate_stamps` sets
+  `STAMPED_OBJECTS` from that, and `camus_stamped_objects` shows it. Until
+  then, objects keep footer version 1 and extents carry no stamps.
+- The capability keys are never removed. Once stamping is on, a broker
+  must not be downgraded to a release that does not read footer version
+  2 or `StampExtents`; one would fail to read new objects and to apply
+  the log. The same holds for a broker that joins later on an older
+  release, since its missing key shuts the gate only after it joins.
+  Upgrade every broker before it joins, as for step 1.
+- Not yet:
+  - A restore from footers (ADR 0008) does not re-stamp extents, though
+    the footers keep the stamps.
+  - The mirror copier copies stamps in step 2's second part, with the
+    frontier reports.
+- `CAMUS_FAILPOINT=assumed-clock` stamps with the system time and an
+  assumed 1 ms bound, for tests on any host.
+- Tests:
+  - Footers: an object without stamps is byte-identical to version 1,
+    version 2 reads back, and an unknown version is refused.
+  - `stamp_extents` stamps only the extent with the named object.
+  - A covering range needs every part stamped.
+  - `extent_stamps` gives the range of a coalesced extent and nothing for
+    one with an unstamped batch.
+  - `StampExtents` reads back from JSON, as a forwarded publish sends it.
+  - A shard with an older member keeps `camus_stamped_objects` at 0.
+  - With MinIO, `uploads_carry_stamps_into_footers_and_extents` produces
+    to a `wal` topic and an `r2` topic. Every extent has a stamp range and
+    every footer entry a stamp. With the gate held shut, it fails.
+

@@ -30,7 +30,19 @@ pub struct Piece {
     pub max_timestamp: i64,
     /// Sealed record batches.
     pub bytes: Bytes,
+    /// The leader's clock stamp for these batches (ADR 0018, phase 3), or
+    /// `None`. An object with any stamp gets a version 2 footer.
+    pub stamp: Option<i64>,
 }
+
+/// Footer version 1: 64 bytes an entry, no stamps.
+const ENTRY_V1: usize = 64;
+/// Footer version 2: version 1's entry, then the stamp as an `i64`, with
+/// [`NO_STAMP`] for none. Written only when some piece has a stamp, so an
+/// object without stamps stays readable by brokers that predate it.
+const ENTRY_V2: usize = ENTRY_V1 + 8;
+/// A version 2 entry with no stamp.
+const NO_STAMP: i64 = i64::MIN;
 
 /// A new write-once object key.
 pub fn object_key() -> String {
@@ -49,9 +61,10 @@ pub fn encode(pieces: &[Piece]) -> (Vec<(u64, u32)>, Bytes) {
         body.extend_from_slice(&piece.bytes);
         index.push((file_offset, length));
     }
+    let stamped = pieces.iter().any(|piece| piece.stamp.is_some());
     let mut footer = BytesMut::new();
     footer.extend_from_slice(MAGIC);
-    footer.put_u16_le(1);
+    footer.put_u16_le(if stamped { 2 } else { 1 });
     footer.put_u32_le(u32::try_from(pieces.len()).expect("piece count fits in u32"));
     for (piece, (file_offset, length)) in pieces.iter().zip(&index) {
         footer.extend_from_slice(&piece.topic_id);
@@ -62,6 +75,9 @@ pub fn encode(pieces: &[Piece]) -> (Vec<(u64, u32)>, Bytes) {
         footer.put_u32_le(*length);
         footer.put_i64_le(piece.base_timestamp);
         footer.put_i64_le(piece.max_timestamp);
+        if stamped {
+            footer.put_i64_le(piece.stamp.unwrap_or(NO_STAMP));
+        }
     }
     let crc = CRC32C.checksum(&footer);
     footer.put_u32_le(crc);
@@ -88,6 +104,8 @@ pub struct FooterEntry {
     pub base_timestamp: i64,
     /// Last timestamp.
     pub max_timestamp: i64,
+    /// The batches' clock stamp, from a version 2 footer.
+    pub stamp: Option<i64>,
 }
 
 /// Read the footer `encode` appends. The last valid footer wins, so batch
@@ -114,11 +132,13 @@ fn footer_at(body: &[u8], at: usize) -> Option<Vec<FooterEntry>> {
         return None;
     }
     let version = u16::from_le_bytes(rest.get(8..10)?.try_into().ok()?);
-    if version != 1 {
-        return None;
-    }
+    let stride = match version {
+        1 => ENTRY_V1,
+        2 => ENTRY_V2,
+        _ => return None,
+    };
     let count = u32::from_le_bytes(rest.get(10..14)?.try_into().ok()?) as usize;
-    let need = 14 + count * 64 + 4;
+    let need = 14 + count.checked_mul(stride)? + 4;
     if rest.len() != need {
         return None;
     }
@@ -129,7 +149,7 @@ fn footer_at(body: &[u8], at: usize) -> Option<Vec<FooterEntry>> {
     }
     let mut entries = Vec::with_capacity(count);
     for index in 0..count {
-        let base = 14 + index * 64;
+        let base = 14 + index * stride;
         let mut topic_id = [0u8; 16];
         topic_id.copy_from_slice(rest.get(base..base + 16)?);
         entries.push(FooterEntry {
@@ -141,6 +161,14 @@ fn footer_at(body: &[u8], at: usize) -> Option<Vec<FooterEntry>> {
             length: u32::from_le_bytes(rest.get(base + 44..base + 48)?.try_into().ok()?),
             base_timestamp: i64::from_le_bytes(rest.get(base + 48..base + 56)?.try_into().ok()?),
             max_timestamp: i64::from_le_bytes(rest.get(base + 56..base + 64)?.try_into().ok()?),
+            stamp: if version == 2 {
+                Some(i64::from_le_bytes(
+                    rest.get(base + 64..base + 72)?.try_into().ok()?,
+                ))
+                .filter(|stamp| *stamp != NO_STAMP)
+            } else {
+                None
+            },
         });
     }
     Some(entries)
@@ -160,6 +188,7 @@ mod tests {
             base_timestamp: 1,
             max_timestamp: 2,
             bytes: Bytes::from_static(b"batch"),
+            stamp: None,
         };
         let (index, body) = encode(&[piece]);
         assert_eq!(index, vec![(0, 5)]);
@@ -175,7 +204,57 @@ mod tests {
                 length: 5,
                 base_timestamp: 1,
                 max_timestamp: 2,
+                stamp: None,
             }]
         );
+    }
+
+    fn piece(start: i64, stamp: Option<i64>) -> Piece {
+        Piece {
+            topic_id: [9; 16],
+            partition: 0,
+            start,
+            end: start + 1,
+            base_timestamp: 1,
+            max_timestamp: 2,
+            bytes: Bytes::from_static(b"batch"),
+            stamp,
+        }
+    }
+
+    #[test]
+    fn a_footer_without_stamps_is_version_one_byte_for_byte() -> Result<(), String> {
+        let (_, body) = encode(&[piece(0, None), piece(1, None)]);
+        let at = body.len() - (14 + 2 * ENTRY_V1 + 4);
+        assert_eq!(body.get(at..at + 8), Some(MAGIC));
+        assert_eq!(body.get(at + 8..at + 10), Some(&1u16.to_le_bytes()[..]));
+        assert!(decode_footer(&body)?
+            .iter()
+            .all(|entry| entry.stamp.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_footer_with_stamps_is_version_two_and_reads_back() -> Result<(), String> {
+        let (_, body) = encode(&[piece(0, Some(1_100)), piece(1, None)]);
+        let at = body.len() - (14 + 2 * ENTRY_V2 + 4);
+        assert_eq!(body.get(at + 8..at + 10), Some(&2u16.to_le_bytes()[..]));
+        let stamps: Vec<Option<i64>> = decode_footer(&body)?
+            .iter()
+            .map(|entry| entry.stamp)
+            .collect();
+        assert_eq!(stamps, [Some(1_100), None]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_footer_version_is_not_read() {
+        let (_, body) = encode(&[piece(0, None)]);
+        let mut body = body.to_vec();
+        let at = body.len() - (14 + ENTRY_V1 + 4);
+        if let Some(version) = body.get_mut(at + 8..at + 10) {
+            version.copy_from_slice(&3u16.to_le_bytes());
+        }
+        assert!(decode_footer(&body).is_err());
     }
 }

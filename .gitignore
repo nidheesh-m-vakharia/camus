@@ -9,3 +9,4 @@ node_modules
 *.log
 crates/broker/tests/ecosystem/confluent_kafka_dotnet/bin/
 crates/broker/tests/ecosystem/confluent_kafka_dotnet/obj/
+__pycache__/

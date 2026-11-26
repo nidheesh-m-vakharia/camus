@@ -441,6 +441,9 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          # HELP camus_wal_stamping_shards WAL shards stamping entries: clock.stamps on and every member reads stamps.\n\
          # TYPE camus_wal_stamping_shards gauge\n\
          camus_wal_stamping_shards {}\n\
+         # HELP camus_stamped_objects 1 while every broker reads stamped objects, so uploads write footer v2 and extent stamps.\n\
+         # TYPE camus_stamped_objects gauge\n\
+         camus_stamped_objects {}\n\
          # HELP camus_wal_stamped_batches_total WAL batches proposed with a clock stamp (ADR 0018 phase 3).\n\
          # TYPE camus_wal_stamped_batches_total counter\n\
          camus_wal_stamped_batches_total {}\n\
@@ -500,6 +503,7 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         kafka::META_SNAPSHOT_INDEX.load(Relaxed),
         kafka::META_SNAPSHOT_AT_MS.load(Relaxed),
         STAMPING_SHARDS.load(Relaxed),
+        u64::from(kafka::STAMPED_OBJECTS.load(Relaxed)),
         camus_wal::STAMPED_BATCHES.load(Relaxed),
         camus_wal::UNSTAMPED_BATCHES.load(Relaxed),
         mirror::COPIED_BYTES.load(Relaxed),
@@ -882,13 +886,29 @@ fn stamp_clock(settings: &settings::Settings) -> Option<Arc<dyn camus_raft::cloc
              camus_wal_unstamped_batches_total counts them"
         );
     }
-    Some(Arc::new(camus_raft::clock::Host))
+    // Test hook: the system time with an assumed 1 ms bound, so tests stamp
+    // on any host.
+    let clock: Arc<dyn camus_raft::clock::Clock> =
+        if std::env::var("CAMUS_FAILPOINT").as_deref() == Ok("assumed-clock") {
+            Arc::new(camus_raft::clock::Assumed { error_us: 1_000 })
+        } else {
+            Arc::new(camus_raft::clock::Host)
+        };
+    // `r2` produce stamps with the same clock.
+    let _ = kafka::R2_CLOCK.set(Arc::clone(&clock));
+    Some(clock)
 }
 
 /// Metadata key a broker writes once it runs a release that reads stamped
 /// WAL entries (ADR 0018, phase 3).
 fn reads_stamps_key(node: NodeId) -> String {
     format!("capability/reads-stamped/{node}")
+}
+
+/// Metadata key a broker writes once it reads footer version 2 and
+/// `StampExtents` (ADR 0018, phase 3).
+fn reads_stamped_objects_key(node: NodeId) -> String {
+    format!("capability/reads-stamped-objects/{node}")
 }
 
 /// Shards whose entries are being stamped, as `gate_stamps` last set them.
@@ -902,19 +922,46 @@ static STAMPING_SHARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// release that only reads stamps never say so, which keeps this closed
 /// until they upgrade.
 async fn gate_stamps(admin: Arc<Admin>) {
-    let mine = reads_stamps_key(admin.node_id);
+    let mine = [
+        reads_stamps_key(admin.node_id),
+        reads_stamped_objects_key(admin.node_id),
+    ];
     let clock_on = admin.settings.is_true("clock.stamps");
+    let has = |key: String| admin.node.read_local(&key).ok().flatten().is_some();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         // Test hook: act as a broker on an older release, which never says it
         // reads stamped entries.
         let older = std::env::var("CAMUS_FAILPOINT").as_deref() == Ok("no-stamp-capability");
-        if !older && admin.node.read_local(&mine).ok().flatten().is_none() {
-            if let Err(err) = metadata_write(&admin, &mine, "1").await {
-                tracing::debug!(%err, "recording that this broker reads stamped entries");
+        if let Some(missing) = mine
+            .iter()
+            .find(|key| !has((*key).clone()))
+            .filter(|_| !older)
+        {
+            if let Err(err) = metadata_write(&admin, missing, "1").await {
+                tracing::debug!(%err, "recording that this broker reads stamps");
             }
             continue;
         }
+        // Objects and extents are read by every broker, through recovery
+        // and fetch, and `StampExtents` by every metadata member: all of
+        // them must say they read stamped objects.
+        let members: Vec<NodeId> = admin
+            .node
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect();
+        let objects = clock_on
+            && !members.is_empty()
+            && members
+                .iter()
+                .all(|member| has(reads_stamped_objects_key(*member)));
+        kafka::STAMPED_OBJECTS.store(objects, std::sync::atomic::Ordering::Release);
         let mut stamping = 0;
         for (_, shard) in admin.wal.all() {
             let members = shard.members();
