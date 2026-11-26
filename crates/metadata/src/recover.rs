@@ -481,6 +481,7 @@ mod tests {
             length: 4,
             base_timestamp: 1,
             max_timestamp: 2,
+            stamps: None,
         };
         rows.push((
             catalog::extent_key("topic-1", 0, 2),

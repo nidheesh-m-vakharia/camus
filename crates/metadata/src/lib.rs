@@ -27,8 +27,8 @@ pub use acl::{
 pub use admin::{ConfigChange, ConfigEdit, Item, OffsetDrop, PartitionIncrease, RecordCut};
 pub use catalog::{
     extent_key, extent_range, extents_after, parse_partition, parse_topic, partition_storage_key,
-    topic_extent_prefix, topic_index_key, topic_storage_key, EpochStart, Extent, Partition,
-    PublishPart, Scan, Span, Topic, SHARDS,
+    topic_extent_prefix, topic_index_key, topic_storage_key, EpochStart, Extent, ExtentStamp,
+    Partition, PublishPart, Scan, Span, StampRange, Topic, SHARDS,
 };
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{
@@ -412,6 +412,13 @@ pub enum Command {
         group: String,
         /// Offsets to store, on mirror topics.
         offsets: Vec<groups::OffsetCommit>,
+    },
+    /// Set the clock stamps of published extents (ADR 0018, phase 3). Sent
+    /// in the same entry as the publish it follows; a stamp for an extent
+    /// that is not there, or points at another object, changes nothing.
+    StampExtents {
+        /// One per extent.
+        stamps: Vec<catalog::ExtentStamp>,
     },
 }
 
@@ -881,6 +888,8 @@ mod command_tests {
             offsets: Vec::new(),
         };
         assert_eq!(first(&sync)?, 37);
+        let stamps = Command::StampExtents { stamps: Vec::new() };
+        assert_eq!(first(&stamps)?, 38);
         Ok(())
     }
 }

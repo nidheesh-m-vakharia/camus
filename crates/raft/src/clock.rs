@@ -73,6 +73,30 @@ fn kernel_error_us() -> Option<i64> {
     None
 }
 
+/// The system time with an error bound taken on trust rather than from the
+/// kernel. For tests only: nothing checks that the bound holds.
+#[derive(Debug, Clone, Copy)]
+pub struct Assumed {
+    /// The error bound to report, in microseconds.
+    pub error_us: i64,
+}
+
+impl Clock for Assumed {
+    fn now(&self) -> Option<Interval> {
+        let now_us = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_micros(),
+        )
+        .ok()?;
+        Some(Interval {
+            earliest_us: now_us.saturating_sub(self.error_us),
+            latest_us: now_us.saturating_add(self.error_us),
+        })
+    }
+}
+
 /// A clock that reads a set interval, for tests, or a host with no clock
 /// at all when `at` is `None`.
 #[derive(Debug, Clone, Copy)]
