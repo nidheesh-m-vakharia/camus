@@ -119,6 +119,13 @@ fn a_shard_with_an_older_member_does_not_stamp() -> TestResult {
         0,
         "an older member keeps the shard unstamped"
     );
+    for node in &nodes {
+        assert_eq!(
+            series(&node.http, "camus_stamped_objects")?,
+            0,
+            "an older member keeps objects unstamped"
+        );
+    }
 
     let older = nodes.get_mut(2).ok_or("three nodes")?;
     older.restart_with(opts(false));

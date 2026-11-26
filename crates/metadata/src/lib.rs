@@ -811,6 +811,31 @@ impl MetadataNode {
 mod command_tests {
     use super::*;
 
+    /// A follower forwards publish notes to the leader as JSON
+    /// (`/admin/publish`), so `StampExtents` has to read back from JSON as
+    /// it was written, with its stamps.
+    #[test]
+    fn stamp_extents_round_trips_through_json() -> Result<(), Box<dyn std::error::Error>> {
+        let command = Command::StampExtents {
+            stamps: vec![ExtentStamp {
+                topic: "t".into(),
+                partition: 2,
+                end: 9,
+                object_key: "o".into(),
+                stamps: StampRange { min: -4, max: 7 },
+            }],
+        };
+        let json = serde_json::to_string(&command)?;
+        let back: Command = serde_json::from_str(&json)?;
+        assert_eq!(serde_json::to_string(&back)?, json);
+        let Command::StampExtents { stamps } = back else {
+            return Err("not StampExtents".into());
+        };
+        let stamp = stamps.first().ok_or("no stamp")?;
+        assert_eq!((stamp.end, stamp.stamps.min, stamp.stamps.max), (9, -4, 7));
+        Ok(())
+    }
+
     /// The Raft log is postcard, which writes a variant's position as its
     /// first byte. Moving a variant would change what logged entries mean.
     #[test]

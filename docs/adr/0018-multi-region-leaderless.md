@@ -1131,6 +1131,12 @@ Step 2, first part, 2026-11-25: stamps in objects and extents.
   `capability/reads-stamped-objects/{node}`. `gate_stamps` sets
   `STAMPED_OBJECTS` from that, and `camus_stamped_objects` shows it. Until
   then, objects keep footer version 1 and extents carry no stamps.
+- The capability keys are never removed. Once stamping is on, a broker
+  must not be downgraded to a release that does not read footer version
+  2 or `StampExtents`; one would fail to read new objects and to apply
+  the log. The same holds for a broker that joins later on an older
+  release, since its missing key shuts the gate only after it joins.
+  Upgrade every broker before it joins, as for step 1.
 - Not yet:
   - A restore from footers (ADR 0008) does not re-stamp extents, though
     the footers keep the stamps.
@@ -1145,6 +1151,8 @@ Step 2, first part, 2026-11-25: stamps in objects and extents.
   - A covering range needs every part stamped.
   - `extent_stamps` gives the range of a coalesced extent and nothing for
     one with an unstamped batch.
+  - `StampExtents` reads back from JSON, as a forwarded publish sends it.
+  - A shard with an older member keeps `camus_stamped_objects` at 0.
   - With MinIO, `uploads_carry_stamps_into_footers_and_extents` produces
     to a `wal` topic and an `r2` topic. Every extent has a stamp range and
     every footer entry a stamp. With the gate held shut, it fails.

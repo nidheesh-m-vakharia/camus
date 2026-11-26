@@ -5316,9 +5316,6 @@ impl Kafka {
     }
 }
 
-/// Merge parts that continue one another in the same object into one, so a
-/// partition gets one extent per object rather than one per batch. Each
-/// partition's parts stay in offset order.
 /// Whether every broker reads stamped objects and `StampExtents`, as
 /// `gate_stamps` last found: until it does, objects keep footer version 1
 /// and extents carry no stamps (ADR 0018, phase 3).
@@ -5337,21 +5334,37 @@ struct BatchStamp {
 
 /// The stamp range of each coalesced extent: the stamps of the batches in
 /// it, when every one of them was stamped. An extent with an unstamped batch
-/// gets none, so a cut cannot rely on it.
+/// gets none, so a cut cannot rely on it. A batch belongs to the extent its
+/// start falls in, so even an empty one on a boundary is counted once.
+/// Grouped by partition and object, then a binary search per extent, so the
+/// work grows with the batches, not with batches times extents.
 fn extent_stamps(
     parts: &[PublishPart],
     batches: &[BatchStamp],
 ) -> Vec<camus_metadata::ExtentStamp> {
+    let mut grouped: BTreeMap<(&str, i32, &str), Vec<&BatchStamp>> = BTreeMap::new();
+    for batch in batches {
+        grouped
+            .entry((&batch.topic, batch.partition, &batch.object_key))
+            .or_default()
+            .push(batch);
+    }
+    for group in grouped.values_mut() {
+        group.sort_by_key(|batch| batch.start);
+    }
     parts
         .iter()
         .filter_map(|part| {
-            let inside = batches.iter().filter(|batch| {
-                batch.topic == part.topic
-                    && batch.partition == part.partition
-                    && batch.object_key == part.object_key
-                    && batch.start >= part.start
-                    && batch.end <= part.end
-            });
+            let group = grouped.get(&(
+                part.topic.as_str(),
+                part.partition,
+                part.object_key.as_str(),
+            ))?;
+            let first = group.partition_point(|batch| batch.start < part.start);
+            let inside = group
+                .get(first..)?
+                .iter()
+                .take_while(|batch| batch.start < part.end);
             let stamps = camus_metadata::StampRange::covering(inside.map(|batch| {
                 batch.stamp.map(|stamp| camus_metadata::StampRange {
                     min: stamp,
@@ -5369,6 +5382,9 @@ fn extent_stamps(
         .collect()
 }
 
+/// Merge parts that continue one another in the same object into one, so a
+/// partition gets one extent per object rather than one per batch. Each
+/// partition's parts stay in offset order.
 fn coalesce(mut parts: Vec<PublishPart>) -> Vec<PublishPart> {
     parts.sort_by(|a, b| (&a.topic, a.partition).cmp(&(&b.topic, b.partition)));
     let mut out: Vec<PublishPart> = Vec::with_capacity(parts.len());
