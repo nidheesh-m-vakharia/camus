@@ -1140,8 +1140,7 @@ Step 2, first part, 2026-11-25: stamps in objects and extents.
 - Not yet:
   - A restore from footers (ADR 0008) does not re-stamp extents, though
     the footers keep the stamps.
-  - The mirror copier carrying stamps comes after the frontier reports,
-    in its own change.
+  - The mirror copier carries stamps since step 2's third part.
 - `CAMUS_FAILPOINT=assumed-clock` stamps with the system time and an
   assumed 1 ms bound, for tests on any host.
 - Tests:
@@ -1233,4 +1232,47 @@ Step 2, second part, 2026-11-25: frontier reports.
   - Nothing tests a leader change with stamped entries in flight, or the
     `r2` term fence. Both need a fault-injected election in the middle
     of a flush.
+
+Step 2, third part, 2026-11-25: the copier carries stamps.
+
+- While the destination's stamped-objects gate is open and a source
+  extent has a stamp range, the copier reads the footer of that
+  extent's object.
+  - It reads the last 1 MiB, at most about 14,500 entries, once per
+    extent, so about one extra GET per source extent per partition.
+  - Partitions copy one at a time, each keeping one decoded footer: about
+    2.3 MiB at peak, with the raw tail live while decoding.
+  - A footer that cannot be read or decoded counts as missing, so stamps
+    never stop the copy.
+  - A batch takes an entry's stamp only when that entry holds both its
+    bytes and its offsets whole. The footer comes from another cluster,
+    and a wrong stamp is worse than none.
+- Each copied batch takes the stamp of the source footer entry its bytes
+  lie in, matched by byte position, topic id, and partition.
+- A copied run, one destination part, is still one extent. Its bytes go
+  into the object as several pieces, split where the stamp changes. So
+  the destination footer keeps each batch's stamp, and metadata gains
+  nothing per batch. Without stamps, a run is one piece, as before.
+- Each mirror extent gets the range of its pieces' stamps. When the
+  footer does not stamp every copied batch, it gets the source extent's
+  range instead, which covers every batch in it. That happens for a
+  compacted source object, whose footer is version 1, or for a footer
+  over 1 MiB.
+  - `StampExtents` rides after `PublishMirror` in one `Batch`, and the
+    publish result decides the round.
+- A mirror's batches carry source stamps. The source's frontier vouches
+  for them, through the destination's `applied_w` in step 3. The
+  destination's own `frontier/*` keys cover only what it takes from its
+  own producers. A mirror of a mirror would therefore need the copier
+  to pass frontiers on, which nothing does yet.
+- Tests:
+  - Each batch takes its footer entry's stamp. Another partition's or
+    another topic's entry, and a gap past every entry, give none.
+  - Runs split into slices where the stamp changes. Across a compaction
+    gap and the extent's tail, the slices cover the run's offsets. With
+    no stamps, a run is one slice.
+  - With MinIO, `a_mirror_carries_the_sources_stamps` runs a stamping
+    source and a stamping destination. Every copied offset sits in a
+    destination piece with its exact source stamp, and every mirror
+    extent's range is the min and max of its offsets' source stamps.
 

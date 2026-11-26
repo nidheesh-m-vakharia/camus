@@ -10,6 +10,19 @@ use support::*;
 fn a_metadata_write_survives_a_kill_before_its_apply_is_durable() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = single(dir.path(), Opts::default());
+    // A broker records what it reads in metadata in its first seconds. Let
+    // those writes land first, so none falls in the second timed below.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while ["reads-stamped", "reads-stamped-objects"]
+        .iter()
+        .any(|what| read_key(&node.http, &format!("capability/{what}/1")).is_none())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "capabilities never recorded"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let (code, offset) = produce(&kafka_addr(&node), "kept");
     assert_eq!(code, 0, "produce");
     // The first write is a second past the last durable commit, so it
