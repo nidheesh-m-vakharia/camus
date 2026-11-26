@@ -231,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tokio::spawn(gate_stamps(Arc::clone(&admin)));
+    tokio::spawn(report_frontiers(Arc::clone(&admin)));
 
     let app = Router::new()
         .route("/health", get(health))
@@ -450,6 +451,9 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
          # HELP camus_wal_unstamped_batches_total WAL batches proposed unstamped on a stamping shard: the clock gave no reading.\n\
          # TYPE camus_wal_unstamped_batches_total counter\n\
          camus_wal_unstamped_batches_total {}\n\
+         # HELP camus_frontier_reports_total Stamp frontiers this broker wrote to metadata, for WAL shards it leads and the r2 buffer.\n\
+         # TYPE camus_frontier_reports_total counter\n\
+         camus_frontier_reports_total {}\n\
          # HELP camus_mirror_copied_bytes_total Batch bytes the mirror copier published into mirror topics.\n\
          # TYPE camus_mirror_copied_bytes_total counter\n\
          camus_mirror_copied_bytes_total {}\n\
@@ -506,6 +510,7 @@ async fn prometheus(State(admin): State<Arc<Admin>>) -> String {
         u64::from(kafka::STAMPED_OBJECTS.load(Relaxed)),
         camus_wal::STAMPED_BATCHES.load(Relaxed),
         camus_wal::UNSTAMPED_BATCHES.load(Relaxed),
+        FRONTIER_REPORTS.load(Relaxed),
         mirror::COPIED_BYTES.load(Relaxed),
         mirror::STALLED.load(Relaxed),
         mirror::WAITING.load(Relaxed),
@@ -978,6 +983,63 @@ async fn gate_stamps(admin: Arc<Admin>) {
             stamping += u64::from(all_read && clock_on);
         }
         STAMPING_SHARDS.store(stamping, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Frontiers this broker has written to metadata.
+static FRONTIER_REPORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Each second, write the stamp frontier of every WAL shard this broker
+/// leads, and of the `r2` buffer while it leads metadata (ADR 0018, phase
+/// 3). Only while stamped objects are on: before that, extents carry no
+/// stamps for a cut to place batches by. A source whose frontier has no
+/// value, for want of a clock reading or for an unstamped batch, writes
+/// nothing, and its last report stays true.
+async fn report_frontiers(admin: Arc<Admin>) {
+    let reported = || FRONTIER_REPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if !kafka::STAMPED_OBJECTS.load(std::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
+        for (id, shard) in admin.wal.all() {
+            if !shard.is_leader() {
+                continue;
+            }
+            // A shard that cannot confirm its leadership in time skips this
+            // report rather than hold the others back.
+            let frontier =
+                tokio::time::timeout(std::time::Duration::from_secs(1), shard.frontier()).await;
+            let Ok(Some(frontier)) = frontier else {
+                continue;
+            };
+            let key = camus_metadata::frontier_key(Some(id));
+            match metadata_write(&admin, &key, &frontier.to_string()).await {
+                Ok(()) => {
+                    reported();
+                }
+                Err(err) => tracing::debug!(shard = id, %err, "reporting a wal frontier"),
+            }
+        }
+        // Written here, never forwarded: only this leader's own log orders
+        // the report after the publishes it vouches for.
+        let leads = admin.node.raft.metrics().borrow().current_leader == Some(admin.node_id);
+        let Some(kafka) = admin.kafka.get().filter(|_| leads) else {
+            continue;
+        };
+        let Some(frontier) = kafka.r2_frontier().await else {
+            continue;
+        };
+        match admin
+            .node
+            .write(camus_metadata::frontier_key(None), frontier.to_string())
+            .await
+        {
+            Ok(_) => {
+                reported();
+            }
+            Err(err) => tracing::debug!(%err, "reporting the r2 frontier"),
+        }
     }
 }
 

@@ -444,6 +444,17 @@ fn names(raw: Option<String>) -> Result<Vec<String>, String> {
 /// shard, as every cluster created before ADR 0014 has.
 pub const SHARDS: &str = "wal/shards";
 
+/// Metadata key of a stamp frontier (ADR 0018, phase 3): WAL shard
+/// `shard`'s, or the `r2` buffer's for `None`. The value is Unix
+/// microseconds in decimal. Every batch that source stamped below it is in
+/// a published extent, so a snapshot holding the key holds those extents.
+pub fn frontier_key(shard: Option<u32>) -> String {
+    match shard {
+        Some(shard) => format!("frontier/wal/{shard}"),
+        None => "frontier/r2".into(),
+    }
+}
+
 /// Metadata key of the next shard to place a partition on.
 const NEXT_SHARD: &str = "wal/next-shard";
 

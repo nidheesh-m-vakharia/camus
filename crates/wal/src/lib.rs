@@ -363,6 +363,52 @@ pub struct Shard {
     /// Whether every member of this shard reads stamped entries. Off until
     /// the owner says so, so a shard fails closed to unstamped entries.
     stamping: Arc<AtomicBool>,
+    /// Stamps of entries proposed and not yet applied here. Shared with the
+    /// commit loop.
+    proposed: Proposals,
+}
+
+/// The stamps of entries the committer has proposed and not yet seen
+/// applied, as a count per stamp, with `None` for an unstamped entry. At
+/// most [`IN_FLIGHT`] entries, since each holds a commit slot. A frontier
+/// reads the clock under this lock, and the committer stamps under it, so
+/// no entry is stamped between a frontier's reading and its count.
+type Proposals = Arc<std::sync::Mutex<BTreeMap<Option<i64>, usize>>>;
+
+/// One entry's place in [`Proposals`], given up once its result is in.
+struct Proposed {
+    proposals: Proposals,
+    stamp: Option<i64>,
+}
+
+impl Proposed {
+    /// Stamp an entry with `read` and count it, in one hold of the lock.
+    fn take(proposals: &Proposals, read: impl FnOnce() -> Option<i64>) -> Self {
+        let mut held = proposals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stamp = read();
+        *held.entry(stamp).or_default() += 1;
+        Self {
+            proposals: Arc::clone(proposals),
+            stamp,
+        }
+    }
+}
+
+impl Drop for Proposed {
+    fn drop(&mut self) {
+        let mut held = self
+            .proposals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = held.get_mut(&self.stamp) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.stamp);
+            }
+        }
+    }
 }
 
 /// One produce batch waiting for the committer. A request's batches for one
@@ -456,6 +502,7 @@ async fn commit_loop(
     mut queue: tokio::sync::mpsc::UnboundedReceiver<Vec<Queued>>,
     clock: Arc<std::sync::OnceLock<Arc<dyn camus_raft::clock::Clock>>>,
     stamping: Arc<AtomicBool>,
+    proposed: Proposals,
 ) {
     // Test hook: the entry is already committed. Holding the ack lets a
     // produce time out and still leave the record in the log.
@@ -513,12 +560,16 @@ async fn commit_loop(
             budgets.push(budget);
         }
         // One reading as the entry is formed, just before it goes to Raft,
-        // so a batch's stamp is no older than its wait in the queue. A
-        // frontier must still count entries proposed and not yet applied.
-        let stamp = clock
-            .get()
-            .filter(|_| stamping.load(Ordering::Acquire))
-            .map(|clock| clock.now().map(|now| now.latest_us));
+        // so a batch's stamp is no older than its wait in the queue. The
+        // entry counts toward the frontier until its result is in.
+        let mut stamp = None;
+        let proposal = Proposed::take(&proposed, || {
+            stamp = clock
+                .get()
+                .filter(|_| stamping.load(Ordering::Acquire))
+                .map(|clock| clock.now().map(|now| now.latest_us));
+            stamp.flatten()
+        });
         if let Some(reading) = &stamp {
             let counter = if reading.is_some() {
                 &STAMPED_BATCHES
@@ -546,6 +597,8 @@ async fn commit_loop(
         let ack_delay = ack_delay;
         tokio::spawn(async move {
             let _slot = slot;
+            // Dropped once the entry is applied here, or has failed.
+            let _proposal = proposal;
             // Dropped once this task has sent every result.
             let _budgets = budgets;
             let failure = |failure: Failure, waiters: Vec<_>| {
@@ -792,12 +845,14 @@ impl Shard {
         let (queue, waiting) = tokio::sync::mpsc::unbounded_channel();
         let clock = Arc::new(std::sync::OnceLock::new());
         let stamping = Arc::new(AtomicBool::new(false));
+        let proposed = Proposals::default();
         tokio::spawn(commit_loop(
             raft.clone(),
             storage_failed.clone(),
             waiting,
             Arc::clone(&clock),
             Arc::clone(&stamping),
+            Arc::clone(&proposed),
         ));
         Ok(Self {
             raft,
@@ -810,6 +865,7 @@ impl Shard {
             _alive: alive,
             clock,
             stamping,
+            proposed,
         })
     }
 
@@ -980,6 +1036,42 @@ impl Shard {
     /// would stop replicating at the first one.
     pub fn set_stamping(&self, on: bool) {
         self.stamping.store(on, Ordering::Release);
+    }
+
+    /// This shard's frontier (ADR 0018, phase 3): a stamp such that every
+    /// batch the shard holds or will take with a lower stamp is sealed, so
+    /// its extent is published. `None` unless this broker leads the shard
+    /// and stamps, or while any unsealed or proposed batch has no stamp.
+    ///
+    /// - Every entry an earlier leader committed is applied here first, so
+    ///   its batches are counted.
+    /// - The frontier is the lowest of the unsealed stamps, the stamps of
+    ///   entries proposed and not yet applied, and the clock's `earliest`
+    ///   now. A batch stamped later takes `latest` of a later time, which
+    ///   is above it.
+    /// - Leadership is confirmed again after the reading, so no later
+    ///   leader can have taken a batch before it.
+    pub async fn frontier(&self) -> Option<i64> {
+        let clock = self.clock.get()?;
+        if !self.stamping.load(Ordering::Acquire) {
+            return None;
+        }
+        self.raft.ensure_linearizable().await.ok()?;
+        let frontier = {
+            let proposed = self
+                .proposed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let earliest = clock.now()?.earliest_us;
+            let bound = match proposed.keys().next() {
+                Some(None) => return None,
+                Some(Some(lowest)) => earliest.min(*lowest),
+                None => earliest,
+            };
+            self.machine.stamp_frontier(bound)?
+        };
+        self.raft.ensure_linearizable().await.ok()?;
+        Some(frontier)
     }
 
     /// Every node in this shard's membership, voters and learners: the
@@ -1777,6 +1869,71 @@ mod tests {
             [None, Some(1_100), Some(1_100), None],
             "stamps survive a restart"
         );
+        Ok(())
+    }
+
+    /// A clock whose interval the test sets, or no reading for `None`.
+    struct Settable(std::sync::Mutex<Option<camus_raft::clock::Interval>>);
+
+    impl camus_raft::clock::Clock for Settable {
+        fn now(&self) -> Option<camus_raft::clock::Interval> {
+            *self.0.lock().ok()?
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_frontier_follows_unsealed_stamps_and_the_clock() -> anyhow::Result<()> {
+        use camus_raft::clock::Interval;
+        let dir = tempfile::tempdir()?;
+        let shard = Shard::open(1, dir.path()).await?;
+        shard.ensure_voter().await?;
+        let append = |value: &'static [u8]| {
+            let shard = &shard;
+            async move {
+                shard
+                    .append(append_of(value))
+                    .await
+                    .map_err(|err| anyhow::anyhow!("append: {err:?}"))
+            }
+        };
+        let clock = Arc::new(Settable(std::sync::Mutex::new(None)));
+        let set = |earliest_us, latest_us| -> anyhow::Result<()> {
+            *clock.0.lock().map_err(|_| anyhow::anyhow!("clock lock"))? = Some(Interval {
+                earliest_us,
+                latest_us,
+            });
+            Ok(())
+        };
+        assert_eq!(shard.frontier().await, None, "no clock");
+
+        // A batch taken before stamping holds the frontier until sealed.
+        append(b"before stamps").await?;
+        shard.stamp_with(clock.clone());
+        shard.set_stamping(true);
+        set(900, 1_000)?;
+        assert_eq!(shard.frontier().await, None, "an unstamped batch");
+        shard
+            .seal(drops_of(&shard.pending(u64::MAX).await?))
+            .await?;
+        assert_eq!(shard.frontier().await, Some(900), "the clock's earliest");
+
+        append(b"stamped").await?;
+        set(1_900, 2_000)?;
+        assert_eq!(
+            shard.frontier().await,
+            Some(1_000),
+            "the unsealed batch's stamp"
+        );
+        shard
+            .seal(drops_of(&shard.pending(u64::MAX).await?))
+            .await?;
+        assert_eq!(shard.frontier().await, Some(1_900));
+
+        *clock.0.lock().map_err(|_| anyhow::anyhow!("clock lock"))? = None;
+        assert_eq!(shard.frontier().await, None, "no reading");
+        set(2_900, 3_000)?;
+        shard.set_stamping(false);
+        assert_eq!(shard.frontier().await, None, "not stamping");
         Ok(())
     }
 

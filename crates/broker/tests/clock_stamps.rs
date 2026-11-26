@@ -140,6 +140,75 @@ fn a_shard_with_an_older_member_does_not_stamp() -> TestResult {
     Ok(())
 }
 
+/// The frontier under `key` on the broker at `http`, once one is written.
+fn frontier(http: &str, key: &str) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    Ok(support::read_key(http, key)
+        .map(|raw| raw.parse::<i64>())
+        .transpose()?)
+}
+
+/// Wait until the frontier under `key` passes `above`, returning it.
+fn frontier_past(http: &str, key: &str, above: i64) -> Result<i64, Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(at) = frontier(http, key)?.filter(|at| *at > above) {
+            return Ok(at);
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("{key} never passed {above}").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Unix microseconds now.
+fn now_us() -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_micros(),
+    )?)
+}
+
+/// A WAL shard's frontier stops below a batch that cannot upload, while the
+/// `r2` frontier, with nothing buffered, follows the clock.
+#[test]
+fn a_frontier_holds_below_an_unsealed_batch() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let node = single(
+        dir.path(),
+        Opts::default()
+            .s3("http://127.0.0.1:9")
+            .env("CAMUS_CLOCK_STAMPS", "true")
+            .env("CAMUS_FAILPOINT", "assumed-clock"),
+    );
+    let wal = camus_metadata::frontier_key(Some(0));
+    let r2 = camus_metadata::frontier_key(None);
+    let started = now_us()?;
+    frontier_past(&node.http, &wal, started)?;
+    frontier_past(&node.http, &r2, started)?;
+
+    let addr = kafka_addr(&node);
+    assert_eq!(produce(&addr, "stuck"), (0, 0));
+    // The assumed bound is 1 ms: the batch's stamp is at most this.
+    let stamped_by = now_us()? + 1_000;
+    let reports = series(&node.http, "camus_frontier_reports_total")?;
+    frontier_past(&node.http, &r2, stamped_by)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while series(&node.http, "camus_frontier_reports_total")? < reports + 4 {
+        if std::time::Instant::now() > deadline {
+            return Err("frontier reports stopped".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let held = frontier(&node.http, &wal)?.ok_or("no wal frontier")?;
+    assert!(
+        held <= stamped_by,
+        "the wal frontier {held} passed the unsealed batch, stamped by {stamped_by}"
+    );
+    Ok(())
+}
+
 /// Produce `value` to `topic` partition 0, returning the error code.
 fn produce_to(addr: &str, topic: &'static str, value: &str) -> i16 {
     use camus_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
@@ -211,6 +280,7 @@ fn uploads_carry_stamps_into_footers_and_extents() -> TestResult {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let mut highest = i64::MIN;
     for topic in [support::TOPIC, "events"] {
         let raw = support::read_key(&node.http, &camus_metadata::topic_storage_key(topic))
             .ok_or("no topic")?;
@@ -229,7 +299,15 @@ fn uploads_carry_stamps_into_footers_and_extents() -> TestResult {
                 footer.iter().all(|entry| entry.stamp.is_some()),
                 "{topic}: every footer entry is stamped"
             );
+            highest = highest.max(stamps.max);
         }
+    }
+    // Every batch is published, so both frontiers move past their stamps.
+    for key in [
+        camus_metadata::frontier_key(Some(0)),
+        camus_metadata::frontier_key(None),
+    ] {
+        frontier_past(&node.http, &key, highest)?;
     }
     Ok(())
 }
