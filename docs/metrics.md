@@ -122,6 +122,7 @@ Histogram buckets are 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms, and
 | `camus_meta_snapshot_unix_ms` | gauge | Unix milliseconds of that snapshot, or 0. |
 | `camus_wal_stamping_shards` | gauge | WAL shards stamping entries: `clock.stamps` is on and every member has recorded that it reads stamps (ADR 0018, phase 3). 0 while an older broker is a member. |
 | `camus_stamped_objects` | gauge | 1 while every metadata member reads stamped objects, so uploads write footer version 2 and extent stamps (ADR 0018, phase 3). |
+| `camus_frontier_reports_total` | counter | Stamp frontiers this broker wrote to metadata: one per second for each WAL shard it leads, and one for the `r2` buffer while it leads metadata, once stamped objects are on (ADR 0018, phase 3). Flat while a source has an unstamped batch or no clock reading. |
 | `camus_wal_stamped_batches_total` | counter | WAL batches proposed with a clock stamp on a stamping shard. A proposal that then fails and is retried counts again. |
 | `camus_wal_unstamped_batches_total` | counter | WAL batches proposed unstamped on a stamping shard, because the clock gave no reading. A source with these cannot be part of a cross-source cut. |
 | `camus_mirror_copied_bytes_total` | counter | Batch bytes the mirror copier published into mirror topics (ADR 0018). |

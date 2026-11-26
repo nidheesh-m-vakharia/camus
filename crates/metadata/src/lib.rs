@@ -26,9 +26,9 @@ pub use acl::{
 };
 pub use admin::{ConfigChange, ConfigEdit, Item, OffsetDrop, PartitionIncrease, RecordCut};
 pub use catalog::{
-    extent_key, extent_range, extents_after, parse_partition, parse_topic, partition_storage_key,
-    topic_extent_prefix, topic_index_key, topic_storage_key, EpochStart, Extent, ExtentStamp,
-    Partition, PublishPart, Scan, Span, StampRange, Topic, SHARDS,
+    extent_key, extent_range, extents_after, frontier_key, parse_partition, parse_topic,
+    partition_storage_key, topic_extent_prefix, topic_index_key, topic_storage_key, EpochStart,
+    Extent, ExtentStamp, Partition, PublishPart, Scan, Span, StampRange, Topic, SHARDS,
 };
 pub use producers::{sequence_key, ProducerNote};
 pub use txn::{

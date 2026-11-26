@@ -1140,8 +1140,8 @@ Step 2, first part, 2026-11-25: stamps in objects and extents.
 - Not yet:
   - A restore from footers (ADR 0008) does not re-stamp extents, though
     the footers keep the stamps.
-  - The mirror copier copies stamps in step 2's second part, with the
-    frontier reports.
+  - The mirror copier carrying stamps comes after the frontier reports,
+    in its own change.
 - `CAMUS_FAILPOINT=assumed-clock` stamps with the system time and an
   assumed 1 ms bound, for tests on any host.
 - Tests:
@@ -1156,4 +1156,81 @@ Step 2, first part, 2026-11-25: stamps in objects and extents.
   - With MinIO, `uploads_carry_stamps_into_footers_and_extents` produces
     to a `wal` topic and an `r2` topic. Every extent has a stamp range and
     every footer entry a stamp. With the gate held shut, it fails.
+
+Step 2, second part, 2026-11-25: frontier reports.
+
+- A frontier is a plain `Put`, not a new `Frontier` command. Every
+  release applies `Put`, so this needs no capability gate. The keys are
+  `frontier/wal/{shard}` and `frontier/r2`, holding Unix microseconds in
+  decimal. `camus_metadata::frontier_key` names them.
+- `report_frontiers` runs each second while stamped objects are on.
+  Before that, extents carry no stamps, so a cut could not use a
+  frontier anyway.
+- WAL shard leader: `Shard::frontier` gives the lowest of three values:
+  - the stamp of each partition's first unsealed batch;
+  - the stamps of entries proposed and not yet applied;
+  - the clock's `earliest` now.
+
+  How it is kept correct:
+  - The committer stamps an entry and records it as proposed in one hold
+    of a lock. The frontier reads the clock under that same lock, so no
+    entry is stamped between the reading and the count. At most
+    `IN_FLIGHT` entries are held.
+  - It calls `ensure_linearizable` before the reading. That waits until
+    every entry from an earlier leader is applied here.
+  - It calls `ensure_linearizable` again after the reading. Any later
+    leader was then elected after the reading, so its batches carry
+    higher stamps.
+  - A report from a deposed leader can still land after a newer one. That
+    is safe: a frontier only claims that batches below it are sealed, and
+    sealed batches stay published, so every report stays true.
+- A batch counts until it is sealed, not just published. That only
+  makes the frontier lower than it could be.
+- `r2`: `Kafka::r2_frontier` takes the flush lock, so no flush is in
+  flight, and then takes the buffer lock. It gives the lowest buffered
+  stamp, or the clock's `earliest`. The metadata leader writes it through
+  its own log, never forwarded. A deposed leader's write therefore cannot
+  commit after a new leader's entries, and a publish proposed earlier,
+  even one that timed out, sits before the report in the log.
+- An `r2` item records the metadata term its broker led in when the item
+  was buffered. A flush publishes a chunk only while the broker still
+  leads in that term. It checks before planning offsets and again right
+  before the publish, after the slow put. Otherwise a broker could lose
+  and regain leadership while holding stamped items, and then publish
+  them below a frontier the leader in between had reported. The flush
+  fails them with `NOT_LEADER_OR_FOLLOWER`, which producers retry. This
+  holds with stamps off too, since offsets planned in an old term are
+  stale anyway.
+- A report never waits on another source:
+  - `r2_frontier` only tries the flush lock, so a slow put skips that
+    tick.
+  - Each shard's frontier has one second to confirm leadership.
+- Known gap. Both the committer and the `r2` flush check leadership
+  before they propose, not as Raft appends the entry. Suppose a
+  proposal waits in openraft's queue on a node while that node loses
+  leadership, another leader reports a frontier, and the node wins
+  again. The entry is then appended in the later term, with a stamp
+  from before that report. That takes two elections while one message
+  sits in the queue. Closing it would need apply itself to check, which
+  changes `StampExtents` and needs a capability gate, so it is left for
+  now.
+- A source with an unstamped unsealed batch, an unstamped buffered item,
+  or no clock reading writes nothing. Its last report stays true, and
+  its `W` stops moving. `camus_wal_unstamped_batches_total` shows why.
+  `camus_frontier_reports_total` counts reports.
+- Tests:
+  - `Heads::stamp_frontier` takes each partition's first stamp, is capped
+    by the bound, and gives none while any head is unstamped.
+  - A shard's frontier follows its clock and its unsealed stamps. It is
+    none while an unstamped batch is unsealed, without a reading, and
+    with stamping off.
+  - `a_frontier_holds_below_an_unsealed_batch`: storage is unreachable.
+    The `r2` frontier follows the clock, and the WAL frontier stays at or
+    below the stamp of the batch that cannot upload. Making the shard
+    ignore its unsealed batches fails this test.
+  - With MinIO, both frontiers pass every extent's stamps once the
+    uploads land.
+  - Nothing tests a leader change with stamped entries in flight, or the
+    `r2` term fence. Both need a fault-injected election in the middle
+    of a flush.
 

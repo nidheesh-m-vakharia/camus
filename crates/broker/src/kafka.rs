@@ -153,6 +153,11 @@ struct Item {
     /// The leader's clock stamp, taken as the item joins the buffer (ADR
     /// 0018, phase 3), when `clock.stamps` is on.
     stamp: Option<i64>,
+    /// The metadata term this broker led in when the item joined the
+    /// buffer, or `None` when it did not lead. Only that term may publish
+    /// the item: another leader may have reported a frontier above its
+    /// stamp in between.
+    term: Option<u64>,
 }
 
 /// The clock `r2` produce stamps with, set at startup when `clock.stamps`
@@ -649,6 +654,20 @@ impl Kafka {
 
     fn leader(&self) -> bool {
         self.node.raft.metrics().borrow().current_leader == Some(self.node_id as u64)
+    }
+
+    /// The metadata term this broker leads in, or `None` when it does not
+    /// lead.
+    fn leading_term(&self) -> Option<u64> {
+        let metrics = self.node.raft.metrics().borrow().clone();
+        (metrics.current_leader == Some(self.node_id as u64)).then_some(metrics.current_term)
+    }
+
+    /// Whether this broker still leads in the term every item joined the
+    /// buffer in.
+    fn leads_since(&self, items: &[Item]) -> bool {
+        let term = self.leading_term();
+        term.is_some() && items.iter().all(|item| item.term == term)
     }
 
     /// The shard serving requests now.
@@ -3739,6 +3758,7 @@ impl Kafka {
                     producer_id: txn.as_ref().map(|(_, id, _)| *id).unwrap_or(-1),
                     producer_epoch: txn.as_ref().map(|(_, _, epoch)| *epoch).unwrap_or(-1),
                     stamp: None,
+                    term: None,
                 },
             )
             .await;
@@ -3966,7 +3986,6 @@ impl Kafka {
                     partition,
                     object_key: key.clone(),
                     start,
-                    end,
                     stamp,
                 });
                 parts.push(PublishPart {
@@ -4208,6 +4227,7 @@ impl Kafka {
             // offsets are assigned in.
             let mut buffer = self.buf.lock().await;
             item.stamp = r2_stamp();
+            item.term = self.leading_term();
             buffer.push(item);
         }
         // A full object goes up now, from the flush task, not this producer.
@@ -4215,6 +4235,32 @@ impl Kafka {
             self.flush_now.notify_one();
         }
         Ok(waited)
+    }
+
+    /// The `r2` frontier (ADR 0018, phase 3): a stamp such that every `r2`
+    /// batch this leader holds or will take with a lower stamp is
+    /// published. `None` without a clock reading, or while a buffered item
+    /// has no stamp.
+    ///
+    /// No flush is in flight while the flush lock is held, so every item
+    /// taken from the buffer has been published or failed. Items are
+    /// stamped under the buffer lock, so none is stamped between the
+    /// reading here and the scan. A later item takes `latest` of a later
+    /// time, which is above the reading's `earliest`.
+    ///
+    /// Only the metadata leader may report it, through its own log: a
+    /// deposed leader's report cannot commit after a new leader takes
+    /// items. A flush publishes only items buffered in the term it leads
+    /// in, so a leader that loses and regains leadership cannot publish
+    /// below a frontier reported in between.
+    pub async fn r2_frontier(&self) -> Option<i64> {
+        let clock = R2_CLOCK.get()?;
+        // A flush can hold this through a slow put: skip the report then.
+        let _gate = self.flush_lock.try_lock().ok()?;
+        let buf = self.buf.lock().await;
+        let earliest = clock.now()?.earliest_us;
+        buf.iter()
+            .try_fold(earliest, |lowest, item| Some(lowest.min(item.stamp?)))
     }
 
     async fn flush(&self) {
@@ -4250,7 +4296,9 @@ impl Kafka {
                 }
             }
         };
-        if !self.leader() {
+        // An item from an earlier term of this leader's may sit below a
+        // frontier another leader reported in between (ADR 0018, phase 3).
+        if !self.leads_since(&items) {
             return fail(items, NOT_LEADER);
         }
         let mut next: BTreeMap<(String, i32), i64> = BTreeMap::new();
@@ -4443,7 +4491,6 @@ impl Kafka {
                     partition: item.partition,
                     object_key: object_key.clone(),
                     start,
-                    end: start + i64::from(item.records),
                     stamp: item.stamp.filter(|_| stamping),
                 });
                 parts.push(PublishPart {
@@ -4467,6 +4514,11 @@ impl Kafka {
             // After the publish in the same entry, so the extents exist.
             if !stamps.is_empty() {
                 span_notes.push(Command::StampExtents { stamps });
+            }
+            // Again after the put, which can take long enough for leadership
+            // to move away and back.
+            if !self.leads_since(&items) {
+                return fail(items, NOT_LEADER);
             }
             let published = tokio::time::timeout(
                 COMMIT_TIMEOUT,
@@ -5328,7 +5380,6 @@ struct BatchStamp {
     partition: i32,
     object_key: String,
     start: i64,
-    end: i64,
     stamp: Option<i64>,
 }
 
@@ -5691,13 +5742,12 @@ mod upload_due_tests {
         }
     }
 
-    fn batch_stamp(start: i64, end: i64, stamp: Option<i64>) -> BatchStamp {
+    fn batch_stamp(start: i64, stamp: Option<i64>) -> BatchStamp {
         BatchStamp {
             topic: "orders".into(),
             partition: 0,
             object_key: "bundle/a.seg".into(),
             start,
-            end,
             stamp,
         }
     }
@@ -5705,10 +5755,10 @@ mod upload_due_tests {
     #[test]
     fn an_extent_takes_the_range_of_its_batches_stamps() {
         let batches = [
-            batch_stamp(0, 2, Some(300)),
-            batch_stamp(2, 5, Some(100)),
-            batch_stamp(5, 6, Some(200)),
-            batch_stamp(6, 8, None),
+            batch_stamp(0, Some(300)),
+            batch_stamp(2, Some(100)),
+            batch_stamp(5, Some(200)),
+            batch_stamp(6, None),
         ];
         let stamps = extent_stamps(&[part(0, 6), part(6, 8)], &batches);
         assert_eq!(

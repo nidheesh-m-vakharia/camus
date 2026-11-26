@@ -134,11 +134,14 @@ struct Heads {
     by_key: BTreeMap<u64, ([u8; 16], i32, i64, u64)>,
     /// Sum of every head's `len`.
     bytes: u64,
+    /// Heads with no stamp.
+    unstamped: usize,
 }
 
 impl Heads {
     fn insert(&mut self, head: Head) {
         self.bytes += head.len;
+        self.unstamped += usize::from(head.stamp.is_none());
         self.by_key.insert(
             head.key(),
             (head.topic_id, head.partition, head.start, unix_ms()),
@@ -157,6 +160,7 @@ impl Heads {
         }
         self.by_key.remove(&head.key());
         self.bytes -= head.len;
+        self.unstamped -= usize::from(head.stamp.is_none());
         Some(head)
     }
 
@@ -171,8 +175,22 @@ impl Heads {
             .and_then(|part| part.get_mut(start))
             .filter(|head| head.key() == key)
         {
+            self.unstamped -= usize::from(head.stamp.is_none());
             head.stamp = Some(stamp);
         }
+    }
+
+    /// See [`Machine::stamp_frontier`].
+    fn stamp_frontier(&self, bound: i64) -> Option<i64> {
+        if self.unstamped > 0 {
+            return None;
+        }
+        Some(
+            self.by_part
+                .values()
+                .filter_map(|part| part.values().next()?.stamp)
+                .fold(bound, i64::min),
+        )
     }
 
     /// Every head, in commit order.
@@ -534,6 +552,14 @@ impl Machine {
             self.state.lock().expect("wal state").dirty.restore(dirty);
         }
         written
+    }
+
+    /// The lowest stamp of any unsealed batch, or `bound` when it is
+    /// lower, and `None` while any unsealed batch has no stamp (ADR 0018,
+    /// phase 3). Apply never lets stamps go back within a partition, so a
+    /// partition's first unsealed batch holds its lowest.
+    pub fn stamp_frontier(&self, bound: i64) -> Option<i64> {
+        self.state.lock().ok()?.heads.stamp_frontier(bound)
     }
 
     pub fn unsealed_bytes(&self) -> u64 {
@@ -1959,6 +1985,37 @@ mod tests {
         let read = decode_snapshot(&before)?;
         assert_eq!(read.next, next);
         assert!(read.stamps.is_empty() && read.stamp_floor.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_frontier_is_the_lowest_unsealed_stamp_until_one_is_missing() -> Result<(), String> {
+        let stamped = |partition, start, log_index, stamp| Head {
+            stamp: Some(stamp),
+            ..head(partition, start, start + 1, log_index, 0)
+        };
+        let mut heads = Heads::default();
+        assert_eq!(heads.stamp_frontier(900), Some(900), "nothing unsealed");
+        heads.insert(stamped(0, 0, 1, 300));
+        heads.insert(stamped(0, 1, 2, 700));
+        heads.insert(stamped(1, 0, 3, 500));
+        assert_eq!(heads.stamp_frontier(900), Some(300));
+        assert_eq!(heads.stamp_frontier(200), Some(200), "the bound is lower");
+        heads
+            .remove([7; 16], 0, 0)
+            .ok_or("sealed the first batch")?;
+        assert_eq!(heads.stamp_frontier(900), Some(500));
+        // A batch with no stamp holds the frontier until it is stamped or
+        // sealed.
+        heads.insert(head(2, 0, 1, 4, 0));
+        assert_eq!(heads.stamp_frontier(900), None);
+        heads.set_stamp(4 << 12, 800);
+        assert_eq!(heads.stamp_frontier(900), Some(500));
+        heads.insert(head(2, 1, 2, 5, 0));
+        heads
+            .remove([7; 16], 2, 1)
+            .ok_or("sealed the unstamped batch")?;
+        assert_eq!(heads.stamp_frontier(900), Some(500));
         Ok(())
     }
 
