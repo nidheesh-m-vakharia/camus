@@ -140,9 +140,21 @@ enum Mirror {
         /// HTTP `host:port`. `CAMUS_HTTP` or `~/.camus/context` when omitted.
         #[arg(long)]
         broker: Option<String>,
-        /// The mirror topic.
-        #[arg(long)]
-        topic: String,
+        /// The mirror topic. Not with `--cut`.
+        #[arg(long, required_unless_present = "cut", conflicts_with = "cut")]
+        topic: Option<String>,
+        /// Promote every mirror topic at one consistent cut, in Unix
+        /// microseconds: each partition keeps what its source stamped at or
+        /// before it (ADR 0018, phase 3). Needs `--all`.
+        #[arg(long, requires = "all")]
+        cut: Option<i64>,
+        /// Every mirror topic, from every source. Only with `--cut`.
+        #[arg(long, default_value_t = false, requires = "cut")]
+        all: bool,
+        /// Cut even where one producer's transaction may fall on both sides
+        /// of the cut, which can keep half of it. Only with `--cut`.
+        #[arg(long, default_value_t = false, requires = "cut")]
+        split_transactions: bool,
         /// Required: unsealed source records are lost to this cluster.
         #[arg(long, default_value_t = false)]
         i_accept_data_loss: bool,
@@ -376,8 +388,35 @@ fn main() -> anyhow::Result<()> {
         }
         Top::Admin(Admin::Mirror(Mirror::Promote {
             broker,
-            topic,
+            cut: Some(cut),
             i_accept_data_loss,
+            split_transactions,
+            ..
+        })) => {
+            confirm(
+                i_accept_data_loss,
+                "promote",
+                "a cut drops what each mirror holds past it, and records the sources acked \
+                 and had not sealed are not on this cluster.",
+            )?;
+            let broker = broker_addr(broker)?;
+            let body = serde_json::json!({
+                "cut": cut,
+                "i_accept_data_loss": true,
+                "split_transactions": split_transactions,
+            });
+            let (status, text) = post(&broker, "/admin/mirror/cut", &body)?;
+            if !status.is_success() {
+                eprintln!("{broker} refused ({status}): {text}");
+                std::process::exit(1);
+            }
+            println!("{text}");
+        }
+        Top::Admin(Admin::Mirror(Mirror::Promote {
+            broker,
+            topic: Some(topic),
+            i_accept_data_loss,
+            ..
         })) => {
             confirm(
                 i_accept_data_loss,
@@ -393,6 +432,14 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             println!("promoted {topic}");
+        }
+        Top::Admin(Admin::Mirror(Mirror::Promote {
+            topic: None,
+            cut: None,
+            ..
+        })) => {
+            eprintln!("pass --topic, or --cut with --all");
+            std::process::exit(2);
         }
         Top::Admin(Admin::Mirror(Mirror::ForkCheck { broker, topic })) => {
             let broker = broker_addr(broker)?;

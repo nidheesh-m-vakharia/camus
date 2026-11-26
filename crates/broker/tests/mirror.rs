@@ -1581,3 +1581,221 @@ fn a_mirror_carries_the_sources_stamps() -> TestResult {
     );
     Ok(())
 }
+
+/// Produce `value` to partition 0 of `topic`: `(error code, base offset)`.
+fn produce_named(addr: &str, topic: &'static str, value: &str) -> (i16, i64) {
+    let mut stream = connect(addr);
+    let mut data = TopicProduceData::default();
+    data.name = TopicName(StrBytes::from_static_str(topic));
+    data.partition_data = vec![PartitionProduceData::default()
+        .with_index(0)
+        .with_records(Some(batch(value)))];
+    send(
+        &mut stream,
+        ApiKey::Produce,
+        9,
+        &ProduceRequest::default()
+            .with_acks(-1)
+            .with_timeout_ms(5_000)
+            .with_topic_data(vec![data]),
+    );
+    let response = recv::<ProduceResponse>(&mut stream, 9);
+    let partition = &response.responses[0].partition_responses[0];
+    (partition.error_code, partition.base_offset)
+}
+
+/// Unix microseconds now.
+fn now_us() -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_micros(),
+    )?)
+}
+
+/// `topic`'s id and partition 0's next offset on `http`.
+fn next_offset(http: &str, topic: &str) -> Result<(String, i64), Box<dyn std::error::Error>> {
+    let raw =
+        support::read_key(http, &camus_metadata::topic_storage_key(topic)).ok_or("no topic")?;
+    let id = camus_metadata::parse_topic(&raw)?.id;
+    let raw = support::read_key(http, &camus_metadata::partition_storage_key(&id, 0))
+        .ok_or("no partition")?;
+    Ok((id, camus_metadata::parse_partition(&raw)?.next_offset))
+}
+
+/// The phase 3 acceptance test (ADR 0018): two sources, one destination.
+/// Records go to the sources in a known real-time order. A cut between two
+/// of them keeps, in both mirrors at once, exactly the records produced
+/// before it, and promotes both.
+#[test]
+fn a_cut_keeps_exactly_what_came_before_it_across_sources() -> TestResult {
+    if std::env::var("CAMUS_MINIO").ok().as_deref() != Some("1") {
+        support::skipped("mirror cut test; set CAMUS_MINIO=1");
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let stamps = [
+        ("CAMUS_CLOCK_STAMPS", "true"),
+        ("CAMUS_FAILPOINT", "assumed-clock"),
+    ];
+    let prefixes = [format!("cut-a-{pid}/"), format!("cut-b-{pid}/")];
+    let dirs = [tempfile::tempdir()?, tempfile::tempdir()?];
+    // Source A checks for uploads every three seconds and holds a small
+    // one three seconds from its first batch, so its three records, within
+    // about half a second, share one object and extent, and the cut
+    // falls inside it: the mirror's extent keeps a front read from its
+    // footer. Source B's land one per extent.
+    let a = spawn_under(
+        dirs[0].path(),
+        &prefixes[0],
+        &[
+            stamps[0],
+            stamps[1],
+            ("CAMUS_FLUSH_MS", "3000"),
+            ("CAMUS_QUIET_FLUSH_MS", "3000"),
+        ],
+    );
+    let b = spawn_under(dirs[1].path(), &prefixes[1], &stamps);
+    support::create_topic_named(&kafka_addr(&b), "events", "wal", 1);
+    for source in [&a, &b] {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while series(&source.http, "camus_stamped_objects")? == 0
+            || series(&source.http, "camus_wal_stamping_shards")? == 0
+        {
+            if std::time::Instant::now() > deadline {
+                return Err("a source never started stamping".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    let gap = || std::thread::sleep(std::time::Duration::from_millis(100));
+    let (a_addr, b_addr) = (kafka_addr(&a), kafka_addr(&b));
+    assert_eq!(produce_named(&a_addr, support::TOPIC, "a0"), (0, 0));
+    gap();
+    assert_eq!(produce_named(&b_addr, "events", "b0"), (0, 0));
+    gap();
+    assert_eq!(produce_named(&a_addr, support::TOPIC, "a1"), (0, 1));
+    gap();
+    // Every stamp so far is at most its append's time plus the 1 ms bound,
+    // and every later one at least its own append's time.
+    let cut = now_us()? + 2_000;
+    gap();
+    assert_eq!(produce_named(&b_addr, "events", "b1"), (0, 1));
+    gap();
+    assert_eq!(produce_named(&a_addr, support::TOPIC, "a2"), (0, 2));
+    support::wait_sealed(&a.http, 3);
+
+    let dest_dir = tempfile::tempdir()?;
+    let dest = support::Node::with(
+        1,
+        dest_dir.path(),
+        Opts::default()
+            .env("CAMUS_S3_PREFIX", &format!("cut-dst-{pid}/"))
+            .env("CAMUS_CLOCK_STAMPS", "true")
+            .env("CAMUS_FAILPOINT", "assumed-clock")
+            .env("CAMUS_MIRROR_COPY_MS", "200")
+            .env("CAMUS_MIRROR_US_EAST_ACCESS_KEY", "camus")
+            .env("CAMUS_MIRROR_US_EAST_SECRET_KEY", "camus-dev-secret")
+            .env("CAMUS_MIRROR_EU_WEST_ACCESS_KEY", "camus")
+            .env("CAMUS_MIRROR_EU_WEST_SECRET_KEY", "camus-dev-secret"),
+    );
+    support::init(std::slice::from_ref(&dest), &[1]);
+    support::wait_settled(&[&dest]);
+    // Copies carry stamps, and cuts apply, once this broker says it can.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while series(&dest.http, "camus_stamped_objects")? == 0
+        || support::read_key(&dest.http, "capability/applies-mirror-cuts/1").is_none()
+    {
+        if std::time::Instant::now() > deadline {
+            return Err("the destination never took stamps or cuts".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let client = reqwest::blocking::Client::new();
+    for ((alias, prefix), topic) in ["us-east", "eu-west"]
+        .into_iter()
+        .zip(&prefixes)
+        .zip([support::TOPIC, "events"])
+    {
+        let link = MirrorLink {
+            alias: alias.into(),
+            endpoint: "http://127.0.0.1:9100".into(),
+            region: "us-east-1".into(),
+            bucket: "camus".into(),
+            prefix: prefix.clone(),
+            virtual_host: false,
+        };
+        until_ok(|| {
+            client
+                .post(format!("http://{}/admin/mirror/links", dest.http))
+                .json(&link)
+                .send()
+        })?;
+        until_ok(|| {
+            client
+                .post(format!("http://{}/admin/mirror/topics", dest.http))
+                .json(&serde_json::json!({ "alias": alias, "topic": topic }))
+                .send()
+        })?;
+    }
+    // Both mirrors hold everything, and are copied past the cut.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let mut ready = true;
+        for (topic, end) in [(support::TOPIC, 3), ("events", 2)] {
+            let (id, next) = next_offset(&dest.http, topic)?;
+            let applied = support::read_key(&dest.http, &camus_metadata::mirror::applied_key(&id))
+                .map(|raw| raw.parse::<i64>())
+                .transpose()?;
+            ready &= next == end && applied.is_some_and(|applied| applied > cut);
+        }
+        if ready {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("the mirrors never caught up past the cut".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    let post_cut = |at: i64| {
+        client
+            .post(format!("http://{}/admin/mirror/cut", dest.http))
+            .json(&serde_json::json!({ "cut": at, "i_accept_data_loss": true }))
+            .send()
+    };
+    // Past what the mirrors are copied to: refused, and nothing changes.
+    let refused = post_cut(now_us()? + 60_000_000)?;
+    assert_eq!(
+        refused.status(),
+        StatusCode::CONFLICT,
+        "{}",
+        refused.text()?
+    );
+    assert_eq!(next_offset(&dest.http, support::TOPIC)?.1, 3);
+
+    let done = post_cut(cut)?;
+    assert_eq!(done.status(), StatusCode::OK, "{}", done.text()?);
+    assert_eq!(
+        next_offset(&dest.http, support::TOPIC)?.1,
+        2,
+        "a0 and a1 came before the cut, a2 after"
+    );
+    assert_eq!(
+        next_offset(&dest.http, "events")?.1,
+        1,
+        "b0 came before the cut, b1 after"
+    );
+    let dest_addr = kafka_addr(&dest);
+    assert_eq!(
+        support::read_all(&dest_addr, 2),
+        vec!["a0".to_string(), "a1".to_string()]
+    );
+    let (id, _) = next_offset(&dest.http, support::TOPIC)?;
+    let extents = support::scan_keys(&dest.http, &format!("ext/{id}/"));
+    assert_eq!(extents.len(), 1, "one extent, cut inside: {extents:?}");
+    // Both are promoted: writable, at the offsets after the cut.
+    assert_eq!(produce_named(&dest_addr, support::TOPIC, "here"), (0, 2));
+    assert_eq!(produce_named(&dest_addr, "events", "here"), (0, 1));
+    Ok(())
+}

@@ -267,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/admin/mirror/reset", post(reset_mirror_partition))
                 .route("/admin/mirror/groups", post(set_mirror_groups))
                 .route("/admin/mirror/promote", post(promote_mirror))
+                .route("/admin/mirror/cut", post(cut_mirrors))
                 .route("/admin/mirror/fork-check", get(fork_check))
                 .route("/wal/{shard}/hand-over", post(shard_hand_over))
                 .route("/wal/{shard}/end-offset", post(shard_end_offset))
@@ -928,6 +929,12 @@ fn reads_stamped_objects_key(node: NodeId) -> String {
     format!("capability/reads-stamped-objects/{node}")
 }
 
+/// Metadata key a broker writes once it applies `CutMirrors` (ADR 0018,
+/// phase 3). A cut is refused until every metadata member has it.
+fn applies_cuts_key(node: NodeId) -> String {
+    format!("capability/applies-mirror-cuts/{node}")
+}
+
 /// Shards whose entries are being stamped, as `gate_stamps` last set them.
 static STAMPING_SHARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -942,6 +949,7 @@ async fn gate_stamps(admin: Arc<Admin>) {
     let mine = [
         reads_stamps_key(admin.node_id),
         reads_stamped_objects_key(admin.node_id),
+        applies_cuts_key(admin.node_id),
     ];
     let clock_on = admin.settings.is_true("clock.stamps");
     let has = |key: String| admin.node.read_local(&key).ok().flatten().is_some();
@@ -950,13 +958,15 @@ async fn gate_stamps(admin: Arc<Admin>) {
         // Test hook: act as a broker on an older release, which never says it
         // reads stamped entries.
         let older = std::env::var("CAMUS_FAILPOINT").as_deref() == Ok("no-stamp-capability");
-        if let Some(missing) = mine
+        let missing: Vec<&String> = mine
             .iter()
-            .find(|key| !has((*key).clone()))
-            .filter(|_| !older)
-        {
-            if let Err(err) = metadata_write(&admin, missing, "1").await {
-                tracing::debug!(%err, "recording that this broker reads stamps");
+            .filter(|key| !older && !has((*key).clone()))
+            .collect();
+        if !missing.is_empty() {
+            for key in missing {
+                if let Err(err) = metadata_write(&admin, key, "1").await {
+                    tracing::debug!(%err, key, "recording what this broker reads");
+                }
             }
             continue;
         }
@@ -1899,6 +1909,96 @@ async fn promote_mirror(
         code => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{what}: error code {code}"),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct MirrorCutBody {
+    /// The cut, in Unix microseconds.
+    cut: i64,
+    #[serde(default)]
+    i_accept_data_loss: bool,
+    /// Cut even where a transaction may fall on both sides.
+    #[serde(default)]
+    split_transactions: bool,
+}
+
+/// Promote every mirror topic at one consistent cut (ADR 0018, phase 3):
+/// each partition keeps the batches its source stamped at or below `cut`,
+/// across every source. Refused unless every mirror is copied past the cut
+/// and every batch that could be at or below it is stamped, and until
+/// every metadata member applies cuts.
+async fn cut_mirrors(
+    State(admin): State<Arc<Admin>>,
+    Json(body): Json<MirrorCutBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !body.i_accept_data_loss {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a cut drops what each mirror holds past it; pass i_accept_data_loss".into(),
+        ));
+    }
+    let members: Vec<NodeId> = admin
+        .node
+        .raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .nodes()
+        .map(|(id, _)| *id)
+        .collect();
+    let missing: Vec<NodeId> = members
+        .into_iter()
+        .filter(|member| {
+            admin
+                .node
+                .read_local(&applies_cuts_key(*member))
+                .ok()
+                .flatten()
+                .is_none()
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("metadata members {missing:?} do not apply cuts yet; upgrade them first"),
+        ));
+    }
+    let kafka = admin
+        .kafka
+        .get()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "not serving yet".into()))?;
+    let planned = mirror::plan_cut(
+        &admin.node,
+        kafka.bucket(),
+        body.cut,
+        body.split_transactions,
+    )
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, format!("{err:#}")))?;
+    let cuts = planned.map_err(|why| (StatusCode::CONFLICT, why))?;
+    let report: Vec<serde_json::Value> = cuts
+        .iter()
+        .map(|cut| {
+            serde_json::json!({
+                "topic": cut.topic,
+                "partition": cut.partition,
+                "end": cut.end,
+            })
+        })
+        .collect();
+    let response = metadata_apply(&admin, Command::CutMirrors { cuts, all: true })
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    match response.error_code {
+        0 => Ok(Json(
+            serde_json::json!({ "cut": body.cut, "partitions": report }),
+        )),
+        code => Err((
+            StatusCode::CONFLICT,
+            format!("the cut changed under the plan (code {code}); try again"),
         )),
     }
 }

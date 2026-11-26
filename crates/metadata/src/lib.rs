@@ -420,6 +420,16 @@ pub enum Command {
         /// One per extent.
         stamps: Vec<catalog::ExtentStamp>,
     },
+    /// Cut mirror partitions at one consistent point and promote their
+    /// topics, all or none (ADR 0018, phase 3). Every partition of each
+    /// named topic has one cut. Applied only once every metadata member
+    /// has said it applies cuts.
+    CutMirrors {
+        /// One per partition.
+        cuts: Vec<mirror::MirrorCut>,
+        /// The cuts cover every mirror topic: refused if one is missing.
+        all: bool,
+    },
 }
 
 /// State-machine response for [`Command`].
@@ -915,6 +925,11 @@ mod command_tests {
         assert_eq!(first(&sync)?, 37);
         let stamps = Command::StampExtents { stamps: Vec::new() };
         assert_eq!(first(&stamps)?, 38);
+        let cuts = Command::CutMirrors {
+            cuts: Vec::new(),
+            all: true,
+        };
+        assert_eq!(first(&cuts)?, 39);
         Ok(())
     }
 }
