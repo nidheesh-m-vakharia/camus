@@ -652,6 +652,11 @@ impl Kafka {
         }
     }
 
+    /// This cluster's bucket.
+    pub fn bucket(&self) -> &Bucket {
+        &self.bucket
+    }
+
     fn leader(&self) -> bool {
         self.node.raft.metrics().borrow().current_leader == Some(self.node_id as u64)
     }

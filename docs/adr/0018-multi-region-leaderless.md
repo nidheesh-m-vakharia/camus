@@ -1312,3 +1312,106 @@ Step 3, first part, 2026-11-25: applied watermarks.
   the mirror's watermark to pass every copied stamp, and for the metric
   to show it.
 
+Step 3, second part, 2026-11-25: the cut.
+
+- `camus admin mirror promote --cut c --all` posts to
+  `/admin/mirror/cut`. Every mirror topic, from every source, keeps
+  exactly the batches stamped at or below `c`, and all of them are
+  promoted in one metadata entry.
+- One command, `CutMirrors` (log position 39), replaces the planned
+  `TruncateMirror` plus a separate promotion. A `Batch` is not atomic,
+  and a separate promotion would leave a moment where producers could
+  write past a cut not yet made, or a copier could copy past one already
+  made. The command:
+  - checks every cut first, so it applies all or none;
+  - cuts each partition;
+  - promotes each topic as phase 2 does, reading the cut rows.
+
+  It refuses unless every partition of each named topic has exactly one
+  cut. Each cut names its topic's id as well as its name, so a topic
+  deleted and made again since the plan is refused. With `all`, a mirror
+  created since the plan is refused too, rather than left uncut.
+- Applying a cut to a partition:
+  - extents that start at or after it are dropped;
+  - the extent it falls inside keeps the front the broker names, by its
+    old end and object key, with the kept byte length, latest timestamp
+    and stamp range; if that extent has changed, the whole command is
+    refused. An empty front is dropped, not kept as a row;
+  - at most 65,536 extents are dropped per cut, over every partition,
+    since every voter holds them in one apply. The planner checks this
+    first, and a cut further behind its mirrors is refused;
+  - leader epochs that start at or after it are dropped. The highest of
+    them stays as an empty range at the cut, so promotion's new epoch is
+    above every epoch the partition had. A client that read under a
+    dropped epoch learns from `OffsetForLeaderEpoch` that it ends at the
+    cut, and truncates;
+  - the offsets of the groups the link syncs come back to the cut when
+    they are past it. Without that, a group would skip what producers
+    write there after promotion. Offsets other groups committed on a
+    mirror are not changed: they are keyed by group, and only the synced
+    list is bounded;
+  - a transaction it falls inside had not ended by the cut, so its kept
+    batches become an aborted span. That includes one the source later
+    committed, because the commit came after the cut.
+- Transactions: a span's end is just past its last data batch, and
+  Camus keeps no commit time. So a transaction whose batches fall on
+  both sides of the cut, in different partitions, looks the same as two
+  transactions of one producer.
+  - The cut would keep the half below and drop the half above.
+  - The planner therefore refuses any cut where one producer has a
+    committed span the cut drops in one partition and one it keeps in
+    another. `--split-transactions` (`split_transactions`) accepts that
+    risk.
+  - A producer that writes several partitions in transactions all the
+    time will need it, or a cut where it was idle.
+  - Recording commit stamps would remove this. It is not built.
+- It is new apply logic, so it is gated. Each broker writes
+  `capability/applies-mirror-cuts/{node}`, and a cut is refused with
+  409 until every metadata member has. Each tick, `gate_stamps` now
+  writes all of a broker's missing capability keys, not one.
+- The broker plans the cut from its applied state:
+  - It refuses unless every mirror's applied watermark is above `c`.
+    Then every batch stamped at or below `c` was here when that
+    watermark was recorded, so a broker whose state lags plans from no
+    less than it needs.
+  - Stamps never go back within a partition, so each partition keeps a
+    prefix. It walks extents in offset order:
+    - an extent whose range is at or below `c` stays;
+    - the first extent whose range starts above `c` is dropped, with
+      everything after it;
+    - for an extent whose range spans `c`, it reads that extent's object
+      footer and cuts at the first piece stamped above `c`.
+  - An unstamped extent or piece before that point refuses the whole
+    cut, because it cannot be placed. So does a footer that does not
+    cover the extent. A mirror copied before stamps were on therefore
+    cannot be cut until retention removes that data.
+  - The planning reads the extents in pages of 1024, and one footer.
+- The cut is ordered by source stamps, compared across sources. The `2ε`
+  window and the `r2` dip from step 2 bound how close two records can be
+  in time and still be ordered.
+- Tests:
+  - `mirror::cut`:
+    - truncates, and shortens the extent the cut falls in;
+    - keeps a committed span below the cut, turns one across it into an
+      aborted span, and drops spans past it;
+    - ends the dropped epoch at the cut, with the new epoch above it;
+    - brings a synced group's offset back to the cut;
+    - promotes.
+
+    Each of these is refused and changes nothing: a missing partition, a
+    cut past the end, a front naming another extent, a missing front, a
+    stale topic id, a mirror left out of an `all` cut, and a second cut
+    of a promoted topic.
+  - The acceptance test, with MinIO,
+    `a_cut_keeps_exactly_what_came_before_it_across_sources`, uses two
+    sources and one destination, all on the test clock (system time
+    with an assumed 1 ms bound). Records go `a0`, `b0`, `a1`, cut, `b1`,
+    `a2`, 100 ms apart.
+    - A cut past the copied watermark is refused and changes nothing.
+    - The real cut leaves `orders` at `a0`, `a1` and `events` at `b0`.
+    - Source A checks for uploads, and holds small ones, for three
+      seconds, so its records share one extent and its cut is inside
+      an extent, read from the footer. The test asserts the single
+      extent. Source B's are dropped whole.
+    - Both topics are then writable at the offsets after the cut.
+

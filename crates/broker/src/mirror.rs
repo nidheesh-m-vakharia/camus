@@ -511,6 +511,258 @@ async fn copy_round(
     Ok((stalled, waiting))
 }
 
+/// Extents a cut plan reads at a time.
+const CUT_PAGE: usize = 1024;
+
+/// Plan one consistent cut of every mirror topic at the stamp `at` (ADR
+/// 0018, phase 3): each partition keeps its batches stamped at or below
+/// `at`. `Err` inside says why the cut cannot be made:
+///
+/// - a mirror's applied watermark is not past `at`, so batches stamped at
+///   or below it may not be here yet;
+/// - a batch that could be at or below `at` has no stamp, so it cannot be
+///   placed.
+///
+/// Reads this broker's applied state. One that lags plans from less of
+/// the mirror, which the watermark check covers: every batch stamped at
+/// or below `at` was here when the watermark it read was recorded.
+pub async fn plan_cut(
+    node: &camus_metadata::MetadataNode,
+    dest: &Bucket,
+    at: i64,
+    split_transactions: bool,
+) -> anyhow::Result<Result<Vec<camus_metadata::mirror::MirrorCut>, String>> {
+    let mut mirrors = Vec::new();
+    for (_, raw) in node.scan_local("topic/")? {
+        let topic = camus_metadata::parse_topic(&raw).map_err(|err| anyhow::anyhow!(err))?;
+        if topic.mirror_of.is_some() {
+            mirrors.push(topic);
+        }
+    }
+    if mirrors.is_empty() {
+        return Ok(Err("there are no mirror topics".into()));
+    }
+    let mut cuts = Vec::new();
+    for topic in &mirrors {
+        match applied(node, topic)? {
+            Some(watermark) if at < watermark => {}
+            held => {
+                return Ok(Err(format!(
+                    "{}: copied only below {held:?}, not past the cut {at}",
+                    topic.name
+                )))
+            }
+        }
+        for partition in 0..topic.partitions {
+            match partition_cut(node, dest, topic, partition, at).await? {
+                Ok(cut) => cuts.push(cut),
+                Err(why) => return Ok(Err(format!("{} partition {partition}: {why}", topic.name))),
+            }
+        }
+    }
+    // The apply refuses a cut that drops more than this; say so first.
+    let cap = camus_metadata::mirror::MAX_CUT_EXTENTS;
+    let mut dropping = 0;
+    for cut in &cuts {
+        let (from, to) = camus_metadata::extent_range(&cut.topic_id, cut.partition, cut.end);
+        dropping += node.scan_range_local(&from, &to, cap + 1)?.len();
+        if dropping > cap {
+            return Ok(Err(format!(
+                "the cut drops more than {cap} extents; it is too far behind the mirrors"
+            )));
+        }
+    }
+    if !split_transactions {
+        if let Some(why) = split_transaction(node, &cuts)? {
+            return Ok(Err(why));
+        }
+    }
+    Ok(Ok(cuts))
+}
+
+/// Why the cut may split a transaction, if it may. Camus keeps no commit
+/// time, so a transaction whose batches fall on both sides of the cut
+/// cannot be told apart from two transactions of one producer. A producer
+/// with a committed span the cut drops in one partition and one it keeps in
+/// another may lose half a transaction; the caller can accept that.
+fn split_transaction(
+    node: &camus_metadata::MetadataNode,
+    cuts: &[camus_metadata::mirror::MirrorCut],
+) -> anyhow::Result<Option<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut kept: BTreeMap<i64, BTreeSet<(&str, i32)>> = BTreeMap::new();
+    let mut dropped: BTreeMap<i64, BTreeSet<(&str, i32)>> = BTreeMap::new();
+    for cut in cuts {
+        let raw = node
+            .read_local(&camus_metadata::partition_storage_key(
+                &cut.topic_id,
+                cut.partition,
+            ))?
+            .ok_or_else(|| anyhow::anyhow!("{} has no partition {}", cut.topic, cut.partition))?;
+        let state = camus_metadata::parse_partition(&raw).map_err(|err| anyhow::anyhow!(err))?;
+        for span in &state.txn_committed {
+            let side = if span.end <= cut.end {
+                &mut kept
+            } else {
+                &mut dropped
+            };
+            side.entry(span.producer_id.unwrap_or(-1))
+                .or_default()
+                .insert((cut.topic.as_str(), cut.partition));
+        }
+    }
+    for (producer, places) in &dropped {
+        let Some(elsewhere) = kept.get(producer) else {
+            continue;
+        };
+        if let Some((topic, partition)) = elsewhere.difference(places).next() {
+            return Ok(Some(format!(
+                "producer {producer} has a committed transaction the cut drops, and one it \
+                 keeps in {topic} partition {partition}: they may be one transaction. \
+                 Choose another cut, or pass split_transactions to accept it"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Where `partition` of `topic` ends after a cut at `at`. Stamps never go
+/// back within a partition, so it keeps a prefix: up to the first batch
+/// stamped above `at`, found by extent stamp ranges and, in the one
+/// extent the cut falls inside, its object's footer.
+async fn partition_cut(
+    node: &camus_metadata::MetadataNode,
+    dest: &Bucket,
+    topic: &Topic,
+    partition: i32,
+    at: i64,
+) -> anyhow::Result<Result<camus_metadata::mirror::MirrorCut, String>> {
+    use camus_metadata::mirror::{MirrorCut, Shorten};
+    let raw = node
+        .read_local(&camus_metadata::partition_storage_key(&topic.id, partition))?
+        .ok_or_else(|| anyhow::anyhow!("{} has no partition {partition}", topic.name))?;
+    let state = camus_metadata::parse_partition(&raw).map_err(|err| anyhow::anyhow!(err))?;
+    let topic_id = *uuid::Uuid::parse_str(&topic.id)?.as_bytes();
+    let cut = |end: i64, shorten| MirrorCut {
+        topic: topic.name.clone(),
+        topic_id: topic.id.clone(),
+        partition,
+        end,
+        shorten,
+    };
+    // Drop an extent whole. One that reaches below the log start keeps an
+    // empty front there, so the cut is never below the log start.
+    let drop_from = |extent: &camus_metadata::Extent| {
+        if extent.start >= state.log_start {
+            return cut(extent.start, None);
+        }
+        cut(
+            state.log_start,
+            Some(Shorten {
+                extent_end: extent.end,
+                object_key: extent.key.clone(),
+                length: 0,
+                max_timestamp: extent.base_timestamp,
+                stamps: None,
+            }),
+        )
+    };
+    let scan = |from: &str, to: &str, limit: usize| {
+        node.scan_range_local(from, to, limit)
+            .map_err(|err| err.to_string())
+    };
+    let mut after = state.log_start;
+    loop {
+        let page =
+            camus_metadata::extents_after(&scan, &topic.id, partition, &state, after, CUT_PAGE)
+                .map_err(|err| anyhow::anyhow!(err))?;
+        if page.is_empty() {
+            return Ok(Ok(cut(state.next_offset, None)));
+        }
+        for extent in page {
+            after = extent.end;
+            let Some(range) = extent.stamps else {
+                return Ok(Err(format!(
+                    "offsets {}..{} have no stamps",
+                    extent.start, extent.end
+                )));
+            };
+            if range.max <= at {
+                continue;
+            }
+            if range.min > at {
+                return Ok(Ok(drop_from(&extent)));
+            }
+            // The cut falls inside: find the first piece stamped above it.
+            let footer = source_footer(dest, &extent.key).await;
+            let low = extent.file_offset;
+            let high = low.saturating_add(u64::from(extent.length));
+            let mut pieces: Vec<&camus_uploader::FooterEntry> = footer
+                .iter()
+                .filter(|entry| {
+                    entry.topic_id == topic_id
+                        && entry.partition == partition
+                        && entry.file_offset >= low
+                        && entry.file_offset.saturating_add(u64::from(entry.length)) <= high
+                })
+                .collect();
+            pieces.sort_by_key(|entry| entry.file_offset);
+            let mut next = low;
+            for piece in &pieces {
+                if piece.file_offset != next {
+                    break;
+                }
+                next = piece.file_offset.saturating_add(u64::from(piece.length));
+            }
+            if next != high {
+                return Ok(Err(format!(
+                    "the stamps of offsets {}..{} cannot be read from {}",
+                    extent.start, extent.end, extent.key
+                )));
+            }
+            let mut kept: Option<camus_metadata::StampRange> = None;
+            let mut max_timestamp = extent.base_timestamp;
+            for piece in pieces {
+                let Some(stamp) = piece.stamp else {
+                    return Ok(Err(format!(
+                        "offsets {}..{} have no stamps",
+                        piece.start, piece.end
+                    )));
+                };
+                if stamp > at {
+                    let length = u32::try_from(piece.file_offset - low)?;
+                    if length == 0 {
+                        return Ok(Ok(drop_from(&extent)));
+                    }
+                    return Ok(Ok(cut(
+                        piece.start.max(state.log_start),
+                        Some(Shorten {
+                            extent_end: extent.end,
+                            object_key: extent.key.clone(),
+                            length,
+                            max_timestamp,
+                            stamps: kept,
+                        }),
+                    )));
+                }
+                max_timestamp = max_timestamp.max(piece.max_timestamp);
+                kept = Some(match kept {
+                    Some(range) => camus_metadata::StampRange {
+                        min: range.min.min(stamp),
+                        max: range.max.max(stamp),
+                    },
+                    None => camus_metadata::StampRange {
+                        min: stamp,
+                        max: stamp,
+                    },
+                });
+            }
+            // Every batch in it is at or below the cut, though its range,
+            // taken from a source extent, reached past.
+        }
+    }
+}
+
 /// Most committed offsets read for one group per round, a block of the
 /// source snapshot at a time. A group with more is synced up to here.
 const MAX_GROUP_OFFSETS: usize = 65_536;

@@ -651,6 +651,7 @@ fn apply_command(
             Command::PromoteMirror { topic } => mirror::promote(&read, &topic),
             Command::SyncMirrorOffsets { .. } => unreachable!("handled above"),
             Command::StampExtents { stamps } => catalog::stamp_extents(&read, &stamps),
+            Command::CutMirrors { cuts, all } => mirror::cut(&read, &scan, &cuts, all),
             Command::SetMirrorGroups { alias, groups } => {
                 mirror::set_groups(&read, &alias, &groups)
             }
